@@ -1069,6 +1069,31 @@ Parameters:
 - `group_policy` (default: `mention_only`) - `open`, `allowlist`, `mention_only`
 - `reply_to_mode` (default: `off`) - `off` threads only when the triggering message is already a thread reply; `all` always replies in a thread
 - `streaming` (default: `false`) - Show the reply while it is still being generated. See below
+- `status_reactions` (default: `false`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
+- `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
+
+#### Slack status reactions
+
+With `status_reactions = true`, nullclaw reacts to the triggering message with
+`reactions.add` and switches the reaction as the turn progresses, then removes it
+on the final state when that state's emoji is empty. Slack adds reactions instead
+of replacing them, so the previous state is removed explicitly.
+
+Give `accepted` and `running` the same name to keep the traffic to one reaction
+per turn:
+
+```json
+"status_reactions": true,
+"reaction_emojis": {
+  "accepted": "hourglass_flowing_sand",
+  "running": "hourglass_flowing_sand",
+  "done": "",
+  "failed": "warning"
+}
+```
+
+An app without `reactions:write` answers `missing_scope`; nullclaw logs it once
+and stops trying for that account.
 
 #### Slack streaming replies
 

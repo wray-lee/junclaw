@@ -1011,6 +1011,26 @@ fn markInboundMessageRead(
     };
 }
 
+/// Show a task lifecycle state on the message that triggered the turn.
+/// Channels that do not implement it answer `error.NotSupported`.
+fn setInboundTaskReaction(
+    channel: ?channels_mod.Channel,
+    target: []const u8,
+    message_id: ?[]const u8,
+    reaction: channels_mod.Channel.TaskReaction,
+) void {
+    const ch = channel orelse return;
+    const id = message_id orelse return;
+    ch.setTaskReaction(.{
+        .target = target,
+        .message_id = id,
+        .reaction = reaction,
+    }) catch |err| switch (err) {
+        error.NotSupported => {},
+        else => log.debug("inbound setTaskReaction failed: {}", .{err}),
+    };
+}
+
 fn sendInboundProcessingIndicator(
     allocator: std.mem.Allocator,
     registry: *const dispatch.ChannelRegistry,
@@ -1309,6 +1329,8 @@ fn processInboundMessage(
 
     if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
 
+    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted);
+
     const typing_recipient = sendInboundProcessingIndicator(
         allocator,
         registry,
@@ -1366,6 +1388,8 @@ fn processInboundMessage(
         defer channels_mod.max.setInteractiveOwnerContext(null);
     }
 
+    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .running);
+
     const reply = runtime.session_mgr.processMessageStreaming(
         routing_plan.session_key,
         msg.content,
@@ -1374,6 +1398,7 @@ fn processInboundMessage(
         null,
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
+        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
 
         // Send user-visible error reply back to the originating channel
         const err_msg: []const u8 = switch (err) {
@@ -1406,11 +1431,22 @@ fn processInboundMessage(
                     routing_plan.outbound_chat_id,
                     reply,
                     outbound_draft_id,
-                ) catch return;
+                ) catch {
+                    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
+                    return;
+                };
+                var published = true;
                 event_bus.publishOutbound(out) catch |publish_err| {
                     out.deinit(allocator);
+                    published = false;
                     log.err("inbound dispatch publishOutbound failed: {}", .{publish_err});
                 };
+                setInboundTaskReaction(
+                    outbound_channel,
+                    msg.chat_id,
+                    parsed_meta.fields.message_id,
+                    if (published) .done else .failed,
+                );
                 return;
             };
             defer payload.deinit(allocator);
@@ -1420,6 +1456,7 @@ fn processInboundMessage(
                 .message_id = parsed_meta.fields.message_id.?,
                 .payload = payload.payload(),
             })) |_| {
+                setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .done);
                 return;
             } else |err| {
                 log.warn("editMessage failed; falling back to normal outbound: {}", .{err});
@@ -1436,6 +1473,7 @@ fn processInboundMessage(
         outbound_draft_id,
     ) catch |err| {
         log.err("inbound dispatch makeOutbound failed: {}", .{err});
+        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
         return;
     };
 
@@ -1444,9 +1482,11 @@ fn processInboundMessage(
         if (err != error.Closed) {
             log.err("inbound dispatch publishOutbound failed: {}", .{err});
         }
+        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
         return;
     };
 
+    setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .done);
     health.markComponentOk("inbound_dispatcher");
     const dispatch_count = evict_counter.fetchAdd(1, .monotonic) + 1;
     if (shouldRunInboundIdleEviction(dispatch_count)) {

@@ -871,7 +871,27 @@ Slack 示例：
 - `dm_policy`（默认 `pairing`）——`allow`、`deny`、`allowlist`/`pairing`
 - `group_policy`（默认 `mention_only`）——`open`、`allowlist`、`mention_only`
 - `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
+- `status_reactions`（默认 `false`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
+- `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
 - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
+
+#### Slack 状态 reaction
+
+`status_reactions = true` 时，nullclaw 用 `reactions.add` 在触发消息上加 reaction，随任务推进在 `accepted`、`running`、`done`/`failed` 之间切换，并在该状态的短名为空时用 `reactions.remove` 移除。Slack 的 reaction 是累加而非替换，因此会显式移除上一个状态。
+
+把 `accepted` 和 `running` 设为同一个短名，可以让每轮只产生一次 reaction 请求：
+
+```json
+"status_reactions": true,
+"reaction_emojis": {
+  "accepted": "hourglass_flowing_sand",
+  "running": "hourglass_flowing_sand",
+  "done": "",
+  "failed": "warning"
+}
+```
+
+若应用没有 `reactions:write`，Slack 返回 `missing_scope`，nullclaw 只记录一次并停止对该账号尝试。
 
 #### Slack 流式回复
 
