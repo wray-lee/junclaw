@@ -91,6 +91,55 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     return allocator.dupe(u8, trimmed);
 }
 
+/// Render `<think>…</think>` blocks as `>`-quoted lines instead of dropping
+/// them. Live channel drafts use this when `reasoning_mode == .stream` so the
+/// thinking is visible while it is produced; the delivered reply always goes
+/// through `stripThinkBlocks`, so the quote never reaches the final message.
+/// An unterminated block (mid-stream) is quoted up to the end of `text`.
+pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    if (std.mem.indexOf(u8, text, think_open_tag) == null) return stripThinkBlocks(allocator, text);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    var depth: usize = 0;
+    var at_line_start = false;
+    while (i < text.len) {
+        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
+            depth += 1;
+            i += think_open_tag.len;
+            if (depth == 1) {
+                try out.appendSlice(allocator, "\n> ");
+                at_line_start = false;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
+            if (depth > 0) depth -= 1;
+            i += think_close_tag.len;
+            if (depth == 0) {
+                try out.appendSlice(allocator, "\n\n");
+                at_line_start = false;
+            }
+            continue;
+        }
+        const byte = text[i];
+        if (depth > 0) {
+            if (at_line_start) try out.appendSlice(allocator, "> ");
+            at_line_start = byte == '\n';
+        }
+        try out.append(allocator, byte);
+        i += 1;
+    }
+
+    const quoted = try out.toOwnedSlice(allocator);
+    const trimmed = std.mem.trim(u8, quoted, " \t\r\n");
+    if (trimmed.ptr == quoted.ptr and trimmed.len == quoted.len) return quoted;
+    defer allocator.free(quoted);
+    return allocator.dupe(u8, trimmed);
+}
+
 fn appendReasoningDetailText(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -865,4 +914,32 @@ test "appendVertexThinkingConfig uses uppercase thinkingLevel for gemini-3 flash
     const thinking = cfg.get("thinkingConfig").?.object;
     try std.testing.expectEqualStrings("MEDIUM", thinking.get("thinkingLevel").?.string);
     try std.testing.expect(thinking.get("includeThoughts").?.bool == true);
+}
+
+test "quoteThinkBlocks renders reasoning as a quote and keeps the answer" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "<think>step one\nstep two</think>The answer");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("> step one\n> step two\n\nThe answer", out);
+}
+
+test "quoteThinkBlocks leaves plain text untouched" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "Just the answer");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("Just the answer", out);
+}
+
+test "quoteThinkBlocks quotes an unterminated reasoning block" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "<think>still thinking");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("> still thinking", out);
+}
+
+test "quoteThinkBlocks drops a stray close tag" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "answer</think> tail");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("answer tail", out);
 }
