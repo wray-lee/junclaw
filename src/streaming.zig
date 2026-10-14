@@ -66,6 +66,10 @@ pub const TagFilter = struct {
     inner: Sink,
     think: ThinkMode = .strip,
     state: State = .passthrough,
+    /// Nesting depth of the provider tool marker currently being suppressed.
+    opaque_depth: u8 = 0,
+    /// True when the marker being eaten is a closer (`</\u{FF5C}...`).
+    opaque_closer: bool = false,
     buf: [max_buf_len]u8 = undefined,
     buf_len: u8 = 0,
 
@@ -76,6 +80,9 @@ pub const TagFilter = struct {
         inside_tag, // inside tag body, suppressing output
         maybe_close, // buffering after '<', checking if close tag matches
         inside_think, // passthrough mode: inside <think>, body flows verbatim
+        opaque_marker, // provider tool marker: eat bytes up to its closing '>'
+        opaque_body, // inside a suppressed marker body
+        opaque_body_maybe_open, // inside a suppressed body, buffering after '<'
     };
 
     // Opening tag prefixes. After matching, skip until '>'.
@@ -104,6 +111,19 @@ pub const TagFilter = struct {
     // Used by `ThinkMode.passthrough`, which forwards the reasoning close tag
     // instead of swallowing it.
     const close_tag_think = "</think>";
+
+    // Provider tool-protocol markers that are neither `<tool_call>` nor user
+    // text. When a model falls back to its own text tool protocol the gateway
+    // can surface those bytes in the content stream - DeepSeek emits
+    // `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>` /
+    // `<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke ...>` - and they must
+    // never reach a channel. The markers nest (`calls` wraps `invoke` wraps
+    // `parameter`), so the body is suppressed until the matching closer, in
+    // both think modes: it is tool markup, not reasoning and not an answer.
+    const opaque_marker_prefixes = [_][]const u8{
+        "<\u{FF5C}",
+        "</\u{FF5C}",
+    };
 
     // Standalone control tokens that should be stripped, but do not wrap body text.
     const standalone_tags = [_][]const u8{
@@ -206,6 +226,18 @@ pub const TagFilter = struct {
                         clean_start = i + 1;
                         continue;
                     }
+                    // Provider tool marker (`<\u{FF5C}...` / `</\u{FF5C}...`): buffer
+                    // the opening bytes, then eat the marker and, for an opener,
+                    // suppress its body too.
+                    if (prefixOfAny(prefix, &opaque_marker_prefixes)) {
+                        if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
+                            self.opaque_closer = prefix.len > 1 and prefix[1] == '/';
+                            self.buf_len = 0;
+                            self.state = .opaque_marker;
+                        }
+                        clean_start = i + 1;
+                        continue;
+                    }
                     // Not a prefix of any tag — flush buffer and resume passthrough.
                     self.inner.emitChunk(self.buf[0..self.buf_len]);
                     self.buf_len = 0;
@@ -246,6 +278,42 @@ pub const TagFilter = struct {
                     }
                     // Still a valid prefix of a close tag — keep buffering.
                 },
+                .opaque_marker => {
+                    // Drop the marker itself; the body is handled by the state
+                    // the closing '>' selects.
+                    clean_start = i + 1;
+                    if (b != '>') continue;
+                    if (self.opaque_closer) {
+                        if (self.opaque_depth > 0) self.opaque_depth -= 1;
+                    } else {
+                        self.opaque_depth +|= 1;
+                    }
+                    self.state = if (self.opaque_depth > 0) .opaque_body else .passthrough;
+                },
+                .opaque_body => {
+                    clean_start = i + 1;
+                    if (b == '<') {
+                        self.buf[0] = b;
+                        self.buf_len = 1;
+                        self.state = .opaque_body_maybe_open;
+                    }
+                },
+                .opaque_body_maybe_open => {
+                    clean_start = i + 1;
+                    self.buf[self.buf_len] = b;
+                    self.buf_len += 1;
+                    const prefix = self.buf[0..self.buf_len];
+                    if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
+                        self.opaque_closer = prefix[1] == '/';
+                        self.buf_len = 0;
+                        self.state = .opaque_marker;
+                        continue;
+                    }
+                    if (prefixOfAny(prefix, &opaque_marker_prefixes)) continue;
+                    // Ordinary text inside the suppressed body — keep dropping.
+                    self.buf_len = 0;
+                    self.state = .opaque_body;
+                },
                 .inside_think => {
                     // Passthrough mode: the body is user-visible reasoning, so
                     // forward it verbatim. The close tag is matched against the
@@ -280,6 +348,8 @@ pub const TagFilter = struct {
             self.inner.emitChunk(self.buf[0..self.buf_len]);
         }
         self.buf_len = 0;
+        self.opaque_depth = 0;
+        self.opaque_closer = false;
         self.state = .passthrough;
     }
 
@@ -554,6 +624,61 @@ test "TagFilter think passthrough still strips tool call markup" {
     s.emitFinal();
     var buf: [128]u8 = undefined;
     try std.testing.expectEqualStrings("<think>thinking</think>AB", col.joined(&buf));
+}
+
+test "TagFilter strips DeepSeek DSML tool markup" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk(
+        "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter name=\"command\">ls -la" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} parameter>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer",
+    );
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
+}
+
+test "TagFilter strips DSML markup in think passthrough mode" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
+    const s = filter.sink();
+    s.emitChunk(
+        "<think>plan</think><\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>" ++
+            "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke name=\"shell\">" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} invoke>" ++
+            "</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Done",
+    );
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("<think>plan</think>Done", col.joined(&buf));
+}
+
+test "TagFilter strips a DSML marker split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} ca");
+    s.emitChunk("lls>secret</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
+}
+
+test "TagFilter drops a stray DSML closer but keeps the answer" {
+    // Regression: a draft that only caught the tail of a marker still showed
+    // the raw `</|DSML| calls>` text ahead of the answer.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("</\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>Answer");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
 }
 
 test "TagFilter strips complete tool_call in single chunk" {

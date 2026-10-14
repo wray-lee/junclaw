@@ -2031,12 +2031,19 @@ pub const SessionManager = struct {
 
     /// True when the session's agent streams reasoning to the caller
     /// (`/reasoning stream`), which is what lets a channel draft show the
-    /// thinking live. Unknown sessions report false: a new session starts in
-    /// the default mode, which does not stream reasoning.
+    /// thinking live.
+    ///
+    /// An unknown key reports the configured default instead of false. A session
+    /// only exists once its first turn has run, and Slack appends the thread ts
+    /// to the key, so a channel turn routinely looks up a session that does not
+    /// exist yet. Returning false there silently stripped the live reasoning
+    /// from every Slack message.
     pub fn streamsReasoning(self: *SessionManager, session_key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = self.sessions.get(session_key) orelse return false;
+        const session = self.sessions.get(session_key) orelse {
+            return self.config.agent.reasoning_mode == .stream;
+        };
         return session.agent.reasoning_mode == .stream;
     }
 
