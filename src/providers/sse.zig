@@ -41,6 +41,19 @@ fn finalizeStreamResult(
     };
 }
 
+/// Finalize a stream that was cut after partial output (wait failure, nonzero
+/// exit, abnormal termination): keep the salvaged text, but flag it truncated so
+/// the agent refuses tool calls parsed out of the partial response.
+fn finalizeRecoveredStreamResult(
+    allocator: std.mem.Allocator,
+    accumulated: []const u8,
+    stream_usage: ?root.TokenUsage,
+) !root.StreamChatResult {
+    var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
+    result.truncated = true;
+    return result;
+}
+
 const ToolCallSlot = struct {
     index: usize,
     id: ?[]u8 = null,
@@ -225,6 +238,10 @@ fn finalizeStreamResultWithToolCalls(
     /// timeout, nonzero exit, read error) pass false: the text they salvage is
     /// worth keeping, but a tool call cut mid-flight must never be executed.
     tool_calls_trusted: bool,
+    /// Whether the response is incomplete: a cut stream or a `finish_reason`
+    /// of "length". Propagated to the agent so it refuses to execute tool
+    /// calls parsed from the partial text.
+    truncated: bool,
 ) !root.StreamChatResult {
     var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
     errdefer {
@@ -239,6 +256,7 @@ fn finalizeStreamResultWithToolCalls(
         if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
     }
 
+    result.truncated = truncated;
     if (tool_calls_trusted) {
         result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
     }
@@ -537,6 +555,76 @@ pub fn extractDeltaContent(allocator: std.mem.Allocator, json_str: []const u8) !
     return null;
 }
 
+fn isJsonWhitespace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\n' or c == '\r';
+}
+
+/// True when an SSE line's choice carries `finish_reason: "length"`, i.e. the
+/// model stopped because it hit its token budget. The accumulated text is a
+/// truncated prefix, so any tool-call markup in it must not be executed.
+///
+/// Scans the payload textually instead of JSON-parsing it: a full parse needs
+/// an allocator, and the previous fixed 16 KB arena silently failed on a larger
+/// data line (a big final delta can carry the finish_reason), so a max_tokens
+/// cut was never flagged. The field is only matched at a JSON value position
+/// (after `{` or `,`) so a quoted mention inside a content string is ignored.
+fn sseLineReportsLengthFinish(line: []const u8) bool {
+    const data = extractSseDataPayload(line) orelse return false;
+    if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) return false;
+
+    const key = "\"finish_reason\"";
+    var search_from: usize = 0;
+    while (std.mem.indexOfPos(u8, data, search_from, key)) |key_start| {
+        search_from = key_start + 1;
+
+        // Reject a mention that is a value, not a key: the byte before the key
+        // must open an object (`{`) or separate a member (`,`).
+        var prev = key_start;
+        while (prev > 0 and isJsonWhitespace(data[prev - 1])) prev -= 1;
+        if (prev != 0 and data[prev - 1] != '{' and data[prev - 1] != ',') continue;
+
+        var i = key_start + key.len;
+        while (i < data.len and isJsonWhitespace(data[i])) i += 1;
+        if (i >= data.len or data[i] != ':') continue;
+        i += 1;
+        while (i < data.len and isJsonWhitespace(data[i])) i += 1;
+        if (i >= data.len or data[i] != '"') continue;
+        const value_start = i + 1;
+        const value_end = std.mem.indexOfScalarPos(u8, data, value_start, '"') orelse continue;
+        if (std.mem.eql(u8, data[value_start..value_end], "length")) return true;
+    }
+    return false;
+}
+
+/// Stop the cancel watcher, then kill and reap curl.
+///
+/// The watcher must be joined BEFORE `wait()` reaps the child: a still-running
+/// watcher otherwise calls `kill(child.id)` in the window after the kernel has
+/// returned that PID to the OS, and a freshly spawned process can reuse it, so
+/// the watcher would signal an unrelated process. This mirrors the established
+/// `http_util.abortCurlChild` ordering (stop watcher, then kill/wait).
+fn stopWatcherAndReap(
+    child: *std_compat.process.Child,
+    cancel_done: *std.atomic.Value(bool),
+    cancel_watcher: *?std.Thread,
+) void {
+    http_util.stopCancelWatcher(cancel_done, cancel_watcher);
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+}
+
+/// True when a stdin write failure must be reported as a user interrupt.
+///
+/// A /stop raises the agent interrupt flag; the cancel watcher then kills curl
+/// mid-upload, so `writeAll(body)` fails with a broken pipe instead of reaching
+/// the read-loop interrupt check. Consulting the flag lets the caller end the
+/// turn with the interrupt reply rather than reporting the stop as a provider
+/// write failure.
+fn stdinWriteFailureIsInterrupt(cancel_flag: ?*const std.atomic.Value(bool)) bool {
+    if (cancel_flag) |flag| return flag.load(.acquire);
+    return false;
+}
+
 /// Run curl in SSE streaming mode and parse output line by line.
 ///
 /// Spawns `curl -s --no-buffer` with the strongest supported fail-fast flag:
@@ -650,19 +738,37 @@ pub fn curlStream(
         debug_log.debug("curl process spawned, pid={d}", .{pid});
     }
 
+    // Abort the stream when the agent interrupt flag is raised (e.g. /stop
+    // during a runaway generation). Killing curl closes the stdout pipe, so
+    // the blocking read below returns and this function returns
+    // error.Interrupted so the caller ends the turn instead of retrying.
+    const cancel_flag = http_util.currentThreadInterruptFlag();
+    var cancel_done = std.atomic.Value(bool).init(false);
+    var cancel_watcher: ?std.Thread = null;
+    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
+    if (cancel_flag) |flag| {
+        cancel_ctx = .{ .child = &child, .cancel_flag = flag, .done = &cancel_done };
+        cancel_watcher = std.Thread.spawn(.{}, http_util.cancelWatcherMain, .{&cancel_ctx}) catch null;
+    }
+    // Safety net only: every path below stops the watcher before reaping curl
+    // (see stopWatcherAndReap), because joining after wait() leaves a PID-reuse
+    // window. This defer is a no-op once that has happened.
+    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            _ = child.kill() catch {};
-            _ = child.wait() catch {};
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            // A /stop can kill curl before the body finishes uploading; the
+            // failed write would otherwise mask the interrupt as a provider error.
+            if (stdinWriteFailureIsInterrupt(cancel_flag)) return error.Interrupted;
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        _ = child.kill() catch {};
-        _ = child.wait() catch {};
+        stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
         return error.CurlWriteError;
     }
 
@@ -676,6 +782,7 @@ pub fn curlStream(
     const stdout_file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
+    var saw_length_finish = false;
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
     var in_reasoning = false;
@@ -715,7 +822,7 @@ pub fn curlStream(
             if (parsed) |p| {
                 defer p.deinit();
                 if (error_classify.classifyKnownApiError(p.value.object)) |kind| {
-                    _ = child.wait() catch {};
+                    stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
                     // Keep the provider's message: without it the channel can
                     // only show a generic "An error occurred" for a 400.
                     var summary_buf: [1024]u8 = undefined;
@@ -729,7 +836,7 @@ pub fn curlStream(
             }
 
             // Return a meaningful error
-            _ = child.wait() catch {};
+            stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
             debug_log.err("Server returned JSON error payload: len={d}", .{json_response.len});
             return error.ServerError;
         }
@@ -740,6 +847,7 @@ pub fn curlStream(
                     debug_log.debug("parsing SSE line: len={d}", .{line_buf.items.len});
                 }
                 try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
+                if (!saw_length_finish and sseLineReportsLengthFinish(line_buf.items)) saw_length_finish = true;
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -768,6 +876,22 @@ pub fn curlStream(
 
     if (log_enabled) {
         debug_log.debug("stdout stream ended, saw_done={}, accumulated_len={d}, total_stdout={d}", .{ saw_done, accumulated.items.len, total_stdout });
+    }
+
+    // A /stop raised the interrupt flag and the watcher killed curl, so the
+    // stream was cut. Return a distinct error rather than salvaging the partial
+    // text: this can happen before any byte arrives (accumulated_len == 0),
+    // where the old code returned error.CurlFailed and the compatible provider
+    // fell back to a fresh non-streaming request — silently ignoring the stop.
+    // The fallback/retry layers must propagate error.Interrupted and the agent
+    // must end the turn with the normal interrupt reply.
+    if (!saw_done) {
+        if (cancel_flag) |flag| {
+            if (flag.load(.acquire)) {
+                stopWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                return error.Interrupted;
+            }
+        }
     }
 
     // Parse a trailing line when the stream ends without a final '\n'.
@@ -800,13 +924,17 @@ pub fn curlStream(
     if (log_enabled) {
         debug_log.debug("waiting for curl process to exit...", .{});
     }
+    // Join the watcher before reaping curl (PID-reuse window; see
+    // stopWatcherAndReap). The stdout stream is already at EOF, so the watcher
+    // has nothing left to unblock.
+    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
     const term = child.wait() catch |err| {
         log.err("curlStream child.wait failed: {}", .{err});
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
+            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
         }
         return error.CurlWaitError;
     };
@@ -819,7 +947,7 @@ pub fn curlStream(
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
             }
             return error.CurlFailed;
         },
@@ -828,7 +956,7 @@ pub fn curlStream(
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
             }
             return error.CurlFailed;
         },
@@ -837,7 +965,7 @@ pub fn curlStream(
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true);
+    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true, saw_length_finish);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1097,7 +1225,7 @@ pub fn curlStreamAnthropic(
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
             log.warn("curlStreamAnthropic proceeding despite wait failure after partial stream output", .{});
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+            return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
         }
         return error.CurlWaitError;
     };
@@ -1106,7 +1234,7 @@ pub fn curlStreamAnthropic(
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic exit code {d} after partial stream output; returning accumulated output", .{code});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
             }
             return error.CurlFailed;
         },
@@ -1114,7 +1242,7 @@ pub fn curlStreamAnthropic(
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
                 log.warn("curlStreamAnthropic abnormal termination after partial stream output; returning accumulated output", .{});
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResult(allocator, accumulated.items, anthropic_usage);
+                return finalizeRecoveredStreamResult(allocator, accumulated.items, anthropic_usage);
             }
             return error.CurlFailed;
         },
@@ -1364,6 +1492,78 @@ test "accumulateToolCallsFromSseLine handles trailing data line without newline"
     try std.testing.expectEqualStrings("shell", tool_calls[0].name);
 }
 
+test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
+    var flag = std.atomic.Value(bool).init(false);
+    try std.testing.expect(!stdinWriteFailureIsInterrupt(&flag));
+    try std.testing.expect(!stdinWriteFailureIsInterrupt(null));
+    flag.store(true, .release);
+    // Regression: a /stop that kills curl mid-upload surfaces as a write error;
+    // the flag must win so the caller ends the turn with the interrupt reply.
+    try std.testing.expect(stdinWriteFailureIsInterrupt(&flag));
+}
+
+test "finalizeStreamResultWithToolCalls flags a cut stream as truncated" {
+    const allocator = std.testing.allocator;
+    var accumulator = ToolCallAccumulator{};
+    defer accumulator.deinit(allocator);
+
+    try accumulator.appendFromJsonPayload(allocator,
+        \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+    );
+
+    // Recovery path: the stream was cut, so tool_calls_trusted=false and
+    // truncated=true. The partial text is kept but no tool call is exposed.
+    const result = try finalizeStreamResultWithToolCalls(allocator, "partial answer", null, &accumulator, false, true);
+    defer {
+        if (result.content) |content| allocator.free(content);
+        if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+        for (result.tool_calls) |tc| {
+            allocator.free(tc.id);
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+    }
+
+    try std.testing.expect(result.truncated);
+    try std.testing.expectEqual(@as(usize, 0), result.tool_calls.len);
+    try std.testing.expectEqualStrings("partial answer", result.content.?);
+}
+
+test "sseLineReportsLengthFinish detects a max_tokens finish" {
+    try std.testing.expect(sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"length"}]}
+    ));
+    try std.testing.expect(!sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+    ));
+    try std.testing.expect(!sseLineReportsLengthFinish("data: [DONE]"));
+    try std.testing.expect(!sseLineReportsLengthFinish(": keep-alive"));
+}
+
+test "sseLineReportsLengthFinish finds finish_reason past 16 KB" {
+    // Regression: the previous fixed 16 KB parse arena silently failed on a
+    // larger data line (a big final delta can carry the finish_reason), so a
+    // max_tokens cut was never flagged and truncated tool calls ran.
+    const prefix = "data: {\"choices\":[{\"delta\":{\"content\":\"";
+    const suffix = "\"},\"finish_reason\":\"length\"}]}";
+    const fill = 20 * 1024;
+    var buf: [prefix.len + fill + suffix.len]u8 = undefined;
+    @memcpy(buf[0..prefix.len], prefix);
+    @memset(buf[prefix.len .. prefix.len + fill], 'x');
+    @memcpy(buf[prefix.len + fill ..], suffix);
+    const line = buf[0 .. prefix.len + fill + suffix.len];
+
+    try std.testing.expect(line.len > 16 * 1024);
+    try std.testing.expect(sseLineReportsLengthFinish(line));
+
+    // A quoted mention of the field inside content must not be mistaken for the
+    // real finish_reason.
+    try std.testing.expect(!sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{"content":"say \"finish_reason\":\"length\" now"}}]}
+    ));
+}
+
 test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
     const allocator = std.testing.allocator;
     var accumulator = ToolCallAccumulator{};
@@ -1373,7 +1573,7 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
         \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
     );
 
-    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true, false);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
@@ -1401,7 +1601,7 @@ test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
     );
 
-    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true, false);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
@@ -1628,6 +1828,23 @@ test "extractStreamUsage returns null for chunk without usage" {
 
 test "extractStreamUsage returns null for invalid JSON" {
     try std.testing.expect(extractStreamUsage("not-json{{{") == null);
+}
+
+test "finalizeRecoveredStreamResult flags a cut stream as truncated" {
+    const result = try finalizeRecoveredStreamResult(
+        std.testing.allocator,
+        "partial answer <tool_call>{\"name\":\"shell\"}</tool_call>",
+        null,
+    );
+    defer {
+        if (result.content) |content| std.testing.allocator.free(content);
+        if (result.reasoning_content) |reasoning| std.testing.allocator.free(reasoning);
+    }
+
+    // The Anthropic recovery paths keep the salvaged text but must flag it
+    // truncated so the agent does not execute tool calls parsed from the cut.
+    try std.testing.expect(result.truncated);
+    try std.testing.expect(std.mem.indexOf(u8, result.content.?, "partial answer") != null);
 }
 
 test "finalizeStreamResult separates think blocks into reasoning content" {

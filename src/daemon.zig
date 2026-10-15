@@ -37,6 +37,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const observability = @import("observability.zig");
+const control_plane = @import("control_plane.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -1240,6 +1241,20 @@ fn shouldRunInboundIdleEviction(dispatch_count: u32) bool {
     return dispatch_count != 0 and (dispatch_count % EVICT_IDLE_DISPATCH_INTERVAL) == 0;
 }
 
+/// Resolve the session key a queued inbound message will run under. Mirrors
+/// `buildInboundRoutingPlan` so the dispatcher shards a message onto the same
+/// FIFO worker as every other message for its session, and so the enqueue-time
+/// stop fast-path targets the session the running turn actually holds.
+fn resolveInboundDispatchSessionKey(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    msg: *const bus_mod.InboundMessage,
+    meta: channel_adapters.InboundMetadata,
+) ?[]const u8 {
+    return resolveInboundMainSessionKeyWithMetadata(allocator, config, msg, meta) orelse
+        resolveInboundRouteSessionKeyWithMetadata(allocator, config, msg, meta);
+}
+
 fn inboundDispatchShardIndex(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -1251,22 +1266,46 @@ fn inboundDispatchShardIndex(
     var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
     defer parsed_meta.deinit();
 
-    const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
-        allocator,
-        config,
-        msg,
-        parsed_meta.fields,
-    ) orelse resolveInboundRouteSessionKeyWithMetadata(
-        allocator,
-        config,
-        msg,
-        parsed_meta.fields,
-    );
+    const routed_session_key = resolveInboundDispatchSessionKey(allocator, config, msg, parsed_meta.fields);
     defer if (routed_session_key) |key| allocator.free(key);
 
     const session_key = routed_session_key orelse msg.session_key;
     const shard_count: u64 = @intCast(worker_count);
     return @intCast(std.hash.Wyhash.hash(0, session_key) % shard_count);
+}
+
+/// A `/stop` (or `/abort`) command must not wait behind the very turn it is
+/// meant to interrupt. Each session maps to one worker queue, so a stop for a
+/// busy session lands on that worker's FIFO behind the running turn and its
+/// `routeInbound` is never reached until the turn finishes. The Telegram loop
+/// already fast-paths stop commands at enqueue time; do the same for the
+/// sharded dispatcher (Slack and every channel routed through the inbound bus).
+///
+/// Signal the interrupt now and drop the message; the running turn's interrupt
+/// reply is the user-visible response. Returns true when the message was
+/// consumed as a stop for a running turn. FIFO is preserved for everything else.
+fn tryHandleStopCommandBeforeEnqueue(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    session_mgr: *@import("session.zig").SessionManager,
+    msg: *const bus_mod.InboundMessage,
+) bool {
+    if (!control_plane.isStopLikeCommand(msg.content)) return false;
+
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+    const routed_session_key = resolveInboundDispatchSessionKey(allocator, config, msg, parsed_meta.fields);
+    defer if (routed_session_key) |key| allocator.free(key);
+    const session_key = routed_session_key orelse msg.session_key;
+
+    var interrupt = session_mgr.requestTurnInterrupt(session_key);
+    defer interrupt.deinit(allocator);
+    if (!interrupt.requested) return false;
+
+    log.info("stop command interrupting running turn before enqueue session=0x{x}", .{
+        std.hash.Wyhash.hash(0, session_key),
+    });
+    return true;
 }
 
 fn publishInboundToWorkerQueue(
@@ -1577,6 +1616,10 @@ fn inboundDispatcherThread(
 
         while (ready_messages.items.len > 0) {
             var msg = ready_messages.orderedRemove(0);
+            if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
+                msg.deinit(allocator);
+                continue;
+            }
             if (worker_count > 0) {
                 publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
                     msg.deinit(allocator);
@@ -1593,6 +1636,10 @@ fn inboundDispatcherThread(
     debouncer.flushAll(&ready_messages) catch {};
     while (ready_messages.items.len > 0) {
         var msg = ready_messages.orderedRemove(0);
+        if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
+            msg.deinit(allocator);
+            continue;
+        }
         if (worker_count > 0) {
             publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
                 msg.deinit(allocator);
@@ -1649,6 +1696,12 @@ fn startConfiguredTunnel(
 /// shutdown is requested (Ctrl+C signal or explicit request).
 /// `host` and `port` are CLI-parsed values that override `config.gateway`.
 pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8, port: u16) !void {
+    // Make logging non-blocking before any channel/turn thread starts: a turn
+    // holds its Session.mutex for the whole turn, so a wedged stderr write
+    // (full docker json-file log pipe, stalled log driver) must not be able to
+    // park every logging thread on the process-global log lock. See logging.zig.
+    @import("logging.zig").start();
+
     // Ensure lifecycle parity: workspace bootstrap files must exist
     // even when users skip onboard and start runtime directly.
     try onboard.scaffoldWorkspaceForConfig(allocator, config, &onboard.ProjectContext{});
@@ -2149,6 +2202,78 @@ test "inboundDispatchShardIndex keeps routed session on same worker" {
     // Regression (#855): same resolved session must stay on one FIFO worker queue.
     try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &first, worker_count));
     try std.testing.expectEqual(expected_shard, inboundDispatchShardIndex(allocator, &config, &second, worker_count));
+}
+
+test "dispatcher interrupts a busy session for /stop before enqueue" {
+    const allocator = std.testing.allocator;
+    const providers_mod = @import("providers/root.zig");
+    const session_mod = @import("session.zig");
+
+    const StopMockProvider = struct {
+        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return a.dupe(u8, "ok");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
+            return error.ShouldNotChat;
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "stop-mock";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var provider_state: u8 = 0;
+    const provider_vtable = providers_mod.Provider.VTable{
+        .chatWithSystem = StopMockProvider.chatWithSystem,
+        .chat = StopMockProvider.chat,
+        .supportsNativeTools = StopMockProvider.supportsNativeTools,
+        .getName = StopMockProvider.getName,
+        .deinit = StopMockProvider.deinitFn,
+    };
+    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+    defer sm.deinit();
+
+    const session_key = "daemon:stop-before-enqueue";
+    const session = try sm.getOrCreate(session_key);
+    defer session.turn_running.store(false, .release);
+    session.agent.clearInterruptRequest();
+    session.turn_running.store(true, .release);
+
+    // Slack /stop for a busy session must reach requestTurnInterrupt at enqueue
+    // time, not sit on the same FIFO worker behind the running turn.
+    var stop_msg = bus_mod.InboundMessage{
+        .channel = "test-channel",
+        .sender_id = "user-1",
+        .chat_id = "chat-1",
+        .content = "/stop",
+        .session_key = session_key,
+    };
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
+    try std.testing.expect(session.agent.interrupt_requested.load(.acquire));
+
+    // A non-stop message is left for the queue and does not raise the flag.
+    session.agent.clearInterruptRequest();
+    var normal_msg = stop_msg;
+    normal_msg.content = "just a message";
+    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &normal_msg));
+    try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
+
+    // /stop with no running turn is not consumed: normal routing replies.
+    session.turn_running.store(false, .release);
+    session.agent.clearInterruptRequest();
+    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
+    try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
 }
 
 test "hasSupervisedChannels false for defaults" {

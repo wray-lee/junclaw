@@ -136,13 +136,13 @@ pub fn currentThreadInterruptFlag() ?*const AtomicBool {
     return thread_interrupt_flag;
 }
 
-const CancelWatcherCtx = struct {
+pub const CancelWatcherCtx = struct {
     child: *std_compat.process.Child,
     cancel_flag: *const AtomicBool,
     done: *AtomicBool,
 };
 
-fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
+pub fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
     while (!ctx.done.load(.acquire)) {
         if (ctx.cancel_flag.load(.acquire)) {
             if (comptime @import("builtin").os.tag == .windows) {
@@ -156,7 +156,7 @@ fn cancelWatcherMain(ctx: *CancelWatcherCtx) void {
     }
 }
 
-fn stopCancelWatcher(done: *AtomicBool, watcher: *?std.Thread) void {
+pub fn stopCancelWatcher(done: *AtomicBool, watcher: *?std.Thread) void {
     done.store(true, .release);
     if (watcher.*) |thread| {
         thread.join();

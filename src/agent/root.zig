@@ -52,6 +52,15 @@ const ToolExecutionResult = dispatcher.ToolExecutionResult;
 const DEFAULT_MAX_TOOL_ITERATIONS: u32 = 25;
 const MAX_MID_TURN_INJECTION_FOLLOWUPS: u32 = 8;
 
+/// Upper bound on tool calls executed from a single model response. A larger
+/// batch is a degenerate/runaway generation (the incident saw 73 and 366 text
+/// calls from one truncated response), not a real request: reject it instead of
+/// executing every call and hammering the process-global log lock.
+const MAX_TOOL_CALLS_PER_BATCH: usize = 24;
+
+const TRUNCATED_RESPONSE_NOTICE =
+    "The model's response was cut off before it finished, so the tool calls it contained were discarded. Please retry your request.";
+
 /// Maximum non-system messages before trimming.
 const DEFAULT_MAX_HISTORY: u32 = 50;
 
@@ -2219,6 +2228,11 @@ pub const Agent = struct {
             var response_attempt: u32 = 1;
             providers.clearLastApiErrorDetail();
             if (is_streaming) {
+                // Expose the agent interrupt flag to the provider stream so /stop
+                // can abort an in-flight generation (curlStream kills the curl
+                // child, which unblocks the read loop).
+                @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
+                defer @import("../http_util.zig").setThreadInterruptFlag(null);
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -2239,6 +2253,14 @@ pub const Agent = struct {
                     self.stream_callback.?,
                     self.stream_ctx.?,
                 ) catch |err| retry_stream: {
+                    // /stop aborted the in-flight stream before it produced any
+                    // output (curlStream returns error.Interrupted when the
+                    // cancel watcher fired). This is a user stop, not a provider
+                    // failure: end the turn with the normal interrupt reply
+                    // rather than recording a failure, retrying, or surfacing a
+                    // generic provider error to the channel.
+                    if (err == error.Interrupted) return self.interruptedReply();
+
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
 
@@ -2276,6 +2298,11 @@ pub const Agent = struct {
                             self.stream_callback.?,
                             self.stream_ctx.?,
                         ) catch |retry_err| {
+                            // /stop can also land while this post-vision-error
+                            // retry stream is running. End the turn with the
+                            // interrupt reply instead of surfacing the raw error
+                            // and degrading the route for a user-initiated stop.
+                            if (retry_err == error.Interrupted) return self.interruptedReply();
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
@@ -2292,6 +2319,7 @@ pub const Agent = struct {
                     .tool_calls = stream_result.tool_calls,
                     .usage = stream_result.usage,
                     .model = stream_result.model,
+                    .truncated = stream_result.truncated,
                 };
             } else {
                 self.recordLlmRequestEvent(turn_model_name, messages);
@@ -2463,6 +2491,14 @@ pub const Agent = struct {
             }
             self.logLlmResponse(iteration + 1, response_attempt, &response);
 
+            // /stop may have aborted the in-flight stream. Honor it before the
+            // response is used at all, otherwise a partial reply would be
+            // returned as if the turn had completed.
+            if (self.isInterruptRequested()) {
+                self.freeResponseFields(&response);
+                return self.interruptedReply();
+            }
+
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
 
             const response_text = response.contentOrEmpty();
@@ -2550,6 +2586,45 @@ pub const Agent = struct {
                 // For XML path, never preserve model-fabricated <tool_result> markup in history.
                 assistant_history_content = try dispatcher.stripToolResultMarkup(self.allocator, response_text);
                 free_assistant_history = true;
+            }
+
+            // A response that was cut (abnormal stream termination) or truncated
+            // by max_tokens (finish_reason == "length") must never drive tool
+            // execution: the XML fallback salvages <tool_call> markup from
+            // whatever partial text arrived, so a degenerate repetition or a
+            // mid-call cut would otherwise run invented calls. Surface it as a
+            // plain reply instead.
+            if (response.truncated and parsed_calls.len > 0) {
+                log.warn("discarding {d} tool call(s) from truncated provider response", .{parsed_calls.len});
+                self.freeResponseFields(&response);
+                const notice = try self.allocator.dupe(u8, TRUNCATED_RESPONSE_NOTICE);
+                errdefer self.allocator.free(notice);
+                try self.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = try self.dupeForHistory(notice),
+                });
+                return notice;
+            }
+
+            // A batch larger than the cap is a runaway generation, not a real
+            // request. Reject it wholesale rather than executing every call.
+            if (parsed_calls.len > MAX_TOOL_CALLS_PER_BATCH) {
+                log.warn(
+                    "rejecting oversized tool-call batch count={d} limit={d}",
+                    .{ parsed_calls.len, MAX_TOOL_CALLS_PER_BATCH },
+                );
+                self.freeResponseFields(&response);
+                const notice = try std.fmt.allocPrint(
+                    self.allocator,
+                    "Rejected a tool-call batch of {d} calls (limit {d}); nothing was executed. Please retry with fewer calls.",
+                    .{ parsed_calls.len, MAX_TOOL_CALLS_PER_BATCH },
+                );
+                errdefer self.allocator.free(notice);
+                try self.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = try self.dupeForHistory(notice),
+                });
+                return notice;
             }
 
             // Determine display text.
@@ -2731,8 +2806,12 @@ pub const Agent = struct {
                     return self.interruptedReply();
                 }
 
+                // Per-call logging stays at debug: on the turn's hot path an
+                // info-level write holds the process-global stderr lock, and a
+                // large batch (or a blocked log sink) then parks the whole
+                // session in futex_do_wait.
                 if (self.log_tool_calls) {
-                    log.info(
+                    log.debug(
                         "tool-call start session=0x{x} index={d} name={s} id={s}",
                         .{ session_hash, idx + 1, call.name, call.tool_call_id orelse "-" },
                     );
@@ -2769,7 +2848,7 @@ pub const Agent = struct {
                 const tool_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - tool_timer)));
 
                 if (self.log_tool_calls) {
-                    log.info(
+                    log.debug(
                         "tool-call done session=0x{x} index={d} name={s} success={} duration_ms={d}",
                         .{ session_hash, idx + 1, call.name, result.success, tool_duration },
                     );
@@ -11447,6 +11526,453 @@ test "Agent executes native tool calls returned from streaming provider" {
     defer allocator.free(response);
 
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expectEqualStrings("done", response);
+}
+
+test "Agent discards tool calls from a truncated provider response" {
+    const TruncatedProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreamingNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            allocator_: std.mem.Allocator,
+            _: providers.ChatRequest,
+            model: []const u8,
+            _: f64,
+            callback: providers.StreamCallback,
+            callback_ctx: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const text = "<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"echo leak\"}}\n</tool_call>";
+            callback(callback_ctx, providers.StreamChunk.textDelta(text));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            return .{
+                .content = try allocator_.dupe(u8, text),
+                .model = try allocator_.dupe(u8, model),
+                .truncated = true,
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "truncated-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = TruncatedProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = TruncatedProvider.chatWithSystem,
+        .chat = TruncatedProvider.chat,
+        .supportsNativeTools = TruncatedProvider.supportsNativeTools,
+        .getName = TruncatedProvider.getName,
+        .deinit = TruncatedProvider.deinitFn,
+        .supports_streaming = TruncatedProvider.supportsStreaming,
+        .supports_streaming_native_tools = TruncatedProvider.supportsStreamingNativeTools,
+        .stream_chat = TruncatedProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 2;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("call shell");
+    defer allocator.free(response);
+
+    // The tool call was discarded, so the loop never ran a second iteration.
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expectEqualStrings(TRUNCATED_RESPONSE_NOTICE, response);
+}
+
+test "Agent ends the turn with the interrupt reply when the stream is interrupted" {
+    const InterruptProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreamingNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // /stop aborted the stream before any output: curlStream returns
+            // error.Interrupted, which must end the turn (no retry, no generic
+            // provider error surfaced to the channel).
+            return error.Interrupted;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "interrupt-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = InterruptProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = InterruptProvider.chatWithSystem,
+        .chat = InterruptProvider.chat,
+        .supportsNativeTools = InterruptProvider.supportsNativeTools,
+        .getName = InterruptProvider.getName,
+        .deinit = InterruptProvider.deinitFn,
+        .supports_streaming = InterruptProvider.supportsStreaming,
+        .supports_streaming_native_tools = InterruptProvider.supportsStreamingNativeTools,
+        .stream_chat = InterruptProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 3;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    // One attempt: the interrupt is terminal, not retried.
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+}
+
+test "Agent ends the turn with the interrupt reply when /stop lands during the vision retry" {
+    const VisionRetryInterruptProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return error.ShouldNotUseBlockingChat;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreamingNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(
+            ptr: *anyopaque,
+            _: std.mem.Allocator,
+            _: providers.ChatRequest,
+            _: []const u8,
+            _: f64,
+            _: providers.StreamCallback,
+            _: *anyopaque,
+        ) anyerror!providers.StreamChatResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            // First attempt trips the vision auto-disable retry; /stop then lands
+            // while that retry stream runs and curlStream returns Interrupted.
+            if (self.calls == 1) return error.ProviderDoesNotSupportVision;
+            return error.Interrupted;
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "vision-retry-interrupt-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = VisionRetryInterruptProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = VisionRetryInterruptProvider.chatWithSystem,
+        .chat = VisionRetryInterruptProvider.chat,
+        .supportsNativeTools = VisionRetryInterruptProvider.supportsNativeTools,
+        .getName = VisionRetryInterruptProvider.getName,
+        .deinit = VisionRetryInterruptProvider.deinitFn,
+        .supports_streaming = VisionRetryInterruptProvider.supportsStreaming,
+        .supports_streaming_native_tools = VisionRetryInterruptProvider.supportsStreamingNativeTools,
+        .stream_chat = VisionRetryInterruptProvider.streamChat,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 3;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+
+    const StreamSink = struct {
+        fn onChunk(_: *anyopaque, _: providers.StreamChunk) void {}
+    };
+    var stream_ctx: u8 = 0;
+    agent.stream_callback = StreamSink.onChunk;
+    agent.stream_ctx = @ptrCast(&stream_ctx);
+
+    const response = try agent.turn("hello");
+    defer allocator.free(response);
+
+    // The vision retry ran (2 calls), and the /stop during it ended the turn
+    // with the interrupt reply instead of the raw error being surfaced.
+    try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+}
+
+test "Agent rejects an oversized tool-call batch" {
+    const BigBatchProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            var buf: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer buf.deinit(allocator_);
+            var i: usize = 0;
+            while (i < MAX_TOOL_CALLS_PER_BATCH + 6) : (i += 1) {
+                try buf.appendSlice(allocator_, "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"echo x\"}}</tool_call>\n");
+            }
+            return .{
+                .content = try buf.toOwnedSlice(allocator_),
+                .model = try allocator_.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "big-batch-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = BigBatchProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = BigBatchProvider.chatWithSystem,
+        .chat = BigBatchProvider.chat,
+        .supportsNativeTools = BigBatchProvider.supportsNativeTools,
+        .getName = BigBatchProvider.getName,
+        .deinit = BigBatchProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const runtime_tools = [_]Tool{
+        try makeMockFilterTool(allocator, "shell"),
+    };
+    defer for (runtime_tools) |t| freeMockFilterTool(t, allocator);
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "openai/gpt-4.1-mini",
+        .allocator = allocator,
+    };
+    cfg.agent.max_tool_iterations = 3;
+    var noop = observability.NoopObserver{};
+    var agent = try Agent.fromConfig(allocator, &cfg, provider, &runtime_tools, null, noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("many calls");
+    defer allocator.free(response);
+
+    // The whole batch was rejected without executing anything and without a
+    // second provider iteration.
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Rejected a tool-call batch") != null);
+}
+
+test "Agent executes a repeated text tool call once per batch" {
+    const CountingTool = struct {
+        const Self = @This();
+        pub const tool_name = "dup_tool";
+        pub const tool_description = "counts executions";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        runs: *usize,
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.runs.* += 1;
+            return .{ .success = true, .output = try allocator.dupe(u8, "ran") };
+        }
+    };
+
+    const DupProvider = struct {
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator_: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator_.dupe(u8, "ok");
+        }
+
+        fn chat(ptr: *anyopaque, allocator_: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                return .{
+                    .content = try allocator_.dupe(u8, "<tool_call>{\"name\":\"dup_tool\",\"arguments\":{}}</tool_call>" ++
+                        "<tool_call>{\"name\":\"dup_tool\",\"arguments\":{}}</tool_call>" ++
+                        "<tool_call>{\"name\":\"dup_tool\",\"arguments\":{}}</tool_call>"),
+                    .model = try allocator_.dupe(u8, "test-model"),
+                };
+            }
+            return .{
+                .content = try allocator_.dupe(u8, "done"),
+                .model = try allocator_.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "dup-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var provider_state = DupProvider{};
+    const provider_vtable = Provider.VTable{
+        .chatWithSystem = DupProvider.chatWithSystem,
+        .chat = DupProvider.chat,
+        .supportsNativeTools = DupProvider.supportsNativeTools,
+        .getName = DupProvider.getName,
+        .deinit = DupProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var runs: usize = 0;
+    var counting_tool = CountingTool{ .runs = &runs };
+    const tool_list = [_]Tool{counting_tool.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = &tool_list,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 3,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+    defer agent.deinit();
+
+    const response = try agent.turn("dup");
+    defer allocator.free(response);
+
+    // The three identical calls share a dedup fingerprint, so the tool ran once.
+    try std.testing.expectEqual(@as(usize, 1), runs);
     try std.testing.expectEqualStrings("done", response);
 }
 
