@@ -1033,6 +1033,7 @@ fn processTelegramMessage(
         // reply still goes through stripThinkBlocks and stays clean.
         .think_mode = if (runtime.session_mgr.streamsReasoning(session_key)) .passthrough else .strip,
     };
+    defer stream_ctx.deinit();
     const sink = tg_ptr.makeSink(&stream_ctx);
 
     if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
@@ -2588,6 +2589,7 @@ pub fn runMaxLoop(
                 .max_ptr = mx_ptr,
                 .chat_id = reply_target,
             };
+            defer stream_ctx.deinit();
             const sink = mx_ptr.makeSink(&stream_ctx);
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, null) catch |err| {

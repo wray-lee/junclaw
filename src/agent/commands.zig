@@ -5442,8 +5442,13 @@ pub fn composeFinalReply(
     const w = &out_writer.writer;
 
     if (show_reasoning) {
+        // Never quote raw tool-call markup (e.g. K2's
+        // <tool_call>{json}</tool_call>) that a model may place in its
+        // reasoning content.
+        const clean_reasoning = try providers.stripToolCallMarkup(self.allocator, reasoning_content.?);
+        defer self.allocator.free(clean_reasoning);
         try w.writeAll("Reasoning:\n");
-        var lines = std.mem.splitScalar(u8, reasoning_content.?, '\n');
+        var lines = std.mem.splitScalar(u8, clean_reasoning, '\n');
         while (lines.next()) |line| {
             try w.writeAll("> ");
             try w.writeAll(line);
@@ -5992,6 +5997,19 @@ test "composeFinalReply stream mode does not prepend reasoning block" {
     try std.testing.expectEqualStrings("Answer", result);
 }
 
+test "composeFinalReply on mode strips tool-call markup from the reasoning quote" {
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const reasoning = "I will call:\n<tool_call>\n{\"name\": \"shell\", \"arguments\": {\"command\": \"echo leakcheck-5\"}}\n</tool_call>\ndone";
+    const result = try composeFinalReply(&agent, "Answer", reasoning, usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "tool_call") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "leakcheck-5") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "> I will call:") != null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "Answer"));
+}
+
 test "composeFinalReply on mode with null reasoning_content returns base text" {
     const allocator = std.testing.allocator;
     var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
@@ -6032,4 +6050,18 @@ test "composeFinalReply cost mode appends estimated cost" {
     defer allocator.free(result);
     try std.testing.expect(std.mem.indexOf(u8, result, "cost=$0.0075") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "session_cost=$0.0123") != null);
+}
+
+test "composeFinalReply on mode strips a stray close tag from the reasoning quote" {
+    // Regression: stripToolCallMarkup left a stray `</tool_call>` verbatim, so
+    // the `Reasoning:` quote in the final reply showed markup the streaming path
+    // already hides.
+    const allocator = std.testing.allocator;
+    var agent = FakeAgent{ .allocator = allocator, .reasoning_mode = .on };
+    const usage = providers.TokenUsage{};
+    const result = try composeFinalReply(&agent, "Answer", "step</tool_call> two", usage);
+    defer allocator.free(result);
+    try std.testing.expect(std.mem.indexOf(u8, result, "tool_call") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "> step two") != null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "Answer"));
 }

@@ -1418,7 +1418,11 @@ pub const MaxChannel = struct {
     pub const StreamCtx = struct {
         max_ptr: *MaxChannel,
         chat_id: []const u8,
-        filter: streaming.TagFilter = undefined,
+        filter: streaming.TagFilter = .{},
+
+        pub fn deinit(self: *StreamCtx) void {
+            self.filter.deinit();
+        }
     };
 
     fn streamCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
