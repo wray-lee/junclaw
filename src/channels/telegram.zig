@@ -3154,6 +3154,36 @@ pub const TelegramChannel = struct {
         }
     }
 
+    /// POST one sendMessageDraft; returns the owned response, or null when the
+    /// request could not be built or sent.
+    fn postDraft(
+        self: *TelegramChannel,
+        parsed_target: ParsedTelegramTarget,
+        draft_id: u64,
+        text: []const u8,
+        html: bool,
+    ) ?[]u8 {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        body.appendSlice(self.allocator, "{\"chat_id\":") catch return null;
+        body.appendSlice(self.allocator, parsed_target.chat_id) catch return null;
+        body.appendSlice(self.allocator, ",\"draft_id\":") catch return null;
+        var id_buf: [20]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{draft_id}) catch return null;
+        body.appendSlice(self.allocator, id_str) catch return null;
+        body.appendSlice(self.allocator, ",\"text\":") catch return null;
+        root.json_util.appendJsonString(&body, self.allocator, text) catch return null;
+        if (html) body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"") catch return null;
+        telegram_api.appendMessageThreadId(&body, self.allocator, parsed_target.message_thread_id) catch return null;
+        body.appendSlice(self.allocator, "}") catch return null;
+
+        return self.api().sendMessageDraft(self.allocator, body.items) catch |err| {
+            log.warn("sendMessageDraft request failed: {}", .{err});
+            return null;
+        };
+    }
+
     fn sendDraft(self: *TelegramChannel, chat_id: []const u8, draft_id: u64, text: []const u8, started_at_ms: i64) void {
         if (!self.draft_previews_enabled) return;
         if (builtin.is_test) return;
@@ -3176,24 +3206,20 @@ pub const TelegramChannel = struct {
         ) catch return;
         defer self.allocator.free(preview_text);
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(self.allocator);
+        // Render the draft the same way the final message is rendered, so
+        // quotes, emphasis and code look identical before and after it lands.
+        const html_text = markdownToTelegramHtml(self.allocator, preview_text) catch null;
+        defer if (html_text) |h| self.allocator.free(h);
 
-        body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body.appendSlice(self.allocator, parsed_target.chat_id) catch return;
-        body.appendSlice(self.allocator, ",\"draft_id\":") catch return;
-        var id_buf: [20]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{draft_id}) catch return;
-        body.appendSlice(self.allocator, id_str) catch return;
-        body.appendSlice(self.allocator, ",\"text\":") catch return;
-        root.json_util.appendJsonString(&body, self.allocator, preview_text) catch return;
-        telegram_api.appendMessageThreadId(&body, self.allocator, parsed_target.message_thread_id) catch return;
-        body.appendSlice(self.allocator, "}") catch return;
-
-        const resp = self.api().sendMessageDraft(self.allocator, body.items) catch |err| {
-            log.warn("sendMessageDraft request failed: {}", .{err});
-            return;
-        };
+        var resp = self.postDraft(parsed_target, draft_id, html_text orelse preview_text, html_text != null) orelse return;
+        if (html_text != null and telegram_api.responseHasTelegramError(resp) and
+            std.mem.indexOf(u8, resp, "can't parse entities") != null)
+        {
+            // A tail cut mid-markup can leave entities Telegram rejects; the
+            // plain text is always accepted.
+            self.allocator.free(resp);
+            resp = self.postDraft(parsed_target, draft_id, preview_text, false) orelse return;
+        }
         defer self.allocator.free(resp);
 
         if (telegram_api.responseHasTelegramError(resp)) {
