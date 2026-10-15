@@ -242,6 +242,10 @@ fn finalizeStreamResultWithToolCalls(
     /// of "length". Propagated to the agent so it refuses to execute tool
     /// calls parsed from the partial text.
     truncated: bool,
+    /// Whether the stream reported a `finish_reason` of "tool_calls": the
+    /// provider stopped to invoke a tool. Only trusted (with a clean,
+    /// untruncated stream) so a cut call never reports a structural tool stop.
+    finish_tool_use: bool,
 ) !root.StreamChatResult {
     var result = try finalizeStreamResult(allocator, accumulated, stream_usage);
     errdefer {
@@ -257,6 +261,10 @@ fn finalizeStreamResultWithToolCalls(
     }
 
     result.truncated = truncated;
+    // Only a clean, untruncated stream that signalled tool use is a structural
+    // tool stop the agent can act on: a call cut mid-flight (untrusted) or a
+    // truncated response must never report one.
+    result.finish_tool_use = tool_calls_trusted and finish_tool_use and !truncated;
     if (tool_calls_trusted) {
         result.tool_calls = try tool_call_accumulator.toOwnedToolCalls(allocator);
     }
@@ -569,6 +577,19 @@ fn isJsonWhitespace(c: u8) bool {
 /// cut was never flagged. The field is only matched at a JSON value position
 /// (after `{` or `,`) so a quoted mention inside a content string is ignored.
 fn sseLineReportsLengthFinish(line: []const u8) bool {
+    return sseLineReportsFinishReason(line, "length");
+}
+
+/// True when the SSE line's JSON payload has a top-level `finish_reason` of
+/// `want` (e.g. "tool_calls"). Mirrors `sseLineReportsLengthFinish`: the scan is
+/// textual so a >16 KB data line cannot hide the signal behind a size-limited
+/// JSON parse, and a quoted mention inside a content string is ignored because
+/// the key must be preceded by `{` or `,`.
+fn sseLineReportsToolCallsFinish(line: []const u8) bool {
+    return sseLineReportsFinishReason(line, "tool_calls");
+}
+
+fn sseLineReportsFinishReason(line: []const u8, want: []const u8) bool {
     const data = extractSseDataPayload(line) orelse return false;
     if (data.len == 0 or std.mem.eql(u8, data, "[DONE]")) return false;
 
@@ -591,7 +612,7 @@ fn sseLineReportsLengthFinish(line: []const u8) bool {
         if (i >= data.len or data[i] != '"') continue;
         const value_start = i + 1;
         const value_end = std.mem.indexOfScalarPos(u8, data, value_start, '"') orelse continue;
-        if (std.mem.eql(u8, data[value_start..value_end], "length")) return true;
+        if (std.mem.eql(u8, data[value_start..value_end], want)) return true;
     }
     return false;
 }
@@ -783,6 +804,7 @@ pub fn curlStream(
     var read_buf: [4096]u8 = undefined;
     var saw_done = false;
     var saw_length_finish = false;
+    var saw_tool_calls_finish = false;
     var total_stdout: usize = 0;
     var stream_usage: ?root.TokenUsage = null;
     var in_reasoning = false;
@@ -848,6 +870,7 @@ pub fn curlStream(
                 }
                 try accumulateToolCallsFromSseLine(&tool_call_accumulator, allocator, line_buf.items);
                 if (!saw_length_finish and sseLineReportsLengthFinish(line_buf.items)) saw_length_finish = true;
+                if (!saw_tool_calls_finish and sseLineReportsToolCallsFinish(line_buf.items)) saw_tool_calls_finish = true;
                 const result = parseSseLine(allocator, line_buf.items) catch {
                     line_buf.clearRetainingCapacity();
                     continue;
@@ -934,7 +957,7 @@ pub fn curlStream(
             log.warn("curlStream proceeding despite wait failure after partial stream output", .{});
             try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
             callback(ctx, root.StreamChunk.finalChunk());
-            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
+            return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true, false);
         }
         return error.CurlWaitError;
     };
@@ -947,7 +970,7 @@ pub fn curlStream(
                 log.warn("curlStream exit code {d} after partial stream output; returning accumulated output", .{code});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true, false);
             }
             return error.CurlFailed;
         },
@@ -956,7 +979,7 @@ pub fn curlStream(
                 log.warn("curlStream abnormal termination after partial stream output; returning accumulated output", .{});
                 try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
                 callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true);
+                return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, false, true, false);
             }
             return error.CurlFailed;
         },
@@ -965,7 +988,7 @@ pub fn curlStream(
     // Signal stream completion only after curl exits successfully.
     try closeReasoningBlock(allocator, &accumulated, &in_reasoning, callback, ctx);
     callback(ctx, root.StreamChunk.finalChunk());
-    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true, saw_length_finish);
+    return finalizeStreamResultWithToolCalls(allocator, accumulated.items, stream_usage, &tool_call_accumulator, true, saw_length_finish, saw_tool_calls_finish);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1513,7 +1536,7 @@ test "finalizeStreamResultWithToolCalls flags a cut stream as truncated" {
 
     // Recovery path: the stream was cut, so tool_calls_trusted=false and
     // truncated=true. The partial text is kept but no tool call is exposed.
-    const result = try finalizeStreamResultWithToolCalls(allocator, "partial answer", null, &accumulator, false, true);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "partial answer", null, &accumulator, false, true, false);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
@@ -1573,7 +1596,7 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
         \\{"choices":[{"delta":{"content":"ignored","tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
     );
 
-    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true, false);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "visible", null, &accumulator, true, false, false);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);
@@ -1592,6 +1615,70 @@ test "finalizeStreamResultWithToolCalls attaches accumulated calls" {
     try std.testing.expectEqualStrings("{}", result.tool_calls[0].arguments);
 }
 
+test "sseLineReportsToolCallsFinish detects a tool_calls finish" {
+    try std.testing.expect(sseLineReportsToolCallsFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+    ));
+    try std.testing.expect(!sseLineReportsToolCallsFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"stop"}]}
+    ));
+    // The two scanners must not cross-match.
+    try std.testing.expect(!sseLineReportsToolCallsFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"length"}]}
+    ));
+    try std.testing.expect(!sseLineReportsLengthFinish(
+        \\data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}
+    ));
+    try std.testing.expect(!sseLineReportsToolCallsFinish("data: [DONE]"));
+    try std.testing.expect(!sseLineReportsToolCallsFinish(": keep-alive"));
+    // A quoted mention inside content is not the real finish_reason.
+    try std.testing.expect(!sseLineReportsToolCallsFinish(
+        \\data: {"choices":[{"delta":{"content":"say \"finish_reason\":\"tool_calls\" now"}}]}
+    ));
+}
+
+test "finalizeStreamResultWithToolCalls sets finish_tool_use only for trusted untruncated calls" {
+    const allocator = std.testing.allocator;
+
+    const Case = struct { trusted: bool, truncated: bool, finish: bool, want: bool };
+    const cases = [_]Case{
+        .{ .trusted = true, .truncated = false, .finish = true, .want = true },
+        .{ .trusted = true, .truncated = true, .finish = true, .want = false },
+        .{ .trusted = false, .truncated = false, .finish = true, .want = false },
+        .{ .trusted = true, .truncated = false, .finish = false, .want = false },
+    };
+
+    for (cases) |case| {
+        var accumulator = ToolCallAccumulator{};
+        defer accumulator.deinit(allocator);
+        try accumulator.appendFromJsonPayload(allocator,
+            \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
+        );
+
+        const result = try finalizeStreamResultWithToolCalls(
+            allocator,
+            "",
+            null,
+            &accumulator,
+            case.trusted,
+            case.truncated,
+            case.finish,
+        );
+        defer {
+            if (result.content) |content| allocator.free(content);
+            if (result.reasoning_content) |reasoning| allocator.free(reasoning);
+            for (result.tool_calls) |tc| {
+                allocator.free(tc.id);
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            if (result.tool_calls.len > 0) allocator.free(result.tool_calls);
+        }
+
+        try std.testing.expectEqual(case.want, result.finish_tool_use);
+    }
+}
+
 test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
     const allocator = std.testing.allocator;
     var accumulator = ToolCallAccumulator{};
@@ -1601,7 +1688,7 @@ test "finalizeStreamResultWithToolCalls supports tool-call-only response" {
         \\{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{}"}}]}}]}
     );
 
-    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true, false);
+    const result = try finalizeStreamResultWithToolCalls(allocator, "", null, &accumulator, true, false, false);
     defer {
         if (result.content) |content| allocator.free(content);
         if (result.reasoning_content) |reasoning| allocator.free(reasoning);

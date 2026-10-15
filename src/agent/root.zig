@@ -955,6 +955,37 @@ pub const Agent = struct {
         return response_text;
     }
 
+    /// Nudge texts and classification for structural turn-completion stalls.
+    /// These guards key on provider output structure (finish_reason/stop_reason,
+    /// empty content, reasoning-only payloads), never on assistant prose, so
+    /// they are language-independent. The prose-shaped case ("I'll check now")
+    /// is covered by the EXECUTION BIAS prompt rule instead.
+    const TOOL_USE_WITHOUT_CALL_NUDGE = "SYSTEM: The previous turn stopped for tool use but contained no tool call, so nothing ran. Continue from the current state: call the tool you need through the tool interface instead of writing the call as text, or produce the visible answer now. Do not restart from scratch.";
+    const SETTLED_TOOLS_NO_ANSWER_NUDGE = "SYSTEM: The previous assistant turn completed its tool calls but did not produce a user-visible answer. Continue from the current transcript and produce the final user-visible answer now. Do not repeat completed tool calls or restart from scratch.";
+    const REASONING_ONLY_NUDGE = "SYSTEM: The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
+
+    const EmptyResponseNudge = enum { generic, settled_tools, reasoning_only };
+
+    fn classifyEmptyResponseNudge(has_hidden_reasoning: bool, tools_ran_this_turn: bool) EmptyResponseNudge {
+        if (has_hidden_reasoning) return .reasoning_only;
+        if (tools_ran_this_turn) return .settled_tools;
+        return .generic;
+    }
+
+    fn emptyResponseNudgeCap(kind: EmptyResponseNudge) u32 {
+        // Mirrors OpenClaw: DEFAULT_REASONING_ONLY_RETRY_LIMIT = 2,
+        // DEFAULT_EMPTY_RESPONSE_RETRY_LIMIT = 1 (settled-tools reuses it).
+        return if (kind == .reasoning_only) 2 else 1;
+    }
+
+    fn emptyResponseNudgeText(kind: EmptyResponseNudge) []const u8 {
+        return switch (kind) {
+            .generic => "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n",
+            .settled_tools => SETTLED_TOOLS_NO_ANSWER_NUDGE,
+            .reasoning_only => REASONING_ONLY_NUDGE,
+        };
+    }
+
     fn shouldForceActionFollowThrough(text: []const u8) bool {
         // Specific "let me <action-verb>" and "i'll/i will <action-verb>" phrases.
         // Kept as explicit verb+phrase pairs to avoid false-positives on conclusory
@@ -2186,6 +2217,8 @@ pub const Agent = struct {
         var injection_followups: u32 = 0;
         var forced_follow_through_count: u32 = 0;
         var empty_response_retry_count: u32 = 0;
+        var tool_use_retry_count: u32 = 0;
+        var tools_ran_this_turn: bool = false;
         var seen_tool_call_results: std.AutoHashMapUnmanaged(u64, CachedToolCallResult) = .empty;
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
@@ -2320,6 +2353,11 @@ pub const Agent = struct {
                     .usage = stream_result.usage,
                     .model = stream_result.model,
                     .truncated = stream_result.truncated,
+                    // Streamed tool calls (native tool use while streaming) reach
+                    // the same structural guard as the non-streaming parsers: the
+                    // provider reported finish_reason "tool_calls" and the calls
+                    // were trusted (clean, untruncated stream).
+                    .finish_tool_use = stream_result.finish_tool_use,
                 };
             } else {
                 self.recordLlmRequestEvent(turn_model_name, messages);
@@ -2636,12 +2674,36 @@ pub const Agent = struct {
             if (parsed_calls.len == 0) {
                 const trimmed_display_text = std.mem.trim(u8, display_text, " \t\r\n");
 
-                if (trimmed_display_text.len == 0) {
+                // Structural stall signal: the provider stopped for tool use
+                // (finish_reason "tool_calls" / stop_reason "tool_use") but no
+                // call was parsed. Nudge once, then fail explicitly instead of
+                // returning nothing (or leaking prose) as the final answer.
+                if (response.finish_tool_use) {
                     self.freeResponseFields(&response);
-                    if (empty_response_retry_count < 1 and
+                    if (tool_use_retry_count < 1 and
                         iteration + 1 < self.max_tool_iterations)
                     {
-                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response. - If the user asks for information from the internet, web, or external sources (for example: recipes, news, latest documentation), you SHOULD use the `web_search` tool immediately.\n- Do not merely state that you can find the information; execute the tool call in the same turn.\n- NEVER respond with just 'I will search' or 'Let me check' without actually calling the tool in the same response.\n- If the user's intent implies a need for fresh data or external verification, default to using `web_search`.\n\n") });
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, TOOL_USE_WITHOUT_CALL_NUDGE) });
+                        self.trimHistory();
+                        tool_use_retry_count += 1;
+                        continue;
+                    }
+                    return error.NoResponseContent;
+                }
+
+                if (trimmed_display_text.len == 0) {
+                    // Reasoning-only replies (content absent, reasoning present)
+                    // are only a stall when reasoning is not surfaced as the
+                    // answer (reasoning_mode == .off).
+                    const has_hidden_reasoning = self.reasoning_mode == .off and
+                        response.reasoning_content != null and
+                        response.reasoning_content.?.len > 0;
+                    const nudge_kind = classifyEmptyResponseNudge(has_hidden_reasoning, tools_ran_this_turn);
+                    self.freeResponseFields(&response);
+                    if (empty_response_retry_count < emptyResponseNudgeCap(nudge_kind) and
+                        iteration + 1 < self.max_tool_iterations)
+                    {
+                        try self.appendOwnedHistoryMessage(.{ .role = .user, .content = try self.allocator.dupe(u8, emptyResponseNudgeText(nudge_kind)) });
                         self.trimHistory();
                         empty_response_retry_count += 1;
                         continue;
@@ -2790,6 +2852,7 @@ pub const Agent = struct {
             try self.appendOwnedHistoryMessage(.{ .role = .assistant, .content = safe_assistant_content });
 
             // Execute each tool call
+            tools_ran_this_turn = true;
             var results_buf: std.ArrayListUnmanaged(ToolExecutionResult) = .empty;
             defer results_buf.deinit(self.allocator);
             try results_buf.ensureTotalCapacity(self.allocator, parsed_calls.len);
@@ -13270,4 +13333,303 @@ test "Agent: redactor scrubs PII in system prompt" {
     // System prompt content must reach provider with email redacted.
     try std.testing.expect(std.mem.indexOf(u8, captured, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.indexOf(u8, captured, "user@example.com") == null);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Turn-completion stall guards
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// One scripted provider response for the turn-completion tests.
+const TurnScript = union(enum) {
+    text: []const u8,
+    empty,
+    tool_call: struct { name: []const u8, args: []const u8, content: []const u8 },
+    finish_tool_use: []const u8,
+    reasoning_only: []const u8,
+};
+
+/// Provider that replays a fixed script of responses by call index.
+const ScriptedTurnProvider = struct {
+    scripts: []const TurnScript,
+    idx: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const script: TurnScript = if (self.idx < self.scripts.len) self.scripts[self.idx] else TurnScript{ .text = "done" };
+        self.idx += 1;
+        return switch (script) {
+            .text => |t| .{ .content = try allocator.dupe(u8, t), .model = try allocator.dupe(u8, "test-model") },
+            .empty => .{ .model = try allocator.dupe(u8, "test-model") },
+            .finish_tool_use => |t| .{
+                .content = if (t.len > 0) try allocator.dupe(u8, t) else null,
+                .finish_tool_use = true,
+                .model = try allocator.dupe(u8, "test-model"),
+            },
+            .reasoning_only => |r| .{
+                .reasoning_content = try allocator.dupe(u8, r),
+                .model = try allocator.dupe(u8, "test-model"),
+            },
+            .tool_call => |tc| blk: {
+                const calls = try allocator.alloc(providers.ToolCall, 1);
+                calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-1"),
+                    .name = try allocator.dupe(u8, tc.name),
+                    .arguments = try allocator.dupe(u8, tc.args),
+                };
+                break :blk .{
+                    .content = if (tc.content.len > 0) try allocator.dupe(u8, tc.content) else null,
+                    .tool_calls = calls,
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            },
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "scripted-turn-provider";
+    }
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+fn scriptedProvider(state: *ScriptedTurnProvider) Provider {
+    const vtable = Provider.VTable{
+        .chatWithSystem = ScriptedTurnProvider.chatWithSystem,
+        .chat = ScriptedTurnProvider.chat,
+        .supportsNativeTools = ScriptedTurnProvider.supportsNativeTools,
+        .getName = ScriptedTurnProvider.getName,
+        .deinit = ScriptedTurnProvider.deinitFn,
+    };
+    return Provider{ .ptr = @ptrCast(state), .vtable = &vtable };
+}
+
+fn makeTurnAgent(
+    allocator: std.mem.Allocator,
+    provider: Provider,
+    tools: []const Tool,
+    specs: []ToolSpec,
+    observer: observability.Observer,
+) Agent {
+    return Agent{
+        .allocator = allocator,
+        .provider = provider,
+        .tools = tools,
+        .tool_specs = specs,
+        .mem = null,
+        .observer = observer,
+        .model_name = "test-model",
+        .temperature = 0.7,
+        .workspace_dir = "/tmp",
+        .max_tool_iterations = 5,
+        .max_history_messages = 50,
+        .auto_save = false,
+        .history = .empty,
+        .total_tokens = 0,
+        .has_system_prompt = false,
+    };
+}
+
+test "classifyEmptyResponseNudge prefers reasoning-only then settled-tools then generic" {
+    try std.testing.expectEqual(Agent.EmptyResponseNudge.reasoning_only, Agent.classifyEmptyResponseNudge(true, true));
+    try std.testing.expectEqual(Agent.EmptyResponseNudge.reasoning_only, Agent.classifyEmptyResponseNudge(true, false));
+    try std.testing.expectEqual(Agent.EmptyResponseNudge.settled_tools, Agent.classifyEmptyResponseNudge(false, true));
+    try std.testing.expectEqual(Agent.EmptyResponseNudge.generic, Agent.classifyEmptyResponseNudge(false, false));
+}
+
+test "emptyResponseNudgeCap allows two reasoning-only retries and one otherwise" {
+    try std.testing.expectEqual(@as(u32, 2), Agent.emptyResponseNudgeCap(.reasoning_only));
+    try std.testing.expectEqual(@as(u32, 1), Agent.emptyResponseNudgeCap(.settled_tools));
+    try std.testing.expectEqual(@as(u32, 1), Agent.emptyResponseNudgeCap(.generic));
+}
+
+test "Agent turn nudges once then fails on finish_tool_use without a tool call" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .finish_tool_use = "" },
+        .{ .finish_tool_use = "" },
+        .{ .text = "done" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+}
+
+test "Agent turn recovers when finish_tool_use is followed by a real answer" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .finish_tool_use = "I will do that now" },
+        .{ .text = "done" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("go");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+}
+
+test "Agent turn uses settled-tools nudge and recovers after tools ran" {
+    const ProbeTool = struct {
+        const Self = @This();
+        count: *usize,
+        pub const tool_name = "probe";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(self: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            self.count.* += 1;
+            return .{ .success = true, .output = "probe ok" };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "" } },
+        .{ .empty = {} },
+        .{ .text = "final answer" },
+    } };
+    const provider = scriptedProvider(&state);
+
+    var probe_count: usize = 0;
+    var probe_impl = ProbeTool{ .count = &probe_count };
+    const tool_list = [_]Tool{probe_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("run probe");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("final answer", response);
+    try std.testing.expectEqual(@as(usize, 1), probe_count);
+    try std.testing.expectEqual(@as(usize, 3), state.idx);
+}
+
+test "Agent turn fails after the settled-tools nudge is exhausted" {
+    const ProbeTool = struct {
+        const Self = @This();
+        pub const tool_name = "probe";
+        pub const tool_description = "probe";
+        pub const tool_params =
+            \\{"type":"object","properties":{"value":{"type":"number"}},"required":["value"]}
+        ;
+        pub const vtable = tools_mod.ToolVTable(Self);
+
+        fn tool(self: *Self) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *Self, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = "probe ok" };
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "" } },
+        .{ .empty = {} },
+        .{ .empty = {} },
+        .{ .text = "final answer" },
+    } };
+    const provider = scriptedProvider(&state);
+
+    var probe_impl = ProbeTool{};
+    const tool_list = [_]Tool{probe_impl.tool()};
+    var specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("run probe"));
+    try std.testing.expectEqual(@as(usize, 3), state.idx);
+}
+
+test "Agent turn retries reasoning-only replies up to two times" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .reasoning_only = "thinking a" },
+        .{ .reasoning_only = "thinking b" },
+        .{ .text = "done" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("go");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqual(@as(usize, 3), state.idx);
+}
+
+test "Agent turn fails after two reasoning-only retries" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .reasoning_only = "thinking a" },
+        .{ .reasoning_only = "thinking b" },
+        .{ .reasoning_only = "thinking c" },
+        .{ .text = "done" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
+    try std.testing.expectEqual(@as(usize, 3), state.idx);
+}
+
+test "Agent turn returns announcing prose without a structural retry (step-5 shape)" {
+    // finish_reason is "stop" (finish_tool_use=false) and the reply is Chinese
+    // prose announcing an action with no tool call. No structural signal fires;
+    // this shape is handled by the EXECUTION BIAS prompt rule, not the guards.
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = "先把 key 拿出来，改脚本重测。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    try std.testing.expectEqualStrings("先把 key 拿出来，改脚本重测。", response);
+    try std.testing.expectEqual(@as(usize, 1), state.idx);
 }

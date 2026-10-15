@@ -219,6 +219,11 @@ pub const ChatResponse = struct {
     /// (`finish_reason == "length"`). Tool calls salvaged from such a response
     /// must never be executed.
     truncated: bool = false,
+    /// True when the provider signalled it stopped to invoke a tool
+    /// (finish_reason "tool_calls" / stop_reason "tool_use") regardless of
+    /// whether any call could be parsed. Structural stall signal; the agent
+    /// uses it to nudge or fail explicitly instead of returning silently.
+    finish_tool_use: bool = false,
 
     /// True when the LLM wants to invoke at least one tool.
     pub fn hasToolCalls(self: ChatResponse) bool {
@@ -291,6 +296,10 @@ pub const StreamChatResult = struct {
     model: []const u8 = "",
     /// See `ChatResponse.truncated`.
     truncated: bool = false,
+    /// True when the stream reported a `finish_reason` of "tool_calls" and the
+    /// calls were trusted (the stream ended cleanly and was not truncated), so
+    /// the provider stopped to invoke a tool. See `ChatResponse.finish_tool_use`.
+    finish_tool_use: bool = false,
 };
 
 pub fn shouldRecoverPartialStream(accumulated_len: usize, saw_done: bool) bool {
