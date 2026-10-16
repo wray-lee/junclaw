@@ -1,3 +1,12 @@
+> **Personal fork.** `junclaw` is a personal hard fork of
+> [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw), maintained by
+> [@wray-lee](https://github.com/wray-lee). It tracks upstream by **merge**
+> (never rebase); fixes here are also submitted upstream and tracked in
+> [nullclaw/nullclaw#1066](https://github.com/nullclaw/nullclaw/issues/1066).
+> MIT licensed with the original copyright retained. The binary name, config
+> directory (`~/.nullclaw`), `NULLCLAW_*` environment variables and the Zig
+> package name are intentionally unchanged for compatibility.
+
 Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
 [nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
