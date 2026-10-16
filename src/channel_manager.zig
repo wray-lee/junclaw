@@ -33,6 +33,10 @@ const Channel = channels_mod.Channel;
 const log = std.log.scoped(.channel_manager);
 const Atomic = @import("portable_atomic.zig").Atomic;
 
+/// How long a polling thread may go without a successful poll before the
+/// supervisor restarts it.
+pub const STALE_THRESHOLD_SECS: i64 = 600;
+
 pub const ListenerType = enum {
     /// Telegram, Signal — poll in a loop
     polling,
@@ -101,6 +105,14 @@ pub const ChannelManager = struct {
             .matrix => |ls| ls.last_activity.load(.acquire),
             .max => |ls| ls.last_activity.load(.acquire),
         };
+    }
+
+    /// A polling thread is stale once it has not completed a successful poll for
+    /// STALE_THRESHOLD_SECS. Failed polls leave `last_activity` alone, so this is
+    /// what catches a long-poll that errors forever while `healthCheck()` — a
+    /// separate short request — keeps reporting the channel as reachable.
+    pub fn isPollingStale(now: i64, last: i64) bool {
+        return (now - last) > STALE_THRESHOLD_SECS;
     }
 
     fn requestPollingStop(state: PollingState) void {
