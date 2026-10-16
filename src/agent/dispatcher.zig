@@ -97,12 +97,18 @@ pub fn parseToolCalls(
 /// Used by the agent loop to avoid leaking raw tool XML-like payloads to users
 /// when parsing fails on malformed inner content.
 pub fn containsToolCallMarkup(text: []const u8) bool {
+    // Only the dispatcher's own unparsed markers are checked here. A legitimate
+    // answer may discuss or quote XML `<function>`/`<parameter>` markup, or show
+    // it in a code block, without containing a tool call; a false positive makes
+    // `selectDisplayText` drop the whole reply. The one XML-`function` shape that
+    // is never prose is a *run* of dangling closers — the runaway loop.
     return std.mem.indexOf(u8, text, "<tool_call>") != null or
         std.mem.indexOf(u8, text, "</tool_call>") != null or
         std.mem.indexOf(u8, text, "[TOOL_CALL]") != null or
         std.mem.indexOf(u8, text, "[tool_call]") != null or
         std.mem.indexOf(u8, text, "[/TOOL_CALL]") != null or
-        std.mem.indexOf(u8, text, "[/tool_call]") != null;
+        std.mem.indexOf(u8, text, "[/tool_call]") != null or
+        providers.helpers.hasRepetitiveToolCloseRun(text);
 }
 
 fn freeParsedToolCall(allocator: std.mem.Allocator, call: ParsedToolCall) void {
@@ -1466,6 +1472,19 @@ test "containsToolCallMarkup detects orphan closing tag" {
     try std.testing.expect(containsToolCallMarkup("</tool_call>"));
     try std.testing.expect(containsToolCallMarkup("Here are the results:\n[/TOOL_CALL]\nSome reply"));
     try std.testing.expect(containsToolCallMarkup("[/tool_call]"));
+    // A degenerate loop of XML `function` closers is tool markup too.
+    try std.testing.expect(containsToolCallMarkup("</function></function></function>"));
+    try std.testing.expect(containsToolCallMarkup("</function>\n</function>\n</function>"));
+    // `</function_calls>` shares a prefix with `</function`; a run of it is
+    // the same runaway and must be detected too.
+    try std.testing.expect(containsToolCallMarkup("</function_calls></function_calls></function_calls>"));
+    try std.testing.expect(!containsToolCallMarkup("a plain answer"));
+    // Prose or a documented sample that merely names the XML `function`
+    // dialect must not be mistaken for an unparsed call: dropping the reply for
+    // it used to abort the turn with error.NoResponseContent.
+    try std.testing.expect(!containsToolCallMarkup("Use the `<function>` and `<parameter>` tags like this."));
+    try std.testing.expect(!containsToolCallMarkup("<function_calls><invoke name=\"shell\"></invoke></function_calls>"));
+    try std.testing.expect(!containsToolCallMarkup("a single </function> closer"));
 }
 
 test "isNativeJsonFormat false for XML response" {

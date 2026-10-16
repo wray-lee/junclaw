@@ -542,6 +542,9 @@ pub const SseStreamCtx = struct {
             .ctx = @ptrCast(self),
         };
         self.filter = streaming.TagFilter.init(raw_sink);
+        // An SSE stream is append-only: an orphan reasoning closer would emit
+        // the raw tag with no way to drop the leaked draft before it.
+        self.filter.orphan_think_closer = .suppress;
         return self.filter.sink();
     }
 };

@@ -125,6 +125,11 @@ pub const StreamState = struct {
 pub const StreamFlush = struct {
     text: []u8,
     delta_start: usize,
+    /// True when the snapshot no longer extends what was already sent, so the
+    /// caller must replace the message rather than append the whole snapshot.
+    /// Set when an orphan reasoning closer drops the leaked draft from earlier
+    /// bytes, or a late `<think>` rewrite moves them.
+    rewrite: bool = false,
 
     pub fn deinit(self: *StreamFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -178,9 +183,11 @@ pub fn appendStreamChunk(
     }
 
     try state.buffer.appendSlice(allocator, chunk);
-    // Checked on the accumulated buffer: a `<think>` tag split across chunks is
-    // only complete once both halves have arrived.
-    if (std.mem.indexOf(u8, state.buffer.items, "<think>") != null) state.rendered_reasoning = true;
+    // Checked on the accumulated buffer: a reasoning tag split across chunks is
+    // only complete once both halves have arrived. Any reasoning tag (including
+    // a namespaced or orphan closer) makes the snapshot diverge from the final
+    // reply, which never carries the reasoning.
+    if (providers.hasReasoningTag(state.buffer.items)) state.rendered_reasoning = true;
     if (!shouldFlush(state, now_ms)) return null;
 
     const text = try snapshotStreamText(allocator, state);
@@ -192,16 +199,19 @@ pub fn appendStreamChunk(
     }
 
     // Normally the snapshot extends what we already sent. If a late `<think>`
-    // rewrite moved earlier bytes, resend the whole snapshot instead of a
-    // suffix that would drop text.
-    const delta_start = if (std.mem.startsWith(u8, text, state.sent)) state.sent.len else 0;
+    // rewrite, or an orphan closer dropping the leaked draft, moved earlier
+    // bytes, the whole snapshot must replace the message instead of a suffix
+    // that would drop text (or an append that would duplicate it).
+    const extends_sent = std.mem.startsWith(u8, text, state.sent);
+    const rewrite = !extends_sent and state.sent.len > 0;
+    const delta_start = if (extends_sent) state.sent.len else 0;
 
     const sent_copy = try allocator.dupe(u8, text);
     if (state.sent.len > 0) allocator.free(state.sent);
     state.sent = sent_copy;
     state.last_flush_time = now_ms;
 
-    return .{ .text = text, .delta_start = delta_start };
+    return .{ .text = text, .delta_start = delta_start, .rewrite = rewrite };
 }
 
 /// Suffix of `final_text` that still has to be streamed so the message content
@@ -582,6 +592,37 @@ test "appendStreamChunk resends the snapshot when a late think block rewrites it
     defer second.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("a\n> b\n\nc", second.text);
     try std.testing.expectEqual(@as(usize, 0), second.delta_start);
+    try std.testing.expect(second.rewrite);
+    try std.testing.expect(state.rendered_reasoning);
+}
+
+test "appendStreamChunk flags a rewrite when an orphan closer drops the draft" {
+    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer state.deinit(std.testing.allocator);
+
+    // The leaked draft streams first (no opener, so nothing flags it yet).
+    var first = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "Draft answer.",
+        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
+    )) orelse return error.TestUnexpectedResult;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Draft answer.", first.text);
+    try std.testing.expect(!first.rewrite);
+
+    // The orphan closer arrives: the snapshot drops the draft, so the caller
+    // must replace the message rather than append the real answer after it.
+    var second = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "</ifm|think>\nReal answer.",
+        1_000 + 2 * STREAM_FLUSH_MIN_INTERVAL_MS,
+    )) orelse return error.TestUnexpectedResult;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("Real answer.", second.text);
+    try std.testing.expectEqual(@as(usize, 0), second.delta_start);
+    try std.testing.expect(second.rewrite);
     try std.testing.expect(state.rendered_reasoning);
 }
 

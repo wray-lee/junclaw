@@ -93,9 +93,25 @@ const tool_body_max = 16384;
 /// bound on a malformed stream.
 const tool_body_hard_max = 1 << 20;
 
+/// What `TagFilter` does with an *orphan* reasoning closer: a `</think>`-family
+/// tag (plain, namespaced or pipe) that has no opener, which a reasoning
+/// gateway leaks into the content stream.
+pub const OrphanThinkCloser = enum {
+    /// Forward the tag. A channel draft presenter re-renders a snapshot of the
+    /// bytes it received (`quoteThinkBlocks`), so it needs the closer to drop
+    /// the leaked reasoning draft that precedes it.
+    release,
+    /// Drop the tag. An append-only sink (the CLI's stdout, an A2A SSE stream)
+    /// has no way to retract the draft, so showing the raw `</ifm|think>` would
+    /// only leak the tag itself.
+    suppress,
+};
+
 pub const TagFilter = struct {
     inner: Sink = undefined,
     think: ThinkMode = .strip,
+    /// How an orphan reasoning closer is handled (see `OrphanThinkCloser`).
+    orphan_think_closer: OrphanThinkCloser = .release,
     /// Which region of the turn the next byte belongs to.
     region: Region = .text,
     state: State = .normal,
@@ -151,6 +167,14 @@ pub const TagFilter = struct {
         "[tool_call",
         "[TOOL_CALL",
         "<think",
+        // OpenAI/Anthropic-style text tool markup. A model that falls back to
+        // this dialect can degenerate into a loop of `</function>` closers that
+        // must never reach a channel (OpenClaw's `TOOL_CALL_TAG_NAMES`).
+        "<function",
+        "<function_calls",
+        "<tool_calls",
+        "<invoke",
+        "<parameter",
     };
 
     // Closing tag *names*, without the trailing delimiter. A close is matched
@@ -168,6 +192,11 @@ pub const TagFilter = struct {
         "<|tool_result_end|",
         "[/tool_call",
         "[/TOOL_CALL",
+        "</function",
+        "</function_calls",
+        "</tool_calls",
+        "</invoke",
+        "</parameter",
     };
 
     const think_open_tag = "<think>";
@@ -225,7 +254,14 @@ pub const TagFilter = struct {
     const max_close_len = maxLen(&close_names) + 1; // name plus its delimiter
     const max_standalone_len = maxLen(&standalone_tags);
     const max_opaque_len = maxLen(&opaque_marker_prefixes);
-    const max_buf_len = @max(@max(max_open_len + 1, max_close_len), @max(max_standalone_len, max_opaque_len)) + 1;
+    // A namespaced reasoning tag (`</ifm|think>`) can be longer than any fixed
+    // tool tag, and the `.lt` buffer must hold one whole tag plus the byte that
+    // completes it before `scanThinkTag` can classify it.
+    const max_think_len = providers.helpers.max_think_tag_len;
+    const max_buf_len = @max(
+        max_think_len + 1,
+        @max(@max(max_open_len + 1, max_close_len), @max(max_standalone_len, max_opaque_len)),
+    ) + 1;
 
     pub fn init(inner: Sink) TagFilter {
         return .{ .inner = inner };
@@ -325,13 +361,21 @@ pub const TagFilter = struct {
                     if (self.buf_len > 1 and delimiterOk(prefix[0 .. self.buf_len - 1], b) and
                         matchesAnyPrefix(prefix[0 .. self.buf_len - 1], &open_prefixes))
                     {
-                        const is_think = std.mem.eql(u8, prefix[0 .. self.buf_len - 1], "<think");
-                        if (is_think and self.region == .text) {
+                        // `<think` is only a reasoning opener with the `>`
+                        // delimiter (matches `scanThinkTag`); prose such as
+                        // "<think twice before…>" must not open a region, and is
+                        // ordinary text rather than a tool block.
+                        const is_think_name = std.mem.eql(u8, prefix[0 .. self.buf_len - 1], "<think");
+                        if (is_think_name and b != '>') {
+                            self.emitRegion(prefix);
+                            self.buf_len = 0;
+                            self.state = .normal;
+                        } else if (is_think_name and self.region == .text) {
                             self.buf_len = 0;
                             self.region = .think;
                             self.state = .normal;
                             self.emitThinkOpen();
-                        } else if (is_think) {
+                        } else if (is_think_name) {
                             // Nested `<think>` inside reasoning is literal text.
                             self.emitRegion(prefix);
                             self.buf_len = 0;
@@ -377,6 +421,49 @@ pub const TagFilter = struct {
                         }
                         continue;
                     }
+                    // A reasoning tag: plain (`<thinking>`) or the namespaced /
+                    // pipe variants a gateway leaks for a non-OpenAI reasoning
+                    // model (`<ifm|think>`, `<|think|>`). An opener enters the
+                    // reasoning region; a closer ends it. An *orphan* closer (no
+                    // opener) is released verbatim by default: a channel draft
+                    // presenter re-renders a snapshot of the bytes it received
+                    // (`quoteThinkBlocks`) and uses the closer as the boundary
+                    // that drops the leaked draft before it. An append-only sink
+                    // (`.suppress`) has no way to retract the draft, so it drops
+                    // the tag instead of showing it.
+                    switch (providers.helpers.scanThinkTag(prefix)) {
+                        .partial => continue,
+                        .complete => |tag| {
+                            if (tag.close) {
+                                if (self.region == .think) {
+                                    self.buf_len = 0;
+                                    self.region = .text;
+                                    self.emitThinkClose();
+                                    self.state = if (isTerminator(b)) .normal else .close_tag;
+                                    continue;
+                                }
+                                if (self.orphan_think_closer == .suppress) {
+                                    self.buf_len = 0;
+                                    self.state = if (isTerminator(b)) .normal else .close_tag;
+                                    continue;
+                                }
+                            } else {
+                                if (self.region == .text) {
+                                    self.buf_len = 0;
+                                    self.region = .think;
+                                    self.state = .normal;
+                                    self.emitThinkOpen();
+                                } else {
+                                    // Nested opener inside reasoning is literal.
+                                    self.emitRegion(prefix);
+                                    self.buf_len = 0;
+                                    self.state = .normal;
+                                }
+                                continue;
+                            }
+                        },
+                        .none => {},
+                    }
                     // The buffered bytes cannot continue any known tag. If what
                     // we held before this byte was a complete tag *name* and
                     // this byte opens a new token, that name was an
@@ -418,9 +505,11 @@ pub const TagFilter = struct {
                     self.appendBodyByte(b);
                     const prefix = self.buf[0..self.buf_len];
 
-                    // A `</think>` always ends a block that opened inside the
-                    // reasoning region, and ends the reasoning region itself.
-                    if (self.tool_in_think and isCloseTag(prefix, &think_close_names)) {
+                    // A reasoning closer - the literal `</think>` or a
+                    // namespaced / pipe variant like `</ifm|think>` - always
+                    // ends a block that opened inside the reasoning region, and
+                    // ends the region itself.
+                    if (self.tool_in_think and isThinkCloseTag(prefix)) {
                         self.resetBody();
                         self.buf_len = 0;
                         self.region = .text;
@@ -447,7 +536,7 @@ pub const TagFilter = struct {
                         continue;
                     }
                     const still_close = prefixOfAny(prefix, &close_names) or
-                        (self.tool_in_think and prefixOfAny(prefix, &think_close_names));
+                        (self.tool_in_think and isThinkTagPrefix(prefix));
                     if (!still_close or self.buf_len >= max_close_len) {
                         // A dispatcher-opened block also ends on a close tag of
                         // *any* name (the dispatcher's fallback close), so scan
@@ -561,7 +650,7 @@ pub const TagFilter = struct {
                     // fragment) swallowed the `</think>` terminator and every
                     // visible byte after it in all three modes.
                     if (self.region == .think) {
-                        if (isCloseTag(prefix, &think_close_names)) {
+                        if (isThinkCloseTag(prefix)) {
                             self.buf_len = 0;
                             self.opaque_depth = 0;
                             self.opaque_closer = false;
@@ -570,7 +659,7 @@ pub const TagFilter = struct {
                             self.state = if (isTerminator(b)) .normal else .close_tag;
                             continue;
                         }
-                        if (prefixOfAny(prefix, &think_close_names)) continue;
+                        if (isThinkTagPrefix(prefix)) continue;
                     }
                     if (matchesAnyPrefix(prefix, &opaque_marker_prefixes)) {
                         self.opaque_closer = prefix[1] == '/';
@@ -754,6 +843,30 @@ pub const TagFilter = struct {
         return matchesAnyPrefix(name, &standalone_names);
     }
 
+    /// True when `prefix` is a complete reasoning *close* tag: the literal
+    /// `</think>` (or its whitespace-delimited form) or a namespaced / pipe
+    /// variant such as `</ifm|think>` or `</|thinking|>`. Used where a block or
+    /// marker that opened inside a reasoning region must end on that region's
+    /// closer, however the gateway spelled it.
+    fn isThinkCloseTag(prefix: []const u8) bool {
+        if (isCloseTag(prefix, &think_close_names)) return true;
+        return switch (providers.helpers.scanThinkTag(prefix)) {
+            .complete => |tag| tag.close,
+            else => false,
+        };
+    }
+
+    /// True when `prefix` could still grow into a reasoning tag (opener or
+    /// closer) - a partial `<ifm|think` run, say - so a buffering caller keeps
+    /// it instead of treating the bytes as body text.
+    fn isThinkTagPrefix(prefix: []const u8) bool {
+        if (prefixOfAny(prefix, &think_close_names)) return true;
+        return switch (providers.helpers.scanThinkTag(prefix)) {
+            .partial => true,
+            else => false,
+        };
+    }
+
     /// Returns true if `text` exactly matches any entry in `prefixes`.
     fn matchesAnyPrefix(text: []const u8, prefixes: []const []const u8) bool {
         for (prefixes) |p| {
@@ -863,6 +976,77 @@ test "TagFilter strips think blocks by default" {
     try std.testing.expectEqualStrings("Visible", col.joined(&buf));
 }
 
+test "TagFilter treats a namespaced think opener and closer as a reasoning region" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("<ifm|think>private</ifm|think>Visible");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Visible", col.joined(&buf));
+}
+
+test "TagFilter recognizes a namespaced think tag split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("<ifm|thi");
+    s.emitChunk("nk>private</ifm|think>Visible");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Visible", col.joined(&buf));
+}
+
+test "TagFilter releases an orphan namespaced think closer for the batch scanner" {
+    // No opener (the gateway swallowed it), so the draft before the closer is
+    // reasoning. The filter must not swallow the closer: the batch scanner
+    // (`scanThinkContent`) uses it as the boundary that drops the draft.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Draft answer.</ifm|think>Real answer.");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Draft answer.</ifm|think>Real answer.", col.joined(&buf));
+}
+
+test "TagFilter suppresses an orphan think closer for an append-only sink" {
+    // The CLI prints chunks straight to a terminal and can never retract the
+    // leaked draft, so the tag itself must not reach the user.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    filter.orphan_think_closer = .suppress;
+    const s = filter.sink();
+    s.emitChunk("Draft answer.</ifm|think>Real answer.");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Draft answer.Real answer.", col.joined(&buf));
+}
+
+test "TagFilter suppresses an orphan closer split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.initWithThinkMode(col.sink(), .render);
+    filter.orphan_think_closer = .suppress;
+    const s = filter.sink();
+    s.emitChunk("Draft.</ifm");
+    s.emitChunk("|think>Answer.");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Draft.Answer.", col.joined(&buf));
+}
+
+test "TagFilter keeps prose containing '<think ' as ordinary text" {
+    // `<think` only opens a reasoning region with a `>` delimiter; with a space
+    // it is a word in a sentence and must not swallow the rest of the reply.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Please <think twice before you answer> ok.");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Please <think twice before you answer> ok.", col.joined(&buf));
+}
+
 test "TagFilter think passthrough forwards reasoning to the inner sink" {
     var col = collectChunks(16){};
     var filter = TagFilter.initWithThinkMode(col.sink(), .passthrough);
@@ -968,6 +1152,26 @@ test "TagFilter strips complete tool_call in single chunk" {
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Hi  bye", col.joined(&buf));
+}
+
+test "TagFilter drops a stray function close tag" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Answer</function></function></function>");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Answer", col.joined(&buf));
+}
+
+test "TagFilter strips a function_calls block" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("A<function_calls><invoke name=\"shell\"></invoke></function_calls>B");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("AB", col.joined(&buf));
 }
 
 test "TagFilter strips tool_result with attributes" {
@@ -1557,6 +1761,36 @@ test "TagFilter ends an unterminated provider marker at </think> in every mode a
         "<think>x</think>Ans",
         THINK_HEADER ++ "x" ++ THINK_FOOTER ++ "Ans",
     );
+}
+
+test "TagFilter ends a tool block inside namespaced reasoning at the namespaced closer" {
+    // The K2 gateway opens reasoning with a namespaced tag (`<ifm|think>`) and
+    // the model closes it with the matching namespaced closer. An unterminated
+    // tool block opened inside that region must end at the namespaced closer,
+    // not swallow the visible answer to end of stream.
+    const input = "<ifm|think>x<tool_result>payload</ifm|think>Visible answer";
+    var split: usize = 0;
+    while (split <= input.len) : (split += 1) {
+        const two = [_][]const u8{ input[0..split], input[split..] };
+        try assertFilteredEquals(.strip, &two, "Visible answer");
+        try assertFilteredEquals(.passthrough, &two, "<think>x</think>Visible answer");
+        try assertFilteredEquals(.render, &two, THINK_HEADER ++ "x" ++ THINK_FOOTER ++ "Visible answer");
+    }
+}
+
+test "TagFilter ends a provider marker inside namespaced reasoning at the namespaced closer" {
+    // Same region boundary, reached through `.opaque_body_lt`: an unterminated
+    // provider marker inside a namespaced reasoning region used to eat the
+    // namespaced closer and every visible byte after it.
+    const marker = "<\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C} calls>";
+    const input = "<ifm|think>x" ++ marker ++ "y</ifm|think>Ans";
+    var split: usize = 0;
+    while (split <= input.len) : (split += 1) {
+        const two = [_][]const u8{ input[0..split], input[split..] };
+        try assertFilteredEquals(.strip, &two, "Ans");
+        try assertFilteredEquals(.passthrough, &two, "<think>x</think>Ans");
+        try assertFilteredEquals(.render, &two, THINK_HEADER ++ "x" ++ THINK_FOOTER ++ "Ans");
+    }
 }
 
 // ---------------------------------------------------------------------------

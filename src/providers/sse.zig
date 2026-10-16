@@ -1763,6 +1763,29 @@ test "extractDeltaContent prefers visible content over reasoning_content" {
     try std.testing.expectEqualStrings("final answer", d.text);
 }
 
+test "extractDeltaContent does not duplicate reasoning sent in both fields" {
+    const allocator = std.testing.allocator;
+    // The K2 gateway can put the same reasoning in `reasoning` and
+    // `reasoning_content` of one delta; exactly one value is returned (the
+    // priority field), never a concatenation of both.
+    const d = (try extractDeltaContent(
+        allocator,
+        "{\"choices\":[{\"delta\":{\"reasoning\":\"step by step\",\"reasoning_content\":\"step by step\"}}]}",
+    )).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("step by step", d.reasoning);
+}
+
+test "extractDeltaContent returns only the priority reasoning field" {
+    const allocator = std.testing.allocator;
+    const d = (try extractDeltaContent(
+        allocator,
+        "{\"choices\":[{\"delta\":{\"reasoning\":\"primary\",\"reasoning_content\":\"duplicate\"}}]}",
+    )).?;
+    defer d.deinit(allocator);
+    try std.testing.expectEqualStrings("primary", d.reasoning);
+}
+
 test "appendDeltaContent closes reasoning before final" {
     const Collector = struct {
         buf: std.ArrayListUnmanaged(u8) = .empty,

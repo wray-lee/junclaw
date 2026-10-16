@@ -179,6 +179,9 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
     filter.* = streaming.TagFilter.init(raw_sink);
+    // The terminal is append-only, so an orphan reasoning closer would print as
+    // a raw `</ifm|think>` with no way to drop the leaked draft before it.
+    filter.orphan_think_closer = .suppress;
     return filter.sink();
 }
 
@@ -186,6 +189,7 @@ fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) str
 /// instead of stripping them. Used when reasoning_mode == .stream.
 fn makeCliStreamSinkPassthrough(raw_sink: streaming.Sink, filter: *streaming.ThinkPassthroughFilter) streaming.Sink {
     filter.* = streaming.ThinkPassthroughFilter.init(raw_sink);
+    filter.filter.orphan_think_closer = .suppress;
     return filter.sink();
 }
 

@@ -1898,6 +1898,16 @@ pub const SlackChannel = struct {
                     log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
                     state.mode = .fallback;
                 };
+            } else if (flush.rewrite) {
+                // The snapshot dropped earlier bytes (an orphan reasoning closer
+                // removed the leaked draft, or a late `<think>` moved them).
+                // chat.appendStream is append-only, so appending the whole
+                // snapshot would show the draft twice; close the stream and
+                // rewrite the message in place from here on.
+                self.stopNativeStream(parsed, state.message_ts) catch |err| {
+                    log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
+                };
+                state.mode = .fallback;
             } else {
                 // Keep the native transport: the streamed message still has to be
                 // closed with chat.stopStream, and the final reply reconciles it.

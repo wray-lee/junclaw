@@ -25,6 +25,236 @@ fn hasOpaqueMarker(text: []const u8) bool {
         std.mem.indexOf(u8, text, opaque_marker_close) != null;
 }
 
+// ── Reasoning-tag recognition ─────────────────────────────────────────────
+//
+// The plain `<think>`/`</think>` forms are only one spelling. Reasoning
+// gateways for non-OpenAI models wrap the same region in a namespaced or
+// pipe-delimited tag — the IFM K2 gateway leaks `</ifm|think>` into the content
+// stream with no opener — and OpenClaw recognises `antml:*`/`mm:*` namespaced
+// tags plus `<|…|>` control tokens. A single scanner classifies them so the
+// streaming `TagFilter` and the batch helpers agree.
+
+/// Longest reasoning tag the scanner will accept (`</namespace|thinking>`), so
+/// an incremental caller can keep a bounded buffer.
+pub const max_think_tag_len = 32;
+
+fn isTagNameByte(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '-';
+}
+
+fn isThinkLeaf(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "think") or std.ascii.eqlIgnoreCase(name, "thinking");
+}
+
+fn isThinkLeafPrefix(name: []const u8) bool {
+    const target = "thinking";
+    if (name.len > target.len) return false;
+    return std.ascii.eqlIgnoreCase(target[0..name.len], name);
+}
+
+/// A recognised reasoning (think) tag.
+pub const ThinkTag = struct {
+    /// True for a closing tag (`</…>`).
+    close: bool,
+    /// Total byte length, including `<`, `</` and the terminating `>`.
+    len: usize,
+};
+
+/// How a `<`-prefixed byte run classifies as a reasoning tag.
+pub const ThinkTagScan = union(enum) {
+    /// Not a reasoning tag, and no extension can make it one.
+    none,
+    /// Still a valid prefix of a reasoning tag — an incremental caller buffers.
+    partial,
+    /// A complete reasoning tag; `len` is its length.
+    complete: ThinkTag,
+};
+
+/// Classify a byte run starting at `<` (which must be `text[0]`) as a reasoning
+/// tag. Recognises `<think>`/`<thinking>` and their closers plus the namespaced
+/// and pipe-delimited spellings gateways leak: `<ifm|think>`, `</ifm|think>`,
+/// `<mm:think>`, `<|think|>`, `</|thinking|>`. Bytes after the tag are ignored,
+/// so the same scanner serves a bounded stream buffer and a whole response.
+pub fn scanThinkTag(text: []const u8) ThinkTagScan {
+    if (text.len == 0 or text[0] != '<') return .none;
+    var i: usize = 1;
+    var close = false;
+    if (i < text.len and text[i] == '/') {
+        close = true;
+        i += 1;
+    }
+    // Optional namespace, then `:` or `|`, then the `think` leaf. Without a
+    // separator the whole name is the leaf (`<think>`).
+    const first_start = i;
+    while (i < text.len and isTagNameByte(text[i])) i += 1;
+    if (i > max_think_tag_len) return .none;
+    const first = text[first_start..i];
+    var leaf = first;
+    var had_sep = false;
+    if (i < text.len and (text[i] == ':' or text[i] == '|')) {
+        had_sep = true;
+        i += 1;
+        const leaf_start = i;
+        while (i < text.len and isTagNameByte(text[i])) i += 1;
+        if (i > max_think_tag_len) return .none;
+        leaf = text[leaf_start..i];
+    }
+    // A pipe-token closer (`<|think|>`).
+    if (i < text.len and text[i] == '|') i += 1;
+    if (i < text.len and text[i] == '>') {
+        i += 1;
+        if (!isThinkLeaf(leaf)) return .none;
+        return .{ .complete = .{ .close = close, .len = i } };
+    }
+    if (i >= text.len) {
+        // Incomplete: valid iff the leaf can still become think/thinking, or
+        // (before any separator) the run can still gain `|`/`:` and a leaf.
+        if (isThinkLeafPrefix(leaf)) return .partial;
+        if (!had_sep and first.len > 0) return .partial;
+    }
+    return .none;
+}
+
+/// The reasoning tag starting at `text[start]`, or null. Whole-text callers use
+/// this; the streaming `TagFilter` uses `scanThinkTag` directly so it can also
+/// observe `.partial`.
+fn matchThinkTag(text: []const u8, start: usize) ?ThinkTag {
+    if (start >= text.len or text[start] != '<') return null;
+    return switch (scanThinkTag(text[start..])) {
+        .complete => |tag| tag,
+        else => null,
+    };
+}
+
+/// True when `text` contains any reasoning tag (opener or closer), including
+/// the namespaced and pipe spellings a gateway leaks.
+pub fn hasReasoningTag(text: []const u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, text, i, '<')) |lt| {
+        if (matchThinkTag(text, lt) != null) return true;
+        i = lt + 1;
+    }
+    return false;
+}
+
+/// True when a stray reasoning closer separates two non-empty visible runs —
+/// i.e. the text before it is a leaked reasoning draft, not the answer.
+/// Mirrors OpenClaw's `hasOrphanReasoningCloseBoundary`.
+pub fn hasOrphanReasoningCloseBoundary(before: []const u8, after: []const u8) bool {
+    return std.mem.trim(u8, before, " \t\r\n").len > 0 and
+        std.mem.trim(u8, after, " \t\r\n").len > 0;
+}
+
+// ── Markdown code regions ────────────────────────────────────────────────
+//
+// A reasoning tag or the XML `function` tool dialect can appear literally in a
+// fenced block or an inline code span (a documented XML sample, a discussion of
+// LLM internals). OpenClaw skips tag matches inside code (`isInsideCode` over
+// `findMarkdownCodeRegions`); the same guard keeps a documented `</think>` or
+// `<function>` from being read as markup and stripped.
+
+pub const CodeRegion = struct { start: usize, end: usize };
+
+/// True when `pos` is inside one of the sorted, non-overlapping `regions`.
+pub fn isInsideCode(regions: []const CodeRegion, pos: usize) bool {
+    var lo: usize = 0;
+    var hi: usize = regions.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const region = regions[mid];
+        if (pos < region.start) {
+            hi = mid;
+        } else if (pos >= region.end) {
+            lo = mid + 1;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn codeRunLen(text: []const u8, start: usize) usize {
+    const ch = text[start];
+    var i = start;
+    while (i < text.len and text[i] == ch) i += 1;
+    return i - start;
+}
+
+/// Byte ranges of Markdown code in `text`: fenced blocks (``` / ~~~, opened by
+/// a run of three or more at the start of a line) and inline code spans (a
+/// backtick run closed by an equal run). Caller frees the returned slice.
+pub fn findCodeRegions(allocator: std.mem.Allocator, text: []const u8) ![]CodeRegion {
+    var regions: std.ArrayListUnmanaged(CodeRegion) = .empty;
+    errdefer regions.deinit(allocator);
+
+    var i: usize = 0;
+    var at_line_start = true;
+    var fence_ch: u8 = 0;
+    var fence_len: usize = 0;
+    var fence_start: usize = 0;
+    var span_len: usize = 0;
+    var span_start: usize = 0;
+    while (i < text.len) {
+        if (at_line_start) {
+            at_line_start = false;
+            var j = i;
+            var indent: usize = 0;
+            while (j < text.len and text[j] == ' ' and indent < 4) : (indent += 1) j += 1;
+            if (indent <= 3 and j < text.len and (text[j] == '`' or text[j] == '~')) {
+                const run = codeRunLen(text, j);
+                if (fence_ch == 0 and run >= 3) {
+                    fence_ch = text[j];
+                    fence_len = run;
+                    fence_start = i;
+                    i = j + run;
+                    continue;
+                }
+                if (fence_ch == text[j] and run >= fence_len) {
+                    try regions.append(allocator, .{ .start = fence_start, .end = j + run });
+                    fence_ch = 0;
+                    i = j + run;
+                    continue;
+                }
+            }
+            if (fence_ch != 0) {
+                // Inside a fence every byte is code until the next line start,
+                // where a closing fence can appear.
+                while (i < text.len and text[i] != '\n') i += 1;
+                if (i < text.len) {
+                    i += 1;
+                    at_line_start = true;
+                }
+                continue;
+            }
+        }
+        const b = text[i];
+        if (b == '\n') {
+            at_line_start = true;
+            i += 1;
+            continue;
+        }
+        if (b == '`') {
+            const run = codeRunLen(text, i);
+            if (span_len == 0) {
+                span_len = run;
+                span_start = i;
+            } else if (run == span_len) {
+                try regions.append(allocator, .{ .start = span_start, .end = i + run });
+                span_len = 0;
+            }
+            i += run;
+            continue;
+        }
+        i += 1;
+    }
+    // An unterminated fence runs to the end of the text (mid-stream).
+    if (fence_ch != 0) {
+        try regions.append(allocator, .{ .start = fence_start, .end = text.len });
+    }
+    return regions.toOwnedSlice(allocator);
+}
+
 /// Byte offset just past the provider tool marker region starting at `start`,
 /// or null when the bytes there are not such a marker. The markers nest, so the
 /// region runs from the opener to the matching closer; a stray closer ends the
@@ -81,6 +311,15 @@ const tool_call_open_tags = [_][]const u8{
     "<tool_result_begin",
     "<|tool_call_begin|",
     "<|tool_result_begin|",
+    // Anthropic-style text tool markup and OpenAI's XML `function` dialect.
+    // A model that falls back to one of these can degenerate into a loop of
+    // `</function>` closers; they are tool markup, not an answer (OpenClaw's
+    // `TOOL_CALL_TAG_NAMES` covers the same set).
+    "<function",
+    "<function_calls",
+    "<tool_calls",
+    "<invoke",
+    "<parameter",
 };
 // Close tag *names*, without the trailing delimiter. Like the opens above, a
 // close is matched with either a `>` or a whitespace delimiter, so a model that
@@ -92,6 +331,11 @@ const tool_call_close_names = [_][]const u8{
     "<tool_result_end",
     "<|tool_call_end|",
     "<|tool_result_end|",
+    "</function",
+    "</function_calls",
+    "</tool_calls",
+    "</invoke",
+    "</parameter",
 };
 const tool_call_standalone_names = [_][]const u8{
     "<tool_calls_section_begin",
@@ -114,7 +358,7 @@ const bracket_tool_call_markers = [_][]const u8{
     "[/TOOL_CALL]",
 };
 
-fn hasToolCallMarkup(text: []const u8) bool {
+pub fn hasToolCallMarkup(text: []const u8) bool {
     if (hasOpaqueMarker(text)) return true;
     for (tool_call_open_tags) |t| {
         if (std.mem.indexOf(u8, text, t) != null) return true;
@@ -131,11 +375,70 @@ fn hasToolCallMarkup(text: []const u8) bool {
     return false;
 }
 
+/// Length (past its delimiter) of an XML `function`-dialect close tag at
+/// `start`, or null. Used only to spot a runaway repetition.
+fn toolFunctionCloseLenAt(text: []const u8, start: usize) ?usize {
+    // Longest first: `</function` is a prefix of `</function_calls`, so the
+    // shorter name would match first and then fail its delimiter check (`_`),
+    // hiding the longer name and missing a `</function_calls>` run.
+    const run_names = [_][]const u8{
+        "</function_calls", "</tool_calls", "</parameter", "</function", "</invoke",
+    };
+    if (text[start] != '<') return null;
+    for (run_names) |name| {
+        if (std.mem.startsWith(u8, text[start..], name)) {
+            const after = start + name.len;
+            if (after < text.len and (text[after] == '>' or std.ascii.isWhitespace(text[after]))) {
+                return name.len + 1;
+            }
+            return null;
+        }
+    }
+    return null;
+}
+
+/// True when `text` holds a run of three or more dangling XML `function`-dialect
+/// close tags (`</function>`, `</function_calls>`, `</tool_calls>`, `</invoke>`,
+/// `</parameter>`), optionally whitespace-separated. That run is the shape a
+/// model degenerates into when it loops until the output cap, so the display
+/// path hides it; a lone mention is prose or a documented sample.
+pub fn hasRepetitiveToolCloseRun(text: []const u8) bool {
+    var i: usize = 0;
+    var run: usize = 0;
+    while (i < text.len) {
+        if (std.ascii.isWhitespace(text[i])) {
+            i += 1;
+            continue;
+        }
+        if (toolFunctionCloseLenAt(text, i)) |len| {
+            run += 1;
+            if (run >= 3) return true;
+            i += len;
+            continue;
+        }
+        run = 0;
+        i += 1;
+    }
+    return false;
+}
+
 // The exact open markers the dispatcher's unclosed recovery keys on. A text tool
 // call the agent would execute can only start with one of these; a payload after
 // any other opener (attributes, a whitespace delimiter, a `_begin` wrapper) is
 // prose, because `parseXmlToolCalls` looks for these literals verbatim.
 const dispatcher_marker_tags = [_][]const u8{ "<tool_call>", "[tool_call]", "[TOOL_CALL]" };
+
+/// True when the bytes at `start` begin one of the dispatcher's own tool
+/// markers. They are stripped even inside a Markdown code region: those bytes
+/// are never a code sample, unlike the XML `function` dialect.
+fn isDispatcherMarkerAt(text: []const u8, start: usize) bool {
+    const rest = text[start..];
+    for (dispatcher_marker_tags) |tag| {
+        if (std.mem.startsWith(u8, rest, tag)) return true;
+    }
+    return std.mem.startsWith(u8, rest, "<tool_call") or
+        std.mem.startsWith(u8, rest, "<tool_result");
+}
 
 /// Case-insensitive substring test, matching the dispatcher's strict-close rule
 /// (`containsIgnoreCase(tag_content, "tool_call")` in `parseXmlToolCalls`).
@@ -1477,6 +1780,12 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
     var think_depth: usize = 0;
     var block_idx: usize = 0;
     var i: usize = 0;
+    // A `<function>`/`</function>`/`<parameter>` tag inside a code fence or
+    // inline span is a literal sample, not markup (OpenClaw's `isInsideCode`).
+    // The dispatcher's own markers are still stripped inside code: they are
+    // never prose.
+    const code = try findCodeRegions(allocator, text);
+    defer allocator.free(code);
     while (i < text.len) {
         // A dispatcher-marker block the shared parse swallowed: skip its whole
         // span (tags and body) in one step.
@@ -1484,6 +1793,13 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
         if (block_idx < blocks.len and blocks[block_idx].start == i) {
             i = blocks[block_idx].end;
             block_idx += 1;
+            continue;
+        }
+        if ((text[i] == '<' or text[i] == '[') and isInsideCode(code, i) and
+            !isDispatcherMarkerAt(text, i))
+        {
+            try out.append(allocator, text[i]);
+            i += 1;
             continue;
         }
         if (text[i] == '<') {
@@ -1560,18 +1876,35 @@ fn scanThinkContent(
 ) !void {
     var i: usize = 0;
     var depth: usize = 0;
+    // Offset in `visible_out` at the last reasoning-tag boundary, so an orphan
+    // closer's "before" is the run since that tag (OpenClaw's `beforeTag`),
+    // while the reset still drops every accumulated draft byte.
+    var seg_start: usize = 0;
+    // A reasoning tag inside a code fence or inline span is a literal sample,
+    // not a boundary (OpenClaw's `isInsideCode` guard).
+    const code = try findCodeRegions(allocator, text);
+    defer allocator.free(code);
     while (i < text.len) {
-        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
-            depth += 1;
-            i += think_open_tag.len;
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
-            if (depth > 0) depth -= 1;
-            i += think_close_tag.len;
-            continue;
-        }
-        if (text[i] == '<') {
+        if (text[i] == '<' and !isInsideCode(code, i)) {
+            if (matchThinkTag(text, i)) |tag| {
+                if (tag.close) {
+                    if (depth > 0) {
+                        depth -= 1;
+                    } else if (hasOrphanReasoningCloseBoundary(visible_out.items[seg_start..], text[i + tag.len ..])) {
+                        // A stray reasoning closer: the visible text before it
+                        // was leaked reasoning (a draft the model wrote as
+                        // thinking), not the answer. Drop it and keep only what
+                        // follows, matching OpenClaw's orphan-close rule.
+                        visible_out.clearRetainingCapacity();
+                        seg_start = 0;
+                    }
+                } else {
+                    depth += 1;
+                }
+                i += tag.len;
+                seg_start = visible_out.items.len;
+                continue;
+            }
             if (skipOpaqueMarkers(text, i, depth > 0)) |end| {
                 i = end;
                 continue;
@@ -1589,9 +1922,7 @@ fn scanThinkContent(
 /// Split `text` into visible content and reasoning extracted from <think>…</think> blocks.
 /// Both returned slices are caller-owned (allocated with `allocator`).
 pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitThinkContent {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null and
-        std.mem.indexOf(u8, text, think_close_tag) == null and !hasOpaqueMarker(text))
-    {
+    if (!hasReasoningTag(text) and !hasOpaqueMarker(text)) {
         return .{
             .visible = try allocator.dupe(u8, text),
             .reasoning = null,
@@ -1617,9 +1948,7 @@ pub fn splitThinkContent(allocator: std.mem.Allocator, text: []const u8) !SplitT
 
 /// Strip all <think>…</think> blocks from `text`. Returns caller-owned slice.
 pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null and
-        std.mem.indexOf(u8, text, think_close_tag) == null and !hasOpaqueMarker(text))
-    {
+    if (!hasReasoningTag(text) and !hasOpaqueMarker(text)) {
         return allocator.dupe(u8, text);
     }
 
@@ -1641,7 +1970,7 @@ pub fn stripThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
 /// through `stripThinkBlocks`, so the quote never reaches the final message.
 /// An unterminated block (mid-stream) is quoted up to the end of `text`.
 pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
-    if (std.mem.indexOf(u8, text, think_open_tag) == null) return stripThinkBlocks(allocator, text);
+    if (!hasReasoningTag(text)) return stripThinkBlocks(allocator, text);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -1649,26 +1978,42 @@ pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
     var i: usize = 0;
     var depth: usize = 0;
     var at_line_start = false;
+    // `out` length at the last reasoning-tag boundary and whether any visible
+    // byte was written since, so an orphan closer drops the leaked draft before
+    // it (keeping the quoted reasoning), like `scanThinkContent`.
+    var seg_start: usize = 0;
+    var visible_in_seg = false;
+    // A reasoning tag inside a code region is a literal sample, not a boundary.
+    const code = try findCodeRegions(allocator, text);
+    defer allocator.free(code);
     while (i < text.len) {
-        if (std.mem.startsWith(u8, text[i..], think_open_tag)) {
-            depth += 1;
-            i += think_open_tag.len;
-            if (depth == 1) {
-                try out.appendSlice(allocator, "\n> ");
-                at_line_start = false;
+        if (text[i] == '<' and !isInsideCode(code, i)) {
+            if (matchThinkTag(text, i)) |tag| {
+                i += tag.len;
+                if (tag.close) {
+                    if (depth > 0) {
+                        depth -= 1;
+                        if (depth == 0) {
+                            try out.appendSlice(allocator, "\n\n");
+                            at_line_start = false;
+                        }
+                    } else if (visible_in_seg and
+                        hasOrphanReasoningCloseBoundary(out.items[seg_start..], text[i..]))
+                    {
+                        out.shrinkRetainingCapacity(seg_start);
+                        at_line_start = false;
+                    }
+                } else {
+                    depth += 1;
+                    if (depth == 1) {
+                        try out.appendSlice(allocator, "\n> ");
+                        at_line_start = false;
+                    }
+                }
+                seg_start = out.items.len;
+                visible_in_seg = false;
+                continue;
             }
-            continue;
-        }
-        if (std.mem.startsWith(u8, text[i..], think_close_tag)) {
-            if (depth > 0) depth -= 1;
-            i += think_close_tag.len;
-            if (depth == 0) {
-                try out.appendSlice(allocator, "\n\n");
-                at_line_start = false;
-            }
-            continue;
-        }
-        if (text[i] == '<') {
             if (skipOpaqueMarkers(text, i, depth > 0)) |end| {
                 i = end;
                 continue;
@@ -1678,6 +2023,8 @@ pub fn quoteThinkBlocks(allocator: std.mem.Allocator, text: []const u8) ![]const
         if (depth > 0) {
             if (at_line_start) try out.appendSlice(allocator, "> ");
             at_line_start = byte == '\n';
+        } else {
+            visible_in_seg = true;
         }
         try out.append(allocator, byte);
         i += 1;
@@ -1774,6 +2121,29 @@ pub fn isReasoningModel(model: []const u8) bool {
         std.mem.startsWith(u8, model, "codex-mini");
 }
 
+/// True when a reasoning effort was requested and is not the explicit "none".
+/// Drives the request cap field: a reasoning endpoint takes
+/// `max_completion_tokens`, a plain one `max_tokens`.
+pub fn reasoningEffortActive(reasoning_effort: ?[]const u8) bool {
+    const raw = reasoning_effort orelse return false;
+    return raw.len > 0 and !std.ascii.eqlIgnoreCase(raw, "none");
+}
+
+/// True when a model name marks an OpenAI-compatible *reasoning* endpoint even
+/// though `isReasoningModel` (which only knows OpenAI's own ids) does not
+/// recognise it. Such gateways take the cap as `max_completion_tokens` and
+/// ignore `max_tokens`, so the field must not depend on `reasoning_effort`
+/// being set: a `k2`/`-reasoner`/`-thinking` model with no effort configured
+/// would otherwise send a cap the gateway drops and run to its hard ceiling.
+pub fn isReasoningEndpointModel(model: []const u8) bool {
+    if (isReasoningModel(model)) return true;
+    const needles = [_][]const u8{ "reason", "think", "k2" };
+    for (needles) |needle| {
+        if (std.ascii.indexOfIgnoreCase(model, needle) != null) return true;
+    }
+    return false;
+}
+
 /// Append model-specific generation controls to a JSON request body buffer:
 /// - non-reasoning: `temperature` + optional `max_tokens`
 /// - reasoning + reasoning_effort=="none": `temperature` + `max_completion_tokens`
@@ -1791,14 +2161,25 @@ pub fn appendGenerationFields(
     reasoning_effort: ?[]const u8,
 ) !void {
     if (!isReasoningModel(model)) {
-        // Non-reasoning model: temperature + max_tokens
+        // Non-reasoning model: temperature + a token cap. When a reasoning
+        // effort was requested, or the model name marks a reasoning endpoint we
+        // do not recognise (K2, DeepSeek-R1, ...), the gateway ignores
+        // `max_tokens` and honours only `max_completion_tokens`, so the cap must
+        // go out under that field or a degenerate loop runs to the gateway's
+        // hard ceiling (OpenClaw's `maxTokensField` default for
+        // OpenAI-compatible endpoints).
         try buf.appendSlice(allocator, ",\"temperature\":");
         var temp_buf: [16]u8 = undefined;
         const temp_str = std.fmt.bufPrint(&temp_buf, "{d:.2}", .{temperature}) catch return error.FormatError;
         try buf.appendSlice(allocator, temp_str);
 
         if (max_tokens) |max_tok| {
-            try buf.appendSlice(allocator, ",\"max_tokens\":");
+            const completion_field = reasoningEffortActive(reasoning_effort) or
+                isReasoningEndpointModel(model);
+            try buf.appendSlice(allocator, if (completion_field)
+                ",\"max_completion_tokens\":"
+            else
+                ",\"max_tokens\":");
             var max_buf: [16]u8 = undefined;
             const max_str = std.fmt.bufPrint(&max_buf, "{d}", .{max_tok}) catch return error.FormatError;
             try buf.appendSlice(allocator, max_str);
@@ -2384,6 +2765,34 @@ test "appendGenerationFields normalizes xhigh reasoning effort for gpt-5" {
     try std.testing.expectEqual(@as(i64, 2048), obj.get("max_completion_tokens").?.integer);
 }
 
+test "appendGenerationFields uses max_completion_tokens for an active reasoning effort" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    // A non-OpenAI reasoning model (K2) with an effort set: the cap must use
+    // the field the gateway honours, or the loop runs to the hard ceiling.
+    try appendGenerationFields(&buf, std.testing.allocator, "k2", 0.7, 8192, "high");
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_completion_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_tokens\":") == null);
+}
+
+test "appendGenerationFields keeps max_tokens for a plain model without an effort" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    try appendGenerationFields(&buf, std.testing.allocator, "llama-3.3-70b", 0.7, 8192, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_tokens\":8192") != null);
+}
+
+test "appendGenerationFields caps a reasoning endpoint even without an effort" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    // A reasoning endpoint whose name we do not know (K2) must still take the
+    // cap as max_completion_tokens: the gateway ignores max_tokens, so a
+    // degenerate loop would otherwise run to its 131k hard ceiling.
+    try appendGenerationFields(&buf, std.testing.allocator, "k2", 0.7, 8192, null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_completion_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"max_tokens\":") == null);
+}
+
 test "appendGeminiThinkingConfig uses thinkingLevel for gemini-3 flash" {
     const alloc = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -2534,11 +2943,115 @@ test "quoteThinkBlocks quotes an unterminated reasoning block" {
     try std.testing.expectEqualStrings("> still thinking", out);
 }
 
-test "quoteThinkBlocks drops a stray close tag" {
+test "quoteThinkBlocks drops leaked draft before an orphan close tag" {
     const alloc = std.testing.allocator;
+    // Text before a stray reasoning closer is a leaked draft, not the answer
+    // (OpenClaw's orphan-close rule).
     const out = try quoteThinkBlocks(alloc, "answer</think> tail");
     defer alloc.free(out);
-    try std.testing.expectEqualStrings("answer tail", out);
+    try std.testing.expectEqualStrings("tail", out);
+}
+
+test "quoteThinkBlocks keeps text before a stray close tag with nothing after it" {
+    const alloc = std.testing.allocator;
+    const out = try quoteThinkBlocks(alloc, "answer</think>");
+    defer alloc.free(out);
+    try std.testing.expectEqualStrings("answer", out);
+}
+
+test "scanThinkTag recognizes plain, namespaced and pipe reasoning tags" {
+    const tags = [_][]const u8{
+        "<think>",     "</think>",
+        "<thinking>",  "</thinking>",
+        "<ifm|think>", "</ifm|think>",
+        "<mm:think>",  "</mm:thinking>",
+        "<|think|>",   "</|think|>",
+    };
+    for (tags) |tag| {
+        switch (scanThinkTag(tag)) {
+            .complete => |t| {
+                try std.testing.expectEqual(tag.len, t.len);
+                try std.testing.expectEqual(tag[1] == '/', t.close);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
+test "scanThinkTag rejects ordinary tags and partial prefixes" {
+    try std.testing.expect(scanThinkTag("<div>") == .none);
+    try std.testing.expect(scanThinkTag("<tool_call>") == .none);
+    try std.testing.expect(scanThinkTag("<ifm|answer>") == .none);
+    try std.testing.expect(scanThinkTag("<b") == .partial);
+    try std.testing.expect(scanThinkTag("<think") == .partial);
+    try std.testing.expect(scanThinkTag("<ifm|think") == .partial);
+}
+
+test "hasRepetitiveToolCloseRun detects the function-dialect runaway" {
+    // A degenerate loop of dangling XML `function` closers, including the
+    // longer `</function_calls>` spelling whose name is prefixed by
+    // `</function`, is the runaway shape the display path hides.
+    try std.testing.expect(hasRepetitiveToolCloseRun("</function></function></function>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun("</function>\n</function>\n</function>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun("</function_calls></function_calls></function_calls>"));
+    try std.testing.expect(hasRepetitiveToolCloseRun("</tool_calls></tool_calls></tool_calls>"));
+    try std.testing.expect(!hasRepetitiveToolCloseRun("</function></function>"));
+    try std.testing.expect(!hasRepetitiveToolCloseRun("<function_calls><invoke name=\"x\"></invoke></function_calls>"));
+}
+
+test "splitThinkContent drops the leaked draft before an orphan namespaced closer" {
+    const a = std.testing.allocator;
+    // The prod shape: the gateway leaks a complete draft answer as content,
+    // then the model's own closing reasoning tag (no opener), then the answer.
+    const input = "Draft answer A.\n</ifm|think>\nThe real answer B.";
+    const split = try splitThinkContent(a, input);
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("The real answer B.", split.visible);
+    try std.testing.expect(split.reasoning == null);
+}
+
+test "splitThinkContent keeps text after an orphan closer only when it is non-empty" {
+    const a = std.testing.allocator;
+    const split = try splitThinkContent(a, "answer</ifm|think>");
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("answer", split.visible);
+}
+
+test "splitThinkContent keeps prose around a reasoning tag quoted in code" {
+    const a = std.testing.allocator;
+    // Both the inline span and the fenced block are literal samples, so neither
+    // is a leaked-draft boundary: the answer must survive intact.
+    const input = "Use `</think>` to end it.\n```\n</ifm|think>\n```\nDone.";
+    const split = try splitThinkContent(a, input);
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings(input, split.visible);
+    try std.testing.expect(split.reasoning == null);
+}
+
+test "splitThinkContent extracts a namespaced reasoning block" {
+    const a = std.testing.allocator;
+    const split = try splitThinkContent(a, "<ifm|think>reasoning</ifm|think>Answer");
+    defer a.free(split.visible);
+    defer if (split.reasoning) |r| a.free(r);
+    try std.testing.expectEqualStrings("Answer", split.visible);
+    try std.testing.expectEqualStrings("reasoning", split.reasoning.?);
+}
+
+test "stripThinkBlocks drops the leaked draft before an orphan namespaced closer" {
+    const a = std.testing.allocator;
+    const out = try stripThinkBlocks(a, "Draft answer A.\n</ifm|think>\nThe real answer B.");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("The real answer B.", out);
+}
+
+test "quoteThinkBlocks keeps reasoning and drops the leaked draft before an orphan closer" {
+    const a = std.testing.allocator;
+    const out = try quoteThinkBlocks(a, "<think>plan</think>Draft.</ifm|think>Real answer.");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("> plan\n\nReal answer.", out);
 }
 
 test "stripToolCallMarkup removes the K2 tool call and keeps surrounding text" {
@@ -2547,6 +3060,62 @@ test "stripToolCallMarkup removes the K2 tool call and keeps surrounding text" {
     const out = try stripToolCallMarkup(allocator, input);
     defer allocator.free(out);
     try std.testing.expectEqualStrings("Before  after", out);
+}
+
+test "stripToolCallMarkup drops stray function close tags" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "Answer</function></function></function>");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("Answer", out);
+}
+
+test "stripToolCallMarkup hides a function_calls block" {
+    const a = std.testing.allocator;
+    const out = try stripToolCallMarkup(a, "A<function_calls><invoke name=\"shell\"></invoke></function_calls>B");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("AB", out);
+}
+
+test "hasToolCallMarkup detects the function dialect" {
+    try std.testing.expect(hasToolCallMarkup("</function>"));
+    try std.testing.expect(hasToolCallMarkup("<function_calls>"));
+    try std.testing.expect(!hasToolCallMarkup("plain answer"));
+}
+
+test "findCodeRegions finds fenced blocks and inline spans" {
+    const a = std.testing.allocator;
+    const text = "before\n```xml\n<function>\n```\nmid `</think>` end\n";
+    const regions = try findCodeRegions(a, text);
+    defer a.free(regions);
+    try std.testing.expect(isInsideCode(regions, std.mem.indexOf(u8, text, "<function>").?));
+    try std.testing.expect(isInsideCode(regions, std.mem.indexOf(u8, text, "</think>").?));
+    try std.testing.expect(!isInsideCode(regions, 0));
+    try std.testing.expect(!isInsideCode(regions, text.len - 1));
+}
+
+test "findCodeRegions treats an unterminated fence as code to the end" {
+    const a = std.testing.allocator;
+    const text = "answer\n```\n<function name=\"shell\">";
+    const regions = try findCodeRegions(a, text);
+    defer a.free(regions);
+    try std.testing.expectEqual(@as(usize, 1), regions.len);
+    try std.testing.expect(isInsideCode(regions, text.len - 1));
+}
+
+test "stripToolCallMarkup keeps function tags inside a code fence" {
+    const a = std.testing.allocator;
+    const input = "Here is the XML:\n```xml\n<function_calls><invoke name=\"x\"></invoke></function_calls>\n```\nDone.";
+    const out = try stripToolCallMarkup(a, input);
+    defer a.free(out);
+    try std.testing.expectEqualStrings(input, out);
+}
+
+test "stripToolCallMarkup still strips a dispatcher call inside a code fence" {
+    const a = std.testing.allocator;
+    const input = "```\n<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>\n```";
+    const out = try stripToolCallMarkup(a, input);
+    defer a.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "tool_call") == null);
 }
 
 test "stripToolCallMarkup leaves prose and code naming tool_call untouched" {

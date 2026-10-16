@@ -66,6 +66,7 @@ pub const SplitThinkContent = helpers.SplitThinkContent;
 pub const splitThinkContent = helpers.splitThinkContent;
 pub const stripThinkBlocks = helpers.stripThinkBlocks;
 pub const quoteThinkBlocks = helpers.quoteThinkBlocks;
+pub const hasReasoningTag = helpers.hasReasoningTag;
 pub const stripToolCallMarkup = helpers.stripToolCallMarkup;
 pub const parseDispatcherXmlToolCalls = helpers.parseDispatcherXmlToolCalls;
 pub const DispatcherCall = helpers.DispatcherCall;
