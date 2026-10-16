@@ -4928,6 +4928,56 @@ test "processMessageStreaming forwards tool progress hints" {
     try testing.expectEqualStrings("probe", collector.lastText());
 }
 
+test "tool progress hints never enter the reply or history" {
+    var provider = SummaryFailureProvider{};
+    var probe_tool = ProbeTool{};
+    const tools = [_]Tool{probe_tool.tool()};
+    const cfg = testConfig();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "progress:no-leak";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.max_tool_iterations = 1;
+
+    var collector = ProgressCollector{};
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "run probe",
+        null,
+        null,
+        .{
+            .callback = ProgressCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    // The sink observed the tool call...
+    try testing.expect(collector.count > 0);
+    // ...but the progress block markers never leak into the delivered reply...
+    try testing.expect(std.mem.indexOf(u8, resp, "\u{1F527}") == null);
+    try testing.expect(std.mem.indexOf(u8, resp, "\u{23F3}") == null);
+    // ...nor into the recorded history.
+    const history = try session.agent.getHistory(testing.allocator);
+    defer testing.allocator.free(history);
+    for (history) |message| {
+        try testing.expect(std.mem.indexOf(u8, message.content, "\u{1F527}") == null);
+        try testing.expect(std.mem.indexOf(u8, message.content, "\u{23F3}") == null);
+    }
+}
+
 test "routeInput observes pending mid-turn injection" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();

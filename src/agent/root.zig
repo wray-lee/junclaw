@@ -4117,11 +4117,13 @@ pub const Agent = struct {
         }
     }
 
+    /// One history entry as a role string plus its content.
+    pub const HistoryEntry = struct { role: []const u8, content: []const u8 };
+
     /// Get history entries as role-string + content pairs (for persistence).
     /// Caller owns the returned slice but NOT the inner strings (borrows from history).
-    pub fn getHistory(self: *const Agent, allocator: std.mem.Allocator) ![]struct { role: []const u8, content: []const u8 } {
-        const Pair = struct { role: []const u8, content: []const u8 };
-        const result = try allocator.alloc(Pair, self.history.items.len);
+    pub fn getHistory(self: *const Agent, allocator: std.mem.Allocator) ![]HistoryEntry {
+        const result = try allocator.alloc(HistoryEntry, self.history.items.len);
         for (self.history.items, 0..) |*msg, i| {
             result[i] = .{
                 .role = switch (msg.role) {

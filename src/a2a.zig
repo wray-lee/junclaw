@@ -559,6 +559,10 @@ const A2aProgressCtx = struct {
     sse_ctx: *SseStreamCtx,
 
     fn progressCallback(ctx: *anyopaque, hint: agent_mod.ProgressHint) void {
+        // Only the tool-call start carries a fresh "Calling tool:" state. The
+        // paired `.end` hint would emit a duplicate, mislabelled status update,
+        // so it is dropped here.
+        if (!emitsProgressHint(hint)) return;
         const self: *A2aProgressCtx = @ptrCast(@alignCast(ctx));
         const data = buildProgressHintEvent(
             self.sse_ctx.allocator,
@@ -576,6 +580,13 @@ const A2aProgressCtx = struct {
         return .{ .callback = progressCallback, .ctx = @ptrCast(self) };
     }
 };
+
+/// A progress hint is forwarded to an A2A SSE stream only on tool-call start;
+/// the paired `.end` hint carries no new state and would duplicate the
+/// "Calling tool:" status update.
+pub fn emitsProgressHint(hint: agent_mod.ProgressHint) bool {
+    return hint.phase == .start;
+}
 
 /// Build a TaskStatusUpdateEvent with state=working and a progress message.
 fn buildProgressHintEvent(
@@ -2781,4 +2792,12 @@ test "buildProgressHintEvent escapes special chars in tool name" {
     defer testing.allocator.free(data);
 
     try testing.expect(std.mem.indexOf(u8, data, "tool\\\"with\\\"quotes") != null);
+}
+
+test "emitsProgressHint forwards only the tool-call start" {
+    // Regression: the agent loop emits a second hint on tool-call end, which
+    // used to produce a duplicate "Calling tool:" SSE status update.
+    try testing.expect(emitsProgressHint(.{ .text = "shell", .phase = .start }));
+    try testing.expect(!emitsProgressHint(.{ .text = "shell", .phase = .end, .success = true }));
+    try testing.expect(!emitsProgressHint(.{ .text = "shell", .phase = .end, .success = false }));
 }

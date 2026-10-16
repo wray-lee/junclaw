@@ -9,6 +9,7 @@ const std_compat = @import("compat");
 const Config = @import("config.zig").Config;
 const config_types = @import("config_types.zig");
 const telegram = @import("channels/telegram.zig");
+const tool_progress = @import("channels/tool_progress.zig");
 const session_mod = @import("session.zig");
 const agent_mod = @import("agent/root.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -1390,7 +1391,14 @@ const TelegramToolProgressCtx = struct {
 fn telegramToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
     const ctx: *TelegramToolProgressCtx = @ptrCast(@alignCast(ctx_ptr));
     if (ctx.heartbeat) |h| bumpProgress(h);
-    ctx.tg_ptr.recordToolProgress(ctx.chat_id, ctx.draft_id, .{
+    ctx.tg_ptr.recordToolProgress(ctx.chat_id, ctx.draft_id, telegramToolProgressUpdate(hint));
+}
+
+/// Map an agent progress hint onto the channel tool-progress update. Kept pure
+/// so the start/end, success and arguments_json mapping is testable without a
+/// live channel.
+fn telegramToolProgressUpdate(hint: agent_mod.ProgressHint) tool_progress.Update {
+    return .{
         .tool = hint.text,
         .arguments_json = hint.arguments_json,
         .phase = switch (hint.phase) {
@@ -1398,7 +1406,7 @@ fn telegramToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHin
             .end => .end,
         },
         .success = hint.success,
-    });
+    };
 }
 
 pub const TelegramLoopState = struct {
@@ -3658,4 +3666,21 @@ test "telegram offset persistence helper retries after write failure" {
     try std.testing.expectEqual(@as(i64, 101), persisted_update_id);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 101), restored);
+}
+
+test "telegramToolProgressUpdate maps hint phase, success and arguments" {
+    const start = telegramToolProgressUpdate(.{
+        .text = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com\"}",
+        .phase = .start,
+    });
+    try std.testing.expectEqual(tool_progress.Phase.start, start.phase);
+    try std.testing.expectEqualStrings("web_fetch", start.tool);
+    try std.testing.expectEqualStrings("{\"url\":\"https://example.com\"}", start.arguments_json.?);
+    try std.testing.expect(start.success);
+
+    const end = telegramToolProgressUpdate(.{ .text = "shell", .phase = .end, .success = false });
+    try std.testing.expectEqual(tool_progress.Phase.end, end.phase);
+    try std.testing.expect(!end.success);
+    try std.testing.expect(end.arguments_json == null);
 }

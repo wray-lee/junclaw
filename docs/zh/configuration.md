@@ -837,6 +837,8 @@ Telegram forum topics：
 - hint 刻意保守：`web_fetch`/`http_request` 只显示 host，`web_search` 显示截断后的查询（≤40 字符），文件类工具显示文件 basename，shell/exec 及未知工具只显示工具名——绝不显示原始命令。所有 hint 都会按 Telegram 的 HTML parse mode 做 HTML 转义。
 - 新的工具事件可以比 12s 心跳更早刷新 draft，但不会快于现有的 draft flush 节流（4s），因此不会触发 `sendMessageDraft` 限流。
 - 一旦有真正的回答文本开始流式输出，draft 会像以前一样只显示该文本；工具行绝不会混入回答文本、最终回复或会话历史。turn 结束时 draft 仍会被清除。
+- 流式推理引用（`/reasoning stream`）不算回答文本：工具运行时 draft 会用工具区块替代该引用，等真正的回答文本到达后再照常切换为文本。
+- 该区块在 Telegram 的两条投递路径上都会渲染——轮询循环与 gateway/webhook 路径。
 - `tool_progress=false` 保留原有行为，但会去掉误导性的 `Current size: 0 bytes` 行：draft 只显示纯 elapsed 时间和“仍在准备中”的提示。
 
 关于 `rich_messages`：
@@ -1052,7 +1054,7 @@ Slack 示例：
 
 增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。
 
-关于 Slack 的 `tool_progress`：为与 Telegram 保持对称而接受该配置，但当前不生效。Slack 只在第一个可见回答增量到达时才创建 live preview，因此在任何回答文本出现前并没有可渲染工具活动的预览消息；原生流式是只追加的，无法展示滚动日志；nullclaw 也不会为了显示进度而额外发一条消息。该配置预留给未来的 pre-text 预览。
+关于 Slack 的 `tool_progress`：为与 Telegram 保持对称而接受该配置，但当前不生效——Slack 在任何模式下都不渲染工具进度区块。原生通路（thread 目标上的 `chat.startStream`/`chat.appendStream`）是只追加的，无法展示滚动日志。编辑消息通路（顶层目标的 `chat.postMessage` + `chat.update`）持有一条可变的预览消息，但 nullclaw 只从流式内容启动它：通常是第一个可见回答增量，使用 `/reasoning stream` 时则是第一段流式推理引用——因此预览可能在出现任何回答文本之前就已存在，但工具进度仍不会渲染进去。nullclaw 不会为了显示进度而额外发一条消息，该配置预留给未来的 pre-text 预览。
 
 #### 草稿中的实时推理
 

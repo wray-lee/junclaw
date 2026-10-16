@@ -19,6 +19,7 @@ const channels_mod = @import("channels/root.zig");
 const dispatch = @import("channels/dispatch.zig");
 const channel_outbox = @import("channels/outbox.zig");
 const channel_loop = @import("channel_loop.zig");
+const agent_mod = @import("agent/root.zig");
 const channel_manager = @import("channel_manager.zig");
 const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
@@ -1073,6 +1074,30 @@ const StreamingOutboundCtx = struct {
     emitted_chunk: bool = false,
 };
 
+/// Per-turn context for the daemon-path tool-progress sink. Lives on the
+/// dispatching thread's stack for the duration of the synchronous
+/// `processMessageStreaming` call, so the borrowed chat id stays valid.
+const DaemonToolProgressCtx = struct {
+    channel: channels_mod.Channel,
+    chat_id: []const u8,
+};
+
+/// Forward a tool event to the outbound channel's live preview. The channel
+/// ignores it when it has no draft transport (its vtable slot is null) or when
+/// tool progress is disabled, so this is a no-op for those channels.
+fn daemonToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
+    const ctx: *DaemonToolProgressCtx = @ptrCast(@alignCast(ctx_ptr));
+    ctx.channel.recordToolProgress(ctx.chat_id, .{
+        .tool = hint.text,
+        .arguments_json = hint.arguments_json,
+        .phase = switch (hint.phase) {
+            .start => .start,
+            .end => .end,
+        },
+        .success = hint.success,
+    });
+}
+
 fn nextOutboundDraftId() u64 {
     return outbound_draft_id_counter.fetchAdd(1, .monotonic);
 }
@@ -1457,12 +1482,24 @@ fn processInboundMessage(
 
     setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .running);
 
+    // Tool progress on the daemon path: forward each tool event straight to the
+    // outbound channel's live preview (the polling path does the same through
+    // channel_loop). Only wired when the turn streams outbound; channels with no
+    // draft transport leave the vtable slot null and ignore it.
+    var tool_progress_ctx: DaemonToolProgressCtx = undefined;
+    const tool_progress_sink: ?agent_mod.ProgressSink = blk: {
+        if (!use_streaming_outbound) break :blk null;
+        const ch = outbound_channel orelse break :blk null;
+        tool_progress_ctx = .{ .channel = ch, .chat_id = routing_plan.outbound_chat_id };
+        break :blk .{ .callback = daemonToolProgressCallback, .ctx = @ptrCast(&tool_progress_ctx) };
+    };
+
     const reply = runtime.session_mgr.processMessageStreaming(
         routing_plan.session_key,
         msg.content,
         routing_plan.conversation_context,
         stream_sink,
-        null,
+        tool_progress_sink,
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
         setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);

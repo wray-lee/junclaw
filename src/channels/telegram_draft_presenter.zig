@@ -56,6 +56,18 @@ pub fn hasVisibleDraftText(text: []const u8) bool {
     return trimmedDraftText(text).len != 0;
 }
 
+/// True when the draft already shows answer text. A streamed reasoning quote is
+/// not answer text: it renders as a `>` quote with the answer below it, so a
+/// reasoning-only draft may still be replaced by the tool-progress block while
+/// tools run (otherwise the draft freezes on the last reasoning quote and the
+/// user cannot tell "calling tools" from "stuck").
+fn hasVisibleAnswerText(allocator: std.mem.Allocator, text: []const u8) !bool {
+    if (!hasVisibleDraftText(text)) return false;
+    const stripped = try providers.stripThinkBlocks(allocator, text);
+    defer allocator.free(stripped);
+    return hasVisibleDraftText(stripped);
+}
+
 fn bytesSinceLastFlush(state: *const DraftState) usize {
     return state.buffer.items.len - state.last_flush_len;
 }
@@ -211,7 +223,13 @@ pub fn heartbeatDraft(
         };
     }
 
-    if (hasVisibleDraftText(state.buffer.items)) return null;
+    if (hasVisibleDraftText(state.buffer.items)) {
+        // Answer text is on screen: never replace it with a heartbeat.
+        if (try hasVisibleAnswerText(allocator, state.buffer.items)) return null;
+        // A streamed reasoning quote is on screen but no answer text yet: keep
+        // it unless a tool event produced a progress block worth showing.
+        if (!state.tool_progress.hasContent()) return null;
+    }
 
     state.last_flush_time = now_ms;
     return .{
@@ -234,7 +252,7 @@ pub fn progressDraft(
 ) !?DraftFlush {
     if (draftSuppressed(state, now_ms)) return null;
     if (!state.tool_progress.hasContent()) return null;
-    if (hasVisibleDraftText(state.buffer.items)) return null;
+    if (try hasVisibleAnswerText(allocator, state.buffer.items)) return null;
     if (millisSinceLastFlush(state, now_ms) < DRAFT_FLUSH_MIN_INTERVAL_MS) return null;
 
     const text = try buildHeartbeatText(allocator, state, now_ms);
@@ -401,8 +419,8 @@ test "buildHeartbeatText emits visible progress status without a size line" {
 test "buildHeartbeatText shows the tool-progress block once tools run" {
     var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 0 };
     defer draft.deinit(std.testing.allocator);
-    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
-    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com\"}" }, 1_000);
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com\"}" }, 1_000);
 
     const heartbeat = try buildHeartbeatText(std.testing.allocator, &draft, 1_000 + 121 * std.time.ms_per_s);
     defer std.testing.allocator.free(heartbeat);
@@ -420,7 +438,7 @@ test "progressDraft respects the flush throttle and needs tool content" {
     // No tool content yet: nothing to show.
     try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) == null);
 
-    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
 
     // Inside the throttle window: suppressed.
     try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS - 1)) == null);
@@ -439,9 +457,46 @@ test "progressDraft stays quiet once answer text is visible" {
     var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
     defer draft.deinit(std.testing.allocator);
     try draft.buffer.appendSlice(std.testing.allocator, "real answer");
-    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
 
     try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) == null);
+}
+
+test "progressDraft shows tools even when only reasoning has streamed" {
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+    // `/reasoning stream` puts the thinking in the draft before any tool runs.
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>pondering</think>");
+    draft.last_flush_len = draft.buffer.items.len;
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+
+    const flush = (try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+}
+
+test "heartbeatDraft keeps a reasoning-only draft unless tools have run" {
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>pondering</think>");
+    draft.last_flush_len = draft.buffer.items.len;
+
+    // No tool lines yet: the reasoning quote stays, no heartbeat replaces it.
+    try std.testing.expect((try heartbeatDraft(std.testing.allocator, &draft, 1_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1)) == null);
+
+    // A tool event produces a block worth replacing the reasoning quote with.
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    const flush = (try heartbeatDraft(std.testing.allocator, &draft, 1_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1)) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
 }
 
 test "heartbeatDraft flushes pending visible text after interval" {

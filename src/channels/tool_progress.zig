@@ -61,7 +61,10 @@ pub const ToolProgress = struct {
         return self.lines.items.len > 0;
     }
 
-    pub fn record(self: *ToolProgress, allocator: std.mem.Allocator, update: Update, now_ms: i64) !void {
+    /// Record one tool event. Returns true when the visible log changed (a
+    /// start line, or a failure line); a successful `.end` is a no-op so callers
+    /// can skip a redundant draft re-render.
+    pub fn record(self: *ToolProgress, allocator: std.mem.Allocator, update: Update, now_ms: i64) !bool {
         if (self.started_at_ms == 0) self.started_at_ms = now_ms;
         switch (update.phase) {
             .start => {
@@ -69,14 +72,16 @@ pub const ToolProgress = struct {
                 const line = try buildStartLine(allocator, update.tool, update.arguments_json);
                 errdefer allocator.free(line);
                 try self.appendLine(allocator, .{ .text = line, .failed = false });
+                return true;
             },
             .end => {
                 // Successes stay as their start line; only failures add a line,
                 // so the log reads like the OpenClaw tool-progress log.
-                if (update.success) return;
+                if (update.success) return false;
                 const line = try buildFailureLine(allocator, update.tool);
                 errdefer allocator.free(line);
                 try self.appendLine(allocator, .{ .text = line, .failed = true });
+                return true;
             },
         }
     }
@@ -156,14 +161,19 @@ pub const ToolProgress = struct {
 };
 
 fn buildStartLine(allocator: std.mem.Allocator, tool: []const u8, arguments_json: ?[]const u8) ![]u8 {
-    const hint = try hintForTool(allocator, tool, arguments_json);
+    // The tool name is model-controlled, so strip control bytes from it too: a
+    // newline in a name would otherwise inject an extra line into the block.
+    const safe_tool = try clean(allocator, tool);
+    defer allocator.free(safe_tool);
+
+    const hint = try hintForTool(allocator, safe_tool, arguments_json);
     defer allocator.free(hint);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     try out.appendSlice(allocator, "\u{1F527} ");
-    try out.appendSlice(allocator, tool);
-    if (hint.len > 0 and !std.mem.eql(u8, hint, tool)) {
+    try out.appendSlice(allocator, safe_tool);
+    if (hint.len > 0 and !std.mem.eql(u8, hint, safe_tool)) {
         try out.append(allocator, ' ');
         try out.appendSlice(allocator, hint);
     }
@@ -174,9 +184,12 @@ fn buildStartLine(allocator: std.mem.Allocator, tool: []const u8, arguments_json
 }
 
 fn buildFailureLine(allocator: std.mem.Allocator, tool: []const u8) ![]u8 {
+    const safe_tool = try clean(allocator, tool);
+    defer allocator.free(safe_tool);
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
-    try out.print(allocator, "\u{274C} {s} failed", .{tool});
+    try out.print(allocator, "\u{274C} {s} failed", .{safe_tool});
     const clamped = try clampUtf8(allocator, out.items, LINE_MAX_CHARS);
     out.deinit(allocator);
     return clamped;
@@ -204,7 +217,9 @@ fn hintForTool(allocator: std.mem.Allocator, tool: []const u8, arguments_json: ?
             return clampUtf8(allocator, cleaned, QUERY_MAX_CHARS);
         }
     }
-    return allocator.dupe(u8, tool);
+    // Unknown tools (and any tool whose safe hint we could not derive) fall
+    // back to the cleaned tool name alone -- never the raw arguments.
+    return clean(allocator, tool);
 }
 
 fn isFileTool(tool: []const u8) bool {
@@ -299,8 +314,8 @@ test "record counts starts and renders elapsed with tool count" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com/page\"}" }, 2_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com/page\"}" }, 2_000);
 
     const block = try state.renderBlock(std.testing.allocator, 1_000 + 121 * std.time.ms_per_s);
     defer std.testing.allocator.free(block);
@@ -314,7 +329,7 @@ test "hint uses host only for url tools" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{
+    _ = try state.record(std.testing.allocator, .{
         .tool = "web_fetch",
         .arguments_json = "{\"url\":\"https://user:pw@Example.com:8443/a/b?q=1\"}",
     }, 1_000);
@@ -327,7 +342,7 @@ test "hint uses truncated query for web_search" {
     defer state.deinit(std.testing.allocator);
 
     const long_query = "q" ** 100;
-    try state.record(std.testing.allocator, .{
+    _ = try state.record(std.testing.allocator, .{
         .tool = "web_search",
         .arguments_json = "{\"query\":\"" ++ long_query ++ "\"}",
     }, 1_000);
@@ -342,7 +357,7 @@ test "hint uses basename for file tools" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{
+    _ = try state.record(std.testing.allocator, .{
         .tool = "file_read",
         .arguments_json = "{\"path\":\"src/deep/nested/config.zig\"}",
     }, 1_000);
@@ -354,7 +369,7 @@ test "hint never leaks the raw shell command" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{
+    _ = try state.record(std.testing.allocator, .{
         .tool = "shell",
         .arguments_json = "{\"command\":\"rm -rf /secret\"}",
     }, 1_000);
@@ -363,15 +378,28 @@ test "hint never leaks the raw shell command" {
     try std.testing.expect(std.mem.indexOf(u8, state.lines.items[0].text, "rm") == null);
 }
 
+test "control bytes in a tool name cannot inject a line" {
+    var state: ToolProgress = .{};
+    defer state.deinit(std.testing.allocator);
+
+    // Regression: a model-supplied tool name with a newline used to be appended
+    // raw, injecting an extra line into the progress block.
+    _ = try state.record(std.testing.allocator, .{ .tool = "evil\nname" }, 1_000);
+    try std.testing.expectEqualStrings("\u{1F527} evilname", state.lines.items[0].text);
+
+    _ = try state.record(std.testing.allocator, .{ .tool = "evil\r\nname", .phase = .end, .success = false }, 1_000);
+    try std.testing.expectEqualStrings("\u{274C} evilname failed", state.lines.items[1].text);
+}
+
 test "failure adds a kept line and successes do not" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{ .tool = "web_fetch" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "web_fetch", .phase = .end, .success = true }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "web_fetch" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "web_fetch", .phase = .end, .success = true }, 1_000);
     try std.testing.expectEqual(@as(usize, 1), state.lines.items.len);
 
-    try state.record(std.testing.allocator, .{ .tool = "web_fetch", .phase = .end, .success = false }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "web_fetch", .phase = .end, .success = false }, 1_000);
     try std.testing.expectEqual(@as(usize, 2), state.lines.items.len);
     try std.testing.expectEqualStrings("\u{274C} web_fetch failed", state.lines.items[1].text);
     try std.testing.expect(state.lines.items[1].failed);
@@ -381,13 +409,13 @@ test "render keeps failures visible over successes when trimming" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{ .tool = "s1" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "f1", .phase = .end, .success = false }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "s2" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "s3" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "s4" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "s5" }, 1_000);
-    try state.record(std.testing.allocator, .{ .tool = "s6" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "s1" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "f1", .phase = .end, .success = false }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "s2" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "s3" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "s4" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "s5" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "s6" }, 1_000);
 
     const block = try state.renderBlock(std.testing.allocator, 1_000);
     defer std.testing.allocator.free(block);
@@ -401,7 +429,7 @@ test "renderBlockHtml escapes a hostile hint" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{
+    _ = try state.record(std.testing.allocator, .{
         .tool = "web_search",
         .arguments_json = "{\"query\":\"<b>&x</b>\"}",
     }, 1_000);
@@ -417,7 +445,7 @@ test "long hints are clamped to the line budget and stay valid UTF-8" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{
+    _ = try state.record(std.testing.allocator, .{
         .tool = "file_read",
         .arguments_json = "{\"path\":\"\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\u{00E9}\"}",
     }, 1_000);
@@ -439,7 +467,7 @@ test "stored lines are capped" {
 
     var i: usize = 0;
     while (i < MAX_STORED_LINES * 2) : (i += 1) {
-        try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+        _ = try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
     }
     try std.testing.expectEqual(@as(usize, MAX_STORED_LINES), state.lines.items.len);
 }
@@ -448,7 +476,7 @@ test "reset frees lines and restarts the clock" {
     var state: ToolProgress = .{};
     defer state.deinit(std.testing.allocator);
 
-    try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
     state.reset(std.testing.allocator, 5_000);
     try std.testing.expectEqual(@as(usize, 0), state.lines.items.len);
     try std.testing.expectEqual(@as(u32, 0), state.tool_calls);

@@ -137,6 +137,17 @@ pub const Channel = struct {
         message_id: []const u8,
         reaction: TaskReaction,
     };
+    /// Phase of a tool-call progress hint (see agent.ProgressHint).
+    pub const ToolPhase = enum { start, end };
+    /// One per-turn tool event forwarded to a channel's live preview. `tool` is
+    /// the tool name only; `arguments_json` is the raw call arguments, from
+    /// which the channel derives a short, safe hint and never renders the blob.
+    pub const ToolProgressUpdate = struct {
+        tool: []const u8,
+        arguments_json: ?[]const u8 = null,
+        phase: ToolPhase = .start,
+        success: bool = true,
+    };
 
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
@@ -210,6 +221,11 @@ pub const Channel = struct {
         /// Optional: drop a target's already-queued `.chunk` events after a
         /// /stop so a stopped turn's leftovers cannot replay to the user.
         cancelStreams: ?*const fn (ptr: *anyopaque, target: []const u8) void = null,
+        /// Optional: show live per-turn tool activity in the channel's preview.
+        /// Polling channels wire this through channel_loop; the daemon calls it
+        /// directly on the event-bus path. A channel with no live preview leaves
+        /// this null and ignores the events.
+        recordToolProgress: ?*const fn (ptr: *anyopaque, target: []const u8, update: ToolProgressUpdate) void = null,
     };
 
     pub fn start(self: Channel) !void {
@@ -302,6 +318,11 @@ pub const Channel = struct {
     /// Drop queued stream chunks for `target` when the channel supports it.
     pub fn cancelStreams(self: Channel, target: []const u8) void {
         if (self.vtable.cancelStreams) |cancel| cancel(self.ptr, target);
+    }
+
+    /// Forward one tool event to the channel's live preview, if it has one.
+    pub fn recordToolProgress(self: Channel, target: []const u8, update: ToolProgressUpdate) void {
+        if (self.vtable.recordToolProgress) |record| record(self.ptr, target, update);
     }
 };
 

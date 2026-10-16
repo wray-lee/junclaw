@@ -904,6 +904,8 @@ About `tool_progress`:
 - Hints are deliberately conservative: `web_fetch`/`http_request` show the host only, `web_search` shows a truncated query (≤40 chars), file tools show the file's basename, and shell/exec and unknown tools show the tool name only — never the raw command. Every hint is HTML-escaped for Telegram's HTML parse mode.
 - A new tool event may refresh the draft sooner than the 12s heartbeat, but never faster than the existing draft flush throttle (4s), so `sendMessageDraft` is not rate-limited.
 - Once real answer text streams, the draft shows that text exactly as before; tool lines are never mixed into the answer text, the final reply, or session history. The draft is still cleared when the turn ends.
+- A streamed reasoning quote (`/reasoning stream`) is not answer text: while tools run the draft shows the tool block in place of the quote, and switches to the answer text once it arrives.
+- The block renders on both Telegram delivery paths - the polling loop and the gateway/webhook path.
 - `tool_progress=false` keeps the previous behaviour but drops the misleading `Current size: 0 bytes` line: the draft shows plain elapsed time and the "still being prepared" note.
 
 About `rich_messages`:
@@ -1280,11 +1282,15 @@ native streaming call fails with a permanent error (`channel_type_not_supported`
 `missing_scope`, `invalid_thread_ts`, ...), nullclaw stops trying the native methods for
 that account and uses edited messages from then on.
 
-About `tool_progress` on Slack: accepted for parity with Telegram, but currently inert.
-Slack creates its live preview only on the first visible answer delta, so before any
-answer text there is no preview message to render tool activity into; native streams are
-append-only and cannot show a rolling log; and nullclaw does not post an extra message
-just to show progress. The setting is reserved for a future pre-text preview.
+About `tool_progress` on Slack: accepted for parity with Telegram, but currently inert -
+Slack renders no tool-progress block in any mode. The native transport
+(`chat.startStream`/`chat.appendStream`, thread targets) is append-only and cannot show a
+rolling log. The edited-message transport (`chat.postMessage` + `chat.update`, top-level
+targets) does hold a mutable preview, but nullclaw only starts it from streamed content:
+normally the first visible answer delta, and with `/reasoning stream` the first streamed
+reasoning quote - so a preview can exist before any answer text, and tool progress is still
+not rendered into it. nullclaw does not post an extra message just to show progress, so the
+setting is reserved for a future pre-text preview.
 
 #### Live reasoning in drafts
 

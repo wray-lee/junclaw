@@ -3388,6 +3388,21 @@ pub const TelegramChannel = struct {
     /// rather than writing into another turn's log.
     pub fn recordToolProgress(self: *TelegramChannel, target: []const u8, draft_id: u64, update: tool_progress.Update) void {
         if (draft_id == 0) return;
+        self.recordToolProgressInner(target, draft_id, update);
+    }
+
+    /// Record a tool event on the daemon (event-bus) path, where the turn does
+    /// not own an explicit draft id. The live draft is the one the chat already
+    /// keeps (`ensureDraftStateLocked`, shared with streamed chunks and the
+    /// typing heartbeat); it is created lazily if a tool event arrives first.
+    pub fn recordToolProgressForTarget(self: *TelegramChannel, target: []const u8, update: tool_progress.Update) void {
+        self.recordToolProgressInner(target, 0, update);
+    }
+
+    /// Shared body. `required_draft_id` of 0 means "whatever draft the chat has
+    /// (create one if needed)"; a non-zero value scopes the event to the turn
+    /// that owns that draft id.
+    fn recordToolProgressInner(self: *TelegramChannel, target: []const u8, required_draft_id: u64, update: tool_progress.Update) void {
         if (!self.streaming_enabled or !self.draft_previews_enabled or !self.tool_progress_enabled) return;
         if (target.len == 0 or !supportsDraftPreviewTarget(target)) return;
 
@@ -3399,9 +3414,18 @@ pub const TelegramChannel = struct {
             self.draft_mu.lock();
             defer self.draft_mu.unlock();
 
-            const state = self.draft_buffers.getPtr(target) orelse return;
-            if (state.draft_id != draft_id) return;
-            state.tool_progress.record(self.allocator, update, now_ms) catch return;
+            const state = if (required_draft_id == 0)
+                (self.ensureDraftStateLocked(target, now_ms) catch return)
+            else blk: {
+                const existing = self.draft_buffers.getPtr(target) orelse return;
+                if (existing.draft_id != required_draft_id) return;
+                break :blk existing;
+            };
+            // A successful `.end` adds no line; skip the redundant re-render (and
+            // the wasted sendMessageDraft it would trigger once the throttle has
+            // elapsed).
+            const changed = state.tool_progress.record(self.allocator, update, now_ms) catch return;
+            if (!changed) return;
             pending_flush = telegram_draft_presenter.progressDraft(
                 self.allocator,
                 state,
@@ -3480,11 +3504,15 @@ pub const TelegramChannel = struct {
         const wire_text = if (html_escaped) preview_text else (html_text orelse preview_text);
 
         var resp = self.postDraft(parsed_target, draft_id, wire_text, use_html) orelse return;
-        if (use_html and telegram_api.responseHasTelegramError(resp) and
+        if (!html_escaped and use_html and telegram_api.responseHasTelegramError(resp) and
             std.mem.indexOf(u8, resp, "can't parse entities") != null)
         {
-            // A tail cut mid-markup can leave entities Telegram rejects; the
-            // plain text is always accepted.
+            // A tail cut mid-markup can leave entities Telegram rejects; the raw
+            // markdown source is always accepted as plain text. Only answer text
+            // has a real plain fallback: a progress block is already escaped HTML
+            // (and far below the 3000-byte transport cap, so it is never cut), so
+            // retrying `preview_text` with parse_mode off would show the user the
+            // literal `&lt;`/`&amp;` entities instead of the intended text.
             self.allocator.free(resp);
             resp = self.postDraft(parsed_target, draft_id, preview_text, false) orelse return;
         }
@@ -3626,6 +3654,19 @@ pub const TelegramChannel = struct {
         try self.editRichMessage(edit);
     }
 
+    fn vtableRecordToolProgress(ptr: *anyopaque, target: []const u8, update: root.Channel.ToolProgressUpdate) void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        self.recordToolProgressForTarget(target, .{
+            .tool = update.tool,
+            .arguments_json = update.arguments_json,
+            .phase = switch (update.phase) {
+                .start => .start,
+                .end => .end,
+            },
+            .success = update.success,
+        });
+    }
+
     fn vtableSupportsStreamingOutbound(ptr: *anyopaque) bool {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         return self.streaming_enabled and self.draft_previews_enabled;
@@ -3644,6 +3685,7 @@ pub const TelegramChannel = struct {
         .editMessage = &vtableEditMessage,
         .setReaction = &vtableSetReaction,
         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
+        .recordToolProgress = &vtableRecordToolProgress,
     };
 
     pub fn channel(self: *TelegramChannel) root.Channel {
@@ -6115,6 +6157,45 @@ test "recordToolProgress is inert when tool_progress is disabled" {
     ch.recordToolProgress("12345", draft_id, .{ .tool = "shell" });
     const state = ch.draft_buffers.getPtr("12345") orelse return error.TestUnexpectedResult;
     try std.testing.expect(!state.tool_progress.hasContent());
+}
+
+test "recordToolProgressForTarget records into the lazily created daemon draft" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    // The daemon path never calls beginDraftTurn: the draft is created on demand,
+    // exactly like a streamed chunk or the typing heartbeat.
+    ch.recordToolProgressForTarget("12345", .{
+        .tool = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com/page\"}",
+    });
+    const state = ch.draft_buffers.getPtr("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.tool_progress.hasContent());
+    try std.testing.expectEqualStrings("\u{1F527} web_fetch example.com", state.tool_progress.lines.items[0].text);
+}
+
+test "vtable recordToolProgress reaches the draft state" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    _ = try ch.beginDraftTurn("12345");
+    ch.channel().recordToolProgress("12345", .{ .tool = "shell", .phase = .start, .success = true });
+    const state = ch.draft_buffers.getPtr("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.tool_progress.hasContent());
+    try std.testing.expectEqualStrings("\u{1F527} shell", state.tool_progress.lines.items[0].text);
+}
+
+test "a successful tool-call end adds no progress line" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    ch.recordToolProgressForTarget("12345", .{ .tool = "shell" });
+    ch.recordToolProgressForTarget("12345", .{ .tool = "shell", .phase = .end, .success = true });
+    const state = ch.draft_buffers.getPtr("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), state.tool_progress.lines.items.len);
 }
 
 test "tool progress never enters the draft answer buffer" {
