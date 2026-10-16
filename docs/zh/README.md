@@ -1,3 +1,10 @@
+> **个人分叉。** `junclaw` 是 [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw)
+> 的个人硬分叉，由 [@wray-lee](https://github.com/wray-lee) 维护。它以 **merge**
+> 方式跟随上游（绝不 rebase）；此处的修复也会提交上游，跟踪于
+> [nullclaw/nullclaw#1066](https://github.com/nullclaw/nullclaw/issues/1066)。
+> MIT 许可，保留原始版权。为保持兼容，二进制名、配置目录（`~/.nullclaw`）、
+> `NULLCLAW_*` 环境变量与 Zig 包名均有意保持不变。
+
 # NullClaw 中文文档
 
 本目录提供面向使用者、运维者与贡献者的中文文档入口。
