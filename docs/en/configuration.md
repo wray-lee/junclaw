@@ -853,6 +853,7 @@ Minimal end-to-end example:
           "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
+          "tool_progress": true,
           "rich_messages": false,
           "binding_commands_enabled": true,
           "topic_commands_enabled": true,
@@ -887,6 +888,23 @@ About `draft_previews`:
 - `draft_previews=false` is the default and recommended setting.
 - When disabled, Telegram still shows activity/typing while the reply is being generated, but it does not use ephemeral `sendMessageDraft` previews.
 - Set `draft_previews=true` only if you explicitly want live partial previews and accept that Telegram may hide and replace those drafts before the final message lands.
+
+About `tool_progress`:
+
+- `tool_progress=true` is the default. While a live draft has no answer text yet (a long turn with many tool-call rounds), the draft shows what the agent is doing instead of a bare elapsed-time heartbeat:
+
+  ```
+  ⏳ 121s · 11 tool calls
+  🔧 web_search
+  🔧 web_fetch example.com
+  ❌ web_fetch failed
+  ```
+
+- The header shows elapsed seconds and the number of tool calls so far. Below it, up to five recent tool lines are shown; failures (`❌`) are kept visible over successes when the list is trimmed. Every line is capped at ~60 characters.
+- Hints are deliberately conservative: `web_fetch`/`http_request` show the host only, `web_search` shows a truncated query (≤40 chars), file tools show the file's basename, and shell/exec and unknown tools show the tool name only — never the raw command. Every hint is HTML-escaped for Telegram's HTML parse mode.
+- A new tool event may refresh the draft sooner than the 12s heartbeat, but never faster than the existing draft flush throttle (4s), so `sendMessageDraft` is not rate-limited.
+- Once real answer text streams, the draft shows that text exactly as before; tool lines are never mixed into the answer text, the final reply, or session history. The draft is still cleared when the turn ends.
+- `tool_progress=false` keeps the previous behaviour but drops the misleading `Current size: 0 bytes` line: the draft shows plain elapsed time and the "still being prepared" note.
 
 About `rich_messages`:
 
@@ -1261,6 +1279,12 @@ per-method rate limits. Tool-call markup is always stripped before anything is s
 native streaming call fails with a permanent error (`channel_type_not_supported`,
 `missing_scope`, `invalid_thread_ts`, ...), nullclaw stops trying the native methods for
 that account and uses edited messages from then on.
+
+About `tool_progress` on Slack: accepted for parity with Telegram, but currently inert.
+Slack creates its live preview only on the first visible answer delta, so before any
+answer text there is no preview message to render tool activity into; native streams are
+append-only and cannot show a rolling log; and nullclaw does not post an extra message
+just to show progress. The setting is reserved for a future pre-text preview.
 
 #### Live reasoning in drafts
 

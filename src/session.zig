@@ -2921,12 +2921,18 @@ const DeltaCollector = struct {
 
 const ProgressCollector = struct {
     count: usize = 0,
+    starts: usize = 0,
+    ends: usize = 0,
     last_text_buf: [64]u8 = undefined,
     last_text_len: usize = 0,
 
     fn onEvent(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
         const self: *ProgressCollector = @ptrCast(@alignCast(ctx_ptr));
         self.count += 1;
+        switch (hint.phase) {
+            .start => self.starts += 1,
+            .end => self.ends += 1,
+        }
         self.last_text_len = @min(hint.text.len, self.last_text_buf.len);
         @memcpy(self.last_text_buf[0..self.last_text_len], hint.text[0..self.last_text_len]);
     }
@@ -4913,8 +4919,12 @@ test "processMessageStreaming forwards tool progress hints" {
     );
     defer testing.allocator.free(resp);
 
-    // Regression: A2A streaming depends on this sink to observe tool-call starts.
-    try testing.expectEqual(@as(usize, 1), collector.count);
+    // Regression: A2A streaming depends on this sink to observe tool-call
+    // starts. The sink now also receives the matching tool-call end hint, so a
+    // single call yields two hints (start then end).
+    try testing.expectEqual(@as(usize, 2), collector.count);
+    try testing.expectEqual(@as(usize, 1), collector.starts);
+    try testing.expectEqual(@as(usize, 1), collector.ends);
     try testing.expectEqualStrings("probe", collector.lastText());
 }
 

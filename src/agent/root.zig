@@ -70,9 +70,19 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
 
 // ─── Progress hints ──────────────────────────────────────────────────────────
 
+/// Phase of a tool-call progress hint.
+pub const ProgressPhase = enum { start, end };
+
 /// Progress hint emitted during a turn. For tool-call starts, text is the tool name.
 pub const ProgressHint = struct {
     text: []const u8,
+    /// Raw JSON arguments of a tool call (tool-call hints only). Borrowed for the
+    /// duration of the callback; a channel derives a short, safe hint from it and
+    /// must never render the raw blob.
+    arguments_json: ?[]const u8 = null,
+    phase: ProgressPhase = .start,
+    /// Whether the tool call succeeded (only meaningful for `.end` hints).
+    success: bool = true,
 };
 
 /// Callback invoked for each progress hint. Same lifetime rules as StreamCallback.
@@ -2945,7 +2955,11 @@ pub const Agent = struct {
                 const tool_start_event = ObserverEvent{ .tool_call_start = .{ .tool = call.name } };
                 self.observer.recordEvent(&tool_start_event);
                 if (self.progress_callback) |cb| {
-                    if (self.progress_ctx) |pctx| cb(pctx, .{ .text = call.name });
+                    if (self.progress_ctx) |pctx| cb(pctx, .{
+                        .text = call.name,
+                        .arguments_json = call.arguments_json,
+                        .phase = .start,
+                    });
                 }
 
                 const tool_timer = std_compat.time.milliTimestamp();
@@ -2999,6 +3013,13 @@ pub const Agent = struct {
                     .detail = tool_detail,
                 } };
                 self.observer.recordEvent(&tool_event);
+                if (self.progress_callback) |cb| {
+                    if (self.progress_ctx) |pctx| cb(pctx, .{
+                        .text = call.name,
+                        .phase = .end,
+                        .success = result.success,
+                    });
+                }
 
                 try results_buf.append(self.allocator, result);
             }

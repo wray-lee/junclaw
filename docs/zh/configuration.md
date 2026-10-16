@@ -786,6 +786,7 @@ Telegram forum topics：
           "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"],
           "draft_previews": false,
+          "tool_progress": true,
           "rich_messages": false,
           "binding_commands_enabled": true,
           "topic_commands_enabled": true,
@@ -820,6 +821,23 @@ Telegram forum topics：
 - 默认值也是推荐值是 `false`。
 - 关闭后，Telegram 仍会在回复生成期间显示活动状态/typing，但不会使用临时的 `sendMessageDraft` 预览。
 - 只有在你明确想要实时部分预览，并且能接受 Telegram 在最终消息到达前隐藏、替换这些 draft 时，才建议设置 `draft_previews=true`。
+
+关于 `tool_progress`：
+
+- 默认值为 `true`。当 live draft 还没有任何回答文本时（长时间、多轮工具调用的 turn），draft 会展示 agent 正在做什么，而不是只显示一个 elapsed 心跳：
+
+  ```
+  ⏳ 121s · 11 tool calls
+  🔧 web_search
+  🔧 web_fetch example.com
+  ❌ web_fetch failed
+  ```
+
+- 首行显示已经过的秒数和目前的工具调用次数。下面最多展示 5 条最近的工具行；裁剪时失败行（`❌`）优先保留、成功行先被丢弃。每行最多约 60 个字符。
+- hint 刻意保守：`web_fetch`/`http_request` 只显示 host，`web_search` 显示截断后的查询（≤40 字符），文件类工具显示文件 basename，shell/exec 及未知工具只显示工具名——绝不显示原始命令。所有 hint 都会按 Telegram 的 HTML parse mode 做 HTML 转义。
+- 新的工具事件可以比 12s 心跳更早刷新 draft，但不会快于现有的 draft flush 节流（4s），因此不会触发 `sendMessageDraft` 限流。
+- 一旦有真正的回答文本开始流式输出，draft 会像以前一样只显示该文本；工具行绝不会混入回答文本、最终回复或会话历史。turn 结束时 draft 仍会被清除。
+- `tool_progress=false` 保留原有行为，但会去掉误导性的 `Current size: 0 bytes` 行：draft 只显示纯 elapsed 时间和“仍在准备中”的提示。
 
 关于 `rich_messages`：
 
@@ -1033,6 +1051,8 @@ Slack 示例：
 - **编辑消息**——顶层目标，或 Slack 拒绝原生方法时，nullclaw 用 `chat.postMessage` 发一条消息，再用限流的 `chat.update` 更新它。
 
 增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。
+
+关于 Slack 的 `tool_progress`：为与 Telegram 保持对称而接受该配置，但当前不生效。Slack 只在第一个可见回答增量到达时才创建 live preview，因此在任何回答文本出现前并没有可渲染工具活动的预览消息；原生流式是只追加的，无法展示滚动日志；nullclaw 也不会为了显示进度而额外发一条消息。该配置预留给未来的 pre-text 预览。
 
 #### 草稿中的实时推理
 

@@ -1056,7 +1056,16 @@ fn processTelegramMessage(
     const sink = tg_ptr.makeSink(&stream_ctx);
 
     tg_ptr.setTaskReaction(sender, message_id, .running);
-    const progress_sink: ?agent_mod.ProgressSink = if (heartbeat) |h| progressHeartbeatSink(h) else null;
+    var tool_progress_ctx = TelegramToolProgressCtx{
+        .tg_ptr = tg_ptr,
+        .chat_id = sender,
+        .draft_id = typing_turn.draft_id,
+        .heartbeat = heartbeat,
+    };
+    const progress_sink: ?agent_mod.ProgressSink = .{
+        .callback = telegramToolProgressCallback,
+        .ctx = @ptrCast(&tool_progress_ctx),
+    };
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink) catch |err| {
         logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
@@ -1364,6 +1373,32 @@ fn progressHeartbeat(ctx: *anyopaque, _: agent_mod.ProgressHint) void {
 /// A `ProgressSink` that refreshes `cell` on every turn progress hint.
 pub fn progressHeartbeatSink(cell: *Atomic(i64)) agent_mod.ProgressSink {
     return .{ .callback = progressHeartbeat, .ctx = @ptrCast(cell) };
+}
+
+/// Per-turn context for the Telegram tool-progress sink. Lives on the dispatching
+/// thread's stack for the duration of the synchronous `processMessageStreaming`
+/// call, so the borrowed `chat_id` is valid for the whole turn.
+const TelegramToolProgressCtx = struct {
+    tg_ptr: *telegram.TelegramChannel,
+    chat_id: []const u8,
+    draft_id: u64,
+    heartbeat: ?*Atomic(i64),
+};
+
+/// Bumps the poller liveness heartbeat and forwards the tool event to the
+/// channel that owns the turn, which records it into that turn's draft state.
+fn telegramToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
+    const ctx: *TelegramToolProgressCtx = @ptrCast(@alignCast(ctx_ptr));
+    if (ctx.heartbeat) |h| bumpProgress(h);
+    ctx.tg_ptr.recordToolProgress(ctx.chat_id, ctx.draft_id, .{
+        .tool = hint.text,
+        .arguments_json = hint.arguments_json,
+        .phase = switch (hint.phase) {
+            .start => .start,
+            .end => .end,
+        },
+        .success = hint.success,
+    });
 }
 
 pub const TelegramLoopState = struct {

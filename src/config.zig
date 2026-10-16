@@ -8596,6 +8596,41 @@ test "parse telegram rich_messages defaults off and can be enabled" {
     allocator.free(cfg.channels.telegram);
 }
 
+test "parse telegram tool_progress defaults on and can be disabled" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"telegram": {"accounts": {"main": {"bot_token": "123:ABC", "tool_progress": false}, "backup": {"bot_token": "backup:tok"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(usize, 2), cfg.channels.telegram.len);
+    for (cfg.channels.telegram) |tg| {
+        if (std.mem.eql(u8, tg.account_id, "main")) {
+            try std.testing.expect(!tg.tool_progress);
+        } else {
+            try std.testing.expect(tg.tool_progress);
+        }
+        allocator.free(tg.account_id);
+        allocator.free(tg.bot_token);
+    }
+    allocator.free(cfg.channels.telegram);
+}
+
+test "parse slack tool_progress defaults on" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(cfg.channels.slack[0].tool_progress);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
 test "parse slack slash command config" {
     const allocator = std.testing.allocator;
     const json =

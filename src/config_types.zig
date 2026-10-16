@@ -659,6 +659,11 @@ pub const TelegramConfig = struct {
     /// Show ephemeral sendMessageDraft previews while the reply is still being generated.
     /// Disabled by default because Telegram drafts can disappear and reappear in a confusing way.
     draft_previews: bool = false,
+    /// While a draft has no answer text yet, show live tool activity (elapsed
+    /// seconds, tool-call count, last tool lines) instead of a bare elapsed
+    /// heartbeat. Defaults on with streaming. When false the draft keeps the
+    /// plain elapsed-time heartbeat (the fake "Current size" line is gone).
+    tool_progress: bool = true,
     /// Send replies as Telegram rich messages (Bot API sendRichMessage). Disabled by
     /// default because some Desktop/Web/Android/third-party clients render rich messages
     /// as unsupported placeholders. When enabled, the model may use GFM Markdown.
@@ -745,6 +750,11 @@ pub const SlackConfig = struct {
     /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
     /// Off by default: it needs the app's "Agents & AI Apps" feature and paid-plan scopes.
     streaming: bool = false,
+    /// Accepted for parity with Telegram. Currently inert on Slack: Slack only
+    /// creates its live preview on the first visible answer delta, so there is
+    /// no pre-text preview to render tool activity into, and posting an extra
+    /// message is out of scope. Reserved for a future pre-text preview.
+    tool_progress: bool = true,
     /// Show task lifecycle on the triggering user message via Slack reactions.
     /// Needs the `reactions:write` scope.
     status_reactions: bool = false,

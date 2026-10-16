@@ -1,5 +1,6 @@
 const std = @import("std");
 const providers = @import("../providers/root.zig");
+const tool_progress = @import("tool_progress.zig");
 
 // Telegram draft previews are easy to rate-limit if we flush tiny deltas too
 // aggressively. Use noticeably coarser thresholds so users still see progress
@@ -25,9 +26,12 @@ pub const DraftState = struct {
     last_flush_time: i64 = 0,
     started_at_ms: i64 = 0,
     suppress_until_ms: i64 = 0,
+    /// Per-turn tool activity shown while the draft has no visible answer text.
+    tool_progress: tool_progress.ToolProgress = .{},
 
     pub fn deinit(self: *DraftState, allocator: std.mem.Allocator) void {
         self.buffer.deinit(allocator);
+        self.tool_progress.deinit(allocator);
     }
 };
 
@@ -35,6 +39,9 @@ pub const DraftFlush = struct {
     draft_id: u64,
     text: []u8,
     started_at_ms: i64,
+    /// True when `text` is already HTML for Telegram's parse_mode, so the caller
+    /// must not run it through the Markdown renderer (which would double-escape).
+    html: bool = false,
 
     pub fn deinit(self: *DraftFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -103,21 +110,27 @@ fn draftTailSlice(text: []const u8, max_bytes: usize) []const u8 {
     return text[alignUtf8Start(text, raw_start)..];
 }
 
-fn appendElapsedSummary(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, text_len: usize, started_at_ms: i64, now_ms: i64) !void {
+fn appendElapsedSummary(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, started_at_ms: i64, now_ms: i64) !void {
     const elapsed_ms = if (started_at_ms > 0 and now_ms > started_at_ms) now_ms - started_at_ms else 0;
     const elapsed_secs = @divFloor(elapsed_ms, std.time.ms_per_s);
-    try buf.print(allocator, "Elapsed: {d}s\nCurrent size: {d} bytes", .{
-        elapsed_secs,
-        text_len,
-    });
+    try buf.print(allocator, "Elapsed: {d}s", .{elapsed_secs});
 }
 
-pub fn buildHeartbeatText(allocator: std.mem.Allocator, started_at_ms: i64, now_ms: i64) ![]u8 {
+/// Build the draft text shown while a turn has no visible answer text yet.
+///
+/// When the turn has already run tools, this is the tool-progress block
+/// (elapsed seconds, tool-call count, last tool lines); otherwise it is the
+/// plain elapsed-time heartbeat. Both are HTML for Telegram's parse_mode.
+pub fn buildHeartbeatText(allocator: std.mem.Allocator, state: *const DraftState, now_ms: i64) ![]u8 {
+    if (state.tool_progress.hasContent()) {
+        return state.tool_progress.renderBlockHtml(allocator, now_ms);
+    }
+
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
 
     try out.appendSlice(allocator, DRAFT_PROGRESS_PREFIX);
-    try appendElapsedSummary(&out, allocator, 0, started_at_ms, now_ms);
+    try appendElapsedSummary(&out, allocator, state.started_at_ms, now_ms);
     try out.appendSlice(allocator, "\n");
     try out.appendSlice(allocator, DRAFT_PROGRESS_HEARTBEAT_ONLY);
     return out.toOwnedSlice(allocator);
@@ -137,7 +150,7 @@ pub fn buildTransportText(
     var prefix: std.ArrayListUnmanaged(u8) = .empty;
     defer prefix.deinit(allocator);
     try prefix.appendSlice(allocator, DRAFT_PROGRESS_PREFIX);
-    try appendElapsedSummary(&prefix, allocator, stripped.len, started_at_ms, now_ms);
+    try appendElapsedSummary(&prefix, allocator, started_at_ms, now_ms);
     try prefix.appendSlice(allocator, DRAFT_PROGRESS_TAIL_LABEL);
 
     if (prefix.items.len >= DRAFT_TRANSPORT_MAX_BYTES) {
@@ -203,8 +216,34 @@ pub fn heartbeatDraft(
     state.last_flush_time = now_ms;
     return .{
         .draft_id = state.draft_id,
-        .text = try buildHeartbeatText(allocator, state.started_at_ms, now_ms),
+        .text = try buildHeartbeatText(allocator, state, now_ms),
         .started_at_ms = state.started_at_ms,
+        .html = true,
+    };
+}
+
+/// Refresh the draft when a new tool event arrives sooner than the heartbeat
+/// interval. Honours the same flush throttle as text chunks (so a burst of tool
+/// calls cannot rate-limit sendMessageDraft) and only fires while the draft has
+/// no visible answer text: once real text streams, the draft shows the text
+/// exactly as before.
+pub fn progressDraft(
+    allocator: std.mem.Allocator,
+    state: *DraftState,
+    now_ms: i64,
+) !?DraftFlush {
+    if (draftSuppressed(state, now_ms)) return null;
+    if (!state.tool_progress.hasContent()) return null;
+    if (hasVisibleDraftText(state.buffer.items)) return null;
+    if (millisSinceLastFlush(state, now_ms) < DRAFT_FLUSH_MIN_INTERVAL_MS) return null;
+
+    const text = try buildHeartbeatText(allocator, state, now_ms);
+    state.last_flush_time = now_ms;
+    return .{
+        .draft_id = state.draft_id,
+        .text = text,
+        .started_at_ms = state.started_at_ms,
+        .html = true,
     };
 }
 
@@ -346,12 +385,63 @@ test "buildTransportText strips think blocks from compact excerpt" {
     try std.testing.expect(std.mem.indexOf(u8, compact, "private") == null);
 }
 
-test "buildHeartbeatText emits visible progress status" {
-    const heartbeat = try buildHeartbeatText(std.testing.allocator, 5_000, 17_500);
+test "buildHeartbeatText emits visible progress status without a size line" {
+    var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 5_000 };
+    defer draft.deinit(std.testing.allocator);
+
+    const heartbeat = try buildHeartbeatText(std.testing.allocator, &draft, 17_500);
     defer std.testing.allocator.free(heartbeat);
 
     try std.testing.expect(hasVisibleDraftText(heartbeat));
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "Elapsed: 12s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "Current size") == null);
     try std.testing.expect(std.mem.indexOf(u8, heartbeat, "Interim result is still being prepared.") != null);
+}
+
+test "buildHeartbeatText shows the tool-progress block once tools run" {
+    var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 0 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
+    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com\"}" }, 1_000);
+
+    const heartbeat = try buildHeartbeatText(std.testing.allocator, &draft, 1_000 + 121 * std.time.ms_per_s);
+    defer std.testing.allocator.free(heartbeat);
+
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "121s") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "2 tool calls") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "web_fetch example.com") != null);
+    try std.testing.expect(std.mem.indexOf(u8, heartbeat, "Interim result is still being prepared.") == null);
+}
+
+test "progressDraft respects the flush throttle and needs tool content" {
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+
+    // No tool content yet: nothing to show.
+    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) == null);
+
+    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+
+    // Inside the throttle window: suppressed.
+    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS - 1)) == null);
+
+    const flush = (try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        var tmp = flush;
+        tmp.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(flush.html);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+}
+
+test "progressDraft stays quiet once answer text is visible" {
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "real answer");
+    try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+
+    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) == null);
 }
 
 test "heartbeatDraft flushes pending visible text after interval" {
