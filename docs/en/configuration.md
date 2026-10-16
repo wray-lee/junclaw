@@ -1138,6 +1138,51 @@ Parameters:
 - `streaming` (default: `false`) - Show the reply while it is still being generated. See below
 - `status_reactions` (default: `false`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
 - `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
+- `slash_command` (default: disabled) - Single-command Slack integration: register one slash command and handle its text like a normal message. See below
+
+#### Slack slash command
+
+Slack only delivers a slash command when the app registers it, and Slack's UI
+supports one command per registration. Set `slash_command.enabled = true` and
+register the same name in your Slack app:
+
+```json
+"slash_command": { "enabled": true, "name": "nullclaw" }
+```
+
+`name` is the command without the leading `/` (default `nullclaw`); the match is
+case-insensitive. In Socket Mode the command's request URL in the app config is
+ignored, because Slack sends the payload over the WebSocket.
+
+Type `/nullclaw <message>` and the text after the command is handled exactly as
+if the user had typed it in that channel. Every normal command works, including
+`/nullclaw /stop`, which interrupts the running turn for that channel (or the
+user's DM) the same way a typed `/stop` does; because a slash command is always
+top-level it also interrupts a turn running inside a thread under that channel.
+The command is an explicit invocation of the app, so it is treated as a mention:
+the `allow_from` and DM/group allowlist gates still apply, but `group_policy =
+mention_only` does not block it. Restrict `allow_from` (or the group allowlist)
+if you do not want every admitted member to be able to drive the agent from a
+mention-only room. An empty command shows a short usage reply; an unauthorized
+sender gets a short ephemeral refusal, and a command name that does not match the
+configured `name` is logged and answered with an ephemeral notice instead of
+being silently dropped.
+
+Add to the app manifest under `features` (Socket Mode):
+
+```json
+"features": {
+  "slash_commands": [
+    {
+      "command": "/nullclaw",
+      "description": "Send a message to nullclaw",
+      "should_escape": false
+    }
+  ]
+}
+```
+
+and add the `commands` scope to `oauth_config.scopes.bot`.
 
 #### Slack status reactions
 

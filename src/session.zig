@@ -2242,6 +2242,38 @@ pub const SessionManager = struct {
         };
     }
 
+    /// Request interruption of a running turn for `session_key` together with
+    /// any active `:thread:` child sessions that name it as their parent.
+    ///
+    /// A top-level stop command carries no thread context (Slack slash commands
+    /// are always top-level), so the busy turn may live in a thread session
+    /// under the routed channel/DM session. This interrupts the routed session
+    /// and every active thread child so `/stop` reaches a turn running inside a
+    /// thread. Returns true when at least one turn was signaled.
+    pub fn requestTurnInterruptWithThreads(self: *SessionManager, session_key: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var requested = false;
+        if (self.sessions.get(session_key)) |session| {
+            if (session.turn_running.load(.acquire)) {
+                session.agent.requestInterrupt();
+                requested = true;
+            }
+        }
+
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const parent = agent_routing.resolveThreadParentSessionKey(entry.key_ptr.*) orelse continue;
+            if (!std.mem.eql(u8, parent, session_key)) continue;
+            const session = entry.value_ptr.*;
+            if (!session.turn_running.load(.acquire)) continue;
+            session.agent.requestInterrupt();
+            requested = true;
+        }
+        return requested;
+    }
+
     pub fn freeSessionSnapshots(allocator: Allocator, snapshots: []SessionSnapshot) void {
         for (snapshots) |*snapshot| snapshot.deinit(allocator);
         allocator.free(snapshots);

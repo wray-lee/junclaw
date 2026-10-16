@@ -940,7 +940,36 @@ Slack 示例：
 - `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
 - `status_reactions`（默认 `false`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
 - `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
+- `slash_command`（默认关闭）——单命令 Slack 集成：注册一个斜杠命令，并把其后的文本当作普通消息处理。见下文
 - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
+
+#### Slack 斜杠命令
+
+只有应用注册了斜杠命令，Slack 才会投递它，且 Slack 界面每次注册只支持一个命令。设置 `slash_command.enabled = true`，并在 Slack 应用里注册同名命令：
+
+```json
+"slash_command": { "enabled": true, "name": "nullclaw" }
+```
+
+`name` 是不带前导 `/` 的命令名（默认 `nullclaw`），匹配不区分大小写。Socket Mode 下应用配置里的请求 URL 会被忽略，因为 Slack 通过 WebSocket 投递 payload。
+
+输入 `/nullclaw <消息>` 后，命令之后的文本会像用户在该频道里直接输入一样被处理。所有普通命令都可用，包括 `/nullclaw /stop`——它会像手动输入 `/stop` 一样中断该频道（或该用户 DM）正在运行的回合；由于斜杠命令始终是顶层的，它也会中断该频道下某个 thread 里正在运行的回合。斜杠命令是对应用的显式调用，因此被视为一次 mention：`allow_from` 以及 DM/群组 allowlist 检查依然生效，但 `group_policy = mention_only` 不会拦截它。若不希望所有被允许的成员都能在 mention_only 房间里驱动 agent，请收紧 `allow_from`（或群组 allowlist）。空命令会返回一条简短用法提示；未授权发送者会收到一条短暂的 ephemeral 拒绝；与配置的 `name` 不匹配的命令名会被记录日志并以 ephemeral 提示回应，而不是被静默丢弃。
+
+在应用 manifest 的 `features` 下添加（Socket Mode）：
+
+```json
+"features": {
+  "slash_commands": [
+    {
+      "command": "/nullclaw",
+      "description": "Send a message to nullclaw",
+      "should_escape": false
+    }
+  ]
+}
+```
+
+并在 `oauth_config.scopes.bot` 中加入 `commands` scope。
 
 #### Slack 状态 reaction
 

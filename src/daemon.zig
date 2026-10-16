@@ -1298,9 +1298,11 @@ fn tryHandleStopCommandBeforeEnqueue(
     defer if (routed_session_key) |key| allocator.free(key);
     const session_key = routed_session_key orelse msg.session_key;
 
-    var interrupt = session_mgr.requestTurnInterrupt(session_key);
-    defer interrupt.deinit(allocator);
-    if (!interrupt.requested) return false;
+    // A stop command carries no thread context (Slack slash commands are always
+    // top-level), so the busy turn may live in a `:thread:` child of the routed
+    // session rather than in the routed session itself. Interrupt the routed
+    // session and any active thread child beneath it.
+    if (!session_mgr.requestTurnInterruptWithThreads(session_key)) return false;
 
     log.info("stop command interrupting running turn before enqueue session=0x{x}", .{
         std.hash.Wyhash.hash(0, session_key),
@@ -3888,4 +3890,103 @@ test "markError records AddressInUse for gateway component" {
     try std.testing.expect(!state.components[0].?.running);
     try std.testing.expectEqual(@as(u64, 1), state.components[0].?.restart_count);
     try std.testing.expectEqualStrings("AddressInUse", state.components[0].?.last_error.?);
+}
+
+/// Produce the InboundMessage a single-command Slack `/name /stop` publishes.
+fn produceSlashStopMessage(allocator: std.mem.Allocator) !bus_mod.InboundMessage {
+    const slack_mod = channels_mod.slack;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = slack_mod.SlackChannel.init(allocator, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.slash_command_enabled = true;
+    ch.slash_command_name = "nullclaw";
+    ch.setBus(&eb);
+
+    const payload_json =
+        \\{"command":"/nullclaw","text":"/stop","user_id":"U1","channel_id":"C1","team_id":"T1","response_url":"https://example.invalid/hook"}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, payload_json, .{});
+    defer parsed.deinit();
+    ch.handleSlashCommand(parsed.value.object);
+
+    return eb.consumeInbound() orelse error.TestExpectedEqual;
+}
+
+test "Slack slash /stop interrupts the busy channel and thread sessions before enqueue" {
+    const allocator = std.testing.allocator;
+    const providers_mod = @import("providers/root.zig");
+    const session_mod = @import("session.zig");
+
+    const MockProvider = struct {
+        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return a.dupe(u8, "ok");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
+            return error.ShouldNotChat;
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "slash-mock";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var provider_state: u8 = 0;
+    const provider_vtable = providers_mod.Provider.VTable{
+        .chatWithSystem = MockProvider.chatWithSystem,
+        .chat = MockProvider.chat,
+        .supportsNativeTools = MockProvider.supportsNativeTools,
+        .getName = MockProvider.getName,
+        .deinit = MockProvider.deinitFn,
+    };
+    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    var noop = observability.NoopObserver{};
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+    defer sm.deinit();
+
+    // The message the Slack channel actually publishes for `/nullclaw /stop`.
+    var msg = try produceSlashStopMessage(allocator);
+    defer msg.deinit(allocator);
+
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+    const routed = resolveInboundDispatchSessionKey(allocator, &config, &msg, parsed_meta.fields) orelse return error.TestExpectedEqual;
+    defer allocator.free(routed);
+
+    // Case 1: the routed channel session itself is busy.
+    const channel_session = try sm.getOrCreate(routed);
+    defer channel_session.turn_running.store(false, .release);
+    channel_session.agent.clearInterruptRequest();
+    channel_session.turn_running.store(true, .release);
+
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
+    try std.testing.expect(channel_session.agent.interrupt_requested.load(.acquire));
+
+    // Case 2: the busy turn lives in a thread session under the channel, which
+    // is what a typed thread reply resolves to. The top-level slash command has
+    // no thread context, so it must still reach that session.
+    channel_session.turn_running.store(false, .release);
+    channel_session.agent.clearInterruptRequest();
+
+    const thread_key = try std.fmt.allocPrint(allocator, "{s}:thread:2.0", .{routed});
+    defer allocator.free(thread_key);
+    const thread_session = try sm.getOrCreate(thread_key);
+    defer thread_session.turn_running.store(false, .release);
+    thread_session.agent.clearInterruptRequest();
+    thread_session.turn_running.store(true, .release);
+
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
+    try std.testing.expect(thread_session.agent.interrupt_requested.load(.acquire));
 }

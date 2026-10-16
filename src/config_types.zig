@@ -715,6 +715,17 @@ pub const SlackReactionEmojisConfig = struct {
     failed: []const u8 = "x",
 };
 
+/// Single-command Slack slash integration (OpenClaw-style). When enabled the
+/// Slack app registers exactly ONE slash command; Slack delivers it over Socket
+/// Mode as a `slash_commands` envelope and the text after the command name is
+/// handled as an ordinary inbound message.
+pub const SlackSlashCommandConfig = struct {
+    /// Accept the configured slash command. Off by default.
+    enabled: bool = false,
+    /// Command name without the leading `/`. Compared case-insensitively.
+    name: []const u8 = "nullclaw",
+};
+
 pub const SlackConfig = struct {
     account_id: []const u8 = "default",
     mode: SlackReceiveMode = .socket,
@@ -727,6 +738,8 @@ pub const SlackConfig = struct {
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
+    /// Single-command slash integration. See SlackSlashCommandConfig.
+    slash_command: SlackSlashCommandConfig = .{},
     /// Stream replies while the model is still generating them.
     /// In a thread this uses Slack's native chat.startStream/appendStream/stopStream;
     /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
