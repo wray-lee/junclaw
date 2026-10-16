@@ -6,16 +6,19 @@
 > MIT licensed with the original copyright retained. The binary name, config
 > directory (`~/.nullclaw`), `NULLCLAW_*` environment variables and the Zig
 > package name are intentionally unchanged for compatibility.
+>
+> The icon is original fan art of Junko (Touhou Project, (c) Team Shanghai
+> Alice), drawn for this project; a non-commercial fan work.
 
 Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
 [nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
 
 <p align="center">
-  <img src="nullclaw.png" alt="nullclaw" width="200" />
+  <img src="junclaw.png" alt="junclaw" width="200" />
 </p>
 
-<h1 align="center">NullClaw</h1>
+<h1 align="center">Junclaw</h1>
 
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>

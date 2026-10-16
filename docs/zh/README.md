@@ -4,8 +4,11 @@
 > [nullclaw/nullclaw#1066](https://github.com/nullclaw/nullclaw/issues/1066)。
 > MIT 许可，保留原始版权。为保持兼容，二进制名、配置目录（`~/.nullclaw`）、
 > `NULLCLAW_*` 环境变量与 Zig 包名均有意保持不变。
+>
+> 图标为原创同人画作，角色为东方 Project 的纯狐（Junko），(c) Team Shanghai
+> Alice，为本项目绘制；非商业同人作品。
 
-# NullClaw 中文文档
+# Junclaw 中文文档
 
 本目录提供面向使用者、运维者与贡献者的中文文档入口。
 
