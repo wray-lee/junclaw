@@ -1967,7 +1967,20 @@ pub const SlackChannel = struct {
         const parsed = stream_presenter.resolveStreamTarget(target);
 
         if (state.mode == .native) {
-            if (state.message_ts.len == 0) {
+            if (flush.native_full) {
+                // The accumulated snapshot has outgrown Slack's message cap, so
+                // the next chat.appendStream would answer `msg_too_long` -- a
+                // per-call split cannot prevent a cumulative overflow. Close the
+                // stream and finish on the edited-message transport, whose
+                // chat.update is capped at STREAM_UPDATE_MAX_BYTES and whose
+                // overflow goes out as thread follow-ups.
+                if (state.message_ts.len > 0) {
+                    self.stopNativeStream(parsed, state.message_ts) catch |err| {
+                        log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
+                    };
+                }
+                state.mode = .fallback;
+            } else if (state.message_ts.len == 0) {
                 self.startNativeStreamLocked(parsed, state, flush.text) catch |err| {
                     log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
                     state.mode = .fallback;
@@ -1986,7 +1999,21 @@ pub const SlackChannel = struct {
                 // Keep the native transport: the streamed message still has to be
                 // closed with chat.stopStream, and the final reply reconciles it.
                 self.appendNativeStreamLocked(parsed, state, flush.delta()) catch |err| {
-                    log.warn("Slack chat.appendStream failed ({s}); continuing without live updates", .{@errorName(err)});
+                    // A failed append — most likely `msg_too_long` once the
+                    // message passes Slack's cumulative cap, which a per-call
+                    // split cannot foresee — leaves the native stream unusable
+                    // for this turn. Close it now rather than only stopping live
+                    // updates: otherwise a turn with no final body can leave the
+                    // message stuck in the streaming state. Finish on the
+                    // edited-message transport, whose chat.update is capped and
+                    // splits, so the final reply is still delivered intact.
+                    log.warn("Slack chat.appendStream failed ({s}); finishing on edited messages", .{@errorName(err)});
+                    if (state.message_ts.len > 0) {
+                        self.stopNativeStream(parsed, state.message_ts) catch |stop_err| {
+                            log.warn("Slack chat.stopStream failed ({s})", .{@errorName(stop_err)});
+                        };
+                    }
+                    state.mode = .fallback;
                     state.send_failed = true;
                 };
             }
@@ -2183,8 +2210,18 @@ pub const SlackChannel = struct {
         const parsed = stream_presenter.resolveStreamTarget(target);
 
         if (state.mode == .native) {
-            const stream_completed = if (stream_presenter.pendingFinalSuffix(message, state.sent)) |suffix| blk: {
-                self.appendNativeStreamLocked(parsed, state, suffix) catch |err| {
+            const suffix = stream_presenter.pendingFinalSuffix(message, state.sent);
+            // The closing append must respect the same cumulative budget as the
+            // live flushes: when the answer lands inside one throttle window the
+            // whole remainder is appended in a single call, and chat.appendStream
+            // would answer `msg_too_long` past Slack's message cap. Finish on the
+            // edited-message transport instead so the answer is delivered intact.
+            const over_budget = if (suffix) |s|
+                stream_presenter.finalAppendOverflowsBudget(state.sent.len, s.len)
+            else
+                false;
+            const stream_completed = if (suffix != null and !over_budget) blk: {
+                self.appendNativeStreamLocked(parsed, state, suffix.?) catch |err| {
                     log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
                     break :blk false;
                 };
@@ -2198,8 +2235,10 @@ pub const SlackChannel = struct {
             // A streamed reasoning quote is deliberately absent from the final
             // reply, so that turn's snapshot can never be a prefix of it.
             // Rewrite the stopped message in place rather than leaving the
-            // thinking behind and posting the reply a second time.
-            if (state.rendered_reasoning) {
+            // thinking behind and posting the reply a second time. The same
+            // rewrite carries a final message that would overflow the stream
+            // budget.
+            if (state.rendered_reasoning or over_budget) {
                 return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
             }
             // When the stream could not be completed the streamed message keeps
@@ -2522,6 +2561,50 @@ test "slack channel init defaults" {
     try std.testing.expect(ch.thread_ts == null);
     try std.testing.expect(ch.app_token == null);
     _ = ch.channelName();
+}
+
+test "slack native stream finishes on the fallback transport past the message budget" {
+    // Slack caps the whole streamed message, so a long turn must leave the
+    // native transport before chat.appendStream answers `msg_too_long`; the
+    // edited-message transport (chat.update + thread follow-ups) then carries
+    // the final answer intact.
+    const allocator = std.testing.allocator;
+    const allowed = [_][]const u8{"U123"};
+    var ch = SlackChannel.init(allocator, "xoxb-test", null, "C123", &allowed);
+    defer stream_presenter.deinitStreamStates(allocator, &ch.stream_states);
+
+    const target = "C123:1700000000.000100";
+    const big = "x" ** (stream_presenter.STREAM_TOTAL_MAX_BYTES + 1);
+    ch.streamChunk(target, big);
+
+    const state = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
+    try std.testing.expect(state.message_ts.len > 0);
+}
+
+test "slack native stream leaves for the fallback transport when a later flush crosses the budget" {
+    // Start the native stream with a sub-budget chunk, then cross the cumulative
+    // budget on a later flush: the stream must be closed and the turn finished
+    // on the edited-message transport, with the message ts kept for the rewrite.
+    const allocator = std.testing.allocator;
+    const allowed = [_][]const u8{"U123"};
+    var ch = SlackChannel.init(allocator, "xoxb-test", null, "C123", &allowed);
+    defer stream_presenter.deinitStreamStates(allocator, &ch.stream_states);
+
+    const target = "C123:1700000000.000100";
+    const part = "x" ** 7_000;
+    ch.streamChunk(target, part);
+    const first = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.native, first.mode);
+    try std.testing.expect(first.message_ts.len > 0);
+
+    // Force the next flush past the coalescing window without waiting a second.
+    first.last_flush_time = 0;
+    ch.streamChunk(target, part);
+
+    const second = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, second.mode);
+    try std.testing.expect(second.message_ts.len > 0);
 }
 
 test "slack initFromConfig maps pairing dm_policy to allowlist" {

@@ -169,12 +169,24 @@ pub const TagFilter = struct {
         "<think",
         // OpenAI/Anthropic-style text tool markup. A model that falls back to
         // this dialect can degenerate into a loop of `</function>` closers that
-        // must never reach a channel (OpenClaw's `TOOL_CALL_TAG_NAMES`).
+        // must never reach a channel. Same name set as OpenClaw's
+        // `TOOL_CALL_TAG_NAMES` and `providers.helpers.tool_call_open_tags`,
+        // including `function_call`/`function_response` and the `antml:`/`mm:`
+        // namespaced variants.
         "<function",
         "<function_calls",
+        "<function_call",
+        "<function_response",
         "<tool_calls",
         "<invoke",
         "<parameter",
+        "<antml:invoke",
+        "<antml:parameter",
+        "<antml:function_calls",
+        "<mm:tool_call",
+        "<mm:function_calls",
+        "<mm:invoke",
+        "<mm:parameter",
     };
 
     // Closing tag *names*, without the trailing delimiter. A close is matched
@@ -194,9 +206,18 @@ pub const TagFilter = struct {
         "[/TOOL_CALL",
         "</function",
         "</function_calls",
+        "</function_call",
+        "</function_response",
         "</tool_calls",
         "</invoke",
         "</parameter",
+        "</antml:invoke",
+        "</antml:parameter",
+        "</antml:function_calls",
+        "</mm:tool_call",
+        "</mm:function_calls",
+        "</mm:invoke",
+        "</mm:parameter",
     };
 
     const think_open_tag = "<think>";
@@ -715,7 +736,17 @@ pub const TagFilter = struct {
                 } else |_| {
                     self.emitRegion(body);
                 }
+            } else if (providers.helpers.isFunctionDialectOpenAt(body, 0)) {
+                // An unterminated `=`-dialect call (`<function=NAME>` /
+                // `<parameter=NAME>`) is garbled tool markup, not prose, so drop
+                // the opener tag. Drop only the tag token, not the whole buffered
+                // block: a mid-sentence mention leaves trailing prose that is a
+                // real answer. Mirrors `stripToolCallMarkup`.
+                const open_end = providers.helpers.matchToolCallOpenTag(body, 0) orelse body.len;
+                self.emitRegion(body[open_end..]);
             } else {
+                // Any other opener is released, so a stray `<tool_call>` in prose
+                // cannot swallow the answer.
                 self.emitRegion(body);
             }
         }
@@ -785,17 +816,14 @@ pub const TagFilter = struct {
         return body[start..end];
     }
 
-    fn isWhitespace(b: u8) bool {
-        return b == ' ' or b == '\t' or b == '\n' or b == '\r' or b == 0x0b or b == 0x0c;
-    }
-
     /// True when `b` may delimit a tag whose name is `name`. Angle tags (`<…`)
     /// are delimited by `>` or whitespace (a model may drop the `>`); the
     /// bracket dialect (`[tool_call]`, which the dispatcher's XML fallback also
-    /// accepts) requires its `]`.
+    /// accepts) requires its `]`. The `=` dialect (`<function=NAME>`) is handled
+    /// by the shared predicate so the preview matches the final strip.
     fn delimiterOk(name: []const u8, b: u8) bool {
         if (name.len > 0 and name[0] == '[') return b == ']';
-        return b == '>' or isWhitespace(b);
+        return providers.helpers.toolTagDelimiterOk(name, b);
     }
 
     /// True when `b` ends a tag token (`>` or the bracket dialect's `]`).
@@ -1162,6 +1190,75 @@ test "TagFilter drops a stray function close tag" {
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Answer", col.joined(&buf));
+}
+
+test "TagFilter drops a single stray function close tag" {
+    // Prod shape: one lone closer at the very end of the answer.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("核心数据到手了。\n</function>");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("核心数据到手了。\n", col.joined(&buf));
+}
+
+test "TagFilter drops the OpenAI function= dialect block" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("prose\n<function=web_search>query</function>\nend");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("prose\n\nend", col.joined(&buf));
+}
+
+test "TagFilter drops a truncated function= opener" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("prose\n<function=web_search>");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("prose\n", col.joined(&buf));
+}
+
+test "TagFilter drops an orphan tool_call closer" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("answer\n</tool_call>");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("answer\n", col.joined(&buf));
+}
+
+test "TagFilter drops the function_call/function_response and namespaced closers" {
+    const cases = [_][]const u8{
+        "answer\n</function_call>",
+        "answer\n</function_response>",
+        "answer\n</antml:invoke>",
+        "answer\n</mm:parameter>",
+    };
+    for (cases) |c| {
+        var col = collectChunks(16){};
+        var filter = TagFilter.init(col.sink());
+        const s = filter.sink();
+        s.emitChunk(c);
+        s.emitFinal();
+        var buf: [64]u8 = undefined;
+        try std.testing.expectEqualStrings("answer\n", col.joined(&buf));
+    }
+}
+
+test "TagFilter keeps the prose after an unclosed = opener" {
+    var col = collectChunks(64){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("The model emits <function=read> tags. Then the real answer here.");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("The model emits  tags. Then the real answer here.", col.joined(&buf));
 }
 
 test "TagFilter strips a function_calls block" {

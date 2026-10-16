@@ -16,6 +16,29 @@ pub const STREAM_FLUSH_MIN_DELTA_BYTES: usize = 128;
 
 /// `markdown_text` cap accepted by chat.startStream/chat.appendStream/chat.stopStream.
 pub const STREAM_MARKDOWN_MAX_BYTES: usize = 12_000;
+/// Cumulative `markdown_text` budget for one streamed turn. Slack caps the whole
+/// streamed message, not just each chat.appendStream call, and answers
+/// `msg_too_long` once the accumulated text passes that undocumented cap, which
+/// a per-call split (STREAM_MARKDOWN_MAX_BYTES) cannot prevent. Past this budget
+/// the native stream is closed and the rest of the turn finishes on the
+/// edited-message transport (chat.update + thread follow-ups).
+///
+/// The value is a conservative proxy: Slack documents the 12,000-char per-call
+/// cap but not the cumulative one, so the per-call cap is reused as the budget
+/// (a lower real cap only means an earlier, safe switch). It is not the sole
+/// trigger — an actual `msg_too_long` from chat.appendStream also closes the
+/// stream (see `publishStreamFlushLocked`), so a wrong constant cannot leak the
+/// error to the user.
+pub const STREAM_TOTAL_MAX_BYTES: usize = STREAM_MARKDOWN_MAX_BYTES;
+
+/// True when appending `suffix_len` more bytes to the already-streamed
+/// `sent_len` would push the native stream past Slack's cumulative message cap.
+/// The caller must then finish on the edited-message transport instead of
+/// issuing a chat.appendStream that would answer `msg_too_long`.
+pub fn finalAppendOverflowsBudget(sent_len: usize, suffix_len: usize) bool {
+    return sent_len + suffix_len > STREAM_TOTAL_MAX_BYTES;
+}
+
 /// `text` cap accepted by chat.update; Slack answers `msg_too_long` above this.
 pub const STREAM_UPDATE_MAX_BYTES: usize = 4_000;
 /// Upper bound on follow-up messages posted when the final reply overflows.
@@ -130,6 +153,11 @@ pub const StreamFlush = struct {
     /// Set when an orphan reasoning closer drops the leaked draft from earlier
     /// bytes, or a late `<think>` rewrite moves them.
     rewrite: bool = false,
+    /// True when the accumulated snapshot has grown past STREAM_TOTAL_MAX_BYTES,
+    /// so extending the native stream would make Slack answer `msg_too_long`.
+    /// The caller closes the stream and finishes on the edited-message
+    /// transport.
+    native_full: bool = false,
 
     pub fn deinit(self: *StreamFlush, allocator: std.mem.Allocator) void {
         allocator.free(self.text);
@@ -217,7 +245,12 @@ pub fn appendStreamChunk(
     state.sent = sent_copy;
     state.last_flush_time = now_ms;
 
-    return .{ .text = text, .delta_start = delta_start, .rewrite = rewrite };
+    return .{
+        .text = text,
+        .delta_start = delta_start,
+        .rewrite = rewrite,
+        .native_full = text.len > STREAM_TOTAL_MAX_BYTES,
+    };
 }
 
 /// Suffix of `final_text` that still has to be streamed so the message content
@@ -671,6 +704,53 @@ test "appendStreamChunk flags a rewrite when an orphan closer drops the draft" {
     try std.testing.expectEqual(@as(usize, 0), second.delta_start);
     try std.testing.expect(second.rewrite);
     try std.testing.expect(state.rendered_reasoning);
+}
+
+test "finalAppendOverflowsBudget guards the closing append" {
+    try std.testing.expect(!finalAppendOverflowsBudget(0, STREAM_TOTAL_MAX_BYTES));
+    try std.testing.expect(finalAppendOverflowsBudget(1, STREAM_TOTAL_MAX_BYTES));
+    try std.testing.expect(finalAppendOverflowsBudget(STREAM_TOTAL_MAX_BYTES - 5, 10));
+}
+
+test "appendStreamChunk does not flag a short snapshot full" {
+    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer state.deinit(std.testing.allocator);
+
+    var flush = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "hello world",
+        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
+    )) orelse return error.TestUnexpectedResult;
+    defer flush.deinit(std.testing.allocator);
+    try std.testing.expect(!flush.native_full);
+}
+
+test "appendStreamChunk flags the native stream full once the turn crosses the budget" {
+    var state = StreamState{ .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer state.deinit(std.testing.allocator);
+
+    // Slack caps the whole streamed message, not each call. Two flushes that
+    // each stay under the per-call cap must trip the flag once their sum does.
+    const part = "x" ** 7_000;
+    var first = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        part,
+        1_000 + STREAM_FLUSH_MIN_INTERVAL_MS,
+    )) orelse return error.TestUnexpectedResult;
+    defer first.deinit(std.testing.allocator);
+    try std.testing.expect(!first.native_full);
+
+    var second = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        part,
+        1_000 + 2 * STREAM_FLUSH_MIN_INTERVAL_MS,
+    )) orelse return error.TestUnexpectedResult;
+    defer second.deinit(std.testing.allocator);
+    try std.testing.expect(second.native_full);
+    try std.testing.expectEqual(@as(usize, 14_000), second.text.len);
 }
 
 test "pendingFinalSuffix returns the unsent remainder for a prefix reply" {
