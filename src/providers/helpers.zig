@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const json_util = @import("../json_util.zig");
 const http_util = @import("../http_util.zig");
@@ -173,6 +174,7 @@ pub fn nextToolCallClose(
 ) ?ToolCallClose {
     var idx = from;
     while (idx < body.len) {
+        noteScan();
         const rel = std.mem.indexOfScalar(u8, body[idx..], open_char) orelse return null;
         const abs_open = idx + rel;
         if (abs_open + 1 >= body.len or body[abs_open + 1] != '/') {
@@ -203,6 +205,20 @@ pub fn nextToolCallClose(
         idx = j;
     }
     return null;
+}
+
+/// Test-only count of the forward-scan steps taken by the shared text
+/// tool-call parser and the batch strip. A linear strip examines each byte a
+/// bounded number of times; the O(N^2) scans this guards against re-walked the
+/// whole remaining text once per opener, so this count grew quadratically. The
+/// complexity regression tests assert a linear bound on it instead of timing
+/// the strip, which made them fail on a slow CI runner.
+pub var scan_work: usize = 0;
+
+/// Bump the test-only scan-work counter (see `scan_work`). A no-op outside
+/// tests, so the production scans pay nothing.
+inline fn noteScan() void {
+    if (comptime builtin.is_test) scan_work += 1;
 }
 
 /// A single text tool call the dispatcher would execute, extracted by the
@@ -935,6 +951,7 @@ pub fn parseDispatcherXmlToolCalls(
             // even when no marker of a given dialect occurs at all.
             var search_pos: usize = 0;
             while (search_pos < remaining.len) {
+                noteScan();
                 const p = std.mem.indexOfAnyPos(u8, remaining, search_pos, "<[") orelse break;
                 for (dispatcher_marker_tags) |m| {
                     if (std.mem.startsWith(u8, remaining[p..], m)) {
@@ -1367,6 +1384,7 @@ const CloseScanner = struct {
         }
         var p = from;
         while (std.mem.indexOfScalarPos(u8, self.text, p, '<')) |lt| {
+            noteScan();
             if (matchToolCallClose(self.text, lt, false)) |end| {
                 self.match_valid = true;
                 self.match_from = from;

@@ -773,7 +773,6 @@ pub const TagFilter = struct {
 };
 
 const std = @import("std");
-const std_compat = @import("compat");
 
 // ---------------------------------------------------------------------------
 // ThinkPassthroughFilter — thin compatibility wrapper around `TagFilter`'s
@@ -1484,6 +1483,14 @@ fn assertEverySplit(
     }
 }
 
+/// Assert the batch strip's forward-scan work stays linear in the input size.
+/// A quadratic strip re-walks the remaining text once per marker, so its step
+/// count is orders of magnitude past this bound; asserting work instead of wall
+/// time keeps the check independent of the CI runner's speed.
+fn expectStripWorkLinear(input_len: usize) !void {
+    try std.testing.expect(providers.helpers.scan_work < 8 * input_len);
+}
+
 test "TagFilter drops an unterminated close tag before </think>" {
     // Regression: a close tag that omits its `>` (whitespace delimiter) right
     // before `</think>` entered `.close_tag`, ate up to the `>` of `</think>`,
@@ -1902,15 +1909,13 @@ test "TagFilter strips a large multi-marker stream in one pass" {
         try input.appendSlice(a, "text <tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls -la\"}}</tool_call> more ");
     }
 
-    const start_ns = std_compat.time.nanoTimestamp();
+    providers.helpers.scan_work = 0;
     const batch = try providers.stripToolCallMarkup(a, input.items);
-    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
     defer a.free(batch);
 
     try std.testing.expect(std.mem.indexOf(u8, batch, "<tool_call>") == null);
     try std.testing.expect(std.mem.indexOf(u8, batch, "more") != null);
-    // Generous bound; a quadratic implementation blows well past it.
-    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
+    try expectStripWorkLinear(input.items.len);
 }
 
 test "TagFilter strips a dense run of unclosed openers in one pass" {
@@ -1926,16 +1931,14 @@ test "TagFilter strips a dense run of unclosed openers in one pass" {
         try input.appendSlice(a, "<tool_call>literal ");
     }
 
-    const start_ns = std_compat.time.nanoTimestamp();
+    providers.helpers.scan_work = 0;
     const batch = try providers.stripToolCallMarkup(a, input.items);
-    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
     defer a.free(batch);
 
     // No opener here closes and none is a call the dispatcher would execute, so
     // every byte is released verbatim.
     try std.testing.expectEqualStrings(input.items, batch);
-    // Generous bound; the quadratic implementation blows well past it.
-    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
+    try expectStripWorkLinear(input.items.len);
 }
 
 test "TagFilter keeps a dense run of unclosed openers in step with the batch strip" {
@@ -1961,16 +1964,15 @@ test "TagFilter strips a large dense run of closed calls in one pass" {
         try input.appendSlice(a, "A<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>B");
     }
 
-    const start_ns = std_compat.time.nanoTimestamp();
+    providers.helpers.scan_work = 0;
     const batch = try providers.stripToolCallMarkup(a, input.items);
-    const elapsed_ns = std_compat.time.nanoTimestamp() - start_ns;
     defer a.free(batch);
 
     // Every block is a call the dispatcher executes, so only the `A`/`B` text
     // survives.
     try std.testing.expect(std.mem.indexOf(u8, batch, "<tool_call>") == null);
     try std.testing.expect(std.mem.indexOf(u8, batch, "AB") != null);
-    try std.testing.expect(elapsed_ns < 2 * std.time.ns_per_s);
+    try expectStripWorkLinear(input.items.len);
 }
 
 test "TagFilter keeps a dense run of closed calls in step with the batch strip" {
