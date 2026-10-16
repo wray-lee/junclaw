@@ -253,6 +253,11 @@ pub const SlackChannel = struct {
     /// Guards `stream_states` and the API calls made from it.
     stream_mu: std_compat.sync.Mutex = .{},
     stream_states: std.StringHashMapUnmanaged(stream_presenter.StreamState) = .empty,
+    /// Targets whose current turn was stopped. Queued `.chunk` events for them
+    /// are dropped so a stopped turn's leftovers cannot replay once the
+    /// outbound dispatcher catches up. Keyed by the exact outbound target and
+    /// expiring after the late-chunk grace window. Guarded by `stream_mu`.
+    stream_cancels: std.StringHashMapUnmanaged(i64) = .empty,
     policy: root.ChannelPolicy = .{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -1810,6 +1815,71 @@ pub const SlackChannel = struct {
         self.stream_mu.lock();
         defer self.stream_mu.unlock();
         stream_presenter.deinitStreamStates(self.allocator, &self.stream_states);
+        var it = self.stream_cancels.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        self.stream_cancels.deinit(self.allocator);
+        self.stream_cancels = .empty;
+    }
+
+    fn vtableCancelStreams(ptr: *anyopaque, target: []const u8) void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        self.cancelStreams(target);
+    }
+
+    /// Mark `target` cancelled after a /stop, so the stopped turn's already
+    /// queued `.chunk` events are dropped instead of replaying. Cleared when the
+    /// stopped turn's final reply is delivered, or after the grace window.
+    pub fn cancelStreams(self: *SlackChannel, target: []const u8) void {
+        if (target.len == 0) return;
+
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+
+        const now_ms = std_compat.time.milliTimestamp();
+        self.pruneStreamCancelsLocked(now_ms);
+
+        const gop = self.stream_cancels.getOrPut(self.allocator, target) catch |err| {
+            log.warn("Slack stream cancel allocation failed: {}", .{err});
+            return;
+        };
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, target) catch {
+                _ = self.stream_cancels.remove(target);
+                log.warn("Slack stream cancel allocation failed: {}", .{error.OutOfMemory});
+                return;
+            };
+        }
+        gop.value_ptr.* = now_ms + stream_presenter.STREAM_LATE_CHUNK_GRACE_MS;
+    }
+
+    fn isStreamCancelledLocked(self: *SlackChannel, target: []const u8, now_ms: i64) bool {
+        const expiry = self.stream_cancels.get(target) orelse return false;
+        if (now_ms >= expiry) {
+            self.clearStreamCancelLocked(target);
+            return false;
+        }
+        return true;
+    }
+
+    fn clearStreamCancelLocked(self: *SlackChannel, target: []const u8) void {
+        if (self.stream_cancels.fetchRemove(target)) |entry| self.allocator.free(entry.key);
+    }
+
+    /// Drop expired cancel markers so a long-running bot does not accumulate one
+    /// entry per target it has ever stopped.
+    fn pruneStreamCancelsLocked(self: *SlackChannel, now_ms: i64) void {
+        var stale: [stream_presenter.STREAM_MAX_TRACKED_TARGETS][]const u8 = undefined;
+        var stale_len: usize = 0;
+        var it = self.stream_cancels.iterator();
+        while (it.next()) |entry| {
+            if (now_ms < entry.value_ptr.*) continue;
+            if (stale_len == stale.len) break;
+            stale[stale_len] = entry.key_ptr.*;
+            stale_len += 1;
+        }
+        for (stale[0..stale_len]) |key| {
+            if (self.stream_cancels.fetchRemove(key)) |entry| self.allocator.free(entry.key);
+        }
     }
 
     /// The turn ended without a reply body; close the turn so late deltas are
@@ -1820,6 +1890,7 @@ pub const SlackChannel = struct {
 
         const now_ms = std_compat.time.milliTimestamp();
         if (self.stream_states.getPtr(target)) |state| state.finishTurn(self.allocator, now_ms);
+        self.clearStreamCancelLocked(target);
     }
 
     fn streamChunk(self: *SlackChannel, target: []const u8, chunk: []const u8) void {
@@ -1830,6 +1901,9 @@ pub const SlackChannel = struct {
         defer self.stream_mu.unlock();
 
         const now_ms = std_compat.time.milliTimestamp();
+        // A /stop cancelled this target: the deltas still queued ahead of the
+        // stop must not replay to the user once the dispatcher catches up.
+        if (self.isStreamCancelledLocked(target, now_ms)) return;
         const state = self.ensureStreamStateLocked(target, now_ms) catch |err| {
             log.warn("Slack streaming state allocation failed: {}", .{err});
             return;
@@ -2091,6 +2165,10 @@ pub const SlackChannel = struct {
         defer self.stream_mu.unlock();
 
         const now_ms = std_compat.time.milliTimestamp();
+        // Every queued delta was dequeued ahead of this final, so the stop marker
+        // has done its job and must not leak into the next turn -- including a
+        // turn that streamed nothing and returns early below without a state.
+        self.clearStreamCancelLocked(target);
         const state = self.stream_states.getPtr(target) orelse
             return vtableSend(@ptrCast(self), target, message, media);
         // Keep the entry: late deltas of this turn are dropped by isLateChunk.
@@ -2252,6 +2330,7 @@ pub const SlackChannel = struct {
         .stopTyping = &vtableStopTyping,
         .setTaskReaction = &vtableSetTaskReaction,
         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
+        .cancelStreams = &vtableCancelStreams,
     };
 
     pub fn channel(self: *SlackChannel) root.Channel {
@@ -3088,11 +3167,13 @@ test "slack streaming keeps the native path across chunks of one turn" {
     defer ch.channel().stop();
 
     try ch.channel().sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    // A second delta inside the flush window is coalesced rather than sent, but
+    // the turn must keep using the native transport.
     try ch.channel().sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
 
     const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(stream_presenter.StreamMode.native, state.mode);
-    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
+    try std.testing.expectEqualStrings("x" ** 200, state.sent);
 }
 
 test "slack streaming uses edited messages when the target has no thread" {
@@ -3177,6 +3258,49 @@ test "slack streaming drops deltas that arrive after the final reply" {
 
     const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 0), state.buffer.items.len);
+}
+
+test "slack streaming drops queued chunks for a cancelled target" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    // The turn opened a stream, then the user hit /stop.
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    {
+        // Advance the flush clock past the 1s floor so the next delta would reach
+        // the wire (and grow state.sent) if the cancel did not drop it.
+        const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+    }
+    iface.cancelStreams("C1:1700.1");
+
+    // Regression: deltas already queued ahead of the /stop must not replay once
+    // the outbound dispatcher catches up.
+    try iface.sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("x" ** 200, state.sent);
+}
+
+test "slack streaming flushes a later delta past the interval when not cancelled" {
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    const iface = ch.channel();
+
+    // Positive control for the cancelled-target test above: the same clock
+    // advance with no /stop must let the delta through, proving the cancel is
+    // what dropped it.
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    {
+        const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+    }
+
+    try iface.sendEvent("C1:1700.1", "y" ** 200, &.{}, .chunk);
+
+    const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(("x" ** 200) ++ ("y" ** 200), state.sent);
 }
 
 test "slack streaming final without streaming enabled is delivered complete" {

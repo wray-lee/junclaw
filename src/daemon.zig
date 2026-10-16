@@ -1091,9 +1091,18 @@ fn publishStreamingChunk(ctx_ptr: *anyopaque, event: streaming.Event) void {
         return;
     };
     message.draft_id = ctx.draft_id;
-    ctx.event_bus.publishOutbound(message) catch |err| {
+    // A stream chunk is a droppable preview: never block the agent turn waiting
+    // for outbound-queue space. The single outbound dispatcher can be parked in
+    // a slow Slack call, and blocking here kept the turn alive (and deaf to
+    // /stop) until the backlog drained. A timeout of 0 drops the chunk the
+    // moment the queue is full instead of sleeping.
+    ctx.event_bus.publishOutboundTimeout(message, 0) catch |err| {
         message.deinit(ctx.allocator);
-        if (err != error.Closed) {
+        if (err == error.Timeout) {
+            // The dispatcher is behind; drop this preview instead of parking the
+            // turn on a full queue.
+            log.debug("inbound dispatch dropped a stream chunk: outbound queue full", .{});
+        } else if (err != error.Closed) {
             log.warn("inbound dispatch chunk publishOutbound failed: {}", .{err});
         }
         return;
@@ -1287,6 +1296,7 @@ fn inboundDispatchShardIndex(
 fn tryHandleStopCommandBeforeEnqueue(
     allocator: std.mem.Allocator,
     config: *const Config,
+    registry: *const dispatch.ChannelRegistry,
     session_mgr: *@import("session.zig").SessionManager,
     msg: *const bus_mod.InboundMessage,
 ) bool {
@@ -1307,6 +1317,21 @@ fn tryHandleStopCommandBeforeEnqueue(
     log.info("stop command interrupting running turn before enqueue session=0x{x}", .{
         std.hash.Wyhash.hash(0, session_key),
     });
+
+    // Drop the stopped turn's already-queued stream chunks so they cannot replay
+    // once the outbound dispatcher catches up. The targets come from the
+    // interrupted sessions, not from the stop message: a Slack slash command has
+    // no thread context, so its own chat id names the whole channel and would
+    // silence every concurrent thread.
+    if (resolveOutboundChannel(registry, msg.channel, parsed_meta.fields.account_id)) |channel| {
+        var targets: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (targets.items) |target| allocator.free(target);
+            targets.deinit(allocator);
+        }
+        session_mgr.collectActiveTurnTargets(allocator, session_key, &targets);
+        for (targets.items) |target| channel.cancelStreams(target);
+    }
     return true;
 }
 
@@ -1618,7 +1643,7 @@ fn inboundDispatcherThread(
 
         while (ready_messages.items.len > 0) {
             var msg = ready_messages.orderedRemove(0);
-            if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
+            if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, registry, &runtime.session_mgr, &msg)) {
                 msg.deinit(allocator);
                 continue;
             }
@@ -1638,7 +1663,7 @@ fn inboundDispatcherThread(
     debouncer.flushAll(&ready_messages) catch {};
     while (ready_messages.items.len > 0) {
         var msg = ready_messages.orderedRemove(0);
-        if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, &runtime.session_mgr, &msg)) {
+        if (tryHandleStopCommandBeforeEnqueue(allocator, runtime.config, registry, &runtime.session_mgr, &msg)) {
             msg.deinit(allocator);
             continue;
         }
@@ -2246,6 +2271,9 @@ test "dispatcher interrupts a busy session for /stop before enqueue" {
     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
     defer sm.deinit();
 
+    var registry = dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+
     const session_key = "daemon:stop-before-enqueue";
     const session = try sm.getOrCreate(session_key);
     defer session.turn_running.store(false, .release);
@@ -2261,21 +2289,153 @@ test "dispatcher interrupts a busy session for /stop before enqueue" {
         .content = "/stop",
         .session_key = session_key,
     };
-    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &stop_msg));
     try std.testing.expect(session.agent.interrupt_requested.load(.acquire));
 
     // A non-stop message is left for the queue and does not raise the flag.
     session.agent.clearInterruptRequest();
     var normal_msg = stop_msg;
     normal_msg.content = "just a message";
-    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &normal_msg));
+    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &normal_msg));
     try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
 
     // /stop with no running turn is not consumed: normal routing replies.
     session.turn_running.store(false, .release);
     session.agent.clearInterruptRequest();
-    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &stop_msg));
+    try std.testing.expect(!tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &stop_msg));
     try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
+}
+
+test "publishStreamingChunk drops a preview instead of blocking on a full outbound queue" {
+    const allocator = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var filled: usize = 0;
+    while (filled < bus_mod.QUEUE_CAPACITY) : (filled += 1) {
+        try event_bus.publishOutbound(try bus_mod.makeOutbound(allocator, "c", "t", "x"));
+    }
+
+    var ctx = StreamingOutboundCtx{
+        .allocator = allocator,
+        .event_bus = &event_bus,
+        .channel = "c",
+        .account_id = null,
+        .chat_id = "t",
+    };
+    const start = std_compat.time.milliTimestamp();
+    publishStreamingChunk(&ctx, .{ .stage = .chunk, .text = "hello" });
+    const elapsed = std_compat.time.milliTimestamp() - start;
+
+    // Regression: a full queue used to park the turn here forever, keeping it
+    // running (and unresponsive to /stop) until the dispatcher drained. The
+    // publish must return at once so the agent loop reaches its interrupt check.
+    try std.testing.expect(elapsed < 100);
+    try std.testing.expect(!ctx.emitted_chunk);
+
+    event_bus.close();
+    while (event_bus.consumeOutbound()) |msg| {
+        var m = msg;
+        m.deinit(allocator);
+    }
+}
+
+test "dispatcher cancels the stopped turn's queued stream chunks before enqueue" {
+    const allocator = std.testing.allocator;
+    const providers_mod = @import("providers/root.zig");
+    const session_mod = @import("session.zig");
+
+    const StopMockProvider = struct {
+        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return a.dupe(u8, "ok");
+        }
+        fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
+            return error.ShouldNotChat;
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "stop-cancel-mock";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var provider_state: u8 = 0;
+    const provider_vtable = providers_mod.Provider.VTable{
+        .chatWithSystem = StopMockProvider.chatWithSystem,
+        .chat = StopMockProvider.chat,
+        .supportsNativeTools = StopMockProvider.supportsNativeTools,
+        .getName = StopMockProvider.getName,
+        .deinit = StopMockProvider.deinitFn,
+    };
+    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const RecordingChannel = struct {
+        var cancelled: [64]u8 = undefined;
+        var cancelled_len: usize = 0;
+
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "test-channel";
+        }
+        fn healthCheck(_: *anyopaque) bool {
+            return true;
+        }
+        fn cancelStreams(_: *anyopaque, target: []const u8) void {
+            cancelled_len = @min(target.len, cancelled.len);
+            @memcpy(cancelled[0..cancelled_len], target[0..cancelled_len]);
+        }
+    };
+    RecordingChannel.cancelled_len = 0;
+
+    var noop = observability.NoopObserver{};
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+    defer sm.deinit();
+
+    var ch_state: u8 = 0;
+    const ch_vtable = channels_mod.Channel.VTable{
+        .start = RecordingChannel.start,
+        .stop = RecordingChannel.stop,
+        .send = RecordingChannel.send,
+        .name = RecordingChannel.name,
+        .healthCheck = RecordingChannel.healthCheck,
+        .cancelStreams = RecordingChannel.cancelStreams,
+    };
+    var registry = dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.register(.{ .ptr = @ptrCast(&ch_state), .vtable = &ch_vtable });
+
+    const session_key = "daemon:stop-cancel-targets";
+    const session = try sm.getOrCreate(session_key);
+    defer session.turn_running.store(false, .release);
+    defer session.agent.conversation_context = null;
+    session.agent.clearInterruptRequest();
+    // The running turn delivers to a thread target, which is what a bare
+    // channel slash stop must cancel (not the whole channel).
+    session.agent.conversation_context = .{
+        .channel = "test-channel",
+        .delivery_chat_id = "C1:1700.0",
+    };
+    session.turn_running.store(true, .release);
+
+    var stop_msg = bus_mod.InboundMessage{
+        .channel = "test-channel",
+        .sender_id = "user-1",
+        .chat_id = "C1",
+        .content = "/stop",
+        .session_key = session_key,
+    };
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &stop_msg));
+    try std.testing.expect(RecordingChannel.cancelled_len > 0);
+    try std.testing.expectEqualStrings("C1:1700.0", RecordingChannel.cancelled[0..RecordingChannel.cancelled_len]);
 }
 
 test "hasSupervisedChannels false for defaults" {
@@ -3956,6 +4116,9 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
     defer sm.deinit();
 
+    var registry = dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+
     // The message the Slack channel actually publishes for `/nullclaw /stop`.
     var msg = try produceSlashStopMessage(allocator);
     defer msg.deinit(allocator);
@@ -3971,7 +4134,7 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
     channel_session.agent.clearInterruptRequest();
     channel_session.turn_running.store(true, .release);
 
-    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &msg));
     try std.testing.expect(channel_session.agent.interrupt_requested.load(.acquire));
 
     // Case 2: the busy turn lives in a thread session under the channel, which
@@ -3987,6 +4150,6 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
     thread_session.agent.clearInterruptRequest();
     thread_session.turn_running.store(true, .release);
 
-    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &sm, &msg));
+    try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &msg));
     try std.testing.expect(thread_session.agent.interrupt_requested.load(.acquire));
 }

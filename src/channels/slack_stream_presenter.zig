@@ -146,8 +146,14 @@ pub fn hasVisibleStreamText(text: []const u8) bool {
 }
 
 fn shouldFlush(state: *const StreamState, now_ms: i64) bool {
-    if (state.buffer.items.len - state.sent.len >= STREAM_FLUSH_MIN_DELTA_BYTES) return true;
-    return now_ms - state.last_flush_time >= STREAM_FLUSH_MIN_INTERVAL_MS;
+    const pending = state.buffer.items.len - state.sent.len;
+    if (pending == 0) return false;
+    if (now_ms - state.last_flush_time >= STREAM_FLUSH_MIN_INTERVAL_MS) return true;
+    // Only the first flush of a turn may open the stream before the interval,
+    // and only once a meaningful amount of text has accumulated. Every later
+    // flush waits the full interval, so a fast token stream can no longer turn
+    // one turn into a burst of synchronous Slack calls.
+    return state.sent.len == 0 and pending >= STREAM_FLUSH_MIN_DELTA_BYTES;
 }
 
 /// Snapshot the buffered stream for the wire.
@@ -493,6 +499,47 @@ test "appendStreamChunk flushes on the minimum delta before the interval" {
         return error.TestUnexpectedResult;
     defer flush.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings(big, flush.text);
+}
+
+test "appendStreamChunk throttles a sustained delta stream to one flush per interval" {
+    var state = StreamState{};
+    defer state.deinit(std.testing.allocator);
+
+    // The first burst opens the stream.
+    var first = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "a" ** STREAM_FLUSH_MIN_DELTA_BYTES,
+        1_000,
+    )) orelse return error.TestUnexpectedResult;
+    defer first.deinit(std.testing.allocator);
+
+    // Regression: a fast token stream used to flush on every delta >=
+    // STREAM_FLUSH_MIN_DELTA_BYTES, turning one turn into dozens of synchronous
+    // Slack calls. Inside the window only the first flush may happen.
+    try std.testing.expect((try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "b" ** STREAM_FLUSH_MIN_DELTA_BYTES,
+        1_100,
+    )) == null);
+    try std.testing.expect((try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "c" ** STREAM_FLUSH_MIN_DELTA_BYTES,
+        1_900,
+    )) == null);
+
+    var next = (try appendStreamChunk(
+        std.testing.allocator,
+        &state,
+        "d" ** STREAM_FLUSH_MIN_DELTA_BYTES,
+        2_000,
+    )) orelse return error.TestUnexpectedResult;
+    defer next.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, STREAM_FLUSH_MIN_DELTA_BYTES * 4), next.text.len);
+    try std.testing.expectEqual(@as(usize, STREAM_FLUSH_MIN_DELTA_BYTES), next.delta_start);
 }
 
 test "appendStreamChunk returns only the unsent suffix on later flushes" {

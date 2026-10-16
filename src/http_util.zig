@@ -164,6 +164,44 @@ pub fn stopCancelWatcher(done: *AtomicBool, watcher: *?std.Thread) void {
     }
 }
 
+/// Spawn the watcher that kills `child` when the current thread's agent
+/// interrupt flag (installed by the agent around a provider call) is raised.
+///
+/// `done`, `watcher`, and `ctx` are caller-owned storage that must outlive the
+/// watcher; pair with `stopCancelWatcher`. A no-op leaving `watcher` null when
+/// no interrupt flag is installed on this thread.
+pub fn spawnCancelWatcher(
+    child: *std_compat.process.Child,
+    done: *AtomicBool,
+    watcher: *?std.Thread,
+    ctx: *CancelWatcherCtx,
+) void {
+    const flag = thread_interrupt_flag orelse return;
+    ctx.* = .{ .child = child, .cancel_flag = flag, .done = done };
+    watcher.* = std.Thread.spawn(.{}, cancelWatcherMain, .{ctx}) catch null;
+}
+
+/// True when the agent /stop raised the interrupt flag on this thread. The curl
+/// transports check it between stream deltas so a stop aborts the in-flight
+/// request instead of draining everything the provider already buffered.
+pub fn interruptRequested() bool {
+    const flag = thread_interrupt_flag orelse return false;
+    return flag.load(.acquire);
+}
+
+/// Stop the cancel watcher, then kill and reap the curl child. The watcher must
+/// be joined before `wait()` clears `child.id`, or a reused PID could be
+/// signalled.
+pub fn stopCancelWatcherAndReap(
+    child: *std_compat.process.Child,
+    done: *AtomicBool,
+    watcher: *?std.Thread,
+) void {
+    stopCancelWatcher(done, watcher);
+    _ = child.kill() catch {};
+    _ = child.wait() catch {};
+}
+
 fn abortCurlChild(
     child: *std_compat.process.Child,
     cancel_done: *AtomicBool,

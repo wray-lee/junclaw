@@ -2274,6 +2274,42 @@ pub const SessionManager = struct {
         return requested;
     }
 
+    /// Copy the outbound delivery target of the turn running for `session_key`
+    /// and any active `:thread:` child into `out` (caller frees each string).
+    ///
+    /// A `/stop` uses this to drop the stopped turn's already-queued stream
+    /// chunks. The target has to come from the running session, not from the
+    /// stop command: a Slack slash command carries no thread context, so its
+    /// own chat id names the whole channel and would silence concurrent
+    /// threads.
+    pub fn collectActiveTurnTargets(
+        self: *SessionManager,
+        allocator: Allocator,
+        session_key: []const u8,
+        out: *std.ArrayListUnmanaged([]u8),
+    ) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        appendActiveTurnTargetHelper(allocator, self.sessions.get(session_key), out);
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const parent = agent_routing.resolveThreadParentSessionKey(entry.key_ptr.*) orelse continue;
+            if (!std.mem.eql(u8, parent, session_key)) continue;
+            appendActiveTurnTargetHelper(allocator, entry.value_ptr.*, out);
+        }
+    }
+
+    fn appendActiveTurnTargetHelper(allocator: Allocator, session: ?*Session, out: *std.ArrayListUnmanaged([]u8)) void {
+        const s = session orelse return;
+        if (!s.turn_running.load(.acquire)) return;
+        const ctx = s.agent.conversation_context orelse return;
+        const target = ctx.delivery_chat_id orelse return;
+        if (target.len == 0) return;
+        const owned = allocator.dupe(u8, target) catch return;
+        out.append(allocator, owned) catch allocator.free(owned);
+    }
+
     pub fn freeSessionSnapshots(allocator: Allocator, snapshots: []SessionSnapshot) void {
         for (snapshots) |*snapshot| snapshot.deinit(allocator);
         allocator.free(snapshots);
