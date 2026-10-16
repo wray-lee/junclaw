@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   nightly:
+    if: github.repository == 'nullclaw/nullclaw'
     uses: nullclaw/nullbuilder/.github/workflows/zig-nightly.yml@v1
     permissions:
       actions: read

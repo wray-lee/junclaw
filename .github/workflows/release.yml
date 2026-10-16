@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   release:
+    if: github.repository == 'nullclaw/nullclaw'
     uses: nullclaw/nullbuilder/.github/workflows/zig-release.yml@v1
     permissions:
       contents: write
