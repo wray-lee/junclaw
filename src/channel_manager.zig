@@ -33,10 +33,6 @@ const Channel = channels_mod.Channel;
 const log = std.log.scoped(.channel_manager);
 const Atomic = @import("portable_atomic.zig").Atomic;
 
-/// How long a polling thread may go without a successful poll before the
-/// supervisor restarts it.
-pub const STALE_THRESHOLD_SECS: i64 = 600;
-
 pub const ListenerType = enum {
     /// Telegram, Signal — poll in a loop
     polling,
