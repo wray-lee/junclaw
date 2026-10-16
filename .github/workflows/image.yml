@@ -1,0 +1,91 @@
+name: image
+
+# Fork-only: build and push the container image to GHCR.
+# Upstream publishes no container image. This builds straight from this
+# repository's own Dockerfile (release target) — same base image, build flags,
+# labels and runtime user/entrypoint as upstream — so an existing deployment
+# only needs its image name changed to ghcr.io/<owner>/<fork>:latest.
+# Rename the fork in one place: the FORK_NAME env var below.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORK_NAME: junclaw
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Version mirrors the previous image workflow's "main-<sha>" style; tags use the tag name.
+      - name: Resolve version and image
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+          else
+            version="main-$(git rev-parse --short=10 HEAD)"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ env.FORK_NAME }}" >> "$GITHUB_OUTPUT"
+          echo "building ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ env.FORK_NAME }} version ${version}"
+
+      # Repository Dockerfile, release target (non-root). Zig cross-compiles for the baseline x86-64 CPU.
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: release
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.ver.outputs.image }}:candidate
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+
+      # Target hosts are x86-64-v2 (no AVX2): refuse binaries that require v3/v4.
+      - name: Verify binary
+        run: |
+          docker run --rm --entrypoint nullclaw ${{ steps.ver.outputs.image }}:candidate --version
+          cid=$(docker create ${{ steps.ver.outputs.image }}:candidate); docker cp "$cid:/usr/local/bin/nullclaw" ./nc-bin; docker rm "$cid" >/dev/null
+          isa=$(readelf -n ./nc-bin | grep -i 'ISA needed' || true)
+          echo "ISA note: ${isa:-none}"
+          if echo "$isa" | grep -qE 'x86-64-v[34]'; then echo "binary requires x86-64-v3+"; exit 1; fi
+
+      - name: Push
+        run: |
+          image="${{ steps.ver.outputs.image }}"
+          docker tag "$image:candidate" "$image:latest"
+          docker push "$image:latest"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            docker tag "$image:candidate" "$image:${GITHUB_REF_NAME}"
+            docker push "$image:${GITHUB_REF_NAME}"
+          else
+            docker tag "$image:candidate" "$image:main-$(git rev-parse --short=10 HEAD)"
+            docker push "$image:main-$(git rev-parse --short=10 HEAD)"
+          fi
