@@ -58,7 +58,7 @@ pub fn hasVisibleDraftText(text: []const u8) bool {
 
 /// True when the draft already shows answer text. A streamed reasoning quote is
 /// not answer text: it renders as a `>` quote with the answer below it, so a
-/// reasoning-only draft may still be replaced by the tool-progress block while
+/// reasoning-only draft is still combined with the tool-progress block while
 /// tools run (otherwise the draft freezes on the last reasoning quote and the
 /// user cannot tell "calling tools" from "stuck").
 fn hasVisibleAnswerText(allocator: std.mem.Allocator, text: []const u8) !bool {
@@ -128,14 +128,84 @@ fn appendElapsedSummary(buf: *std.ArrayListUnmanaged(u8), allocator: std.mem.All
     try buf.print(allocator, "Elapsed: {d}s", .{elapsed_secs});
 }
 
+/// Start index of the newest `budget` bytes of `text`, aligned to a UTF-8
+/// boundary. Used to tail-truncate a reasoning excerpt so the combined draft
+/// stays under DRAFT_TRANSPORT_MAX_BYTES.
+fn boundedTailStart(text: []const u8, budget: usize) usize {
+    if (text.len <= budget) return 0;
+    return alignUtf8Start(text, text.len - budget);
+}
+
+/// Move `start` past an escaped HTML entity (`&amp;`, `&lt;`, ...) that the
+/// tail cut landed in the middle of, so Telegram never receives a broken
+/// entity. `start` is already on a UTF-8 boundary.
+fn alignHtmlTailStart(text: []const u8, start_in: usize) usize {
+    var start = alignUtf8Start(text, start_in);
+    var look = start;
+    const floor = start -| 6;
+    while (look > floor) {
+        look -= 1;
+        if (text[look] != '&') continue;
+        // The entity already ended before `start`: nothing to skip.
+        if (std.mem.indexOfScalar(u8, text[look..start], ';') == null) {
+            if (std.mem.indexOfScalarPos(u8, text, start, ';')) |semi| start = semi + 1;
+        }
+        break;
+    }
+    return alignUtf8Start(text, start);
+}
+
+/// Tool-progress block plus the reasoning streamed so far.
+///
+/// The reasoning is kept above the progress block: replacing the draft with the
+/// progress block alone made `/reasoning stream` lose the thinking as soon as a
+/// tool ran. The reasoning is escaped because it is model output, and only its
+/// newest bytes are kept so the whole draft fits the transport cap (the tool
+/// block is at the end, where the transport compaction would otherwise cut it).
+fn buildProgressText(allocator: std.mem.Allocator, state: *const DraftState, now_ms: i64) ![]u8 {
+    const progress = try state.tool_progress.renderBlockHtml(allocator, now_ms);
+    var progress_owned = true;
+    defer if (progress_owned) allocator.free(progress);
+
+    const quoted = try snapshotDraftText(allocator, state);
+    defer allocator.free(quoted);
+    if (!hasVisibleDraftText(quoted)) {
+        progress_owned = false;
+        return progress;
+    }
+
+    const escaped = try tool_progress.escapeHtml(allocator, quoted);
+    defer allocator.free(escaped);
+
+    const separator = "\n\n";
+    if (progress.len + separator.len >= DRAFT_TRANSPORT_MAX_BYTES) {
+        progress_owned = false;
+        return progress;
+    }
+    const budget = DRAFT_TRANSPORT_MAX_BYTES - progress.len - separator.len;
+    const start = alignHtmlTailStart(escaped, boundedTailStart(escaped, budget));
+    if (start >= escaped.len) {
+        progress_owned = false;
+        return progress;
+    }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, escaped[start..]);
+    try out.appendSlice(allocator, separator);
+    try out.appendSlice(allocator, progress);
+    return out.toOwnedSlice(allocator);
+}
+
 /// Build the draft text shown while a turn has no visible answer text yet.
 ///
 /// When the turn has already run tools, this is the tool-progress block
-/// (elapsed seconds, tool-call count, last tool lines); otherwise it is the
-/// plain elapsed-time heartbeat. Both are HTML for Telegram's parse_mode.
+/// (elapsed seconds, tool-call count, last tool lines) preceded by the
+/// reasoning streamed so far; otherwise it is the plain elapsed-time heartbeat.
+/// Both are HTML for Telegram's parse_mode.
 pub fn buildHeartbeatText(allocator: std.mem.Allocator, state: *const DraftState, now_ms: i64) ![]u8 {
     if (state.tool_progress.hasContent()) {
-        return state.tool_progress.renderBlockHtml(allocator, now_ms);
+        return buildProgressText(allocator, state, now_ms);
     }
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
@@ -227,7 +297,7 @@ pub fn heartbeatDraft(
         // Answer text is on screen: never replace it with a heartbeat.
         if (try hasVisibleAnswerText(allocator, state.buffer.items)) return null;
         // A streamed reasoning quote is on screen but no answer text yet: keep
-        // it unless a tool event produced a progress block worth showing.
+        // it, together with the progress block when tools have run.
         if (!state.tool_progress.hasContent()) return null;
     }
 
@@ -477,6 +547,83 @@ test "progressDraft shows tools even when only reasoning has streamed" {
         tmp.deinit(std.testing.allocator);
     }
     try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+}
+
+test "progressDraft keeps the streamed reasoning above the tool block" {
+    // Regression: the tool-progress block replaced the draft outright, so a
+    // turn that ran tools lost the reasoning it had just streamed under
+    // `/reasoning stream`.
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>pondering the options</think>");
+    draft.last_flush_len = draft.buffer.items.len;
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+
+    var flush = (try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) orelse
+        return error.TestUnexpectedResult;
+    defer flush.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "pondering the options") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, flush.text, "pondering the options").? <
+            std.mem.indexOf(u8, flush.text, "shell").?,
+    );
+}
+
+test "heartbeatDraft keeps the reasoning quote next to the tool block" {
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>thinking it through</think>");
+    draft.last_flush_len = draft.buffer.items.len;
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
+
+    var flush = (try heartbeatDraft(std.testing.allocator, &draft, 1_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1)) orelse
+        return error.TestUnexpectedResult;
+    defer flush.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "thinking it through") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "web_search") != null);
+}
+
+test "buildProgressText bounds the reasoning tail and keeps the tool block" {
+    var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 0 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>");
+    try draft.buffer.appendSlice(std.testing.allocator, "old " ** 2_000);
+    try draft.buffer.appendSlice(std.testing.allocator, "LATEST-REASONING</think>");
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+
+    const text = try buildHeartbeatText(std.testing.allocator, &draft, 1_000);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(text.len <= DRAFT_TRANSPORT_MAX_BYTES);
+    try std.testing.expect(std.mem.indexOf(u8, text, "LATEST-REASONING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "shell") != null);
+    // The oldest reasoning is dropped, not the tool block at the end.
+    try std.testing.expect(!std.mem.startsWith(u8, text, "&gt; old"));
+}
+
+test "alignHtmlTailStart skips a partial escaped entity" {
+    const text = "abc&amp;def";
+    // A cut inside "&amp;" must resume after the ';'.
+    try std.testing.expectEqual(@as(usize, 8), alignHtmlTailStart(text, 5));
+    // A cut on a normal boundary is left alone.
+    try std.testing.expectEqual(@as(usize, 8), alignHtmlTailStart(text, 8));
+    try std.testing.expectEqual(@as(usize, 0), alignHtmlTailStart(text, 0));
+}
+
+test "buildProgressText escapes reasoning instead of injecting HTML" {
+    var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 0 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "<think><b>&x</b></think>");
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+
+    const text = try buildHeartbeatText(std.testing.allocator, &draft, 1_000);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(std.mem.indexOf(u8, text, "<b>") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "&lt;b&gt;") != null);
 }
 
 test "heartbeatDraft keeps a reasoning-only draft unless tools have run" {

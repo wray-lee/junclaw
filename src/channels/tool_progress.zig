@@ -291,7 +291,7 @@ fn clampUtf8(allocator: std.mem.Allocator, text: []const u8, max_chars: usize) !
     return allocator.dupe(u8, text[0..i]);
 }
 
-fn escapeHtml(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
+pub fn escapeHtml(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
     for (text) |c| {
