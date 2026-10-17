@@ -1129,14 +1129,49 @@ const MessageTask = struct {
     }
 };
 
-/// Wrapper for thread spawn compatibility
-fn messageTaskWorker(task_ptr: *MessageTask) void {
-    defer {
-        task_ptr.deinit();
-        task_ptr.allocator.destroy(task_ptr);
+/// Global cap on turns that are actually running across session workers.
+/// `session.max_concurrent_tasks` used to only gate whether workers were used
+/// at all, so N active sessions meant N concurrent provider calls and N
+/// 16 MB-stack turn threads. Workers wait here for a slot; the poller only
+/// enqueues, so the cap can never stall polling.
+const TurnSlots = struct {
+    mu: std_compat.sync.Mutex = .{},
+    cond: std_compat.sync.Condition = .{},
+    available: usize,
+    /// Workers currently blocked waiting for a slot (test seam).
+    waiters: usize = 0,
+
+    fn init(limit: usize) TurnSlots {
+        return .{ .available = @max(limit, 1) };
     }
-    task_ptr.run();
-}
+
+    fn acquire(self: *TurnSlots) void {
+        self.mu.lock();
+        while (self.available == 0) {
+            self.waiters += 1;
+            // Wake anyone observing the blocked set; blocked acquirers re-check
+            // the slot count and wait again.
+            self.cond.broadcast();
+            self.cond.wait(&self.mu);
+            self.waiters -= 1;
+        }
+        self.available -= 1;
+        self.mu.unlock();
+    }
+
+    fn release(self: *TurnSlots) void {
+        self.mu.lock();
+        self.available += 1;
+        self.cond.signal();
+        self.mu.unlock();
+    }
+
+    fn blockedCount(self: *TurnSlots) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.waiters;
+    }
+};
 
 /// Bound on follow-up messages queued behind one session's running turn. A
 /// chat that floods the bot gets a "dropped" notice instead of unbounded
@@ -1147,23 +1182,36 @@ const DEFAULT_SESSION_QUEUE_CAP: usize = 8;
 /// it. The poller only appends and never joins a turn, so a long turn in one
 /// chat cannot stall polling or another chat. The worker exits when its queue
 /// drains and is respawned by the next message for that session, so messages
-/// cost queue entries, not threads.
+/// cost queue entries, not threads. Each running turn holds a global
+/// `TurnSlots` slot, which bounds in-flight turns across sessions.
 const SessionWorker = struct {
     allocator: std.mem.Allocator,
     session_key: []u8,
+    /// Shared cap on concurrently running turns. Null in unit tests that do not
+    /// exercise the bound.
+    slots: ?*TurnSlots = null,
+    /// Test seam: run a queued task through this hook instead of the real
+    /// Telegram turn.
+    run_hook: ?RunHook = null,
     queue_cap: usize = DEFAULT_SESSION_QUEUE_CAP,
     mu: std_compat.sync.Mutex = .{},
     queue: std.ArrayListUnmanaged(*MessageTask) = .empty,
     running: bool = false,
     thread: ?std.Thread = null,
 
-    fn create(allocator: std.mem.Allocator, session_key: []const u8) !*SessionWorker {
+    const RunHook = struct {
+        run: *const fn (ctx: *anyopaque, task: *MessageTask) void,
+        ctx: *anyopaque,
+    };
+
+    fn create(allocator: std.mem.Allocator, session_key: []const u8, slots: ?*TurnSlots) !*SessionWorker {
         const self = try allocator.create(SessionWorker);
         errdefer allocator.destroy(self);
         const key = try allocator.dupe(u8, session_key);
         self.* = .{
             .allocator = allocator,
             .session_key = key,
+            .slots = slots,
         };
         return self;
     }
@@ -1239,11 +1287,29 @@ const SessionWorker = struct {
         }
         return self.queue.orderedRemove(0);
     }
+
+    /// Run one queued task and release its allocations.
+    fn runTask(self: *SessionWorker, task: *MessageTask) void {
+        defer {
+            task.deinit();
+            self.allocator.destroy(task);
+        }
+        if (self.run_hook) |hook| {
+            hook.run(hook.ctx, task);
+        } else {
+            task.run();
+        }
+    }
 };
 
 fn sessionWorkerLoop(worker: *SessionWorker) void {
     while (worker.popOrStop()) |task| {
-        messageTaskWorker(task);
+        // Wait for a global turn slot on the worker thread, never on the
+        // poller, so max_concurrent_tasks bounds running turns without
+        // stalling message intake.
+        if (worker.slots) |slots| slots.acquire();
+        worker.runTask(task);
+        if (worker.slots) |slots| slots.release();
     }
 }
 
@@ -1255,7 +1321,8 @@ fn drainSessionWorkerSynchronously(worker: *SessionWorker) void {
     worker.running = false;
     worker.mu.unlock();
     while (worker.popOrStop()) |task| {
-        messageTaskWorker(task);
+        // This runs on the poller, which must never wait for a turn slot.
+        worker.runTask(task);
     }
 }
 
@@ -1853,10 +1920,11 @@ pub fn runTelegramLoop(
     const SessionWorkerRegistry = struct {
         allocator: std.mem.Allocator,
         workers: *std.StringHashMapUnmanaged(*SessionWorker),
+        slots: *TurnSlots,
 
         fn getOrCreate(self: @This(), session_key: []const u8) !*SessionWorker {
             if (self.workers.get(session_key)) |worker| return worker;
-            const worker = try SessionWorker.create(self.allocator, session_key);
+            const worker = try SessionWorker.create(self.allocator, session_key, self.slots);
             errdefer worker.deinit();
             try self.workers.put(self.allocator, worker.session_key, worker);
             return worker;
@@ -1867,16 +1935,18 @@ pub fn runTelegramLoop(
             return worker.isRunning();
         }
     };
-    const worker_registry = SessionWorkerRegistry{
-        .allocator = allocator,
-        .workers = &session_workers,
-    };
-
     const max_parallel_tasks: usize = if (config.session.max_concurrent_tasks > 1)
         @intCast(config.session.max_concurrent_tasks)
     else
         1;
     const enable_parallel = max_parallel_tasks > 1;
+
+    var turn_slots = TurnSlots.init(max_parallel_tasks);
+    const worker_registry = SessionWorkerRegistry{
+        .allocator = allocator,
+        .workers = &session_workers,
+        .slots = &turn_slots,
+    };
 
     var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
 
@@ -3205,6 +3275,182 @@ test "session worker queue keeps FIFO, bounds backlog, and spawns no thread per 
     try std.testing.expect(!worker.push(overflow));
     overflow.deinit();
     alloc.destroy(overflow);
+}
+
+test "turn slots block a third turn until one finishes" {
+    var slots = TurnSlots.init(2);
+    slots.acquire();
+    slots.acquire();
+
+    const Waiter = struct {
+        slots: *TurnSlots,
+        mu: std_compat.sync.Mutex = .{},
+        cond: std_compat.sync.Condition = .{},
+        acquired: bool = false,
+
+        fn run(self: *@This()) void {
+            self.slots.acquire();
+            self.mu.lock();
+            self.acquired = true;
+            self.cond.broadcast();
+            self.mu.unlock();
+            self.slots.release();
+        }
+    };
+    var waiter = Waiter{ .slots = &slots };
+    const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+    defer thread.join();
+
+    // Wait until the third turn is blocked on the semaphore.
+    slots.mu.lock();
+    while (slots.waiters == 0) slots.cond.wait(&slots.mu);
+    slots.mu.unlock();
+
+    waiter.mu.lock();
+    const acquired_before_release = waiter.acquired;
+    waiter.mu.unlock();
+    // Regression: the limit only gated whether workers were used, not how many
+    // turns ran, so a third turn could run while two were still in flight.
+    try std.testing.expect(!acquired_before_release);
+
+    slots.release();
+    waiter.mu.lock();
+    while (!waiter.acquired) waiter.cond.wait(&waiter.mu);
+    waiter.mu.unlock();
+}
+
+test "session workers cap concurrent turns and keep per-session FIFO" {
+    const alloc = std.testing.allocator;
+    var slots = TurnSlots.init(2);
+
+    const Probe = struct {
+        allocator: std.mem.Allocator,
+        slots: *TurnSlots,
+        mu: std_compat.sync.Mutex = .{},
+        cond: std_compat.sync.Condition = .{},
+        running: usize = 0,
+        max_running: usize = 0,
+        started: usize = 0,
+        completed: usize = 0,
+        order: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn run(ctx: *anyopaque, task: *MessageTask) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.mu.lock();
+            self.running += 1;
+            if (self.running > self.max_running) self.max_running = self.running;
+            self.started += 1;
+            self.cond.broadcast();
+            self.mu.unlock();
+
+            // Wait until every worker has either started its task or is
+            // blocked on a turn slot. With the bound, the running workers wait
+            // for the other two to block; without it all four start at once.
+            // This is a liveness wait, not a wall-clock threshold.
+            while (true) {
+                self.mu.lock();
+                const settled = self.started + self.slots.blockedCount() >= 4;
+                self.mu.unlock();
+                if (settled) break;
+                std_compat.thread.sleep(1 * std.time.ns_per_ms);
+            }
+
+            self.mu.lock();
+            if (std.fmt.allocPrint(self.allocator, "{s}:{s}", .{ task.session_key, task.content }) catch null) |entry| {
+                self.order.append(self.allocator, entry) catch self.allocator.free(entry);
+            }
+            self.mu.unlock();
+
+            std_compat.thread.sleep(5 * std.time.ns_per_ms);
+
+            self.mu.lock();
+            self.running -= 1;
+            self.completed += 1;
+            self.cond.broadcast();
+            self.mu.unlock();
+        }
+    };
+    var probe = Probe{ .allocator = alloc, .slots = &slots };
+    defer {
+        for (probe.order.items) |entry| alloc.free(entry);
+        probe.order.deinit(alloc);
+    }
+
+    // Four sessions with two queued messages each.
+    var workers: [4]SessionWorker = undefined;
+    var worker_count: usize = 0;
+    defer {
+        for (workers[0..worker_count]) |*worker| {
+            if (worker.thread) |thread| thread.join();
+            worker.thread = null;
+            for (worker.queue.items) |task| {
+                task.deinit();
+                alloc.destroy(task);
+            }
+            worker.queue.deinit(alloc);
+            alloc.free(worker.session_key);
+        }
+    }
+    const contents = [_][]const u8{ "a", "b" };
+    for (0..4) |i| {
+        const session_key = try std.fmt.allocPrint(alloc, "session-{d}", .{i});
+        defer alloc.free(session_key);
+        workers[i] = SessionWorker{
+            .allocator = alloc,
+            .session_key = try alloc.dupe(u8, session_key),
+            .slots = &slots,
+            .run_hook = .{ .run = Probe.run, .ctx = @ptrCast(&probe) },
+        };
+        worker_count += 1;
+        for (contents) |content| {
+            const task = try alloc.create(MessageTask);
+            task.* = .{
+                .allocator = alloc,
+                .runtime = undefined,
+                .tg_ptr = undefined,
+                .session_key = try alloc.dupe(u8, session_key),
+                .content = try alloc.dupe(u8, content),
+                .sender = try alloc.dupe(u8, "sender"),
+                .message_id = null,
+                .is_group = false,
+                .reply_to_id = null,
+                .message_sender_id = try alloc.dupe(u8, "message"),
+                .replace_message = false,
+                .heartbeat = null,
+            };
+            try std.testing.expect(workers[i].push(task));
+        }
+        try workers[i].ensureRunning();
+    }
+
+    // Wait for all eight turns to complete.
+    probe.mu.lock();
+    while (probe.completed < 8) probe.cond.wait(&probe.mu);
+    probe.mu.unlock();
+
+    // Regression: concurrency used to equal the number of active sessions
+    // (four here), each with its own turn thread and provider call.
+    try std.testing.expect(probe.max_running <= 2);
+
+    // FIFO per session: a session's queued messages ran in push order.
+    for (0..4) |i| {
+        const prefix = try std.fmt.allocPrint(alloc, "session-{d}:", .{i});
+        defer alloc.free(prefix);
+        var seen_a = false;
+        var seen_b = false;
+        for (probe.order.items) |entry| {
+            if (!std.mem.startsWith(u8, entry, prefix)) continue;
+            const content = entry[prefix.len..];
+            if (std.mem.eql(u8, content, "a")) {
+                try std.testing.expect(!seen_b);
+                seen_a = true;
+            } else if (std.mem.eql(u8, content, "b")) {
+                try std.testing.expect(seen_a);
+                seen_b = true;
+            }
+        }
+        try std.testing.expect(seen_a and seen_b);
+    }
 }
 
 test "ProviderHolder tagged union fields" {
