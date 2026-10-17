@@ -585,7 +585,8 @@ const A2aProgressCtx = struct {
 /// the paired `.end` hint carries no new state and would duplicate the
 /// "Calling tool:" status update.
 pub fn emitsProgressHint(hint: agent_mod.ProgressHint) bool {
-    return hint.phase == .start;
+    // Retry hints are live-draft only; an A2A task has no draft to refresh.
+    return hint.kind == .tool and hint.phase == .start;
 }
 
 /// Build a TaskStatusUpdateEvent with state=working and a progress message.
@@ -2800,4 +2801,10 @@ test "emitsProgressHint forwards only the tool-call start" {
     try testing.expect(emitsProgressHint(.{ .text = "shell", .phase = .start }));
     try testing.expect(!emitsProgressHint(.{ .text = "shell", .phase = .end, .success = true }));
     try testing.expect(!emitsProgressHint(.{ .text = "shell", .phase = .end, .success = false }));
+    // Retry hints have no draft on an A2A task.
+    try testing.expect(!emitsProgressHint(.{
+        .kind = .retry,
+        .text = "Retrying (1/2)",
+        .retry = .{ .attempt = 1, .max = 2 },
+    }));
 }

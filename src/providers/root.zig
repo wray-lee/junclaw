@@ -11,6 +11,7 @@ pub const vertex = @import("vertex.zig");
 pub const openrouter = @import("openrouter.zig");
 pub const compatible = @import("compatible.zig");
 pub const reliable = @import("reliable.zig");
+pub const error_classify = @import("error_classify.zig");
 pub const router = @import("router.zig");
 pub const sse = @import("sse.zig");
 pub const claude_cli = @import("claude_cli.zig");
@@ -38,6 +39,12 @@ pub const compatibleApiErrorMessage = scrub.compatibleApiErrorMessage;
 pub const clearLastApiErrorDetail = api_error_details.clear;
 pub const setLastApiErrorDetail = api_error_details.set;
 pub const snapshotLastApiErrorDetail = api_error_details.snapshot;
+
+/// Classified, user-facing error copy. Reads the last sanitized provider
+/// detail and retry counters; the returned slice points into `buf`.
+pub fn userErrorMessage(buf: []u8, err: anyerror, with_fresh_hint: bool) []const u8 {
+    return error_classify.userErrorMessage(buf, err, reliable.lastRetryStats().used, with_fresh_hint);
+}
 
 // Re-exports from api_key.zig
 pub const resolveApiKey = api_key.resolveApiKey;

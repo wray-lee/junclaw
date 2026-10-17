@@ -359,7 +359,28 @@ pub fn progressDraft(
     now_ms: i64,
 ) !?DraftFlush {
     if (draftSuppressed(state, now_ms)) return null;
-    if (!state.tool_progress.hasContent()) return null;
+
+    if (!state.tool_progress.hasContent()) {
+        // Regression: clearing a retry indicator returned null here, so the
+        // draft kept showing "Retrying (n/m)..." after the retried call
+        // resumed until the next heartbeat. Replace it with the plain
+        // heartbeat now.
+        if (!state.tool_progress.needs_clear) return null;
+        if (try hasVisibleAnswerText(allocator, state.buffer.items)) {
+            state.tool_progress.markRendered();
+            return null;
+        }
+        const text = try buildHeartbeatText(allocator, state, now_ms);
+        state.tool_progress.markRendered();
+        markDraftFlushed(state, now_ms);
+        return .{
+            .draft_id = state.draft_id,
+            .text = text,
+            .started_at_ms = state.started_at_ms,
+            .html = true,
+        };
+    }
+
     if (try hasVisibleAnswerText(allocator, state.buffer.items)) return null;
 
     const first_render = !state.tool_progress.rendered;
@@ -793,6 +814,25 @@ test "heartbeatDraft emits heartbeat when no visible draft is available" {
     try std.testing.expect(std.mem.indexOf(u8, flush.text, "Interim result is still being prepared.") != null);
     try std.testing.expectEqual(@as(usize, 0), draft.last_flush_len);
     try std.testing.expectEqual(@as(i64, 5_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1), draft.last_flush_time);
+}
+
+test "progressDraft clears a retry-only draft immediately" {
+    var draft = DraftState{ .draft_id = 7, .started_at_ms = 1_000 };
+    defer draft.deinit(std.testing.allocator);
+
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 1, .max = 3 } }, 1_000);
+    var shown = (try progressDraft(std.testing.allocator, &draft, 1_000)) orelse
+        return error.TestUnexpectedResult;
+    defer shown.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, shown.text, "Retrying (1/3)") != null);
+
+    // Clear inside the 4s flush throttle: the stale line must still go away.
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 0, .max = 0 } }, 1_100);
+    var cleared = (try progressDraft(std.testing.allocator, &draft, 1_100)) orelse
+        return error.TestUnexpectedResult;
+    defer cleared.deinit(std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, cleared.text, "Retrying") == null);
+    try std.testing.expect(!draft.tool_progress.needs_clear);
 }
 
 test "progressDraft shows the first tool call immediately after a reasoning flush" {

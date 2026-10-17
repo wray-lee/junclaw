@@ -23,15 +23,29 @@ pub const MAX_STORED_LINES: usize = 32;
 
 pub const Phase = enum { start, end };
 
-/// One tool event as it arrives from the agent loop.
+/// What one progress update describes.
+pub const Kind = enum { tool, retry };
+
+/// Retry attempt numbers carried by `.retry` updates.
+pub const RetryInfo = struct {
+    /// 1-based retry number; 0 clears the indicator.
+    attempt: u32 = 0,
+    /// Total retries allowed by the provider wrapper.
+    max: u32 = 0,
+};
+
+/// One progress event as it arrives from the agent loop.
 pub const Update = struct {
+    kind: Kind = .tool,
     /// Tool name as reported by the agent (never the raw command).
-    tool: []const u8,
+    tool: []const u8 = "",
     /// Raw JSON arguments of the call. Only a few safe fields are read to build
     /// a short hint; the raw blob itself is never rendered.
     arguments_json: ?[]const u8 = null,
     phase: Phase = .start,
     success: bool = true,
+    /// Retry numbers for `.retry` updates.
+    retry: RetryInfo = .{},
 };
 
 /// One stored progress line. `text` is owned by the state.
@@ -52,6 +66,12 @@ pub const ToolProgress = struct {
     /// render bypasses the chunk throttle (OpenClaw's `startImmediately`), so
     /// the first tool call is visible as soon as it starts.
     rendered: bool = false,
+    /// Latest provider-retry indicator. Replaced in place so the block shows a
+    /// single line no matter how many retries run; null hides it.
+    retry: ?RetryInfo = null,
+    /// A retry indicator was cleared but the draft still shows it. Lets
+    /// `progressDraft` refresh the draft even though the block is now empty.
+    needs_clear: bool = false,
 
     pub fn deinit(self: *ToolProgress, allocator: std.mem.Allocator) void {
         for (self.lines.items) |line| allocator.free(line.text);
@@ -66,7 +86,7 @@ pub const ToolProgress = struct {
     }
 
     pub fn hasContent(self: *const ToolProgress) bool {
-        return self.lines.items.len > 0;
+        return self.lines.items.len > 0 or self.retry != null;
     }
 
     /// Mark the current log as rendered. Clears `dirty` so the heartbeat stops
@@ -75,6 +95,7 @@ pub const ToolProgress = struct {
     pub fn markRendered(self: *ToolProgress) void {
         self.dirty = false;
         self.rendered = true;
+        self.needs_clear = false;
     }
 
     /// Record one tool event. Returns true when the visible log changed (a
@@ -82,6 +103,30 @@ pub const ToolProgress = struct {
     /// can skip a redundant draft re-render.
     pub fn record(self: *ToolProgress, allocator: std.mem.Allocator, update: Update, now_ms: i64) !bool {
         if (self.started_at_ms == 0) self.started_at_ms = now_ms;
+
+        if (update.kind == .retry) {
+            if (update.retry.attempt == 0) {
+                if (self.retry == null) return false;
+                self.retry = null;
+                self.needs_clear = true;
+            } else {
+                if (self.retry) |current| {
+                    if (current.attempt == update.retry.attempt and current.max == update.retry.max) {
+                        return false;
+                    }
+                }
+                self.retry = .{ .attempt = update.retry.attempt, .max = update.retry.max };
+            }
+            self.dirty = true;
+            return true;
+        }
+
+        // A real tool event means the retried call resumed; drop a stale
+        // indicator so the draft does not claim a retry is still running.
+        const had_retry = self.retry != null;
+        self.retry = null;
+        if (had_retry) self.needs_clear = true;
+
         switch (update.phase) {
             .start => {
                 self.tool_calls +|= 1;
@@ -94,7 +139,7 @@ pub const ToolProgress = struct {
             .end => {
                 // Successes stay as their start line; only failures add a line,
                 // so the log reads like the OpenClaw tool-progress log.
-                if (update.success) return false;
+                if (update.success) return had_retry;
                 const line = try buildFailureLine(allocator, update.tool);
                 errdefer allocator.free(line);
                 try self.appendLine(allocator, .{ .text = line, .failed = true });
@@ -137,11 +182,21 @@ pub const ToolProgress = struct {
             if (calls == 1) "" else "s",
         });
 
+        if (self.lines.items.len == 0) {
+            if (self.retry) |retry| {
+                try out.print(allocator, " \u{00B7} Retrying ({d}/{d})\u{2026}", .{ retry.attempt, retry.max });
+            }
+            return out.toOwnedSlice(allocator);
+        }
+
         var selected: [MAX_VISIBLE_LINES]usize = undefined;
         const count = self.selectVisible(&selected);
         for (selected[0..count]) |idx| {
             try out.append(allocator, '\n');
             try out.appendSlice(allocator, self.lines.items[idx].text);
+        }
+        if (self.retry) |retry| {
+            try out.print(allocator, "\nRetrying ({d}/{d})\u{2026}", .{ retry.attempt, retry.max });
         }
         return out.toOwnedSlice(allocator);
     }
@@ -524,4 +579,51 @@ test "dirty tracks visible changes until the presenter renders them" {
     state.reset(std.testing.allocator, 5_000);
     try std.testing.expect(!state.dirty);
     try std.testing.expect(!state.rendered);
+}
+
+test "retry updates render a single replaceable indicator" {
+    var state: ToolProgress = .{};
+    defer state.deinit(std.testing.allocator);
+
+    _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 1, .max = 3 } }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 2, .max = 3 } }, 1_000);
+
+    const block = try state.renderBlock(std.testing.allocator, 1_000 + 5 * std.time.ms_per_s);
+    defer std.testing.allocator.free(block);
+
+    try std.testing.expect(std.mem.indexOf(u8, block, "Retrying (2/3)\u{2026}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "Retrying (1/3)") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, block, "Retrying ("));
+}
+
+test "a resumed call clears the retry indicator" {
+    var state: ToolProgress = .{};
+    defer state.deinit(std.testing.allocator);
+
+    _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 1, .max = 3 } }, 1_000);
+    try std.testing.expect(state.hasContent());
+    _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 0, .max = 0 } }, 1_000);
+    try std.testing.expect(!state.hasContent());
+    // The clear must be flushed even though the block is now empty.
+    try std.testing.expect(state.needs_clear);
+    state.markRendered();
+    try std.testing.expect(!state.needs_clear);
+
+    // A tool start also clears a stale indicator.
+    _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 2, .max = 3 } }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    try std.testing.expect(state.retry == null);
+}
+
+test "retry indicator renders after tool lines when tools already ran" {
+    var state: ToolProgress = .{};
+    defer state.deinit(std.testing.allocator);
+
+    _ = try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 1, .max = 2 } }, 1_000);
+
+    const block = try state.renderBlock(std.testing.allocator, 1_000);
+    defer std.testing.allocator.free(block);
+    try std.testing.expect(std.mem.indexOf(u8, block, "1 tool call") != null);
+    try std.testing.expect(std.mem.indexOf(u8, block, "Retrying (1/2)\u{2026}") != null);
 }

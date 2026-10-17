@@ -130,25 +130,6 @@ fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
     return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
 }
 
-fn detailedProviderErrorForDisplay(
-    allocator: std.mem.Allocator,
-    err: anyerror,
-) !?[]u8 {
-    switch (err) {
-        error.ApiError, error.ProviderError, error.AllProvidersFailed => {},
-        else => return null,
-    }
-
-    const detail = try providers.snapshotLastApiErrorDetail(allocator);
-    if (detail) |owned| {
-        defer allocator.free(owned);
-        if (owned.len == 0) return null;
-        const formatted = try std.fmt.allocPrint(allocator, "Provider API error: {s}", .{owned});
-        return formatted;
-    }
-    return null;
-}
-
 fn logAgentProcessingError(
     allocator: std.mem.Allocator,
     prefix: []const u8,
@@ -163,27 +144,6 @@ fn logAgentProcessingError(
         }
     }
     log.err("{s}: {}", .{ prefix, err });
-}
-
-fn defaultAgentErrorMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.CurlTimeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-        error.ProviderDoesNotSupportVision => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
-        error.NoResponseContent => "Model returned an empty response. Please retry or /new for a fresh session.",
-        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-        error.OutOfMemory => "Out of memory.",
-        else => "An error occurred. Try again or /new for a fresh session.",
-    };
-}
-
-fn compactAgentErrorMessage(err: anyerror) []const u8 {
-    return switch (err) {
-        error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-        error.NoResponseContent => "Model returned an empty response. Please try again.",
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.AllProvidersFailed, error.OutOfMemory => defaultAgentErrorMessage(err),
-        else => "An error occurred. Try again.",
-    };
 }
 
 const TelegramSessionTarget = struct {
@@ -842,7 +802,8 @@ fn handleTelegramInteractiveCallback(
         const model_reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, null, progress_sink) catch |err| {
             log.err("failed to process telegram callback interaction: {}", .{err});
             response_owned = true;
-            break :blk allocator.dupe(u8, defaultAgentErrorMessage(err)) catch return true;
+            var err_buf: [256]u8 = undefined;
+            break :blk allocator.dupe(u8, providers.userErrorMessage(&err_buf, err, true)) catch return true;
         };
         response_owned = true;
         break :blk model_reply;
@@ -1070,9 +1031,8 @@ fn processTelegramMessage(
     const reply = runtime.session_mgr.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink) catch |err| {
         logAgentProcessingError(allocator, "Agent error", err);
         tg_ptr.setTaskReaction(sender, message_id, .failed);
-        const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
-        defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
-        const err_msg = owned_err_msg orelse defaultAgentErrorMessage(err);
+        var err_buf: [256]u8 = undefined;
+        const err_msg = providers.userErrorMessage(&err_buf, err, true);
         tg_ptr.sendMessageWithReply(sender, err_msg, reply_to_id) catch |send_err| log.err("failed to send error reply: {}", .{send_err});
         return;
     };
@@ -1399,6 +1359,10 @@ fn telegramToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHin
 /// live channel.
 fn telegramToolProgressUpdate(hint: agent_mod.ProgressHint) tool_progress.Update {
     return .{
+        .kind = switch (hint.kind) {
+            .tool => .tool,
+            .retry => .retry,
+        },
         .tool = hint.text,
         .arguments_json = hint.arguments_json,
         .phase = switch (hint.phase) {
@@ -1406,6 +1370,10 @@ fn telegramToolProgressUpdate(hint: agent_mod.ProgressHint) tool_progress.Update
             .end => .end,
         },
         .success = hint.success,
+        .retry = if (hint.retry) |retry| .{
+            .attempt = retry.attempt,
+            .max = retry.max,
+        } else .{},
     };
 }
 
@@ -2228,9 +2196,8 @@ pub fn runSignalLoop(
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Signal agent error", err);
-                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
-                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
-                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
+                var err_buf: [256]u8 = undefined;
+                const err_msg = providers.userErrorMessage(&err_buf, err, false);
                 if (msg.reply_target) |target| {
                     sg_ptr.sendMessage(target, err_msg, &.{}) catch |send_err| log.err("failed to send signal error reply: {}", .{send_err});
                 }
@@ -2349,9 +2316,8 @@ pub fn runWeixinLoop(
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Weixin agent error", err);
-                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
-                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
-                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
+                var err_buf: [256]u8 = undefined;
+                const err_msg = providers.userErrorMessage(&err_buf, err, false);
                 wx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send weixin error reply: {}", .{send_err});
                 continue;
             };
@@ -2660,9 +2626,8 @@ pub fn runMatrixLoop(
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, null, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Matrix agent error", err);
-                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
-                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
-                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
+                var err_buf: [256]u8 = undefined;
+                const err_msg = providers.userErrorMessage(&err_buf, err, false);
                 mx_ptr.sendMessage(typing_target, err_msg) catch |send_err| log.err("failed to send matrix error reply: {}", .{send_err});
                 continue;
             };
@@ -2830,9 +2795,8 @@ pub fn runMaxLoop(
 
             const reply = runtime.session_mgr.processMessageStreaming(session_key, msg.content, conversation_context, sink, progressHeartbeatSink(&loop_state.progress)) catch |err| {
                 logAgentProcessingError(allocator, "Max agent error", err);
-                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
-                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
-                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
+                var err_buf: [256]u8 = undefined;
+                const err_msg = providers.userErrorMessage(&err_buf, err, false);
                 mx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send max error reply: {}", .{send_err});
                 continue;
             };
@@ -3409,15 +3373,39 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
     try std.testing.expect(tg.draft_buffers.get("12345") == null);
 }
 
-test "defaultAgentErrorMessage distinguishes timeout from generic network errors" {
+test "userErrorMessage distinguishes timeout from network errors" {
+    var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings(
         "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
-        defaultAgentErrorMessage(error.CurlTimeout),
+        providers.userErrorMessage(&buf, error.CurlTimeout, true),
     );
     try std.testing.expectEqualStrings(
         "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-        defaultAgentErrorMessage(error.CurlConnectError),
+        providers.userErrorMessage(&buf, error.CurlConnectError, true),
     );
+}
+
+test "userErrorMessage classifies provider detail without leaking it" {
+    providers.clearLastApiErrorDetail();
+    defer providers.clearLastApiErrorDetail();
+    providers.reliable.resetRetryStats();
+    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
+
+    var buf: [256]u8 = undefined;
+    const text = providers.userErrorMessage(&buf, error.AllProvidersFailed, true);
+    try std.testing.expectEqualStrings("Rate limited by the provider. Wait a minute and try again.", text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "status=429") == null);
+}
+
+test "telegramToolProgressUpdate maps retry hints" {
+    const update = telegramToolProgressUpdate(.{
+        .kind = .retry,
+        .text = "Retrying (2/3)\u{2026}",
+        .retry = .{ .attempt = 2, .max = 3 },
+    });
+    try std.testing.expectEqual(tool_progress.Kind.retry, update.kind);
+    try std.testing.expectEqual(@as(u32, 2), update.retry.attempt);
+    try std.testing.expectEqual(@as(u32, 3), update.retry.max);
 }
 
 test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provisioned dm" {
@@ -3530,30 +3518,10 @@ test "telegram update offset path resolves relative config path" {
     try std.testing.expectEqualStrings(expected, resolved);
 }
 
-test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {
-    const allocator = std.testing.allocator;
-    providers.clearLastApiErrorDetail();
-    defer providers.clearLastApiErrorDetail();
-
-    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
-    const msg = (try detailedProviderErrorForDisplay(allocator, error.ApiError)).?;
-    defer allocator.free(msg);
-
-    try std.testing.expectEqualStrings("Provider API error: compatible: status=429 message=Rate limit exceeded", msg);
-}
-
-test "detailedProviderErrorForDisplay ignores non-provider errors" {
-    const allocator = std.testing.allocator;
-    providers.clearLastApiErrorDetail();
-    defer providers.clearLastApiErrorDetail();
-
-    providers.setLastApiErrorDetail("compatible", "status=429 message=Rate limit exceeded");
-    try std.testing.expect((try detailedProviderErrorForDisplay(allocator, error.OutOfMemory)) == null);
-}
-
-test "compactAgentErrorMessage keeps non-telegram fallback concise" {
+test "userErrorMessage keeps non-telegram fallback concise" {
     // Regression: Signal/Matrix/Max should not inherit Telegram's `/new` guidance for generic failures.
-    try std.testing.expectEqualStrings("An error occurred. Try again.", compactAgentErrorMessage(error.Unexpected));
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("An error occurred. Try again.", providers.userErrorMessage(&buf, error.Unexpected, false));
 }
 
 test "telegram update offset store returns null for mismatched bot id" {

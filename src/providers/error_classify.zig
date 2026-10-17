@@ -1,4 +1,5 @@
 const std = @import("std");
+const api_error_details = @import("api_error_details.zig");
 const text_helpers = @import("text_helpers.zig");
 
 pub const ApiErrorKind = enum {
@@ -431,4 +432,229 @@ test "summarizeKnownApiError captures nested error msg field" {
     const summary = summarizeKnownApiError(parsed.value.object, &buf).?;
     try std.testing.expect(std.mem.indexOf(u8, summary, "message=") != null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "image_url") != null);
+}
+
+// ─── User-facing error classification ────────────────────────────────────────
+
+/// Failure class shown to a chat user. Kept separate from `ApiErrorKind`:
+/// transport errors carry no provider payload, and the user copy also covers
+/// auth and overload cases the JSON classifier does not need.
+pub const UserErrorKind = enum {
+    rate_limited,
+    overloaded,
+    auth,
+    timeout,
+    network,
+    context_exhausted,
+    vision_unsupported,
+    empty_response,
+    all_providers_failed,
+    out_of_memory,
+    generic,
+};
+
+/// Classify a terminal agent error for a short, actionable user message.
+/// `detail` is the sanitized last provider error (`snapshotInto` format), used
+/// only for matching; it is never echoed back to the user.
+pub fn classifyUserError(err: anyerror, detail: ?[]const u8) UserErrorKind {
+    switch (err) {
+        error.RateLimited => return .rate_limited,
+        error.ContextLengthExceeded => return .context_exhausted,
+        error.ProviderDoesNotSupportVision => return .vision_unsupported,
+        error.NoResponseContent => return .empty_response,
+        error.OutOfMemory => return .out_of_memory,
+        error.CurlTimeout => return .timeout,
+        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => return .network,
+        // Providers return these directly when no local credential is
+        // configured (streaming path) or wrap them in AllProvidersFailed with
+        // a "<provider>: CredentialsNotSet" detail (blocking path).
+        error.CredentialsNotSet, error.TokenExpired => return .auth,
+        else => {},
+    }
+
+    // Only provider failures carry a detail that describes this failure. A
+    // successful fallback can leave an earlier provider's detail behind, so
+    // matching it for unrelated errors would misclassify them.
+    const has_provider_detail = err == error.ApiError or
+        err == error.ProviderError or
+        err == error.AllProvidersFailed;
+    if (has_provider_detail) {
+        if (detail) |text| {
+            // Rate limits win over context checks: quota messages often contain
+            // "token" + "exceed" and would otherwise look like context overflow.
+            if (text_helpers.isRateLimitedText(text)) return .rate_limited;
+            if (text_helpers.isContextExhaustedText(text)) return .context_exhausted;
+            if (text_helpers.isAuthErrorText(text)) return .auth;
+            // Timeouts win over the overload heuristic: a detail such as
+            // "request timed out after 500 ms" must not read as an HTTP 5xx.
+            if (text_helpers.isTimeoutText(text)) return .timeout;
+            if (text_helpers.isOverloadedText(text)) return .overloaded;
+        }
+    }
+
+    if (err == error.AllProvidersFailed) return .all_providers_failed;
+    return .generic;
+}
+
+fn rateLimitedCopy(buf: []u8, retries_used: u32) []const u8 {
+    if (retries_used == 0) {
+        return "Rate limited by the provider. Wait a minute and try again.";
+    }
+    const retry_word = if (retries_used == 1) "retry" else "retries";
+    return std.fmt.bufPrint(
+        buf,
+        "Rate limited by the provider after {d} {s}. Wait a minute and try again.",
+        .{ retries_used, retry_word },
+    ) catch "Rate limited by the provider. Wait a minute and try again.";
+}
+
+/// Render the user-facing copy for a failure class into `buf`.
+/// `retries_used` makes an exhausted rate limit say how many retries ran.
+/// `with_fresh_hint` keeps `/new` guidance on generic failures for chat
+/// channels that own a session; compact channels keep the shorter fallback.
+pub fn formatUserError(
+    buf: []u8,
+    kind: UserErrorKind,
+    retries_used: u32,
+    with_fresh_hint: bool,
+) []const u8 {
+    return switch (kind) {
+        .rate_limited => rateLimitedCopy(buf, retries_used),
+        .overloaded => "The provider is overloaded or temporarily unavailable. Please try again shortly.",
+        .auth => "Provider authentication failed. Check the API key in config, then try again.",
+        .timeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
+        .network => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+        .context_exhausted => "This conversation exceeded the model's context window. Use /new to start a fresh session or send a shorter message.",
+        .vision_unsupported => "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
+        .empty_response => "Model returned an empty response. Please retry or /new for a fresh session.",
+        .all_providers_failed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
+        .out_of_memory => "Out of memory.",
+        .generic => if (with_fresh_hint)
+            "An error occurred. Try again or /new for a fresh session."
+        else
+            "An error occurred. Try again.",
+    };
+}
+
+/// Classify and render in one call, reading the last sanitized provider detail
+/// without allocating. The returned slice points into `buf`.
+pub fn userErrorMessage(
+    buf: []u8,
+    err: anyerror,
+    retries_used: u32,
+    with_fresh_hint: bool,
+) []const u8 {
+    var detail_buf: [256]u8 = undefined;
+    const detail = api_error_details.snapshotInto(&detail_buf);
+    return formatUserError(buf, classifyUserError(err, detail), retries_used, with_fresh_hint);
+}
+
+test "classifyUserError uses provider detail for rate limits" {
+    try std.testing.expectEqual(
+        UserErrorKind.rate_limited,
+        classifyUserError(error.AllProvidersFailed, "compatible: status=429 message=Rate limit exceeded"),
+    );
+    try std.testing.expectEqual(UserErrorKind.rate_limited, classifyUserError(error.RateLimited, null));
+}
+
+test "classifyUserError detects auth, overload, timeout and context" {
+    try std.testing.expectEqual(
+        UserErrorKind.auth,
+        classifyUserError(error.AllProvidersFailed, "compatible: status=401 message=Incorrect API key provided"),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.overloaded,
+        classifyUserError(error.AllProvidersFailed, "compatible: status=503 message=This model is currently experiencing high demand."),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.timeout,
+        classifyUserError(error.AllProvidersFailed, "compatible: request timed out"),
+    );
+    // Regression: a bare number in the detail used to be read as an HTTP 5xx.
+    try std.testing.expectEqual(
+        UserErrorKind.timeout,
+        classifyUserError(error.AllProvidersFailed, "compatible: request timed out after 500 ms"),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.all_providers_failed,
+        classifyUserError(error.AllProvidersFailed, "compatible: max_tokens must be <= 500"),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.context_exhausted,
+        classifyUserError(error.AllProvidersFailed, "compatible: maximum context length is 128000 tokens"),
+    );
+    try std.testing.expectEqual(UserErrorKind.context_exhausted, classifyUserError(error.ContextLengthExceeded, null));
+}
+
+test "classifyUserError maps missing credentials and expired tokens to auth" {
+    try std.testing.expectEqual(UserErrorKind.auth, classifyUserError(error.CredentialsNotSet, null));
+    try std.testing.expectEqual(UserErrorKind.auth, classifyUserError(error.TokenExpired, null));
+    // Blocking providers wrap the raw error and only leave the detail behind.
+    try std.testing.expectEqual(
+        UserErrorKind.auth,
+        classifyUserError(error.AllProvidersFailed, "openai: CredentialsNotSet"),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.auth,
+        classifyUserError(error.AllProvidersFailed, "openai_codex: TokenExpired"),
+    );
+}
+
+test "classifyUserError keeps transport and fallback classes" {
+    try std.testing.expectEqual(UserErrorKind.timeout, classifyUserError(error.CurlTimeout, null));
+    try std.testing.expectEqual(UserErrorKind.network, classifyUserError(error.CurlConnectError, null));
+    try std.testing.expectEqual(UserErrorKind.all_providers_failed, classifyUserError(error.AllProvidersFailed, null));
+    try std.testing.expectEqual(UserErrorKind.generic, classifyUserError(error.Unexpected, null));
+    // Regression: a leftover detail from an earlier failed provider must not
+    // classify an unrelated agent error.
+    try std.testing.expectEqual(
+        UserErrorKind.generic,
+        classifyUserError(error.Unexpected, "compatible: status=429 message=Rate limit exceeded"),
+    );
+}
+
+test "formatUserError reports exhausted rate-limit retries" {
+    var buf: [256]u8 = undefined;
+    const text = formatUserError(&buf, .rate_limited, 3, false);
+    try std.testing.expectEqualStrings(
+        "Rate limited by the provider after 3 retries. Wait a minute and try again.",
+        text,
+    );
+
+    // Regression: a single configured retry used to read "after 1 retries".
+    const one = formatUserError(&buf, .rate_limited, 1, false);
+    try std.testing.expectEqualStrings(
+        "Rate limited by the provider after 1 retry. Wait a minute and try again.",
+        one,
+    );
+
+    const no_retries = formatUserError(&buf, .rate_limited, 0, false);
+    try std.testing.expectEqualStrings("Rate limited by the provider. Wait a minute and try again.", no_retries);
+}
+
+test "formatUserError keeps generic copy compact unless a session hint is wanted" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "An error occurred. Try again.",
+        formatUserError(&buf, .generic, 0, false),
+    );
+    try std.testing.expectEqualStrings(
+        "An error occurred. Try again or /new for a fresh session.",
+        formatUserError(&buf, .generic, 0, true),
+    );
+}
+
+test "userErrorMessage never echoes provider detail or secrets" {
+    api_error_details.clear();
+    defer api_error_details.clear();
+    api_error_details.set("compatible", "status=401 message=Incorrect API key provided: sk-secret-test-key");
+
+    var buf: [256]u8 = undefined;
+    const text = userErrorMessage(&buf, error.AllProvidersFailed, 0, true);
+    try std.testing.expectEqualStrings(
+        "Provider authentication failed. Check the API key in config, then try again.",
+        text,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, text, "sk-secret") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "status=401") == null);
 }
