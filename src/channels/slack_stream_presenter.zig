@@ -908,8 +908,10 @@ test "splitForLimit handles text without newlines" {
 }
 
 test "boundUpdatePreview keeps a growing preview under the chat.update cap" {
-    // Regression: a live DM preview that outgrew Slack's chat.update cap was
-    // sent whole, so Slack answered msg_too_long and live updates stopped.
+    // Regression: updateStreamMessage sent only the head chunk (chunks[0]) of
+    // splitForLimit, so a growing DM preview froze on its oldest 4,000 bytes.
+    // `msg_too_long` is the error the chat.update cap would raise; the bound
+    // keeps the newest text instead of the oldest.
     const text = ("x" ** 5_000) ++ "LATEST";
     const preview = try boundUpdatePreview(std.testing.allocator, text, STREAM_UPDATE_MAX_BYTES);
     defer std.testing.allocator.free(preview);
@@ -920,12 +922,21 @@ test "boundUpdatePreview keeps a growing preview under the chat.update cap" {
 }
 
 test "boundUpdatePreview never cuts a multibyte character" {
-    const text = "\u{00E9}" ** 3_000; // 6,000 bytes
+    // One ASCII byte shifts the tail cut onto a continuation byte of a 3-byte
+    // codepoint, so a naive `text.len - max_bytes` cut would emit invalid UTF-8.
+    const text = "x" ++ "\u{20AC}" ** 2_000; // 6,001 bytes
+    const budget = STREAM_UPDATE_MAX_BYTES - PREVIEW_TRUNCATED_MARKER.len;
+    try std.testing.expect((text[text.len - budget] & 0xC0) == 0x80);
+
     const preview = try boundUpdatePreview(std.testing.allocator, text, STREAM_UPDATE_MAX_BYTES);
     defer std.testing.allocator.free(preview);
 
     try std.testing.expect(preview.len <= STREAM_UPDATE_MAX_BYTES);
     try std.testing.expect(std.unicode.utf8ValidateSlice(preview));
+    try std.testing.expect(std.mem.startsWith(u8, preview, PREVIEW_TRUNCATED_MARKER));
+    // The cut resumed on the next full codepoint, keeping the newest text.
+    try std.testing.expectEqual(@as(u8, 0xE2), preview[PREVIEW_TRUNCATED_MARKER.len]);
+    try std.testing.expect(std.mem.endsWith(u8, preview, "\u{20AC}"));
 }
 
 test "boundUpdatePreview leaves a short preview untouched" {

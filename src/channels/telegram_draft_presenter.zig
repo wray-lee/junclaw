@@ -572,6 +572,8 @@ test "progressDraft keeps the streamed reasoning above the tool block" {
 }
 
 test "heartbeatDraft keeps the reasoning quote next to the tool block" {
+    // Regression: the 12s heartbeat wrote the progress block over the draft,
+    // hiding the reasoning that was already on screen.
     var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
     defer draft.deinit(std.testing.allocator);
     try draft.buffer.appendSlice(std.testing.allocator, "<think>thinking it through</think>");
@@ -587,6 +589,9 @@ test "heartbeatDraft keeps the reasoning quote next to the tool block" {
 }
 
 test "buildProgressText bounds the reasoning tail and keeps the tool block" {
+    // Regression: the progress block replaced the draft, hiding the newest
+    // streamed reasoning; the tail bound keeps it without overrunning the
+    // transport cap and cutting off the tool block at the end.
     var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 0 };
     defer draft.deinit(std.testing.allocator);
     try draft.buffer.appendSlice(std.testing.allocator, "<think>");
@@ -602,6 +607,34 @@ test "buildProgressText bounds the reasoning tail and keeps the tool block" {
     try std.testing.expect(std.mem.indexOf(u8, text, "shell") != null);
     // The oldest reasoning is dropped, not the tool block at the end.
     try std.testing.expect(!std.mem.startsWith(u8, text, "&gt; old"));
+}
+
+test "buildProgressText never cuts a multibyte reasoning character" {
+    var draft: DraftState = .{ .draft_id = 1, .started_at_ms = 0 };
+    defer draft.deinit(std.testing.allocator);
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>x");
+    try draft.buffer.appendSlice(std.testing.allocator, "\u{20AC}" ** 2_000);
+    try draft.buffer.appendSlice(std.testing.allocator, "</think>");
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_search" }, 1_000);
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_fetch" }, 1_000);
+
+    // The ASCII prefix makes the raw tail cut land on a continuation byte of a
+    // 3-byte codepoint: without UTF-8 alignment the draft HTML would be invalid.
+    const progress = try draft.tool_progress.renderBlockHtml(std.testing.allocator, 1_000);
+    defer std.testing.allocator.free(progress);
+    const budget = DRAFT_TRANSPORT_MAX_BYTES - progress.len - "\n\n".len;
+    const quoted = try snapshotDraftText(std.testing.allocator, &draft);
+    defer std.testing.allocator.free(quoted);
+    const escaped = try tool_progress.escapeHtml(std.testing.allocator, quoted);
+    defer std.testing.allocator.free(escaped);
+    try std.testing.expect((escaped[escaped.len - budget] & 0xC0) == 0x80);
+
+    const text = try buildHeartbeatText(std.testing.allocator, &draft, 1_000);
+    defer std.testing.allocator.free(text);
+
+    try std.testing.expect(text.len <= DRAFT_TRANSPORT_MAX_BYTES);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(text));
+    try std.testing.expect(std.mem.indexOf(u8, text, "web_search") != null);
 }
 
 test "alignHtmlTailStart skips a partial escaped entity" {

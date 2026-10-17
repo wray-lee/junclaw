@@ -1318,7 +1318,17 @@ pub const SlackChannel = struct {
     ) !void {
         const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
         defer self.allocator.free(mrkdwn_text);
+        try self.appendPostMessageMrkdwnBody(body_list, actual_channel, thread_ts, mrkdwn_text);
+    }
 
+    /// Same as `appendPostMessageBody`, for text already converted to mrkdwn.
+    fn appendPostMessageMrkdwnBody(
+        self: *SlackChannel,
+        body_list: *std.ArrayListUnmanaged(u8),
+        actual_channel: []const u8,
+        thread_ts: ?[]const u8,
+        mrkdwn_text: []const u8,
+    ) !void {
         try body_list.appendSlice(self.allocator, "{\"channel\":\"");
         try body_list.appendSlice(self.allocator, actual_channel);
         try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
@@ -2162,7 +2172,19 @@ pub const SlackChannel = struct {
         );
         defer self.allocator.free(preview);
 
-        const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, preview);
+        try self.updateStreamMessageMrkdwn(parsed, ts, preview);
+    }
+
+    /// `chat.update` with text already converted to mrkdwn and known to fit the
+    /// cap. The final reply uses this directly: re-converting and re-bounding it
+    /// would silently drop the head of a chunk that expanded during conversion.
+    fn updateStreamMessageMrkdwn(
+        self: *SlackChannel,
+        parsed: stream_presenter.StreamTarget,
+        ts: []const u8,
+        mrkdwn_text: []const u8,
+    ) !void {
+        const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, mrkdwn_text);
         defer self.allocator.free(body);
 
         var result = try self.callSlackApi("chat.update", body, parsed.channel_id);
@@ -2259,14 +2281,10 @@ pub const SlackChannel = struct {
         media: []const []const u8,
         target: []const u8,
     ) !void {
-        const chunks = try stream_presenter.splitForLimit(
-            self.allocator,
-            message,
-            stream_presenter.STREAM_UPDATE_MAX_BYTES,
-        );
+        const chunks = try chunkFinalFallbackReply(self.allocator, message);
         defer stream_presenter.freeChunks(self.allocator, chunks);
 
-        self.updateStreamMessage(parsed, ts, chunks[0]) catch |err| {
+        self.updateStreamMessageMrkdwn(parsed, ts, chunks[0]) catch |err| {
             log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
             return vtableSend(@ptrCast(self), target, message, media);
         };
@@ -2288,11 +2306,11 @@ pub const SlackChannel = struct {
     fn postStreamFollowup(
         self: *SlackChannel,
         parsed: stream_presenter.StreamTarget,
-        markdown_text: []const u8,
+        mrkdwn_text: []const u8,
     ) !void {
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, markdown_text);
+        try self.appendPostMessageMrkdwnBody(&body_list, parsed.channel_id, parsed.thread_ts, mrkdwn_text);
 
         var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
         result.deinit(self.allocator);
@@ -2397,6 +2415,18 @@ pub fn containsMention(text: []const u8, user_id: []const u8) bool {
         i += 1;
     }
     return false;
+}
+
+/// Split the authoritative final reply for the edited-message transport.
+///
+/// Convert to mrkdwn before splitting: conversion can expand text ("- " ->
+/// "• "), so splitting markdown first and converting each piece could push it
+/// past chat.update's cap, where the live-preview tail bound would drop the
+/// head of the final reply.
+fn chunkFinalFallbackReply(allocator: std.mem.Allocator, message: []const u8) ![][]const u8 {
+    const mrkdwn = try markdownToSlackMrkdwn(allocator, message);
+    defer allocator.free(mrkdwn);
+    return stream_presenter.splitForLimit(allocator, mrkdwn, stream_presenter.STREAM_UPDATE_MAX_BYTES);
 }
 
 /// Convert standard Markdown to Slack mrkdwn format.
@@ -3422,6 +3452,33 @@ test "slack streaming final splits overflowing fallback replies" {
 
     const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
     try std.testing.expect(state.finished_at_ms != 0);
+}
+
+test "slack final fallback chunks converted mrkdwn without losing content" {
+    // Regression: the final reply was split as markdown and then converted, so
+    // a chunk that expanded past chat.update's cap ("- " -> "• ") was
+    // tail-truncated by the preview bound and lost its head.
+    var message: std.ArrayListUnmanaged(u8) = .empty;
+    defer message.deinit(std.testing.allocator);
+    for (0..600) |i| try message.print(std.testing.allocator, "- item {d}\n", .{i});
+
+    const chunks = try chunkFinalFallbackReply(std.testing.allocator, message.items);
+    defer stream_presenter.freeChunks(std.testing.allocator, chunks);
+
+    try std.testing.expect(chunks.len > 1);
+    for (chunks) |chunk| {
+        try std.testing.expect(chunk.len <= stream_presenter.STREAM_UPDATE_MAX_BYTES);
+        try std.testing.expect(std.mem.indexOf(u8, chunk, stream_presenter.PREVIEW_TRUNCATED_MARKER) == null);
+    }
+
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+    for (chunks) |chunk| try joined.appendSlice(std.testing.allocator, chunk);
+
+    // Every bullet survived, including the head of the reply.
+    try std.testing.expectEqual(@as(usize, 600), std.mem.count(u8, joined.items, "• "));
+    try std.testing.expect(std.mem.startsWith(u8, joined.items, "• item 0"));
+    try std.testing.expect(std.mem.endsWith(u8, joined.items, "• item 599\n"));
 }
 
 test "slack streaming ignores chunks when streaming is disabled" {
