@@ -3418,12 +3418,18 @@ test "discarding a session queue cancels the task waiting for a turn slot" {
     while (slots.waiters == 0) slots.cond.wait(&slots.mu);
     slots.mu.unlock();
 
+    // Release the held slot even if the assertion fails: the deferred thread
+    // join would otherwise block forever and hide the failure.
+    var slot_released = false;
+    defer if (!slot_released) slots.release();
+
     // Regression: /stop saw a "running" worker but turn_running == false, so it
     // reported "no in-flight turn" and both messages still ran later. The
     // message already popped and waiting for a slot is cancelled too, so it
     // must be counted (the reply otherwise said nothing was discarded).
     try std.testing.expectEqual(@as(usize, 2), worker.discardQueued());
     slots.release();
+    slot_released = true;
 
     // Let the worker drain and exit.
     while (true) {
