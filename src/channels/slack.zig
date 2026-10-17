@@ -1381,14 +1381,24 @@ pub const SlackChannel = struct {
             if (std.mem.eql(u8, sender_id, bot_uid)) return false;
         }
 
-        const text = if (msg_obj.get("text")) |text_val|
+        const raw_text = if (msg_obj.get("text")) |text_val|
             if (text_val == .string) std.mem.trim(u8, text_val.string, " \t\r\n") else ""
         else
             "";
+        // In a mention-only group the accepted form is "<@BOT> /stop", which
+        // parseSlashCommand does not recognise. Strip the leading mention for
+        // the stop check and publish the command itself, so the daemon's
+        // isStopLikeCommand sees the same text a typed "/stop" produces.
+        const text = if (self.bot_user_id) |bot_uid|
+            stripLeadingMention(raw_text, bot_uid) orelse raw_text
+        else
+            raw_text;
         if (!control_plane.isStopLikeCommand(text)) return false;
 
         const is_dm = isDirectConversationId(channel_id);
-        if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return false;
+        // Policy is checked against the raw text: mention_only requires the
+        // mention stripped above.
+        if (!self.shouldHandle(sender_id, is_dm, raw_text, self.bot_user_id)) return false;
 
         const message_ts = if (msg_obj.get("ts")) |ts_val| switch (ts_val) {
             .string => |v| if (v.len > 0) v else null,
@@ -3535,6 +3545,18 @@ fn buildDeleteMessageBody(allocator: std.mem.Allocator, channel_id: []const u8, 
     return try body_list.toOwnedSlice(allocator);
 }
 
+/// Strip a leading Slack mention of `user_id` from `text` and return the
+/// trimmed remainder, or null when `text` does not start with that mention.
+/// Slack's app_mention text in a channel has the form "<@UBOT> /stop".
+fn stripLeadingMention(text: []const u8, user_id: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "<@")) return null;
+    const rest = trimmed[2..];
+    const end = std.mem.indexOfScalar(u8, rest, '>') orelse return null;
+    if (!std.mem.eql(u8, rest[0..end], user_id)) return null;
+    return std.mem.trimStart(u8, rest[end + 1 ..], " \t\r\n");
+}
+
 /// Check if a message text contains a Slack mention of the given user ID.
 /// Slack mentions use the format `<@U12345>`.
 pub fn containsMention(text: []const u8, user_id: []const u8) bool {
@@ -4812,6 +4834,38 @@ test "slack channel api base constant" {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+test "typed /stop in a mention-only group is fast-pathed" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .mention_only };
+    ch.bot_user_id = try alloc.dupe(u8, "UBOT");
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"app_mention\",\"user\":\"U1\",\"channel\":\"C1\",\"text\":\"<@UBOT> /stop\",\"ts\":\"1700000000.000\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    // Regression: only the bare "/stop" form was recognised, so the default
+    // mention-only policy accepted "<@UBOT> /stop" on the normal path and
+    // enqueued it behind the very turn it was meant to interrupt.
+    try std.testing.expect(ch.maybePublishStopMessage(parsed.value.object, "C1"));
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("/stop", msg.content);
+    try std.testing.expect(control_plane.isStopLikeCommand(msg.content));
+}
+
 // containsMention tests
 // ════════════════════════════════════════════════════════════════════════════
 
