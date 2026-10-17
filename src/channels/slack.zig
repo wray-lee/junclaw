@@ -2151,16 +2151,18 @@ pub const SlackChannel = struct {
         const mrkdwn = try markdownToSlackMrkdwn(self.allocator, markdown_text);
         defer self.allocator.free(mrkdwn);
 
-        // chat.update rejects text above 4,000 chars with `msg_too_long`; the
-        // final reply is delivered separately once it no longer fits.
-        const chunks = try stream_presenter.splitForLimit(
+        // chat.update rejects text above 4,000 chars with `msg_too_long`. Bound
+        // the in-place preview to that cap, keeping the newest text so a growing
+        // turn keeps moving instead of freezing on its first chunk; the final
+        // reply is still delivered complete by deliverFallbackFinal.
+        const preview = try stream_presenter.boundUpdatePreview(
             self.allocator,
             mrkdwn,
             stream_presenter.STREAM_UPDATE_MAX_BYTES,
         );
-        defer stream_presenter.freeChunks(self.allocator, chunks);
+        defer self.allocator.free(preview);
 
-        const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, chunks[0]);
+        const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, preview);
         defer self.allocator.free(body);
 
         var result = try self.callSlackApi("chat.update", body, parsed.channel_id);

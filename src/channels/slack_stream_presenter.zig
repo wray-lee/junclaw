@@ -41,6 +41,9 @@ pub fn finalAppendOverflowsBudget(sent_len: usize, suffix_len: usize) bool {
 
 /// `text` cap accepted by chat.update; Slack answers `msg_too_long` above this.
 pub const STREAM_UPDATE_MAX_BYTES: usize = 4_000;
+/// Prefix shown when a live preview had to drop its oldest text to fit the
+/// chat.update cap.
+pub const PREVIEW_TRUNCATED_MARKER = "\u{2026} (earlier text truncated)\n\n";
 /// Upper bound on follow-up messages posted when the final reply overflows.
 pub const STREAM_MAX_FOLLOWUPS: usize = 8;
 /// How long a finalized target keeps ignoring `.chunk` events. The daemon
@@ -416,6 +419,39 @@ fn utf8SafeCut(text: []const u8, limit: usize) usize {
     var cut = @min(limit, text.len);
     while (cut > 0 and (text[cut] & 0xC0) == 0x80) cut -= 1;
     return cut;
+}
+
+/// Start index of the newest `max_bytes` bytes of `text`, moved forward past
+/// UTF-8 continuation bytes so the tail starts on a codepoint boundary.
+fn utf8SafeTailStart(text: []const u8, max_bytes: usize) usize {
+    if (text.len <= max_bytes) return 0;
+    var start = text.len - max_bytes;
+    while (start < text.len and (text[start] & 0xC0) == 0x80) start += 1;
+    return start;
+}
+
+/// Bound a live preview to Slack's chat.update cap.
+///
+/// A preview that grows past the cap is truncated from the front so the message
+/// keeps showing the newest text instead of freezing on its first 4,000 bytes,
+/// and the omission is marked. The cut never splits a UTF-8 codepoint. This only
+/// bounds the in-place preview; the authoritative final reply is still delivered
+/// complete through `splitForLimit` and thread follow-ups.
+pub fn boundUpdatePreview(allocator: std.mem.Allocator, text: []const u8, limit: usize) ![]u8 {
+    if (text.len <= limit) return allocator.dupe(u8, text);
+
+    if (limit <= PREVIEW_TRUNCATED_MARKER.len) {
+        return allocator.dupe(u8, text[utf8SafeTailStart(text, limit)..]);
+    }
+
+    const budget = limit - PREVIEW_TRUNCATED_MARKER.len;
+    const start = utf8SafeTailStart(text, budget);
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, PREVIEW_TRUNCATED_MARKER);
+    try out.appendSlice(allocator, text[start..]);
+    return out.toOwnedSlice(allocator);
 }
 
 /// Split `text` into pieces of at most `limit` bytes, preferring a newline
@@ -869,6 +905,33 @@ test "splitForLimit handles text without newlines" {
     try std.testing.expectEqual(@as(usize, 3), chunks.len);
     try std.testing.expectEqual(@as(usize, 10), chunks[0].len);
     try std.testing.expectEqual(@as(usize, 5), chunks[2].len);
+}
+
+test "boundUpdatePreview keeps a growing preview under the chat.update cap" {
+    // Regression: a live DM preview that outgrew Slack's chat.update cap was
+    // sent whole, so Slack answered msg_too_long and live updates stopped.
+    const text = ("x" ** 5_000) ++ "LATEST";
+    const preview = try boundUpdatePreview(std.testing.allocator, text, STREAM_UPDATE_MAX_BYTES);
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(preview.len <= STREAM_UPDATE_MAX_BYTES);
+    try std.testing.expect(std.mem.startsWith(u8, preview, PREVIEW_TRUNCATED_MARKER));
+    try std.testing.expect(std.mem.endsWith(u8, preview, "LATEST"));
+}
+
+test "boundUpdatePreview never cuts a multibyte character" {
+    const text = "\u{00E9}" ** 3_000; // 6,000 bytes
+    const preview = try boundUpdatePreview(std.testing.allocator, text, STREAM_UPDATE_MAX_BYTES);
+    defer std.testing.allocator.free(preview);
+
+    try std.testing.expect(preview.len <= STREAM_UPDATE_MAX_BYTES);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(preview));
+}
+
+test "boundUpdatePreview leaves a short preview untouched" {
+    const preview = try boundUpdatePreview(std.testing.allocator, "short", STREAM_UPDATE_MAX_BYTES);
+    defer std.testing.allocator.free(preview);
+    try std.testing.expectEqualStrings("short", preview);
 }
 
 test "finishTurn clears per-turn state and marks the target finished" {
