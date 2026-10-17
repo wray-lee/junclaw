@@ -6888,14 +6888,16 @@ test "parse agent.default_queue_mode" {
     try std.testing.expectEqual(config_types.QueueMode.latest, cfg.agent.default_queue_mode);
 }
 
-test "agent.default_queue_mode defaults to off" {
+test "agent.default_queue_mode defaults to steer" {
+    // Regression: the old off default silently dropped every message that
+    // arrived while a turn was running.
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     const json = "{}";
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
-    try std.testing.expectEqual(config_types.QueueMode.off, cfg.agent.default_queue_mode);
+    try std.testing.expectEqual(config_types.QueueMode.steer, cfg.agent.default_queue_mode);
 }
 
 test "agent.default_queue_mode rejects invalid values" {

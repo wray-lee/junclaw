@@ -12,6 +12,7 @@ const std_compat = @import("compat");
 const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
 const gateway = @import("gateway.zig");
+const session_mod = @import("session.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 const buildConversationContext = @import("agent/prompt.zig").buildConversationContext;
 const streaming = @import("streaming.zig");
@@ -689,7 +690,7 @@ pub fn handleStreamingRpc(
     const progress_sink = progress_ctx.makeSink();
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processInboundMessageStreaming(task.session_key, text, context, sink, progress_sink) catch |err| {
+    const inbound_result = session_mgr.processInboundMessageStreaming(task.session_key, text, context, sink, progress_sink) catch |err| {
         log.err("streaming turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         var failed_task = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         defer if (failed_task) |*snapshot| snapshot.deinit(allocator);
@@ -706,7 +707,11 @@ pub fn handleStreamingRpc(
         }
         return;
     };
-    defer if (response) |r| freeSessionResponse(session_mgr, r);
+    defer if (inbound_result.reply) |r| freeSessionResponse(session_mgr, r);
+
+    // Regression: a message consumed by the running turn completed the task
+    // with no output, so the caller could not tell it was accepted or dropped.
+    const response = inbound_result.reply orelse session_mod.SessionManager.consumedNotice(inbound_result.action);
 
     var final_task = registry.finalizeTask(allocator, task.id, .completed, response) catch return;
     defer if (final_task) |*snapshot| snapshot.deinit(allocator);
@@ -822,14 +827,18 @@ fn handleSendMessage(
     _ = registry.setTaskState(task.id, .working);
 
     const context: ConversationContext = buildConversationContext(.{ .channel = "a2a" }).?;
-    const response = session_mgr.processInboundMessage(task.session_key, text, context) catch |err| {
+    const inbound_result = session_mgr.processInboundMessage(task.session_key, text, context) catch |err| {
         log.err("turn failed task={s} err={s}", .{ task.id, @errorName(err) });
         _ = registry.finalizeTask(allocator, task.id, .failed, null) catch null;
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Agent processing failed") catch
             return errorResponse();
         return .{ .body = err_body };
     };
-    defer if (response) |r| freeSessionResponse(session_mgr, r);
+    defer if (inbound_result.reply) |r| freeSessionResponse(session_mgr, r);
+
+    // Regression: a message consumed by the running turn completed the task
+    // with no output, so the caller could not tell it was accepted or dropped.
+    const response = inbound_result.reply orelse session_mod.SessionManager.consumedNotice(inbound_result.action);
 
     var completed_task = registry.finalizeTask(allocator, task.id, .completed, response) catch {
         const err_body = buildJsonRpcError(allocator, request_id, -32603, "Out of memory") catch
@@ -1671,10 +1680,10 @@ const MockSessionManager = struct {
         return self.allocator.dupe(u8, self.response);
     }
 
-    pub fn processInboundMessage(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype) !?[]const u8 {
+    pub fn processInboundMessage(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype) !session_mod.SessionManager.InboundResult {
         self.inbound_calls += 1;
-        if (self.skip_inbound) return null;
-        return try self.processMessage(session_key, content, conversation_context);
+        if (self.skip_inbound) return .{ .action = .skip };
+        return .{ .reply = try self.processMessage(session_key, content, conversation_context) };
     }
 
     pub fn processMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, _: ?agent_mod.ProgressSink) ![]const u8 {
@@ -1686,10 +1695,10 @@ const MockSessionManager = struct {
         return self.processMessage(session_key, content, conversation_context);
     }
 
-    pub fn processInboundMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, progress_sink: ?agent_mod.ProgressSink) !?[]const u8 {
+    pub fn processInboundMessageStreaming(self: *MockSessionManager, session_key: []const u8, content: []const u8, conversation_context: anytype, sink: ?streaming.Sink, progress_sink: ?agent_mod.ProgressSink) !session_mod.SessionManager.InboundResult {
         self.inbound_streaming_calls += 1;
-        if (self.skip_inbound) return null;
-        return try self.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink);
+        if (self.skip_inbound) return .{ .action = .skip };
+        return .{ .reply = try self.processMessageStreaming(session_key, content, conversation_context, sink, progress_sink) };
     }
 
     pub fn requestTurnInterrupt(self: *MockSessionManager, _: []const u8) struct {

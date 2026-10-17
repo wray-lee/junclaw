@@ -29,6 +29,7 @@ const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
+const inbound_router = @import("inbound_router.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
 const provider_probe = @import("provider_probe.zig");
@@ -768,7 +769,7 @@ fn handleTelegramInteractiveCallback(
     // draft turn and reset the running turn's live draft. Slash commands are
     // handled locally and never consult the router, so they keep the indicator.
     const is_slash_command = control_plane.parseSlashCommand(content) != null;
-    if (!is_slash_command and runtime.session_mgr.routeInbound(session_key, content) == .skip) {
+    if (!is_slash_command and runtime.session_mgr.routeInbound(session_key, content).skipsTurn()) {
         return true;
     }
 
@@ -971,7 +972,19 @@ fn processTelegramMessage(
     // Route before starting the typing/draft turn: a message the router folds
     // into the running turn (injected/dropped) must not start a new draft turn
     // and reset the running turn's live draft.
-    if (runtime.session_mgr.routeInbound(session_key, content) == .skip) return;
+    const route_action = runtime.session_mgr.routeInbound(session_key, content);
+    if (route_action.skipsTurn()) {
+        if (route_action == .steered) {
+            // Acknowledge an enqueued mid-turn message so the sender sees it
+            // was accepted by the active turn.
+            tg_ptr.startTyping(sender) catch {};
+        } else if (route_action == .dropped) {
+            // Never drop silently: say why the message was not delivered.
+            tg_ptr.sendMessageWithReply(sender, inbound_router.dropped_notice, reply_to_id) catch {};
+            tg_ptr.setTaskReaction(sender, message_id, .failed);
+        }
+        return;
+    }
 
     const typing_target = sender;
     const typing_turn = tg_ptr.startTypingTurn(typing_target) catch telegram.TelegramChannel.TypingTurn{};
@@ -1858,11 +1871,21 @@ pub fn runTelegramLoop(
                         break :parallel_attempt;
                     }
 
-                    if (active_worker_threads.get(session_key) != null and
-                        runtime.session_mgr.routeInbound(session_key, msg.content) == .skip)
-                    {
-                        handled_in_worker = true;
-                        break :parallel_attempt;
+                    if (active_worker_threads.get(session_key) != null) {
+                        const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
+                        if (route_action.skipsTurn()) {
+                            if (route_action == .steered) {
+                                // Acknowledge an enqueued mid-turn message so the
+                                // sender sees it was accepted by the active turn.
+                                tg_ptr.startTyping(msg.sender) catch {};
+                            } else if (route_action == .dropped) {
+                                // Never drop silently: say why it was not delivered.
+                                tg_ptr.sendMessageWithReply(msg.sender, inbound_router.dropped_notice, reply_to_id) catch {};
+                                tg_ptr.setTaskReaction(msg.sender, msg.message_id, .failed);
+                            }
+                            handled_in_worker = true;
+                            break :parallel_attempt;
+                        }
                     }
 
                     // Preserve message order per session_key.
@@ -2176,7 +2199,18 @@ pub fn runSignalLoop(
                 break :blk route.session_key;
             };
 
-            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+            const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
+            if (route_action.skipsTurn()) {
+                if (route_action == .steered) {
+                    // Acknowledge the enqueued message with a typing indicator.
+                    if (msg.reply_target) |target| sg_ptr.startTyping(target) catch {};
+                } else if (route_action == .dropped) {
+                    if (msg.reply_target) |target| {
+                        sg_ptr.sendMessage(target, inbound_router.dropped_notice, &.{}) catch {};
+                    }
+                }
+                continue;
+            }
 
             const typing_target = msg.reply_target;
             if (typing_target) |target| sg_ptr.startTyping(target) catch {};
@@ -2303,7 +2337,17 @@ pub fn runWeixinLoop(
                 break :blk route.session_key;
             };
 
-            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+            const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
+            if (route_action.skipsTurn()) {
+                // Weixin has no typing indicator; acknowledge with a short
+                // message so an enqueued mid-turn message is never invisible.
+                if (route_action == .steered) {
+                    wx_ptr.sendMessage(reply_target, inbound_router.queued_notice) catch {};
+                } else if (route_action == .dropped) {
+                    wx_ptr.sendMessage(reply_target, inbound_router.dropped_notice) catch {};
+                }
+                continue;
+            }
 
             const conversation_context = buildConversationContext(.{
                 .channel = "weixin",
@@ -2609,7 +2653,17 @@ pub fn runMatrixLoop(
                 break :blk route.session_key;
             };
 
-            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+            const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
+            if (route_action.skipsTurn()) {
+                const ack_target = msg.reply_target orelse msg.sender;
+                if (route_action == .steered) {
+                    // Acknowledge the enqueued message with a typing indicator.
+                    mx_ptr.startTyping(ack_target) catch {};
+                } else if (route_action == .dropped) {
+                    mx_ptr.sendMessage(ack_target, inbound_router.dropped_notice) catch {};
+                }
+                continue;
+            }
 
             const typing_target = msg.reply_target orelse msg.sender;
             mx_ptr.startTyping(typing_target) catch {};
@@ -2772,7 +2826,16 @@ pub fn runMaxLoop(
                 break :blk route.session_key;
             };
 
-            if (runtime.session_mgr.routeInbound(session_key, msg.content) == .skip) continue;
+            const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
+            if (route_action.skipsTurn()) {
+                if (route_action == .steered) {
+                    // Acknowledge the enqueued message with a typing indicator.
+                    mx_ptr.startTyping(reply_target) catch {};
+                } else if (route_action == .dropped) {
+                    mx_ptr.sendMessage(reply_target, inbound_router.dropped_notice) catch {};
+                }
+                continue;
+            }
 
             mx_ptr.startTyping(reply_target) catch {};
             defer mx_ptr.stopTyping(reply_target) catch {};
