@@ -394,6 +394,10 @@ pub const ChannelManager = struct {
             // transcription config; `vtableStart` builds the transcriber.
             ch_ptr.audio_media = self.config.audio_media;
             ch_ptr.audio_provider_key = self.config.getProviderKey(self.config.audio_media.provider);
+            // The inbound FIFO must key DMs by the daemon's routed session
+            // (dm_scope, identity_links), not the raw sender.
+            ch_ptr.dm_scope = self.config.session.dm_scope;
+            ch_ptr.identity_links = self.config.session.identity_links;
         }
         self.maybeAttachBus(ch_ptr);
 

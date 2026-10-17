@@ -10,6 +10,7 @@ const config_types = @import("../config_types.zig");
 const telegram = @import("telegram.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const control_plane = @import("../control_plane.zig");
+const agent_routing = @import("../agent_routing.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 const stream_presenter = @import("slack_stream_presenter.zig");
@@ -316,6 +317,11 @@ pub const SlackChannel = struct {
     /// expiring after the late-chunk grace window. Guarded by `stream_mu`.
     stream_cancels: std.StringHashMapUnmanaged(i64) = .empty,
     policy: root.ChannelPolicy = .{},
+    /// Session DM scope and identity links mirrored from the daemon config.
+    /// The inbound FIFO hash keys DMs by the routed session, not the raw
+    /// sender, so peers that share a session cannot run concurrently.
+    dm_scope: config_types.DmScope = .per_channel_peer,
+    identity_links: []const config_types.IdentityLink = &.{},
     bus: ?*bus_mod.Bus = null,
     running: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     connected: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -893,14 +899,22 @@ pub const SlackChannel = struct {
         } else null;
 
         const is_dm = isDirectConversationId(channel_id);
+        // Policy is checked against the raw text: mention_only requires the
+        // mention. Publishing strips a leading bot mention so a "<@BOT> /stop"
+        // that had to queue behind earlier work is still a command for the
+        // daemon (the stop fast path already strips it).
         if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
+        const publish_text = if (self.bot_user_id) |bot_uid|
+            stripLeadingMention(text, bot_uid) orelse text
+        else
+            text;
 
         const file_content = if (has_files)
-            try self.buildFileShareContent(self.allocator, msg_obj, text)
+            try self.buildFileShareContent(self.allocator, msg_obj, publish_text)
         else
             null;
         defer if (file_content) |owned| self.allocator.free(owned);
-        const content = file_content orelse text;
+        const content = file_content orelse publish_text;
         if (content.len == 0) return;
 
         try self.publishInboundMessage(sender_id, channel_id, content, message_ts, thread_ts);
@@ -1355,7 +1369,15 @@ pub const SlackChannel = struct {
             hasher.update("slack:");
             hasher.update(self.account_id);
             hasher.update(":direct:");
-            hasher.update(sender_id);
+            if (self.dm_scope == .main) {
+                // dm_scope=main maps every DM of this agent to one session;
+                // key them together or two workers can publish into that
+                // session concurrently and reorder messages.
+                hasher.update("main");
+            } else {
+                // identity_links merges peer ids into one routed session.
+                hasher.update(agent_routing.resolveLinkedPeerId(sender_id, self.identity_links));
+            }
         } else {
             hasher.update("slack:");
             hasher.update(self.account_id);
@@ -4226,6 +4248,37 @@ test "slack processHistoryMessage publishes inbound message to bus" {
     try std.testing.expectEqualStrings("1700000000.000", meta.value.object.get("thread_id").?.string);
 }
 
+test "processHistoryMessage strips a leading bot mention before publishing" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.bot_user_id = try alloc.dupe(u8, "UBOT");
+    defer alloc.free(ch.bot_user_id.?);
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"user":"U1","text":"<@UBOT> /stop","ts":"1700000000.100","channel":"C1"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C1");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    // Regression: a "<@BOT> /stop" that had to queue behind earlier work was
+    // published with the mention, so the daemon treated it as ordinary text
+    // instead of a stop command.
+    try std.testing.expectEqualStrings("/stop", msg.content);
+}
+
 test "processHistoryMessage off mode top-level post uses channel_id as chat_id" {
     const alloc = std.testing.allocator;
     var eb = bus_mod.Bus.init();
@@ -5263,6 +5316,37 @@ test "slack FIFO key follows the daemon session, including the thread" {
     // Different channels and DMs are different sessions.
     try std.testing.expect(top_level != ch.inboundConversationHash("U1", "C2", null));
     try std.testing.expect(top_level != ch.inboundConversationHash("U2", "D1", null));
+}
+
+test "slack FIFO hash follows the routed DM session" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+
+    const peer_a = ch.inboundConversationHash("U1", "D1", null);
+    const peer_b = ch.inboundConversationHash("U2", "D2", null);
+    try std.testing.expect(peer_a != peer_b);
+
+    // Regression: dm_scope=main maps every DM to one daemon session, but the
+    // hash keyed the raw sender, so two workers processed them concurrently
+    // and the session mutex did not preserve their publish order.
+    ch.dm_scope = .main;
+    try std.testing.expectEqual(
+        ch.inboundConversationHash("U1", "D1", null),
+        ch.inboundConversationHash("U2", "D2", null),
+    );
+
+    // identity_links merge peer ids into one routed session as well.
+    ch.dm_scope = .per_channel_peer;
+    const links = [_]config_types.IdentityLink{
+        .{ .canonical = "U1", .peers = &.{"U2"} },
+    };
+    ch.identity_links = &links;
+    try std.testing.expectEqual(
+        ch.inboundConversationHash("U1", "D1", null),
+        ch.inboundConversationHash("U2", "D2", null),
+    );
 }
 
 test "slack FIFO isolates threads of one channel" {
