@@ -144,6 +144,15 @@ fn slashCommandClearsSession(kind: SlashCommandKind) bool {
     return kind == .new_reset or kind == .restart;
 }
 
+/// True when `message` names a slash command the turn loop executes locally.
+/// Slash-prefixed text that is not a known command (for example
+/// "/tmp/report.csv please read") is ordinary user text and must be routed to
+/// the model, not held back as a command.
+pub fn isKnownSlashCommand(message: []const u8) bool {
+    const cmd = parseSlashCommand(message) orelse return false;
+    return classifySlashCommand(cmd) != .unknown;
+}
+
 pub fn planTurnInput(message: []const u8) TurnInputPlan {
     const cmd = parseSlashCommand(message) orelse return .{ .llm_user_message = message };
     const kind = classifySlashCommand(cmd);
@@ -1055,6 +1064,17 @@ test "planTurnInput keeps /menu on local-only path" {
     try std.testing.expect(!plan.clear_session);
     try std.testing.expect(plan.invoke_local_handler);
     try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "isKnownSlashCommand distinguishes commands from slash-prefixed paths" {
+    // Regression: any "/word" counted as a command, so a message like
+    // "/tmp/report.csv please read" was withheld from the model and waited on
+    // the running turn's lock instead of being steered as user text.
+    try std.testing.expect(isKnownSlashCommand("/help"));
+    try std.testing.expect(isKnownSlashCommand("/model@nullclaw_bot gpt-5.2"));
+    try std.testing.expect(!isKnownSlashCommand("/tmp/report.csv please read"));
+    try std.testing.expect(!isKnownSlashCommand("/etc/hosts"));
+    try std.testing.expect(!isKnownSlashCommand("plain text"));
 }
 
 test "planTurnInput keeps interactive skill activation local-only" {

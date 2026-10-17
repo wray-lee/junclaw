@@ -1138,6 +1138,28 @@ fn messageTaskWorker(task_ptr: *MessageTask) void {
     task_ptr.run();
 }
 
+/// Spawn `func(args)` on a new worker that first joins `previous`, the
+/// session's in-flight turn. The poller must never join that worker itself:
+/// joining on the poller thread stopped every account from polling until a
+/// long turn ended, so even a later /stop could not be read. Chaining keeps
+/// FIFO per session without blocking the poller.
+fn spawnAfterPrevious(previous: ?std.Thread, comptime func: anytype, args: anytype) !std.Thread {
+    const Runner = struct {
+        previous: ?std.Thread,
+        inner_args: @TypeOf(args),
+
+        fn run(self: @This()) void {
+            if (self.previous) |thread| thread.join();
+            @call(.auto, func, self.inner_args);
+        }
+    };
+    return std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        Runner.run,
+        .{Runner{ .previous = previous, .inner_args = args }},
+    );
+}
+
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
 
 fn extractTelegramBotId(bot_token: []const u8) ?[]const u8 {
@@ -1888,7 +1910,13 @@ pub fn runTelegramLoop(
                         }
                     }
 
-                    // Preserve message order per session_key.
+                    // Preserve message order per session_key. A follow-up for a
+                    // busy session is chained behind its in-flight worker (the
+                    // new worker joins it) instead of joining here: a join on
+                    // the poller thread stopped all polling for the duration of
+                    // a long turn, so a later /stop could not be read.
+                    var previous_worker: ?std.Thread = null;
+                    defer if (previous_worker) |previous| previous.join();
                     if (active_worker_threads.fetchRemove(session_key)) |entry| {
                         var idx: usize = 0;
                         while (idx < active_worker_order.items.len) : (idx += 1) {
@@ -1897,7 +1925,7 @@ pub fn runTelegramLoop(
                                 break;
                             }
                         }
-                        entry.value.join();
+                        previous_worker = entry.value;
                         allocator.free(@constCast(entry.key));
                     }
 
@@ -1958,12 +1986,15 @@ pub fn runTelegramLoop(
                         .heartbeat = &loop_state.turn_progress,
                     };
 
-                    const thread = std.Thread.spawn(.{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE }, messageTaskWorker, .{task}) catch |err| {
+                    const thread = spawnAfterPrevious(previous_worker, messageTaskWorker, .{task}) catch |err| {
                         log.err("Failed to spawn worker thread: {}, falling back to synchronous", .{err});
                         task.deinit();
                         allocator.destroy(task);
                         break :parallel_attempt;
                     };
+                    // The spawned worker now owns the previous thread handle and
+                    // joins it before running this message.
+                    previous_worker = null;
 
                     const tracked_session_key = allocator.dupe(u8, session_key) catch |err| {
                         log.err("Failed to duplicate tracking session key: {}", .{err});
@@ -3038,6 +3069,53 @@ test "isStopLikeCommand rejects non-control commands" {
     try std.testing.expect(!control_plane.isStopLikeCommand("/aborted"));
     try std.testing.expect(!control_plane.isStopLikeCommand("/help"));
     try std.testing.expect(!control_plane.isStopLikeCommand(""));
+}
+
+test "spawnAfterPrevious chains the follow-up behind the running worker" {
+    const Gate = struct {
+        mutex: std_compat.sync.Mutex = .{},
+        cond: std_compat.sync.Condition = .{},
+        release_previous: bool = false,
+        previous_done: bool = false,
+        follow_done: bool = false,
+        follow_saw_previous: bool = false,
+
+        fn previous(self: *@This()) void {
+            self.mutex.lock();
+            while (!self.release_previous) self.cond.wait(&self.mutex);
+            self.previous_done = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+        }
+
+        fn follow(self: *@This()) void {
+            self.mutex.lock();
+            self.follow_saw_previous = self.previous_done;
+            self.follow_done = true;
+            self.cond.broadcast();
+            self.mutex.unlock();
+        }
+    };
+
+    var gate: Gate = .{};
+    const previous = try std.Thread.spawn(.{}, Gate.previous, .{&gate});
+    const follow = try spawnAfterPrevious(previous, Gate.follow, .{&gate});
+
+    // Regression: the poller joined the session's in-flight worker itself, so a
+    // follow-up message blocked all polling until the turn ended. The follow-up
+    // must instead wait on its own thread.
+    gate.mutex.lock();
+    try std.testing.expect(!gate.follow_done);
+    gate.release_previous = true;
+    gate.cond.broadcast();
+    while (!gate.follow_done) gate.cond.wait(&gate.mutex);
+    gate.mutex.unlock();
+
+    // The follow-up worker owns the previous handle and joins it, so joining
+    // the follow-up thread here transitively waits for both. Joining `previous`
+    // again would be a double join.
+    follow.join();
+    try std.testing.expect(gate.follow_saw_previous);
 }
 
 test "ProviderHolder tagged union fields" {

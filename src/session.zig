@@ -2379,12 +2379,16 @@ pub const SessionManager = struct {
             }
         }
 
-        // A slash command is executed by the turn loop (agent.handleSlashCommand),
-        // not by the model. Injecting it as user text would leave the command
-        // unexecuted and the model would answer the literal text. Return .process
-        // so the caller waits on the session lock and runs it as a serial
-        // follow-up after the active turn.
-        if (control_plane.parseSlashCommand(content) != null) return .process;
+        // A known slash command is executed by the turn loop
+        // (agent.handleSlashCommand), not by the model. Injecting it as user text
+        // would leave the command unexecuted and the model would answer the
+        // literal text. Return .process so the caller waits on the session lock
+        // and runs it as a serial follow-up after the active turn.
+        //
+        // Only known commands count: slash-prefixed text such as
+        // "/tmp/report.csv please read" is ordinary user text and must steer
+        // like any other message instead of stalling behind the turn lock.
+        if (agent_mod.commands.isKnownSlashCommand(content)) return .process;
 
         return switch (inbound_router.route(self.routeInput(session_key))) {
             .inject, .replace_injection => blk: {
@@ -4809,6 +4813,30 @@ test "routeInbound never injects slash commands into a running turn" {
         sm.routeInbound(session_key, "/model gpt-5.2"),
     );
     try testing.expect(!sm.routeInput(session_key).has_pending_injection);
+}
+
+test "routeInbound steers slash-prefixed text that is not a known command" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:slash-path";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    // Regression: parseSlashCommand accepted any slash-prefixed token, so
+    // "/tmp/report.csv please read" was treated as a command, held back from
+    // the running turn, and waited on the session lock.
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.steered,
+        sm.routeInbound(session_key, "/tmp/report.csv please read"),
+    );
+    const drained = (try session.drainInjection(sm.allocator, testing.allocator)).?;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("/tmp/report.csv please read", drained);
 }
 
 test "appendMidTurnIfRunning refuses stopped sessions" {
