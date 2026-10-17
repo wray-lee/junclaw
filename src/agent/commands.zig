@@ -3327,6 +3327,9 @@ fn clearSessionState(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "last_turn_usage")) {
         self.last_turn_usage = .{};
     }
+    if (@hasField(@TypeOf(self.*), "compaction_count")) {
+        self.compaction_count = 0;
+    }
 
     if (self.session_store) |store| {
         store.clearAutoSaved(self.memory_session_id) catch {};
@@ -3492,6 +3495,11 @@ fn resetRuntimeCommandState(self: anytype) void {
     self.send_mode = .inherit;
 }
 
+fn contextPercent(used: u64, window: u64) u64 {
+    if (window == 0) return 0;
+    return @min(999, (used *| 100 +| window / 2) / window);
+}
+
 fn formatStatus(self: anytype) ![]const u8 {
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(self.allocator);
@@ -3503,6 +3511,10 @@ fn formatStatus(self: anytype) ![]const u8 {
     const model_label = if (show_emojis) "🧠 Model" else "Model";
     const history_label = if (show_emojis) "💬 History" else "History";
     const tokens_label = if (show_emojis) "🧮 Tokens used" else "Tokens used";
+    const context_label = if (show_emojis) "📚 Context" else "Context";
+    const compactions_label = if (show_emojis) "🧹 Compactions" else "Compactions";
+    const token_limit: u64 = if (@hasField(@TypeOf(self.*), "token_limit")) self.token_limit else 0;
+    const compaction_count: u64 = if (@hasField(@TypeOf(self.*), "compaction_count")) self.compaction_count else 0;
     const tools_label = if (show_emojis) "🔧 Tools" else "Tools";
     const thinking_label = if (show_emojis) "💭 Thinking" else "Thinking";
     const verbose_label = if (show_emojis) "📢 Verbose" else "Verbose";
@@ -3532,6 +3544,13 @@ fn formatStatus(self: anytype) ![]const u8 {
     }
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
+    const token_estimate = self.tokenEstimate();
+    if (token_limit > 0) {
+        try w.print("{s}: {d}/{d} ({d}%)\n", .{ context_label, token_estimate, token_limit, contextPercent(token_estimate, token_limit) });
+    } else {
+        try w.print("{s}: {d}\n", .{ context_label, token_estimate });
+    }
+    try w.print("{s}: {d}\n", .{ compactions_label, compaction_count });
     try w.print("{s}: {d} available\n", .{ tools_label, self.tools.len });
     try w.print("{s}: {s}\n", .{ thinking_label, self.reasoning_effort orelse "off" });
     try w.print("{s}: {s}\n", .{ verbose_label, self.verbose_level.toSlice() });
@@ -3884,13 +3903,21 @@ fn handleAllowlistCommand(self: anytype, arg: []const u8) ![]const u8 {
 
 fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
     const mode = firstToken(arg);
+    const token_limit: u64 = if (@hasField(@TypeOf(self.*), "token_limit")) self.token_limit else 0;
+    const compaction_count: u64 = if (@hasField(@TypeOf(self.*), "compaction_count")) self.compaction_count else 0;
+    const token_estimate = self.tokenEstimate();
     if (std.ascii.eqlIgnoreCase(mode, "json")) {
         return try std.fmt.allocPrint(
             self.allocator,
-            "{{\"model\":\"{s}\",\"history_messages\":{d},\"token_estimate\":{d},\"tools\":{d}}}",
-            .{ self.model_name, self.history.items.len, self.tokenEstimate(), self.tools.len },
+            "{{\"model\":\"{s}\",\"history_messages\":{d},\"token_estimate\":{d},\"context_window\":{d},\"compactions\":{d},\"tools\":{d}}}",
+            .{ self.model_name, self.history.items.len, token_estimate, token_limit, compaction_count, self.tools.len },
         );
     }
+
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(self.allocator);
+    var out_writer: std.Io.Writer.Allocating = .fromArrayList(self.allocator, &out);
+    const w = &out_writer.writer;
 
     if (std.ascii.eqlIgnoreCase(mode, "detail")) {
         var sys: usize = 0;
@@ -3905,18 +3932,21 @@ fn handleContextCommand(self: anytype, arg: []const u8) ![]const u8 {
                 .tool => tool += 1,
             }
         }
-        return try std.fmt.allocPrint(
-            self.allocator,
-            "Context detail:\n  model: {s}\n  messages: {d}\n  token_estimate: {d}\n  tools: {d}\n  by_role: system={d} user={d} assistant={d} tool={d}",
-            .{ self.model_name, self.history.items.len, self.tokenEstimate(), self.tools.len, sys, usr, asst, tool },
-        );
+        try w.print("Context detail:\n  model: {s}\n  messages: {d}\n  token_estimate: {d}", .{ self.model_name, self.history.items.len, token_estimate });
+        if (token_limit > 0) {
+            try w.print("/{d} ({d}%)", .{ token_limit, contextPercent(token_estimate, token_limit) });
+        }
+        try w.print("\n  compactions: {d}\n  tools: {d}\n  by_role: system={d} user={d} assistant={d} tool={d}", .{ compaction_count, self.tools.len, sys, usr, asst, tool });
+    } else {
+        try w.print("Context: messages={d}, token_estimate={d}", .{ self.history.items.len, token_estimate });
+        if (token_limit > 0) {
+            try w.print("/{d} ({d}%)", .{ token_limit, contextPercent(token_estimate, token_limit) });
+        }
+        try w.print(", tools={d}, compactions={d}", .{ self.tools.len, compaction_count });
     }
 
-    return try std.fmt.allocPrint(
-        self.allocator,
-        "Context: messages={d}, token_estimate={d}, tools={d}",
-        .{ self.history.items.len, self.tokenEstimate(), self.tools.len },
-    );
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
 }
 
 fn handleExportSessionCommand(self: anytype, arg: []const u8) ![]const u8 {

@@ -49,6 +49,11 @@
 - 通过 `--skill <name>` 启动 `nullclaw agent` 时，会在第一条消息或 REPL 轮次前激活该 skill。
 - `nullclaw acp` 通过 stdio 使用按行分隔的 JSON-RPC。编辑器创建 ACP 会话时传入绝对 `cwd`；NullClaw 会把它作为 `agent invoke` 的 workspace。
 
+### 会话上下文
+
+- `/status` 会显示 `📚 Context: 已用/窗口 (百分比%)` 和 `🧹 Compactions: N`，可以直接看出当前会话窗口占用了多少、历史已被压缩几次。
+- `/context` 会显示同样的数字，并附带消息数、工具数和按角色统计；`/context json` 会输出 `context_window` 与 `compactions` 供脚本读取。
+
 ## 运行与运维
 
 | 命令 | 说明 |

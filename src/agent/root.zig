@@ -443,6 +443,9 @@ pub const Agent = struct {
     /// Whether compaction was performed during the last turn.
     last_turn_compacted: bool = false,
 
+    /// Number of successful context compactions in this session.
+    compaction_count: u64 = 0,
+
     /// Whether context was force-compacted due to exhaustion during the current turn.
     context_was_compacted: bool = false,
 
@@ -901,7 +904,7 @@ pub const Agent = struct {
 
     /// Auto-compact history when it exceeds thresholds.
     pub fn autoCompactHistory(self: *Agent) !bool {
-        return compaction.autoCompactHistory(self.allocator, &self.history, self.provider, self.model_name, .{
+        const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, self.provider, self.model_name, .{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
@@ -910,11 +913,15 @@ pub const Agent = struct {
             .workspace_dir = self.workspace_dir,
             .bootstrap_provider = self.bootstrap,
         }, self.redactor);
+        if (compacted) self.compaction_count += 1;
+        return compacted;
     }
 
     /// Force-compress history for context exhaustion recovery.
     pub fn forceCompressHistory(self: *Agent) bool {
-        return compaction.forceCompressHistory(self.allocator, &self.history);
+        const compressed = compaction.forceCompressHistory(self.allocator, &self.history);
+        if (compressed) self.compaction_count += 1;
+        return compressed;
     }
 
     fn appendUniqueString(
@@ -4358,6 +4365,7 @@ test "maybeAutoCompactHistory skips compaction when compact_context is false (re
     try std.testing.expect(!compacted);
     try std.testing.expectEqual(len_before, agent.history.items.len);
     try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
+    try std.testing.expectEqual(@as(u64, 0), agent.compaction_count);
 }
 
 test "maybeAutoCompactHistory compacts when compact_context is true" {
@@ -4378,6 +4386,24 @@ test "maybeAutoCompactHistory compacts when compact_context is true" {
     try std.testing.expect(compacted);
     try std.testing.expect(agent.history.items.len < len_before);
     try std.testing.expect(provider_state.calls > 0);
+    try std.testing.expectEqual(@as(u64, 1), agent.compaction_count);
+}
+
+test "compaction count increments on forced context recovery" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    for (0..8) |i| {
+        try agent.history.append(allocator, .{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = try std.fmt.allocPrint(allocator, "message {d}", .{i}),
+        });
+    }
+
+    try std.testing.expectEqual(@as(u64, 0), agent.compaction_count);
+    try std.testing.expect(agent.forceCompressHistory());
+    try std.testing.expectEqual(@as(u64, 1), agent.compaction_count);
 }
 
 test "cli module reexport" {
@@ -5755,6 +5781,7 @@ test "slash /new clears history" {
     agent.has_system_prompt = true;
     agent.total_tokens = 42;
     agent.last_turn_usage = .{ .prompt_tokens = 10, .completion_tokens = 5, .total_tokens = 15 };
+    agent.compaction_count = 3;
 
     const response = (try agent.handleSlashCommand("/new")).?;
     defer allocator.free(response);
@@ -5764,6 +5791,7 @@ test "slash /new clears history" {
     try std.testing.expect(!agent.has_system_prompt);
     try std.testing.expectEqual(@as(u64, 0), agent.total_tokens);
     try std.testing.expectEqual(@as(u32, 0), agent.last_turn_usage.total_tokens);
+    try std.testing.expectEqual(@as(u64, 0), agent.compaction_count);
 }
 
 test "slash /reset clears history and switches model" {
@@ -6302,11 +6330,60 @@ test "slash /status returns agent info" {
     try std.testing.expect(std.mem.indexOf(u8, response, "42") != null);
 }
 
+test "slash /status reports context usage and compaction count" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.token_limit = 1000;
+    agent.compaction_count = 2;
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "a" ** 400),
+    });
+
+    const response = (try agent.handleSlashCommand("/status")).?;
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "📚 Context: 100/1000 (10%)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "🧹 Compactions: 2") != null);
+}
+
+test "slash /context reports context window and compactions" {
+    const allocator = std.testing.allocator;
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+
+    agent.token_limit = 2000;
+    agent.compaction_count = 3;
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "a" ** 400),
+    });
+
+    const plain = (try agent.handleSlashCommand("/context")).?;
+    defer allocator.free(plain);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "token_estimate=100/2000 (5%)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, plain, "compactions=3") != null);
+
+    const json = (try agent.handleSlashCommand("/context json")).?;
+    defer allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"context_window\":2000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"compactions\":3") != null);
+
+    const detail = (try agent.handleSlashCommand("/context detail")).?;
+    defer allocator.free(detail);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "token_estimate: 100/2000 (5%)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail, "compactions: 3") != null);
+}
+
 test "slash /status can render without emojis" {
     const allocator = std.testing.allocator;
     var agent = try makeTestAgent(allocator);
     defer agent.deinit();
     agent.status_show_emojis = false;
+    agent.token_limit = 1000;
+    agent.compaction_count = 1;
 
     const response = (try agent.handleSlashCommand("/status")).?;
     defer allocator.free(response);
@@ -6315,6 +6392,10 @@ test "slash /status can render without emojis" {
     try std.testing.expect(std.mem.indexOf(u8, response, "NullClaw") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "Model:") != null);
     try std.testing.expect(std.mem.indexOf(u8, response, "🧠") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Context: 0/1000 (0%)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Compactions: 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "📚") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "🧹") == null);
 }
 
 test "slash /whoami returns current session id" {
