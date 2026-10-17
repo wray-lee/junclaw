@@ -2930,9 +2930,21 @@ pub const SlackChannel = struct {
             return;
         }
 
-        self.updateStreamMessage(parsed, state.message_ts, flush.text) catch |err| {
-            log.warn("Slack streaming chat.update failed ({s}); continuing without live updates", .{@errorName(err)});
-            state.send_failed = true;
+        self.updateStreamMessage(parsed, state.message_ts, flush.text, state.preview_limit) catch |err| {
+            if (err == error.SlackMessageTooLong and state.preview_limit > 512) {
+                state.preview_limit = @max(@as(usize, 512), state.preview_limit / 2);
+                self.updateStreamMessage(parsed, state.message_ts, flush.text, state.preview_limit) catch |retry_err| {
+                    if (retry_err == error.SlackMessageTooLong) {
+                        log.warn("Slack streaming chat.update still too long after rebinding; continuing with smaller previews", .{});
+                    } else {
+                        log.warn("Slack streaming chat.update retry failed ({s}); continuing without live updates", .{@errorName(retry_err)});
+                        state.send_failed = true;
+                    }
+                };
+            } else {
+                log.warn("Slack streaming chat.update failed ({s}); continuing without live updates", .{@errorName(err)});
+                state.send_failed = true;
+            }
         };
     }
 
@@ -2949,7 +2961,7 @@ pub const SlackChannel = struct {
             return error.SlackStreamNotThreaded;
         };
 
-        const chunks = try stream_presenter.splitForLimit(
+        const chunks = try stream_presenter.splitForSlackLimit(
             self.allocator,
             text,
             stream_presenter.STREAM_MARKDOWN_MAX_BYTES,
@@ -2987,7 +2999,7 @@ pub const SlackChannel = struct {
     ) !void {
         if (text.len == 0) return;
 
-        const chunks = try stream_presenter.splitForLimit(
+        const chunks = try stream_presenter.splitForSlackLimit(
             self.allocator,
             text,
             stream_presenter.STREAM_MARKDOWN_MAX_BYTES,
@@ -3041,6 +3053,7 @@ pub const SlackChannel = struct {
         parsed: stream_presenter.StreamTarget,
         ts: []const u8,
         markdown_text: []const u8,
+        preview_limit: usize,
     ) !void {
         const mrkdwn = try markdownToSlackMrkdwn(self.allocator, markdown_text);
         defer self.allocator.free(mrkdwn);
@@ -3052,7 +3065,7 @@ pub const SlackChannel = struct {
         const preview = try stream_presenter.boundUpdatePreview(
             self.allocator,
             mrkdwn,
-            stream_presenter.STREAM_UPDATE_MAX_BYTES,
+            preview_limit,
         );
         defer self.allocator.free(preview);
 
@@ -3077,6 +3090,7 @@ pub const SlackChannel = struct {
             if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
                 self.native_stream_disabled.store(true, .release);
             }
+            if (std.mem.eql(u8, code, "msg_too_long")) return error.SlackMessageTooLong;
             return error.SlackStreamRejected;
         }
     }
@@ -3126,7 +3140,7 @@ pub const SlackChannel = struct {
             // would answer `msg_too_long` past Slack's message cap. Finish on the
             // edited-message transport instead so the answer is delivered intact.
             const over_budget = if (suffix) |s|
-                stream_presenter.finalAppendOverflowsBudget(state.sent.len, s.len)
+                stream_presenter.finalAppendOverflowsEscapedBudget(state.sent, s)
             else
                 false;
             const stream_completed = if (!force_rewrite and suffix != null and !over_budget) blk: {
@@ -3174,19 +3188,43 @@ pub const SlackChannel = struct {
     ) !void {
         const chunks = try chunkFinalFallbackReply(self.allocator, message);
         defer stream_presenter.freeChunks(self.allocator, chunks);
+        var final_chunks = chunks;
+        var rebound_chunks: ?[][]const u8 = null;
+        defer if (rebound_chunks) |smaller| stream_presenter.freeChunks(self.allocator, smaller);
 
-        self.updateStreamMessageMrkdwn(parsed, ts, chunks[0]) catch |err| {
-            log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
-            return vtableSend(@ptrCast(self), target, message, media);
+        self.updateStreamMessageMrkdwn(parsed, ts, final_chunks[0]) catch |err| {
+            if (err == error.SlackMessageTooLong) {
+                const smaller_mrkdwn = markdownToSlackMrkdwn(self.allocator, message) catch {
+                    log.warn("Slack streaming final chat.update conversion failed", .{});
+                    return vtableSend(@ptrCast(self), target, message, media);
+                };
+                defer self.allocator.free(smaller_mrkdwn);
+                rebound_chunks = stream_presenter.splitForSlackLimit(
+                    self.allocator,
+                    smaller_mrkdwn,
+                    stream_presenter.STREAM_UPDATE_MAX_BYTES / 2,
+                ) catch {
+                    log.warn("Slack streaming final chat.update could not be rebound", .{});
+                    return vtableSend(@ptrCast(self), target, message, media);
+                };
+                final_chunks = rebound_chunks.?;
+                self.updateStreamMessageMrkdwn(parsed, ts, final_chunks[0]) catch |retry_err| {
+                    log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(retry_err)});
+                    return vtableSend(@ptrCast(self), target, message, media);
+                };
+            } else {
+                log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
+                return vtableSend(@ptrCast(self), target, message, media);
+            }
         };
 
         // Anything past the first chat.update-able slice goes out as follow-up
         // messages in the same thread.
-        const followups = @min(chunks.len - 1, stream_presenter.STREAM_MAX_FOLLOWUPS);
-        if (chunks.len - 1 > followups) {
-            log.warn("Slack streaming reply truncated: {} overflow chunks dropped", .{chunks.len - 1 - followups});
+        const followups = @min(final_chunks.len - 1, stream_presenter.STREAM_MAX_FOLLOWUPS);
+        if (final_chunks.len - 1 > followups) {
+            log.warn("Slack streaming reply truncated: {} overflow chunks dropped", .{final_chunks.len - 1 - followups});
         }
-        for (chunks[1 .. 1 + followups]) |chunk| {
+        for (final_chunks[1 .. 1 + followups]) |chunk| {
             self.postStreamFollowup(parsed, chunk) catch |err| {
                 log.warn("Slack streaming follow-up post failed ({s})", .{@errorName(err)});
                 break;
@@ -3638,7 +3676,7 @@ pub fn containsMention(text: []const u8, user_id: []const u8) bool {
 fn chunkFinalFallbackReply(allocator: std.mem.Allocator, message: []const u8) ![][]const u8 {
     const mrkdwn = try markdownToSlackMrkdwn(allocator, message);
     defer allocator.free(mrkdwn);
-    return stream_presenter.splitForLimit(allocator, mrkdwn, stream_presenter.STREAM_UPDATE_MAX_BYTES);
+    return stream_presenter.splitForSlackLimit(allocator, mrkdwn, stream_presenter.STREAM_UPDATE_MAX_BYTES);
 }
 
 /// Convert standard Markdown to Slack mrkdwn format.

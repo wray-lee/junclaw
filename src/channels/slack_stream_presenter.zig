@@ -31,6 +31,27 @@ pub const STREAM_MARKDOWN_MAX_BYTES: usize = 12_000;
 /// error to the user.
 pub const STREAM_TOTAL_MAX_BYTES: usize = STREAM_MARKDOWN_MAX_BYTES;
 
+/// Slack counts the text after escaping `&`, `<`, and `>` for mrkdwn. Counting
+/// those expansions here keeps byte-bounded previews and stream chunks below
+/// Slack's character limits while remaining a conservative UTF-8 upper bound.
+pub fn slackEscapedLen(text: []const u8) usize {
+    var len: usize = 0;
+    for (text) |c| {
+        len += switch (c) {
+            '&' => 5, // &amp;
+            '<', '>' => 4, // &lt; / &gt;
+            else => 1,
+        };
+    }
+    return len;
+}
+
+/// True when appending `suffix_len` more raw bytes to the already-streamed
+/// text would push the escaped native stream past Slack's cumulative cap.
+pub fn finalAppendOverflowsEscapedBudget(sent: []const u8, suffix: []const u8) bool {
+    return slackEscapedLen(sent) + slackEscapedLen(suffix) > STREAM_TOTAL_MAX_BYTES;
+}
+
 /// True when appending `suffix_len` more bytes to the already-streamed
 /// `sent_len` would push the native stream past Slack's cumulative message cap.
 /// The caller must then finish on the edited-message transport instead of
@@ -101,6 +122,9 @@ pub const StreamState = struct {
     /// A live update failed; stop flushing this turn and let the final reply
     /// reconcile the message.
     send_failed: bool = false,
+    /// Current escaped preview budget. Slack may reject a nominally bounded
+    /// update, so the fallback retries with a smaller bound for this turn.
+    preview_limit: usize = STREAM_UPDATE_MAX_BYTES,
     /// A reasoning block was rendered into this turn's stream. The final reply
     /// never contains the thinking, so the streamed snapshot cannot be a prefix
     /// of it; the final pass rewrites the message in place instead of posting a
@@ -128,6 +152,7 @@ pub const StreamState = struct {
         self.last_flush_time = 0;
         self.started_at_ms = 0;
         self.send_failed = false;
+        self.preview_limit = STREAM_UPDATE_MAX_BYTES;
         self.rendered_reasoning = false;
         self.finished_at_ms = now_ms;
     }
@@ -252,7 +277,7 @@ pub fn appendStreamChunk(
         .text = text,
         .delta_start = delta_start,
         .rewrite = rewrite,
-        .native_full = text.len > STREAM_TOTAL_MAX_BYTES,
+        .native_full = slackEscapedLen(text) > STREAM_TOTAL_MAX_BYTES,
     };
 }
 
@@ -430,6 +455,69 @@ fn utf8SafeTailStart(text: []const u8, max_bytes: usize) usize {
     return start;
 }
 
+/// Return the newest UTF-8-safe tail whose escaped Slack length fits `limit`.
+fn escapedSafeTailStart(text: []const u8, limit: usize) usize {
+    var cost: usize = 0;
+    var start = text.len;
+    var i = text.len;
+    while (i > 0) {
+        var cp_start = i - 1;
+        while (cp_start > 0 and (text[cp_start] & 0xC0) == 0x80) cp_start -= 1;
+        const cp_cost = switch (text[cp_start]) {
+            '&' => 5,
+            '<', '>' => 4,
+            else => i - cp_start,
+        };
+        if (cost + cp_cost > limit) break;
+        cost += cp_cost;
+        start = cp_start;
+        i = cp_start;
+    }
+    return start;
+}
+
+/// Split text so each chunk's escaped mrkdwn length fits Slack's limit.
+pub fn splitForSlackLimit(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    limit: usize,
+) ![][]const u8 {
+    std.debug.assert(limit > 0);
+    var chunks: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (chunks.items) |chunk| allocator.free(chunk);
+        chunks.deinit(allocator);
+    }
+    var rest = text;
+    while (slackEscapedLen(rest) > limit) {
+        var cost: usize = 0;
+        var cut: usize = 0;
+        var i: usize = 0;
+        while (i < rest.len) {
+            const cp_len = std.unicode.utf8ByteSequenceLength(rest[i]) catch 1;
+            const next = @min(rest.len, i + cp_len);
+            const cp_cost = switch (rest[i]) {
+                '&' => 5,
+                '<', '>' => 4,
+                else => next - i,
+            };
+            if (cost + cp_cost > limit) break;
+            cost += cp_cost;
+            cut = next;
+            i = next;
+        }
+        if (cut == 0) return error.TextCannotFitSlackLimit;
+        if (std.mem.lastIndexOfScalar(u8, rest[0..cut], '\n')) |nl| {
+            if (nl > 0) cut = nl;
+        }
+        try chunks.append(allocator, try allocator.dupe(u8, rest[0..cut]));
+        rest = rest[cut..];
+        if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
+    }
+    if (rest.len > 0 or chunks.items.len == 0) try chunks.append(allocator, try allocator.dupe(u8, rest));
+    return chunks.toOwnedSlice(allocator);
+}
+
 /// Bound a live preview to Slack's chat.update cap.
 ///
 /// A preview that grows past the cap is truncated from the front so the message
@@ -438,14 +526,14 @@ fn utf8SafeTailStart(text: []const u8, max_bytes: usize) usize {
 /// bounds the in-place preview; the authoritative final reply is still delivered
 /// complete through `splitForLimit` and thread follow-ups.
 pub fn boundUpdatePreview(allocator: std.mem.Allocator, text: []const u8, limit: usize) ![]u8 {
-    if (text.len <= limit) return allocator.dupe(u8, text);
+    if (slackEscapedLen(text) <= limit) return allocator.dupe(u8, text);
 
-    if (limit <= PREVIEW_TRUNCATED_MARKER.len) {
-        return allocator.dupe(u8, text[utf8SafeTailStart(text, limit)..]);
+    if (limit <= slackEscapedLen(PREVIEW_TRUNCATED_MARKER)) {
+        return allocator.dupe(u8, text[escapedSafeTailStart(text, limit)..]);
     }
 
-    const budget = limit - PREVIEW_TRUNCATED_MARKER.len;
-    const start = utf8SafeTailStart(text, budget);
+    const budget = limit - slackEscapedLen(PREVIEW_TRUNCATED_MARKER);
+    const start = escapedSafeTailStart(text, budget);
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -905,6 +993,27 @@ test "splitForLimit handles text without newlines" {
     try std.testing.expectEqual(@as(usize, 3), chunks.len);
     try std.testing.expectEqual(@as(usize, 10), chunks[0].len);
     try std.testing.expectEqual(@as(usize, 5), chunks[2].len);
+}
+
+test "slackEscapedLen counts mrkdwn entity expansion" {
+    // Regression: the old byte bound let chat.update reject a 4,000-byte
+    // preview after Slack expanded shell operators and URLs.
+    try std.testing.expectEqual(@as(usize, 1), slackEscapedLen("x"));
+}
+
+test "boundUpdatePreview respects Slack escaped length" {
+    const text = ("<&>" ** 1_500) ++ "LATEST";
+    const preview = try boundUpdatePreview(std.testing.allocator, text, STREAM_UPDATE_MAX_BYTES);
+    defer std.testing.allocator.free(preview);
+    try std.testing.expect(slackEscapedLen(preview) <= STREAM_UPDATE_MAX_BYTES);
+    try std.testing.expect(std.mem.endsWith(u8, preview, "LATEST"));
+}
+
+test "splitForSlackLimit keeps escaped chunks under the cap" {
+    const text = "<&>" ** 2_000;
+    const chunks = try splitForSlackLimit(std.testing.allocator, text, 400);
+    defer freeChunks(std.testing.allocator, chunks);
+    for (chunks) |chunk| try std.testing.expect(slackEscapedLen(chunk) <= 400);
 }
 
 test "boundUpdatePreview keeps a growing preview under the chat.update cap" {
