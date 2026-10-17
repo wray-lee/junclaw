@@ -1138,26 +1138,125 @@ fn messageTaskWorker(task_ptr: *MessageTask) void {
     task_ptr.run();
 }
 
-/// Spawn `func(args)` on a new worker that first joins `previous`, the
-/// session's in-flight turn. The poller must never join that worker itself:
-/// joining on the poller thread stopped every account from polling until a
-/// long turn ended, so even a later /stop could not be read. Chaining keeps
-/// FIFO per session without blocking the poller.
-fn spawnAfterPrevious(previous: ?std.Thread, comptime func: anytype, args: anytype) !std.Thread {
-    const Runner = struct {
-        previous: ?std.Thread,
-        inner_args: @TypeOf(args),
+/// Bound on follow-up messages queued behind one session's running turn. A
+/// chat that floods the bot gets a "dropped" notice instead of unbounded
+/// memory (or an unbounded thread chain, as the old join-chain did).
+const DEFAULT_SESSION_QUEUE_CAP: usize = 8;
 
-        fn run(self: @This()) void {
-            if (self.previous) |thread| thread.join();
-            @call(.auto, func, self.inner_args);
+/// Per-session FIFO of follow-up messages plus the single worker that drains
+/// it. The poller only appends and never joins a turn, so a long turn in one
+/// chat cannot stall polling or another chat. The worker exits when its queue
+/// drains and is respawned by the next message for that session, so messages
+/// cost queue entries, not threads.
+const SessionWorker = struct {
+    allocator: std.mem.Allocator,
+    session_key: []u8,
+    queue_cap: usize = DEFAULT_SESSION_QUEUE_CAP,
+    mu: std_compat.sync.Mutex = .{},
+    queue: std.ArrayListUnmanaged(*MessageTask) = .empty,
+    running: bool = false,
+    thread: ?std.Thread = null,
+
+    fn create(allocator: std.mem.Allocator, session_key: []const u8) !*SessionWorker {
+        const self = try allocator.create(SessionWorker);
+        errdefer allocator.destroy(self);
+        const key = try allocator.dupe(u8, session_key);
+        self.* = .{
+            .allocator = allocator,
+            .session_key = key,
+        };
+        return self;
+    }
+
+    fn deinit(self: *SessionWorker) void {
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        // A joined worker drains its queue; free anything left behind (spawn
+        // failure or shutdown while a fallback was queued).
+        for (self.queue.items) |task| {
+            task.deinit();
+            self.allocator.destroy(task);
         }
-    };
-    return std.Thread.spawn(
-        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
-        Runner.run,
-        .{Runner{ .previous = previous, .inner_args = args }},
-    );
+        self.queue.deinit(self.allocator);
+        self.allocator.free(self.session_key);
+        self.allocator.destroy(self);
+    }
+
+    /// Append a follow-up. Returns false when the bounded queue is full.
+    fn push(self: *SessionWorker, task: *MessageTask) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.queue.items.len >= self.queue_cap) return false;
+        self.queue.append(self.allocator, task) catch return false;
+        return true;
+    }
+
+    fn isRunning(self: *SessionWorker) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.running;
+    }
+
+    /// Start the worker unless it is already running. A finished worker handle
+    /// is joined here (it returns immediately) instead of accumulating one
+    /// thread per queued message.
+    fn ensureRunning(self: *SessionWorker) !void {
+        self.mu.lock();
+        if (self.running) {
+            self.mu.unlock();
+            return;
+        }
+        const stale = self.thread;
+        self.thread = null;
+        self.running = true;
+        self.mu.unlock();
+        if (stale) |thread| thread.join();
+
+        const thread = std.Thread.spawn(
+            .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+            sessionWorkerLoop,
+            .{self},
+        ) catch |err| {
+            self.mu.lock();
+            self.running = false;
+            self.mu.unlock();
+            return err;
+        };
+        self.mu.lock();
+        self.thread = thread;
+        self.mu.unlock();
+    }
+
+    /// Pop the next queued task; null means the queue is empty and the worker
+    /// marks itself stopped (under the same lock, so a racing push either lands
+    /// before this check or respawns the worker).
+    fn popOrStop(self: *SessionWorker) ?*MessageTask {
+        self.mu.lock();
+        defer self.mu.unlock();
+        if (self.queue.items.len == 0) {
+            self.running = false;
+            return null;
+        }
+        return self.queue.orderedRemove(0);
+    }
+};
+
+fn sessionWorkerLoop(worker: *SessionWorker) void {
+    while (worker.popOrStop()) |task| {
+        messageTaskWorker(task);
+    }
+}
+
+/// Spawn failure fallback: drain the session queue on the poller rather than
+/// losing the messages. This is the old synchronous behaviour, only used when
+/// a thread cannot be created at all.
+fn drainSessionWorkerSynchronously(worker: *SessionWorker) void {
+    worker.mu.lock();
+    worker.running = false;
+    worker.mu.unlock();
+    while (worker.popOrStop()) |task| {
+        messageTaskWorker(task);
+    }
 }
 
 const TELEGRAM_OFFSET_STORE_VERSION: i64 = 1;
@@ -1741,28 +1840,37 @@ pub fn runTelegramLoop(
     // Update activity timestamp at start
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
 
-    // Parallel worker bookkeeping.
-    // Keep at most one in-flight worker per session_key to preserve order.
-    //
-    // The joins below are deliberately unbounded. A worker wedged in a non-network
-    // op cannot be joined with a timeout (std.Thread.join has none), and detaching
-    // it would let a hung turn keep holding its session lock while the channel
-    // silently kept polling - masking the stall. Instead the poller records a
-    // `progress` heartbeat (see bumpProgress) and the supervisor detaches and
-    // respawns a poller that stops making progress (see channel_manager).
-    var active_worker_threads: std.StringHashMapUnmanaged(std.Thread) = .empty;
-    var active_worker_order: std.ArrayListUnmanaged([]const u8) = .empty;
+    // Per-session follow-up queues. One worker per session drains its FIFO and
+    // exits when the queue is empty, so a slow turn in one chat never blocks
+    // the poller or another chat and messages do not spawn threads.
+    var session_workers: std.StringHashMapUnmanaged(*SessionWorker) = .empty;
     defer {
-        while (active_worker_order.items.len > 0) {
-            const key = active_worker_order.orderedRemove(0);
-            if (active_worker_threads.fetchRemove(key)) |entry| {
-                entry.value.join();
-                allocator.free(@constCast(entry.key));
-            }
-        }
-        active_worker_order.deinit(allocator);
-        active_worker_threads.deinit(allocator);
+        var worker_it = session_workers.valueIterator();
+        while (worker_it.next()) |worker| worker.*.deinit();
+        session_workers.deinit(allocator);
     }
+
+    const SessionWorkerRegistry = struct {
+        allocator: std.mem.Allocator,
+        workers: *std.StringHashMapUnmanaged(*SessionWorker),
+
+        fn getOrCreate(self: @This(), session_key: []const u8) !*SessionWorker {
+            if (self.workers.get(session_key)) |worker| return worker;
+            const worker = try SessionWorker.create(self.allocator, session_key);
+            errdefer worker.deinit();
+            try self.workers.put(self.allocator, worker.session_key, worker);
+            return worker;
+        }
+
+        fn active(self: @This(), session_key: []const u8) bool {
+            const worker = self.workers.get(session_key) orelse return false;
+            return worker.isRunning();
+        }
+    };
+    const worker_registry = SessionWorkerRegistry{
+        .allocator = allocator,
+        .workers = &session_workers,
+    };
 
     const max_parallel_tasks: usize = if (config.session.max_concurrent_tasks > 1)
         @intCast(config.session.max_concurrent_tasks)
@@ -1864,7 +1972,7 @@ pub fn runTelegramLoop(
             if (enable_parallel) {
                 var handled_in_worker = false;
                 parallel_attempt: {
-                    if (control_plane.isStopLikeCommand(msg.content) and active_worker_threads.get(session_key) != null) {
+                    if (control_plane.isStopLikeCommand(msg.content) and worker_registry.active(session_key)) {
                         var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
                         defer interrupt.deinit(allocator);
                         var dynamic_notice: ?[]u8 = null;
@@ -1893,7 +2001,7 @@ pub fn runTelegramLoop(
                         break :parallel_attempt;
                     }
 
-                    if (active_worker_threads.get(session_key) != null) {
+                    if (worker_registry.active(session_key)) {
                         const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
                         if (route_action.skipsTurn()) {
                             if (route_action == .steered) {
@@ -1910,35 +2018,11 @@ pub fn runTelegramLoop(
                         }
                     }
 
-                    // Preserve message order per session_key. A follow-up for a
-                    // busy session is chained behind its in-flight worker (the
-                    // new worker joins it) instead of joining here: a join on
-                    // the poller thread stopped all polling for the duration of
-                    // a long turn, so a later /stop could not be read.
-                    var previous_worker: ?std.Thread = null;
-                    defer if (previous_worker) |previous| previous.join();
-                    if (active_worker_threads.fetchRemove(session_key)) |entry| {
-                        var idx: usize = 0;
-                        while (idx < active_worker_order.items.len) : (idx += 1) {
-                            if (std.mem.eql(u8, active_worker_order.items[idx], session_key)) {
-                                _ = active_worker_order.orderedRemove(idx);
-                                break;
-                            }
-                        }
-                        previous_worker = entry.value;
-                        allocator.free(@constCast(entry.key));
-                    }
-
-                    // Bound total parallelism per channel loop instance.
-                    while (active_worker_order.items.len >= max_parallel_tasks) {
-                        const oldest_key = active_worker_order.orderedRemove(0);
-                        if (active_worker_threads.fetchRemove(oldest_key)) |entry| {
-                            entry.value.join();
-                            allocator.free(@constCast(entry.key));
-                        }
-                    }
-
-                    // Spawn a worker thread for this message.
+                    // Preserve FIFO per session without blocking the poller:
+                    // append to the session's bounded queue and make sure its
+                    // worker is running. The worker drains the queue after its
+                    // current turn, so N queued messages cost N queue entries,
+                    // not N threads.
                     const task = allocator.create(MessageTask) catch |err| {
                         log.err("Failed to allocate task: {}, falling back to synchronous", .{err});
                         break :parallel_attempt;
@@ -1986,42 +2070,29 @@ pub fn runTelegramLoop(
                         .heartbeat = &loop_state.turn_progress,
                     };
 
-                    const thread = spawnAfterPrevious(previous_worker, messageTaskWorker, .{task}) catch |err| {
-                        log.err("Failed to spawn worker thread: {}, falling back to synchronous", .{err});
+                    const worker = worker_registry.getOrCreate(session_key) catch |err| {
+                        log.err("Failed to allocate session worker: {}, falling back to synchronous", .{err});
                         task.deinit();
                         allocator.destroy(task);
                         break :parallel_attempt;
                     };
-                    // The spawned worker now owns the previous thread handle and
-                    // joins it before running this message.
-                    previous_worker = null;
 
-                    const tracked_session_key = allocator.dupe(u8, session_key) catch |err| {
-                        log.err("Failed to duplicate tracking session key: {}", .{err});
-                        thread.join();
+                    if (!worker.push(task)) {
+                        // Bounded per-session queue: never drop silently.
+                        tg_ptr.sendMessageWithReply(
+                            msg.sender,
+                            "Too many queued messages for this chat; this one was dropped. Try again after the current turn finishes.",
+                            reply_to_id,
+                        ) catch {};
+                        tg_ptr.setTaskReaction(msg.sender, msg.message_id, .failed);
+                        task.deinit();
+                        allocator.destroy(task);
                         handled_in_worker = true;
                         break :parallel_attempt;
-                    };
-
-                    active_worker_threads.put(allocator, tracked_session_key, thread) catch |err| {
-                        log.err("Failed to register worker thread: {}", .{err});
-                        thread.join();
-                        allocator.free(tracked_session_key);
-                        handled_in_worker = true;
-                        break :parallel_attempt;
-                    };
-
-                    active_worker_order.append(allocator, tracked_session_key) catch |err| {
-                        log.err("Failed to enqueue worker thread: {}", .{err});
-                        if (active_worker_threads.fetchRemove(tracked_session_key)) |entry| {
-                            entry.value.join();
-                            allocator.free(@constCast(entry.key));
-                        } else {
-                            thread.join();
-                            allocator.free(tracked_session_key);
-                        }
-                        handled_in_worker = true;
-                        break :parallel_attempt;
+                    }
+                    worker.ensureRunning() catch |err| {
+                        log.err("Failed to spawn session worker: {}, processing queued messages synchronously", .{err});
+                        drainSessionWorkerSynchronously(worker);
                     };
 
                     handled_in_worker = true;
@@ -3071,51 +3142,69 @@ test "isStopLikeCommand rejects non-control commands" {
     try std.testing.expect(!control_plane.isStopLikeCommand(""));
 }
 
-test "spawnAfterPrevious chains the follow-up behind the running worker" {
-    const Gate = struct {
-        mutex: std_compat.sync.Mutex = .{},
-        cond: std_compat.sync.Condition = .{},
-        release_previous: bool = false,
-        previous_done: bool = false,
-        follow_done: bool = false,
-        follow_saw_previous: bool = false,
-
-        fn previous(self: *@This()) void {
-            self.mutex.lock();
-            while (!self.release_previous) self.cond.wait(&self.mutex);
-            self.previous_done = true;
-            self.cond.broadcast();
-            self.mutex.unlock();
-        }
-
-        fn follow(self: *@This()) void {
-            self.mutex.lock();
-            self.follow_saw_previous = self.previous_done;
-            self.follow_done = true;
-            self.cond.broadcast();
-            self.mutex.unlock();
-        }
+fn testQueuedTask(allocator: std.mem.Allocator, content: []const u8) !*MessageTask {
+    const task = try allocator.create(MessageTask);
+    task.* = .{
+        .allocator = allocator,
+        .runtime = undefined,
+        .tg_ptr = undefined,
+        .session_key = try allocator.dupe(u8, "session"),
+        .content = try allocator.dupe(u8, content),
+        .sender = try allocator.dupe(u8, "sender"),
+        .message_id = null,
+        .is_group = false,
+        .reply_to_id = null,
+        .message_sender_id = try allocator.dupe(u8, "message"),
+        .replace_message = false,
+        .heartbeat = null,
     };
+    return task;
+}
 
-    var gate: Gate = .{};
-    const previous = try std.Thread.spawn(.{}, Gate.previous, .{&gate});
-    const follow = try spawnAfterPrevious(previous, Gate.follow, .{&gate});
+test "session worker queue keeps FIFO, bounds backlog, and spawns no thread per message" {
+    const alloc = std.testing.allocator;
+    var worker = SessionWorker{
+        .allocator = alloc,
+        .session_key = try alloc.dupe(u8, "session"),
+    };
+    defer {
+        for (worker.queue.items) |task| {
+            task.deinit();
+            alloc.destroy(task);
+        }
+        worker.queue.deinit(alloc);
+        alloc.free(worker.session_key);
+    }
 
-    // Regression: the poller joined the session's in-flight worker itself, so a
-    // follow-up message blocked all polling until the turn ended. The follow-up
-    // must instead wait on its own thread.
-    gate.mutex.lock();
-    try std.testing.expect(!gate.follow_done);
-    gate.release_previous = true;
-    gate.cond.broadcast();
-    while (!gate.follow_done) gate.cond.wait(&gate.mutex);
-    gate.mutex.unlock();
+    const first = try testQueuedTask(alloc, "first");
+    const second = try testQueuedTask(alloc, "second");
+    // Regression: every follow-up used to spawn a thread chained on the
+    // session's previous worker (one 16 MB-stack thread per mid-turn message,
+    // all blocked in join). Pushing only enqueues.
+    try std.testing.expect(worker.push(first));
+    try std.testing.expect(worker.push(second));
+    try std.testing.expect(worker.thread == null);
 
-    // The follow-up worker owns the previous handle and joins it, so joining
-    // the follow-up thread here transitively waits for both. Joining `previous`
-    // again would be a double join.
-    follow.join();
-    try std.testing.expect(gate.follow_saw_previous);
+    const popped_first = worker.popOrStop() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("first", popped_first.content);
+    popped_first.deinit();
+    alloc.destroy(popped_first);
+    const popped_second = worker.popOrStop() orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("second", popped_second.content);
+    popped_second.deinit();
+    alloc.destroy(popped_second);
+    try std.testing.expect(worker.popOrStop() == null);
+
+    // The per-session backlog is bounded; the poller tells the sender when the
+    // cap is hit instead of growing without bound.
+    for (0..DEFAULT_SESSION_QUEUE_CAP) |_| {
+        const task = try testQueuedTask(alloc, "queued");
+        try std.testing.expect(worker.push(task));
+    }
+    const overflow = try testQueuedTask(alloc, "overflow");
+    try std.testing.expect(!worker.push(overflow));
+    overflow.deinit();
+    alloc.destroy(overflow);
 }
 
 test "ProviderHolder tagged union fields" {
