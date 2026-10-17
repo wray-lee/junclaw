@@ -216,9 +216,10 @@ Notes:
 
 ### `agent.default_queue_mode`
 
-- Sets the inbound queue mode for newly created sessions. Accepted values are `off`, `serial`, `latest`, and `debounce`; the default is `off`.
-- `off` drops messages that arrive while a turn is running, `serial` waits for the active turn, and `latest` keeps the newest pending injection. `debounce` selects the existing runtime debounce mode; this field does not configure its duration, cap, or drop policy.
-- `/queue` can override the mode for the current session. `/queue reset`, `/restart`, and `/debug reset` restore the configured default.
+- Sets the inbound queue mode for newly created sessions. Accepted values are `steer`, `off`, `serial`, `latest`, and `debounce`; the default is `steer`.
+- `steer` (default) injects a message that arrives while a turn is running into that active turn at the next tool or model boundary, in arrival order, so nothing is silently dropped. The sender is acknowledged immediately with a typing indicator or an accepted reaction.
+- `off` discards messages that arrive while a turn is running; the sender is told the message was not delivered. `serial` waits for the active turn, `latest` keeps only the newest pending injection (replacing an earlier one), and `debounce` selects the existing runtime debounce mode; this field does not configure its duration, cap, or drop policy.
+- `/queue` can override the mode for the current session (`/queue steer`, `/queue latest`, and so on). `/queue reset`, `/restart`, and `/debug reset` restore the configured default.
 - Changes require a restart so the session manager and newly created sessions use the same default.
 
 Example:
@@ -226,7 +227,7 @@ Example:
 ```json
 {
   "agent": {
-    "default_queue_mode": "latest"
+    "default_queue_mode": "steer"
   }
 }
 ```

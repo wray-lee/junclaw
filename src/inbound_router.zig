@@ -9,11 +9,20 @@
 //!       .process           => session_mgr.processMessageStreaming(...),
 //!       .inject            => session_mgr.injectMidTurn(session_key, text),
 //!       .replace_injection => session_mgr.injectMidTurn(session_key, text),  // same effect
+//!       .append_injection  => session_mgr.appendMidTurn(session_key, text),  // keeps earlier text
 //!       .queue             => session_mgr.processMessageStreaming(...),      // waits on session lock
-//!       .drop              => {},
+//!       .drop              => {},                                            // tell the user
 //!   }
 
 const config_types = @import("config_types.zig");
+
+/// User-visible acknowledgement when a mid-turn message was accepted by the
+/// active turn on a channel without a typing indicator.
+pub const queued_notice = "Message received; it will be applied when the current step finishes.";
+
+/// User-visible notice when `queue_mode=off` discards a mid-turn message.
+/// Dropping is never silent: the sender learns the message was not delivered.
+pub const dropped_notice = "Message not delivered: the assistant is still working and queue mode is off. Send /queue steer to allow mid-turn messages.";
 
 pub const QueueMode = config_types.QueueMode;
 
@@ -39,7 +48,10 @@ pub const RoutingDecision = enum {
     inject,
     /// Turn running and an injection is already pending: replace it (latest-wins).
     replace_injection,
-    /// Turn running, queue mode is off: discard the message silently.
+    /// Turn running: append text to the injection buffer so every mid-turn
+    /// message reaches the active turn in arrival order.
+    append_injection,
+    /// Turn running, queue mode is off: discard the message, then tell the user.
     drop,
 };
 
@@ -48,6 +60,7 @@ pub fn route(input: RouteInput) RoutingDecision {
     if (!input.turn_running) return .process;
     return switch (input.queue_mode) {
         .off => .drop,
+        .steer => .append_injection,
         .serial => .queue,
         .latest => if (input.has_pending_injection) .replace_injection else .inject,
         .debounce => .inject,
@@ -59,7 +72,7 @@ pub fn route(input: RouteInput) RoutingDecision {
 const testing = @import("std").testing;
 
 test "route returns process when turn is not running" {
-    for ([_]QueueMode{ .off, .serial, .latest, .debounce }) |mode| {
+    for ([_]QueueMode{ .off, .steer, .serial, .latest, .debounce }) |mode| {
         const decision = route(.{
             .turn_running = false,
             .queue_mode = mode,
@@ -74,6 +87,23 @@ test "route drops when turn running and queue_mode is off" {
         .turn_running = true,
         .queue_mode = .off,
         .has_pending_injection = false,
+    }));
+}
+
+test "route appends when turn running and queue_mode is steer" {
+    // Regression: steer used to fall through to the off branch and silently
+    // drop the message.
+    try testing.expectEqual(RoutingDecision.append_injection, route(.{
+        .turn_running = true,
+        .queue_mode = .steer,
+        .has_pending_injection = false,
+    }));
+    // Every mid-turn message is kept, so a pending injection is appended to
+    // instead of replaced.
+    try testing.expectEqual(RoutingDecision.append_injection, route(.{
+        .turn_running = true,
+        .queue_mode = .steer,
+        .has_pending_injection = true,
     }));
 }
 
@@ -124,6 +154,7 @@ test "route injects when turn running and queue_mode is debounce" {
 test "route process takes priority over all modes when not running" {
     const inputs = [_]RouteInput{
         .{ .turn_running = false, .queue_mode = .off, .has_pending_injection = true },
+        .{ .turn_running = false, .queue_mode = .steer, .has_pending_injection = true },
         .{ .turn_running = false, .queue_mode = .latest, .has_pending_injection = true },
         .{ .turn_running = false, .queue_mode = .debounce, .has_pending_injection = false },
     };

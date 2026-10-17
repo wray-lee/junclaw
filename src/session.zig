@@ -257,6 +257,38 @@ pub const Session = struct {
         self.injection_pending = duped;
     }
 
+    /// Append text to the injection buffer, preserving any earlier pending text.
+    /// `steer` uses this so consecutive mid-turn messages are all delivered, in
+    /// arrival order, at the next tool/model boundary.
+    /// Must be called with the SM allocator, NOT while holding session.mutex.
+    pub fn appendMidTurn(self: *Session, allocator: Allocator, text: []const u8) !void {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        if (self.injection_pending) |old| {
+            const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ old, text });
+            allocator.free(old);
+            self.injection_pending = merged;
+            return;
+        }
+        self.injection_pending = try allocator.dupe(u8, text);
+    }
+
+    /// Append only if a turn is still running after the injection lock is held.
+    pub fn appendMidTurnIfRunning(self: *Session, allocator: Allocator, text: []const u8) !bool {
+        if (!self.turn_running.load(.acquire)) return false;
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        if (!self.turn_running.load(.acquire)) return false;
+        if (self.injection_pending) |old| {
+            const merged = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ old, text });
+            allocator.free(old);
+            self.injection_pending = merged;
+            return true;
+        }
+        self.injection_pending = try allocator.dupe(u8, text);
+        return true;
+    }
+
     /// Deposit text only if a turn is still running after the injection lock is held.
     pub fn injectMidTurnIfRunning(self: *Session, allocator: Allocator, text: []const u8) !bool {
         if (!self.turn_running.load(.acquire)) return false;
@@ -1828,7 +1860,7 @@ pub const SessionManager = struct {
     /// Route and process an inbound message. Returns null when routing consumed
     /// the message via drop/injection and the caller should not send a reply.
     pub fn processInboundMessage(self: *SessionManager, session_key: []const u8, content: []const u8, conversation_context: ?ConversationContext) !?[]const u8 {
-        if (self.routeInbound(session_key, content) == .skip) return null;
+        if (self.routeInbound(session_key, content).skipsTurn()) return null;
         return try self.processMessage(session_key, content, conversation_context);
     }
 
@@ -1841,7 +1873,7 @@ pub const SessionManager = struct {
         stream_sink: ?streaming.Sink,
         progress_sink: ?agent_mod.ProgressSink,
     ) !?[]const u8 {
-        if (self.routeInbound(session_key, content) == .skip) return null;
+        if (self.routeInbound(session_key, content).skipsTurn()) return null;
         return try self.processMessageStreaming(session_key, content, conversation_context, stream_sink, progress_sink);
     }
 
@@ -2139,7 +2171,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return .{
             .turn_running = false,
-            .queue_mode = .off,
+            .queue_mode = self.config.agent.default_queue_mode,
             .has_pending_injection = false,
         };
         return .{
@@ -2169,6 +2201,14 @@ pub const SessionManager = struct {
         return try session.injectMidTurnIfRunning(self.allocator, text);
     }
 
+    /// Append a mid-turn injection only if the session is still running.
+    fn appendMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8) !bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.get(session_key) orelse return false;
+        return try session.appendMidTurnIfRunning(self.allocator, text);
+    }
+
     fn isSessionTurnRunning(self: *SessionManager, session_key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -2196,11 +2236,20 @@ pub const SessionManager = struct {
 
     pub const InboundRouteAction = enum {
         process,
+        /// Consumed by the running turn (mid-turn injection or /stop).
         skip,
+        /// Discarded because queue_mode is off; the caller should tell the user.
+        dropped,
+
+        /// True when the caller must not start a new turn for this message.
+        pub fn skipsTurn(self: InboundRouteAction) bool {
+            return self != .process;
+        }
     };
 
     /// Apply inbound routing side effects for a message.
-    /// Returns .skip when the caller should not start a new turn.
+    /// Returns .skip when the caller should not start a new turn, and .dropped
+    /// when the message was discarded and the caller should notify the sender.
     pub fn routeInbound(self: *SessionManager, session_key: []const u8, content: []const u8) InboundRouteAction {
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -2227,10 +2276,17 @@ pub const SessionManager = struct {
                 };
                 break :blk if (injected) .skip else .process;
             },
+            .append_injection => blk: {
+                const injected = self.appendMidTurnIfRunning(session_key, content) catch |err| {
+                    log.warn("mid-turn append failed session=0x{x} err={}", .{ session_hash, err });
+                    break :blk .process;
+                };
+                break :blk if (injected) .skip else .process;
+            },
             .drop => blk: {
                 if (!self.isSessionTurnRunning(session_key)) break :blk .process;
                 log.info("dropping message: session busy queue_mode=off session=0x{x}", .{session_hash});
-                break :blk .skip;
+                break :blk .dropped;
             },
             .process, .queue => .process,
         };
@@ -4519,6 +4575,14 @@ test "session has correct initial state" {
     try testing.expectEqual(@as(usize, 0), s.agent.historyLen());
 }
 
+test "InboundRouteAction.skipsTurn covers every non-process action" {
+    // Regression: shells gate on skipsTurn(), so a new non-process action must
+    // never start a turn for a message the router already consumed or dropped.
+    try testing.expect(!SessionManager.InboundRouteAction.process.skipsTurn());
+    try testing.expect(SessionManager.InboundRouteAction.skip.skipsTurn());
+    try testing.expect(SessionManager.InboundRouteAction.dropped.skipsTurn());
+}
+
 test "routeInbound handles active session routing side effects" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -4541,8 +4605,10 @@ test "routeInbound handles active session routing side effects" {
     try testing.expectEqualStrings("latest message", drained);
 
     session.agent.queue_mode = .off;
+    // Regression: a dropped message must be reported so the shell can tell the
+    // sender instead of discarding it silently.
     try testing.expectEqual(
-        SessionManager.InboundRouteAction.skip,
+        SessionManager.InboundRouteAction.dropped,
         sm.routeInbound(session_key, "drop message"),
     );
     try testing.expect(!sm.routeInput(session_key).has_pending_injection);
@@ -4552,6 +4618,44 @@ test "routeInbound handles active session routing side effects" {
         SessionManager.InboundRouteAction.process,
         sm.routeInbound(session_key, "queued message"),
     );
+}
+
+test "routeInbound appends steer messages in arrival order" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "route:steer";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    // Regression: consecutive mid-turn messages used to replace each other,
+    // silently losing every message but the newest.
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInbound(session_key, "use the other file"),
+    );
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.skip,
+        sm.routeInbound(session_key, "and keep the header"),
+    );
+
+    const drained = (try session.drainInjection(sm.allocator, testing.allocator)).?;
+    defer testing.allocator.free(drained);
+    try testing.expectEqualStrings("use the other file\n\nand keep the header", drained);
+}
+
+test "new sessions default to steer so mid-turn messages are not dropped" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("route:default");
+    try testing.expectEqual(agent_mod.Agent.QueueMode.steer, session.agent.queue_mode);
 }
 
 test "routeInbound interrupts a busy session for /stop instead of dropping" {
@@ -4579,7 +4683,7 @@ test "routeInbound interrupts a busy session for /stop instead of dropping" {
     // A non-stop message in the same state is still dropped without interrupt.
     session.agent.clearInterruptRequest();
     try testing.expectEqual(
-        SessionManager.InboundRouteAction.skip,
+        SessionManager.InboundRouteAction.dropped,
         sm.routeInbound(session_key, "just a message"),
     );
     try testing.expect(!session.agent.interrupt_requested.load(.acquire));

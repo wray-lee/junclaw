@@ -385,6 +385,8 @@ pub const ToolFilterGroup = struct {
 
 pub const QueueMode = enum {
     off,
+    /// Inject every mid-turn message into the active turn, preserving order.
+    steer,
     serial,
     latest,
     debounce,
@@ -392,6 +394,7 @@ pub const QueueMode = enum {
     pub fn toSlice(self: QueueMode) []const u8 {
         return switch (self) {
             .off => "off",
+            .steer => "steer",
             .serial => "serial",
             .latest => "latest",
             .debounce => "debounce",
@@ -401,6 +404,8 @@ pub const QueueMode = enum {
     pub fn fromSlice(s: []const u8) ?QueueMode {
         return if (std.ascii.eqlIgnoreCase(s, "off"))
             .off
+        else if (std.ascii.eqlIgnoreCase(s, "steer"))
+            .steer
         else if (std.ascii.eqlIgnoreCase(s, "serial"))
             .serial
         else if (std.ascii.eqlIgnoreCase(s, "latest"))
@@ -453,7 +458,10 @@ pub const AgentConfig = struct {
     /// `/reasoning <off|on|stream>` overrides it per session; `/restart` and
     /// `/debug reset` restore this default instead of hard-coding `off`.
     reasoning_mode: ReasoningMode = .off,
-    default_queue_mode: QueueMode = .off,
+    /// Inbound queue policy for new sessions. Defaults to `steer` so a
+    /// message that arrives mid-turn is injected into the active turn instead
+    /// of being silently dropped.
+    default_queue_mode: QueueMode = .steer,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.
@@ -2418,6 +2426,7 @@ test "QueueMode parser and serializer cover every mode" {
         text: []const u8,
     }{
         .{ .mode = .off, .text = "off" },
+        .{ .mode = .steer, .text = "steer" },
         .{ .mode = .serial, .text = "serial" },
         .{ .mode = .latest, .text = "latest" },
         .{ .mode = .debounce, .text = "debounce" },

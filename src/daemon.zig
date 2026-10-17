@@ -39,6 +39,7 @@ const tunnel_mod = @import("tunnel.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const observability = @import("observability.zig");
 const control_plane = @import("control_plane.zig");
+const inbound_router = @import("inbound_router.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -1418,7 +1419,24 @@ fn processInboundMessage(
         markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
     }
 
-    if (runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content) == .skip) return;
+    const route_action = runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content);
+    if (route_action.skipsTurn()) {
+        if (route_action == .skip) {
+            // Acknowledge an enqueued mid-turn message so the sender sees it
+            // was accepted by the active turn.
+            setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted);
+        } else {
+            // Never drop silently: tell the sender the message was not delivered.
+            var notice = if (routing_plan.outbound_account_id) |aid|
+                bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return
+            else
+                bus_mod.makeOutbound(allocator, routing_plan.outbound_channel, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return;
+            event_bus.publishOutbound(notice) catch {
+                notice.deinit(allocator);
+            };
+        }
+        return;
+    }
 
     setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted);
 
