@@ -69,6 +69,9 @@ pub const ToolProgress = struct {
     /// Latest provider-retry indicator. Replaced in place so the block shows a
     /// single line no matter how many retries run; null hides it.
     retry: ?RetryInfo = null,
+    /// A retry indicator was cleared but the draft still shows it. Lets
+    /// `progressDraft` refresh the draft even though the block is now empty.
+    needs_clear: bool = false,
 
     pub fn deinit(self: *ToolProgress, allocator: std.mem.Allocator) void {
         for (self.lines.items) |line| allocator.free(line.text);
@@ -92,6 +95,7 @@ pub const ToolProgress = struct {
     pub fn markRendered(self: *ToolProgress) void {
         self.dirty = false;
         self.rendered = true;
+        self.needs_clear = false;
     }
 
     /// Record one tool event. Returns true when the visible log changed (a
@@ -104,6 +108,7 @@ pub const ToolProgress = struct {
             if (update.retry.attempt == 0) {
                 if (self.retry == null) return false;
                 self.retry = null;
+                self.needs_clear = true;
             } else {
                 if (self.retry) |current| {
                     if (current.attempt == update.retry.attempt and current.max == update.retry.max) {
@@ -118,7 +123,9 @@ pub const ToolProgress = struct {
 
         // A real tool event means the retried call resumed; drop a stale
         // indicator so the draft does not claim a retry is still running.
+        const had_retry = self.retry != null;
         self.retry = null;
+        if (had_retry) self.needs_clear = true;
 
         switch (update.phase) {
             .start => {
@@ -132,7 +139,7 @@ pub const ToolProgress = struct {
             .end => {
                 // Successes stay as their start line; only failures add a line,
                 // so the log reads like the OpenClaw tool-progress log.
-                if (update.success) return false;
+                if (update.success) return had_retry;
                 const line = try buildFailureLine(allocator, update.tool);
                 errdefer allocator.free(line);
                 try self.appendLine(allocator, .{ .text = line, .failed = true });
@@ -597,6 +604,10 @@ test "a resumed call clears the retry indicator" {
     try std.testing.expect(state.hasContent());
     _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 0, .max = 0 } }, 1_000);
     try std.testing.expect(!state.hasContent());
+    // The clear must be flushed even though the block is now empty.
+    try std.testing.expect(state.needs_clear);
+    state.markRendered();
+    try std.testing.expect(!state.needs_clear);
 
     // A tool start also clears a stale indicator.
     _ = try state.record(std.testing.allocator, .{ .kind = .retry, .retry = .{ .attempt = 2, .max = 3 } }, 1_000);

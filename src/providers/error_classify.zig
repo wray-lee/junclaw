@@ -465,6 +465,10 @@ pub fn classifyUserError(err: anyerror, detail: ?[]const u8) UserErrorKind {
         error.OutOfMemory => return .out_of_memory,
         error.CurlTimeout => return .timeout,
         error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => return .network,
+        // Providers return these directly when no local credential is
+        // configured (streaming path) or wrap them in AllProvidersFailed with
+        // a "<provider>: CredentialsNotSet" detail (blocking path).
+        error.CredentialsNotSet, error.TokenExpired => return .auth,
         else => {},
     }
 
@@ -481,13 +485,27 @@ pub fn classifyUserError(err: anyerror, detail: ?[]const u8) UserErrorKind {
             if (text_helpers.isRateLimitedText(text)) return .rate_limited;
             if (text_helpers.isContextExhaustedText(text)) return .context_exhausted;
             if (text_helpers.isAuthErrorText(text)) return .auth;
-            if (text_helpers.isOverloadedText(text)) return .overloaded;
+            // Timeouts win over the overload heuristic: a detail such as
+            // "request timed out after 500 ms" must not read as an HTTP 5xx.
             if (text_helpers.isTimeoutText(text)) return .timeout;
+            if (text_helpers.isOverloadedText(text)) return .overloaded;
         }
     }
 
     if (err == error.AllProvidersFailed) return .all_providers_failed;
     return .generic;
+}
+
+fn rateLimitedCopy(buf: []u8, retries_used: u32) []const u8 {
+    if (retries_used == 0) {
+        return "Rate limited by the provider. Wait a minute and try again.";
+    }
+    const retry_word = if (retries_used == 1) "retry" else "retries";
+    return std.fmt.bufPrint(
+        buf,
+        "Rate limited by the provider after {d} {s}. Wait a minute and try again.",
+        .{ retries_used, retry_word },
+    ) catch "Rate limited by the provider. Wait a minute and try again.";
 }
 
 /// Render the user-facing copy for a failure class into `buf`.
@@ -501,14 +519,7 @@ pub fn formatUserError(
     with_fresh_hint: bool,
 ) []const u8 {
     return switch (kind) {
-        .rate_limited => if (retries_used > 0)
-            std.fmt.bufPrint(
-                buf,
-                "Rate limited by the provider after {d} retries. Wait a minute and try again.",
-                .{retries_used},
-            ) catch "Rate limited by the provider. Wait a minute and try again."
-        else
-            "Rate limited by the provider. Wait a minute and try again.",
+        .rate_limited => rateLimitedCopy(buf, retries_used),
         .overloaded => "The provider is overloaded or temporarily unavailable. Please try again shortly.",
         .auth => "Provider authentication failed. Check the API key in config, then try again.",
         .timeout => "Provider timed out waiting for a response. Please retry or /new for a fresh session.",
@@ -559,11 +570,34 @@ test "classifyUserError detects auth, overload, timeout and context" {
         UserErrorKind.timeout,
         classifyUserError(error.AllProvidersFailed, "compatible: request timed out"),
     );
+    // Regression: a bare number in the detail used to be read as an HTTP 5xx.
+    try std.testing.expectEqual(
+        UserErrorKind.timeout,
+        classifyUserError(error.AllProvidersFailed, "compatible: request timed out after 500 ms"),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.all_providers_failed,
+        classifyUserError(error.AllProvidersFailed, "compatible: max_tokens must be <= 500"),
+    );
     try std.testing.expectEqual(
         UserErrorKind.context_exhausted,
         classifyUserError(error.AllProvidersFailed, "compatible: maximum context length is 128000 tokens"),
     );
     try std.testing.expectEqual(UserErrorKind.context_exhausted, classifyUserError(error.ContextLengthExceeded, null));
+}
+
+test "classifyUserError maps missing credentials and expired tokens to auth" {
+    try std.testing.expectEqual(UserErrorKind.auth, classifyUserError(error.CredentialsNotSet, null));
+    try std.testing.expectEqual(UserErrorKind.auth, classifyUserError(error.TokenExpired, null));
+    // Blocking providers wrap the raw error and only leave the detail behind.
+    try std.testing.expectEqual(
+        UserErrorKind.auth,
+        classifyUserError(error.AllProvidersFailed, "openai: CredentialsNotSet"),
+    );
+    try std.testing.expectEqual(
+        UserErrorKind.auth,
+        classifyUserError(error.AllProvidersFailed, "openai_codex: TokenExpired"),
+    );
 }
 
 test "classifyUserError keeps transport and fallback classes" {
@@ -585,6 +619,13 @@ test "formatUserError reports exhausted rate-limit retries" {
     try std.testing.expectEqualStrings(
         "Rate limited by the provider after 3 retries. Wait a minute and try again.",
         text,
+    );
+
+    // Regression: a single configured retry used to read "after 1 retries".
+    const one = formatUserError(&buf, .rate_limited, 1, false);
+    try std.testing.expectEqualStrings(
+        "Rate limited by the provider after 1 retry. Wait a minute and try again.",
+        one,
     );
 
     const no_retries = formatUserError(&buf, .rate_limited, 0, false);

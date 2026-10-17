@@ -752,6 +752,11 @@ pub const ReliableProvider = struct {
         callback_ctx: *anyopaque,
     ) anyerror!root.StreamChatResult {
         const self: *ReliableProvider = @ptrCast(@alignCast(ptr));
+        // Regression: streaming never runs the retry loop, so counters left by
+        // an earlier blocking call on this thread (compaction, vision probe)
+        // made a streamed 429 claim "after N retries" although this request
+        // retried zero times.
+        resetRetryStats();
         const needs_vision = hasImageParts(request);
         const target = self.resolveProviderTarget(model);
 
@@ -1910,6 +1915,28 @@ test "streamChatImpl returns ProviderDoesNotSupportVision when all providers lac
         prov.streamChat(std.testing.allocator, request, "codex", 0.7, NoopCtx.cb, &dummy),
     );
     try std.testing.expect(inner.call_count == 0);
+}
+
+test "streamChatImpl clears stale retry stats from earlier blocking calls" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 0, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 50);
+    // Seed counters the way a prior blocking retry loop would.
+    tls_retry_stats = .{ .used = 2, .max = 2 };
+
+    const prov = reliable.provider();
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("plain text")};
+    const request = ChatRequest{ .messages = &msgs };
+
+    const NoopCtx = struct {
+        fn cb(_: *anyopaque, _: root.StreamChunk) void {}
+    };
+    var dummy: u8 = 0;
+    const sr = try prov.streamChat(std.testing.allocator, request, "codex", 0.7, NoopCtx.cb, &dummy);
+    defer if (sr.content) |c| std.testing.allocator.free(c);
+    defer if (sr.model.len > 0) std.testing.allocator.free(sr.model);
+
+    try std.testing.expectEqual(@as(u32, 0), lastRetryStats().used);
+    try std.testing.expectEqual(@as(u32, 0), lastRetryStats().max);
 }
 
 const RetryNoticeCollector = struct {

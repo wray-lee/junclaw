@@ -124,6 +124,26 @@ fn containsStatusCodeIn(text: []const u8, min: u16, max: u16) bool {
     return false;
 }
 
+/// True when `text` carries a `status=` field whose value is in `[min, max]`.
+/// Provider summaries are rendered as `status=503 message=...`; matching the
+/// field avoids reading an unrelated number (a timeout in ms, a token limit)
+/// as an HTTP status.
+fn containsStatusFieldIn(text: []const u8, min: u16, max: u16) bool {
+    const marker = "status=";
+    var i: usize = 0;
+    while (i + marker.len <= text.len) : (i += 1) {
+        if (!sliceEqlAsciiFold(text[i .. i + marker.len], marker)) continue;
+        var start = i + marker.len;
+        while (start < text.len and (text[start] == ' ' or text[start] == '\t')) start += 1;
+        var end = start;
+        while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
+        if (end - start != 3) continue;
+        const code = std.fmt.parseInt(u16, text[start..end], 10) catch continue;
+        if (code >= min and code <= max) return true;
+    }
+    return false;
+}
+
 /// Returns true if `text` indicates an overloaded provider or a transient 5xx.
 pub fn isOverloadedText(text: []const u8) bool {
     if (text.len == 0) return false;
@@ -137,8 +157,10 @@ pub fn isOverloadedText(text: []const u8) bool {
     {
         return true;
     }
+    // Only the summarized `status=` field is an HTTP status. A bare number
+    // (e.g. "timed out after 500 ms") must not be read as a 5xx.
     // 529 is Anthropic's non-standard overload status.
-    return containsStatusCodeIn(text, 500, 599) or containsAsciiFold(text, "529");
+    return containsStatusFieldIn(text, 500, 599) or containsAsciiFold(text, "529");
 }
 
 /// Returns true if `text` indicates a provider authentication/authorization
@@ -155,6 +177,11 @@ pub fn isAuthErrorText(text: []const u8) bool {
         containsAsciiFold(text, "missing api key") or
         containsAsciiFold(text, "no api key") or
         containsAsciiFold(text, "api key is required") or
+        // @errorName forms left behind by a provider that returned no body.
+        containsAsciiFold(text, "credentialsnotset") or
+        containsAsciiFold(text, "credentials not set") or
+        containsAsciiFold(text, "tokenexpired") or
+        containsAsciiFold(text, "token expired") or
         containsAsciiFold(text, "permission denied"))
     {
         return true;
@@ -177,6 +204,19 @@ test "isOverloadedText matches 5xx and overload phrasing" {
     try std.testing.expect(!isOverloadedText("status=401 message=Unauthorized"));
     try std.testing.expect(!isOverloadedText("status=429 message=Rate limit exceeded"));
     try std.testing.expect(!isOverloadedText(""));
+}
+
+test "isOverloadedText ignores bare numbers outside the status field" {
+    try std.testing.expect(!isOverloadedText("request timed out after 500 ms"));
+    try std.testing.expect(!isOverloadedText("max_tokens must be <= 500"));
+    try std.testing.expect(isOverloadedText("status=503 message=server error"));
+    try std.testing.expect(isOverloadedText("status = 529"));
+}
+
+test "isAuthErrorText matches credential error names" {
+    try std.testing.expect(isAuthErrorText("openai: CredentialsNotSet"));
+    try std.testing.expect(isAuthErrorText("openai_codex: TokenExpired"));
+    try std.testing.expect(!isAuthErrorText("status=503 message=overloaded"));
 }
 
 test "isAuthErrorText matches auth failures without secrets" {
