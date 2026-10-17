@@ -1213,6 +1213,10 @@ const SessionWorker = struct {
     /// after it leaves the turn-slot wait, so /stop also cancels the message
     /// that had already been picked but had not started running.
     cancel_epoch: u64 = 0,
+    /// Task popped from `queue` that is currently waiting for a turn slot.
+    /// `discardQueued` counts it: it is no longer in `queue`, but the epoch
+    /// bump cancels it just the same.
+    waiting_task: ?*MessageTask = null,
 
     const RunHook = struct {
         run: *const fn (ctx: *anyopaque, task: *MessageTask) void,
@@ -1310,7 +1314,18 @@ const SessionWorker = struct {
     fn shouldRun(self: *SessionWorker, task: *const MessageTask) bool {
         self.mu.lock();
         defer self.mu.unlock();
+        // The slot wait is over; from here the task runs (or is discarded just
+        // below), so /stop counts it through the running-turn interrupt.
+        self.waiting_task = null;
         return task.epoch == self.cancel_epoch;
+    }
+
+    /// Record the popped task as slot-waiting so `/stop` counts it as
+    /// discarded (it is no longer in `queue`).
+    fn beginSlotWait(self: *SessionWorker, task: *MessageTask) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.waiting_task = task;
     }
 
     fn discardTask(self: *SessionWorker, task: *MessageTask) void {
@@ -1325,7 +1340,9 @@ const SessionWorker = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.cancel_epoch +%= 1;
-        const count = self.queue.items.len;
+        // A popped task blocked in `slots.acquire()` is not in `queue`, but
+        // the epoch bump cancels it too, so it counts as discarded.
+        const count = self.queue.items.len + @intFromBool(self.waiting_task != null);
         for (self.queue.items) |task| self.discardTask(task);
         self.queue.clearRetainingCapacity();
         return count;
@@ -1350,7 +1367,10 @@ fn sessionWorkerLoop(worker: *SessionWorker) void {
         // Wait for a global turn slot on the worker thread, never on the
         // poller, so max_concurrent_tasks bounds running turns without
         // stalling message intake.
-        if (worker.slots) |slots| slots.acquire();
+        if (worker.slots) |slots| {
+            worker.beginSlotWait(task);
+            slots.acquire();
+        }
         if (worker.shouldRun(task)) {
             worker.runTask(task);
         } else {
@@ -3399,8 +3419,10 @@ test "discarding a session queue cancels the task waiting for a turn slot" {
     slots.mu.unlock();
 
     // Regression: /stop saw a "running" worker but turn_running == false, so it
-    // reported "no in-flight turn" and both messages still ran later.
-    try std.testing.expectEqual(@as(usize, 1), worker.discardQueued());
+    // reported "no in-flight turn" and both messages still ran later. The
+    // message already popped and waiting for a slot is cancelled too, so it
+    // must be counted (the reply otherwise said nothing was discarded).
+    try std.testing.expectEqual(@as(usize, 2), worker.discardQueued());
     slots.release();
 
     // Let the worker drain and exit.
