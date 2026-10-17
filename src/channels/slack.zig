@@ -9,6 +9,7 @@ const net_security = @import("../net_security.zig");
 const config_types = @import("../config_types.zig");
 const telegram = @import("telegram.zig");
 const interaction_choices = @import("../interactions/choices.zig");
+const control_plane = @import("../control_plane.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 const stream_presenter = @import("slack_stream_presenter.zig");
@@ -129,11 +130,40 @@ fn buildSlashResponseBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 
 /// Recently seen inbound event hashes, used to drop Slack redeliveries.
 const SEEN_INBOUND_EVENTS = 256;
 
-/// An owned Socket Mode message event waiting for the inbound worker.
+/// One unit of inbound work for the worker pool. Message events carry the
+/// serialized Slack event; slash commands carry the command text and sender.
 const InboundEvent = struct {
-    event_json: []u8,
+    kind: Kind,
+    /// Serialized event JSON for `.message`; command text for `.slash`.
+    payload: []u8,
     channel_id: []u8,
+    /// Slash commands only: the invoking user.
+    sender_id: ?[]u8 = null,
+    /// Hash of channel (+ thread for messages). Events sharing it are processed
+    /// in FIFO order while other conversations proceed concurrently.
+    conversation_hash: u64,
+    /// Assigned under `inbound_mu` by the producer.
+    id: u64 = 0,
+    /// Set by the worker that picked the event; keeps later events of the same
+    /// conversation from overtaking it.
+    claimed: bool = false,
+
+    const Kind = enum { message, slash };
+
+    fn deinit(self: *InboundEvent, allocator: std.mem.Allocator) void {
+        allocator.free(self.payload);
+        allocator.free(self.channel_id);
+        if (self.sender_id) |sender| allocator.free(sender);
+    }
 };
+
+/// One worker per conversation keeps FIFO, so a handful of workers let other
+/// chats proceed while a file download or transcription blocks one.
+const INBOUND_WORKER_COUNT = 4;
+/// Total queued inbound events. Past this the socket reader drops the event
+/// instead of growing without bound. A per-conversation reply is not sent from
+/// the reader: a network call there is exactly what the queue exists to avoid.
+const MAX_INBOUND_QUEUE = 256;
 
 /// Slack re-delivers an envelope (after a failed ack) with `retry_attempt`
 /// set. Return it, or 0 when absent, so a first delivery is always processed.
@@ -290,15 +320,15 @@ pub const SlackChannel = struct {
     poll_thread: ?std.Thread = null,
     socket_thread: ?std.Thread = null,
     socket_mu: std_compat.sync.Mutex = .{},
-    /// Socket Mode events are handed to this worker so inbound file downloads
+    /// Socket Mode events are handed to this pool so inbound file downloads
     /// and transcription never run on the websocket reader thread (which also
     /// has to keep answering pings and acking queued envelopes).
     inbound_mu: std_compat.sync.Mutex = .{},
     inbound_cond: std_compat.sync.Condition = .{},
     inbound_queue: std.ArrayListUnmanaged(InboundEvent) = .empty,
-    inbound_thread: ?std.Thread = null,
+    inbound_threads: [INBOUND_WORKER_COUNT]?std.Thread = [_]?std.Thread{null} ** INBOUND_WORKER_COUNT,
+    inbound_next_id: u64 = 1,
     inbound_stop: bool = false,
-    inbound_busy: bool = false,
     /// Bounded ring of recently seen event hashes (redelivery dedupe).
     inbound_seen: [SEEN_INBOUND_EVENTS]u64 = [_]u64{0} ** SEEN_INBOUND_EVENTS,
     inbound_seen_count: usize = 0,
@@ -875,20 +905,26 @@ pub const SlackChannel = struct {
     /// True when this event was already processed. Slack redelivers an event
     /// (same `event_id`, or `client_msg_id`/`ts` for older payloads) when the
     /// envelope ack was lost; processing it again would duplicate the turn.
+    /// Every available key is checked: the same post can arrive as both
+    /// `app_mention` and `message.channels` with different event_ids.
     fn inboundEventAlreadySeen(self: *SlackChannel, payload_obj: std.json.ObjectMap, event_obj: std.json.ObjectMap) bool {
+        var seen = false;
         if (jsonStringValue(payload_obj, "event_id")) |event_id| {
-            return self.markInboundSeen(std.hash.Wyhash.hash(0, event_id));
+            if (self.markInboundSeen(std.hash.Wyhash.hash(0, event_id))) seen = true;
         }
         if (jsonStringValue(event_obj, "client_msg_id")) |client_msg_id| {
-            return self.markInboundSeen(std.hash.Wyhash.hash(0, client_msg_id));
+            if (self.markInboundSeen(std.hash.Wyhash.hash(0, client_msg_id))) seen = true;
         }
-        const ts = jsonStringValue(event_obj, "ts") orelse return false;
-        const channel_id = jsonStringValue(event_obj, "channel") orelse return false;
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(channel_id);
-        hasher.update(":");
-        hasher.update(ts);
-        return self.markInboundSeen(hasher.final());
+        if (jsonStringValue(event_obj, "ts")) |ts| {
+            if (jsonStringValue(event_obj, "channel")) |channel_id| {
+                var hasher = std.hash.Wyhash.init(0);
+                hasher.update(channel_id);
+                hasher.update(":");
+                hasher.update(ts);
+                if (self.markInboundSeen(hasher.final())) seen = true;
+            }
+        }
+        return seen;
     }
 
     fn markInboundSeen(self: *SlackChannel, hash: u64) bool {
@@ -903,77 +939,125 @@ pub const SlackChannel = struct {
         return false;
     }
 
-    /// Hand an owned event to the inbound worker. Takes ownership of both
-    /// slices, including on failure.
-    fn enqueueInboundEvent(self: *SlackChannel, event_json: []u8, channel_id: []u8) !void {
-        if (!self.ensureInboundWorker()) {
-            self.allocator.free(event_json);
-            self.allocator.free(channel_id);
-            return error.SlackInboundWorkerUnavailable;
-        }
+    /// Hand an owned event to the worker pool. Takes ownership of the event,
+    /// including on failure.
+    fn enqueueInboundEvent(self: *SlackChannel, event: InboundEvent) !void {
+        var owned = event;
         self.inbound_mu.lock();
         defer self.inbound_mu.unlock();
-        self.inbound_queue.append(self.allocator, .{
-            .event_json = event_json,
-            .channel_id = channel_id,
-        }) catch |err| {
-            self.allocator.free(event_json);
-            self.allocator.free(channel_id);
+
+        if (self.inbound_stop or !self.ensureInboundWorkersLocked()) {
+            owned.deinit(self.allocator);
+            return error.SlackInboundWorkerUnavailable;
+        }
+        if (self.inbound_queue.items.len >= MAX_INBOUND_QUEUE) {
+            log.warn("Slack inbound queue full ({d}); dropping event for channel {s}", .{ MAX_INBOUND_QUEUE, owned.channel_id });
+            owned.deinit(self.allocator);
+            return error.SlackInboundQueueFull;
+        }
+        owned.id = self.inbound_next_id;
+        self.inbound_next_id +%= 1;
+        self.inbound_queue.append(self.allocator, owned) catch |err| {
+            owned.deinit(self.allocator);
             return err;
         };
-        self.inbound_cond.signal();
+        self.inbound_cond.broadcast();
     }
 
-    fn ensureInboundWorker(self: *SlackChannel) bool {
-        if (self.inbound_thread != null) return true;
-        self.inbound_thread = std.Thread.spawn(
-            .{ .stack_size = SOCKET_THREAD_STACK_SIZE },
-            inboundWorkerLoop,
-            .{self},
-        ) catch |err| {
-            log.warn("Slack inbound worker spawn failed: {}", .{err});
-            return false;
-        };
+    /// Spawn any missing pool worker. Called with `inbound_mu` held.
+    fn ensureInboundWorkersLocked(self: *SlackChannel) bool {
+        for (&self.inbound_threads) |*slot| {
+            if (slot.* != null) continue;
+            slot.* = std.Thread.spawn(
+                .{ .stack_size = SOCKET_THREAD_STACK_SIZE },
+                inboundWorkerLoop,
+                .{self},
+            ) catch |err| {
+                log.warn("Slack inbound worker spawn failed: {}", .{err});
+                return false;
+            };
+        }
         return true;
+    }
+
+    /// Pick the oldest event whose conversation has no in-flight event. Called
+    /// with `inbound_mu` held; the event stays queued (claimed) until its worker
+    /// finishes, so other workers can see the conversation is busy.
+    fn takeInboundEventLocked(self: *SlackChannel) ?InboundEvent {
+        if (self.inbound_stop) return null;
+        for (self.inbound_queue.items) |*candidate| {
+            if (candidate.claimed) continue;
+            var busy = false;
+            for (self.inbound_queue.items) |other| {
+                if (other.claimed and other.conversation_hash == candidate.conversation_hash) {
+                    busy = true;
+                    break;
+                }
+            }
+            if (busy) continue;
+            candidate.claimed = true;
+            return candidate.*;
+        }
+        return null;
+    }
+
+    fn removeInboundEventLocked(self: *SlackChannel, id: u64) void {
+        for (self.inbound_queue.items, 0..) |candidate, idx| {
+            if (candidate.id == id) {
+                _ = self.inbound_queue.orderedRemove(idx);
+                return;
+            }
+        }
     }
 
     fn inboundWorkerLoop(self: *SlackChannel) void {
         while (true) {
             self.inbound_mu.lock();
-            while (self.inbound_queue.items.len == 0 and !self.inbound_stop) {
+            const picked = self.takeInboundEventLocked();
+            if (picked == null) {
+                if (self.inbound_stop) {
+                    self.inbound_mu.unlock();
+                    return;
+                }
                 self.inbound_cond.wait(&self.inbound_mu);
-            }
-            if (self.inbound_stop) {
                 self.inbound_mu.unlock();
-                return;
+                continue;
             }
-            const event = self.inbound_queue.orderedRemove(0);
-            self.inbound_busy = true;
             self.inbound_mu.unlock();
 
+            var event = picked.?;
             defer {
-                self.allocator.free(event.event_json);
-                self.allocator.free(event.channel_id);
                 self.inbound_mu.lock();
-                self.inbound_busy = false;
+                self.removeInboundEventLocked(event.id);
                 self.inbound_cond.broadcast();
                 self.inbound_mu.unlock();
+                event.deinit(self.allocator);
             }
 
-            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, event.event_json, .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value != .object) continue;
-            self.processHistoryMessage(parsed.value.object, event.channel_id) catch |err| {
-                log.warn("Slack inbound event processing failed: {}", .{err});
-            };
+            switch (event.kind) {
+                .message => {
+                    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, event.payload, .{}) catch continue;
+                    defer parsed.deinit();
+                    if (parsed.value != .object) continue;
+                    self.processHistoryMessage(parsed.value.object, event.channel_id) catch |err| {
+                        log.warn("Slack inbound event processing failed: {}", .{err});
+                    };
+                },
+                .slash => {
+                    const sender = event.sender_id orelse continue;
+                    self.publishInboundMessage(sender, event.channel_id, event.payload, null, null) catch |err| {
+                        log.warn("Slack slash command publish failed: {}", .{err});
+                    };
+                },
+            }
         }
     }
 
-    /// Test seam: wait until the inbound worker has drained every queued event.
+    /// Test seam: wait until the inbound pool has drained every queued event.
     fn waitForInboundIdle(self: *SlackChannel) void {
         self.inbound_mu.lock();
         defer self.inbound_mu.unlock();
-        while (self.inbound_queue.items.len > 0 or self.inbound_busy) {
+        while (self.inbound_queue.items.len > 0) {
             self.inbound_cond.wait(&self.inbound_mu);
         }
     }
@@ -1275,8 +1359,41 @@ pub const SlackChannel = struct {
         // Feed the text as if the user typed it in this channel (top level), so
         // the normal command handling runs. A `/stop` therefore reaches the same
         // interrupt path as a typed message.
-        self.publishInboundMessage(sender_id, channel_id, text, null, null) catch |err| {
-            log.warn("Slack slash command publish failed: {}", .{err});
+        //
+        // `/stop` must stay immediate (it has to interrupt the turn that is
+        // blocking the queue). Every other command joins the same
+        // per-conversation FIFO as messages, so `/new` cannot run ahead of an
+        // earlier queued message in this channel.
+        if (control_plane.isStopLikeCommand(text)) {
+            self.publishInboundMessage(sender_id, channel_id, text, null, null) catch |err| {
+                log.warn("Slack slash command publish failed: {}", .{err});
+            };
+            return;
+        }
+
+        const text_copy = self.allocator.dupe(u8, text) catch return;
+        const channel_copy = self.allocator.dupe(u8, channel_id) catch {
+            self.allocator.free(text_copy);
+            return;
+        };
+        const sender_copy = self.allocator.dupe(u8, sender_id) catch {
+            self.allocator.free(text_copy);
+            self.allocator.free(channel_copy);
+            return;
+        };
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(channel_id);
+        self.enqueueInboundEvent(.{
+            .kind = .slash,
+            .payload = text_copy,
+            .channel_id = channel_copy,
+            .sender_id = sender_copy,
+            .conversation_hash = hasher.final(),
+        }) catch |err| {
+            if (err == error.SlackInboundQueueFull) return;
+            self.publishInboundMessage(sender_id, channel_id, text, null, null) catch |publish_err| {
+                log.warn("Slack slash command publish failed: {}", .{publish_err});
+            };
         };
     }
 
@@ -1563,7 +1680,23 @@ pub const SlackChannel = struct {
             self.allocator.free(event_json);
             return self.processHistoryMessage(event_val.object, channel_val.string);
         };
-        self.enqueueInboundEvent(event_json, channel_id) catch {
+        // One conversation = channel (+ thread). Events of the same
+        // conversation run FIFO; different conversations run concurrently.
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(channel_val.string);
+        if (jsonStringValue(event_val.object, "thread_ts")) |thread_ts| {
+            hasher.update(":");
+            hasher.update(thread_ts);
+        }
+        self.enqueueInboundEvent(.{
+            .kind = .message,
+            .payload = event_json,
+            .channel_id = channel_id,
+            .conversation_hash = hasher.final(),
+        }) catch |err| {
+            // The queue is bounded; a full queue drops the event with a log
+            // rather than blocking the socket reader on a slow turn.
+            if (err == error.SlackInboundQueueFull) return;
             // enqueueInboundEvent freed the owned copies; process the still-live
             // event rather than dropping it.
             return self.processHistoryMessage(event_val.object, channel_val.string);
@@ -2151,6 +2284,32 @@ pub const SlackChannel = struct {
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
 
+        // Regression: stop() left inbound_stop set and the worker handles
+        // cleared, and channel_manager restarts the same instance after a
+        // health-check failure. Without resetting both here the respawned
+        // worker exited immediately, events queued forever and inbound went
+        // silently dead. Join any worker that outlived a failed start, then
+        // start a fresh pool.
+        self.inbound_mu.lock();
+        self.inbound_stop = true;
+        self.inbound_cond.broadcast();
+        self.inbound_mu.unlock();
+        for (&self.inbound_threads) |*slot| {
+            if (slot.*) |thread| {
+                thread.join();
+                slot.* = null;
+            }
+        }
+        self.inbound_mu.lock();
+        var stale_queue = self.inbound_queue;
+        self.inbound_queue = .empty;
+        self.inbound_stop = false;
+        const workers_ok = self.ensureInboundWorkersLocked();
+        self.inbound_mu.unlock();
+        for (stale_queue.items) |*event| event.deinit(self.allocator);
+        stale_queue.deinit(self.allocator);
+        if (!workers_ok) return error.SlackInboundWorkerUnavailable;
+
         // Best-effort bot identity fetch for mention-only policies.
         var fetched_bot_identity = true;
         self.fetchBotUserId() catch |err| {
@@ -2210,23 +2369,22 @@ pub const SlackChannel = struct {
         }
 
         // No producer is left after the socket/poll joins; stop the inbound
-        // worker before freeing the fields it reads (bot ids, transcriber).
+        // pool before freeing the fields it reads (bot ids, transcriber).
         self.inbound_mu.lock();
         self.inbound_stop = true;
-        self.inbound_cond.signal();
+        self.inbound_cond.broadcast();
         self.inbound_mu.unlock();
-        if (self.inbound_thread) |t| {
-            t.join();
-            self.inbound_thread = null;
+        for (&self.inbound_threads) |*slot| {
+            if (slot.*) |thread| {
+                thread.join();
+                slot.* = null;
+            }
         }
         self.inbound_mu.lock();
         var queued = self.inbound_queue;
         self.inbound_queue = .empty;
         self.inbound_mu.unlock();
-        for (queued.items) |event| {
-            self.allocator.free(event.event_json);
-            self.allocator.free(event.channel_id);
-        }
+        for (queued.items) |*event| event.deinit(self.allocator);
         queued.deinit(self.allocator);
 
         self.socket_fallback_to_polling.store(false, .release);
@@ -4801,6 +4959,8 @@ test "slack slash command publishes the text as a top-level channel message" {
     ch.slash_command_enabled = true;
     ch.slash_command_name = "nullclaw";
     ch.setBus(&eb);
+    // Non-stop commands now run on the inbound pool; stop joins its workers.
+    defer ch.channel().stop();
 
     const parsed = try slashCommandTestPayload(alloc, "/nullclaw", "hello there");
     defer parsed.deinit();
@@ -5047,6 +5207,277 @@ test "slack socket message file downloads run off the reader thread" {
     var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
     defer msg.deinit(alloc);
     try std.testing.expect(std.mem.indexOf(u8, msg.content, "see file") != null);
+}
+
+/// Test seam: block one inbound file download until the test releases it.
+const TestInboundGate = struct {
+    var mutex: std_compat.sync.Mutex = .{};
+    var cond: std_compat.sync.Condition = .{};
+    var entered: bool = false;
+    var release: bool = false;
+
+    fn reset() void {
+        mutex.lock();
+        entered = false;
+        release = false;
+        mutex.unlock();
+    }
+
+    fn fetch(_: std.mem.Allocator, _: SlackFileInfo) ?[]u8 {
+        mutex.lock();
+        defer mutex.unlock();
+        entered = true;
+        cond.broadcast();
+        while (!release) cond.wait(&mutex);
+        return null;
+    }
+
+    /// Bounded wait so a broken worker fails the test instead of hanging it.
+    fn waitEntered() bool {
+        var waited_ms: u64 = 0;
+        while (waited_ms < 10_000) : (waited_ms += 10) {
+            mutex.lock();
+            const ready = entered;
+            mutex.unlock();
+            if (ready) return true;
+            std_compat.thread.sleep(10 * std.time.ns_per_ms);
+        }
+        return false;
+    }
+
+    fn open() void {
+        mutex.lock();
+        release = true;
+        cond.broadcast();
+        mutex.unlock();
+    }
+};
+
+test "slack restart after stop respawns the inbound pool" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    var ch = SlackChannel.initFromConfig(alloc, .{
+        .account_id = "sl-main",
+        .mode = .http,
+        .bot_token = "xoxb-test",
+        .signing_secret = "secret",
+    });
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+
+    const channel = ch.channel();
+    try channel.start();
+    channel.stop();
+    // Regression: vtableStop set inbound_stop and cleared the worker handle,
+    // but vtableStart never reset them. channel_manager restarts the same
+    // instance after a health-check failure, so the worker exited immediately
+    // and every later event queued forever (silent inbound outage).
+    try channel.start();
+    defer channel.stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = invalid_socket },
+        .tls = null,
+        .write_mu = .{},
+    };
+    const envelope =
+        \\{"type":"events_api","payload":{"event_id":"EvRestart","event":{"type":"message","channel":"C1","user":"U1","text":"after restart","ts":"1700000000.300"}}}
+    ;
+    try ch.handleSocketPayload(&ws, envelope);
+    ch.waitForInboundIdle();
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("after restart", msg.content);
+}
+
+test "slack slow download in one conversation does not block another" {
+    TestInboundGate.reset();
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.file_fetch_override = TestInboundGate.fetch;
+    ch.setBus(&eb);
+    defer {
+        TestInboundGate.open();
+        ch.channel().stop();
+    }
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = invalid_socket },
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    const slow =
+        \\{"type":"events_api","payload":{"event_id":"EvSlow","event":{"type":"message","subtype":"file_share","channel":"C1","user":"U1","text":"slow file","ts":"1700000000.400","files":[{"id":"F1","name":"a.png","mimetype":"image/png","url_private":"https://files.slack.com/a.png","size":10}]}}}
+    ;
+    try ch.handleSocketPayload(&ws, slow);
+    try std.testing.expect(TestInboundGate.waitEntered());
+
+    const fast =
+        \\{"type":"events_api","payload":{"event_id":"EvFast","event":{"type":"message","channel":"C2","user":"U2","text":"other chat","ts":"1700000000.500"}}}
+    ;
+    try ch.handleSocketPayload(&ws, fast);
+
+    // Regression: one serial worker meant a slow download in C1 delayed every
+    // other conversation until it finished.
+    var msg = (try eb.consumeInboundTimeout(5000)) orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("other chat", msg.content);
+    // The slow conversation is still blocked.
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+
+    TestInboundGate.open();
+    ch.waitForInboundIdle();
+    var slow_msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer slow_msg.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, slow_msg.content, "slow file") != null);
+}
+
+test "slack slash commands queue behind earlier messages per conversation" {
+    TestInboundGate.reset();
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.slash_command_enabled = true;
+    ch.slash_command_name = "nullclaw";
+    ch.file_fetch_override = TestInboundGate.fetch;
+    ch.setBus(&eb);
+    defer {
+        TestInboundGate.open();
+        ch.channel().stop();
+    }
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = invalid_socket },
+        .tls = null,
+        .write_mu = .{},
+    };
+    const slow =
+        \\{"type":"events_api","payload":{"event_id":"EvSlashSlow","event":{"type":"message","subtype":"file_share","channel":"C1","user":"U1","text":"slow file","ts":"1700000000.600","files":[{"id":"F1","name":"a.png","mimetype":"image/png","url_private":"https://files.slack.com/a.png","size":10}]}}}
+    ;
+    try ch.handleSocketPayload(&ws, slow);
+    try std.testing.expect(TestInboundGate.waitEntered());
+
+    var payload = try slashCommandTestPayload(alloc, "/nullclaw", "/new");
+    defer payload.deinit();
+    ch.handleSlashCommand(payload.value.object);
+
+    // Regression: slash commands ran inline while messages were queued, so
+    // /new could run ahead of an earlier message in the same channel.
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+
+    TestInboundGate.open();
+    ch.waitForInboundIdle();
+
+    var slow_msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer slow_msg.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, slow_msg.content, "slow file") != null);
+    var slash_msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer slash_msg.deinit(alloc);
+    try std.testing.expectEqualStrings("/new", slash_msg.content);
+}
+
+test "slack /stop bypasses the conversation queue" {
+    TestInboundGate.reset();
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.slash_command_enabled = true;
+    ch.slash_command_name = "nullclaw";
+    ch.file_fetch_override = TestInboundGate.fetch;
+    ch.setBus(&eb);
+    defer {
+        TestInboundGate.open();
+        ch.channel().stop();
+    }
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = invalid_socket },
+        .tls = null,
+        .write_mu = .{},
+    };
+    const slow =
+        \\{"type":"events_api","payload":{"event_id":"EvStopSlow","event":{"type":"message","subtype":"file_share","channel":"C1","user":"U1","text":"slow file","ts":"1700000000.700","files":[{"id":"F1","name":"a.png","mimetype":"image/png","url_private":"https://files.slack.com/a.png","size":10}]}}}
+    ;
+    try ch.handleSocketPayload(&ws, slow);
+    try std.testing.expect(TestInboundGate.waitEntered());
+
+    var payload = try slashCommandTestPayload(alloc, "/nullclaw", "/stop");
+    defer payload.deinit();
+    ch.handleSlashCommand(payload.value.object);
+
+    // /stop must stay immediate: it has to interrupt the turn that is holding
+    // up the queue, so it cannot wait behind that turn.
+    var stop_msg = (try eb.consumeInboundTimeout(5000)) orelse return error.TestExpectedEqual;
+    defer stop_msg.deinit(alloc);
+    try std.testing.expectEqualStrings("/stop", stop_msg.content);
+
+    TestInboundGate.open();
+    ch.waitForInboundIdle();
+    var slow_msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer slow_msg.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, slow_msg.content, "slow file") != null);
+}
+
+test "slack app_mention and message delivery of one post is processed once" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = invalid_socket },
+        .tls = null,
+        .write_mu = .{},
+    };
+    // Same post, two event types and different event_ids, but one
+    // client_msg_id/ts.
+    const mention =
+        \\{"type":"events_api","payload":{"event_id":"EvMention","event":{"type":"app_mention","client_msg_id":"CM1","channel":"C1","user":"U1","text":"hello there","ts":"1700000000.800"}}}
+    ;
+    const message =
+        \\{"type":"events_api","payload":{"event_id":"EvMessage","event":{"type":"message","client_msg_id":"CM1","channel":"C1","user":"U1","text":"hello there","ts":"1700000000.800"}}}
+    ;
+    try ch.handleSocketPayload(&ws, mention);
+    try ch.handleSocketPayload(&ws, message);
+    ch.waitForInboundIdle();
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("hello there", msg.content);
+    // Regression: dedupe returned after the first key, so the same post
+    // delivered as both app_mention and message produced two turns.
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
 }
 
 test "slack redelivered socket event is processed once" {
