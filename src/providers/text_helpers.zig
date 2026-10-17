@@ -124,16 +124,19 @@ fn containsStatusCodeIn(text: []const u8, min: u16, max: u16) bool {
     return false;
 }
 
-/// True when `text` carries a `status=` field whose value is in `[min, max]`.
-/// Provider summaries are rendered as `status=503 message=...`; matching the
-/// field avoids reading an unrelated number (a timeout in ms, a token limit)
-/// as an HTTP status.
+/// True when `text` carries a `status` field whose value is in `[min, max]`.
+/// Provider summaries are rendered as `status=503 message=...` (spaces around
+/// `=` are tolerated); matching the field avoids reading an unrelated number
+/// (a timeout in ms, a token limit) as an HTTP status.
 fn containsStatusFieldIn(text: []const u8, min: u16, max: u16) bool {
-    const marker = "status=";
+    const marker = "status";
     var i: usize = 0;
     while (i + marker.len <= text.len) : (i += 1) {
         if (!sliceEqlAsciiFold(text[i .. i + marker.len], marker)) continue;
         var start = i + marker.len;
+        while (start < text.len and (text[start] == ' ' or text[start] == '\t')) start += 1;
+        if (start >= text.len or text[start] != '=') continue;
+        start += 1;
         while (start < text.len and (text[start] == ' ' or text[start] == '\t')) start += 1;
         var end = start;
         while (end < text.len and std.ascii.isDigit(text[end])) end += 1;
@@ -159,8 +162,9 @@ pub fn isOverloadedText(text: []const u8) bool {
     }
     // Only the summarized `status=` field is an HTTP status. A bare number
     // (e.g. "timed out after 500 ms") must not be read as a 5xx.
-    // 529 is Anthropic's non-standard overload status.
-    return containsStatusFieldIn(text, 500, 599) or containsAsciiFold(text, "529");
+    // 529 is Anthropic's non-standard overload status, so it is covered by the
+    // 5xx status-field range; a bare "529" anywhere is not a status.
+    return containsStatusFieldIn(text, 500, 599);
 }
 
 /// Returns true if `text` indicates a provider authentication/authorization
@@ -209,6 +213,9 @@ test "isOverloadedText matches 5xx and overload phrasing" {
 test "isOverloadedText ignores bare numbers outside the status field" {
     try std.testing.expect(!isOverloadedText("request timed out after 500 ms"));
     try std.testing.expect(!isOverloadedText("max_tokens must be <= 500"));
+    // Regression: a bare "529" anywhere matched, so an unrelated number such
+    // as a retry delay was classified as Anthropic's overload status.
+    try std.testing.expect(!isOverloadedText("retry after 529 ms"));
     try std.testing.expect(isOverloadedText("status=503 message=server error"));
     try std.testing.expect(isOverloadedText("status = 529"));
 }
