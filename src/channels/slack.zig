@@ -1531,10 +1531,20 @@ pub const SlackChannel = struct {
         // per-conversation FIFO as messages, so `/new` cannot run ahead of an
         // earlier queued message in this channel.
         if (control_plane.isStopLikeCommand(text)) {
-            self.publishInboundMessage(sender_id, channel_id, text, null, null) catch |err| {
-                log.warn("Slack slash command publish failed: {}", .{err});
+            // Bound the bus write like the typed-/stop fast path: this runs on
+            // the Socket Mode reader, which must keep acking and answering
+            // pings. On a full bus fall through to the per-conversation FIFO
+            // below instead of blocking the reader until a turn drains it.
+            var published = true;
+            self.publishInboundMessageTimeout(sender_id, channel_id, text, null, null, STOP_PUBLISH_TIMEOUT_MS) catch |err| {
+                if (err == error.Timeout) {
+                    published = false;
+                } else {
+                    log.warn("Slack slash command publish failed: {}", .{err});
+                    return;
+                }
             };
-            return;
+            if (published) return;
         }
 
         const text_copy = self.allocator.dupe(u8, text) catch return;
@@ -5508,6 +5518,58 @@ test "slack slash command /stop is published verbatim as a stop command" {
     try std.testing.expectEqualStrings("/stop", msg.content);
     try std.testing.expect(@import("../control_plane.zig").isStopLikeCommand(msg.content));
     try std.testing.expectEqualStrings("slack:sl-main:channel:C1", msg.session_key);
+}
+
+test "slack slash command /stop does not block the socket reader on a full bus" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer {
+        // consumeInbound() blocks when empty; drain with a zero timeout.
+        while (true) {
+            const queued = eb.consumeInboundTimeout(0) catch break;
+            var owned = queued orelse break;
+            owned.deinit(alloc);
+        }
+        eb.close();
+    }
+
+    // Fill the inbound bus so a blocking publish would never return.
+    for (0..bus_mod.QUEUE_CAPACITY) |_| {
+        const queued = try bus_mod.makeInbound(alloc, "slack", "U1", "C1", "queued", "slack:sl-main:channel:C1");
+        try eb.publishInbound(queued);
+    }
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.slash_command_enabled = true;
+    ch.slash_command_name = "nullclaw";
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    const parsed = try slashCommandTestPayload(alloc, "/nullclaw", "/stop");
+    defer parsed.deinit();
+
+    // Regression: this sibling of the typed-/stop fast path used the blocking
+    // publish, so a full bus stalled the Socket Mode reader (no acks/pings)
+    // until a turn drained it. It now falls back to the conversation FIFO.
+    ch.handleSlashCommand(parsed.value.object);
+
+    // Free bus slots one at a time: the pre-filled messages drain first and
+    // each freed slot lets the inbound worker publish the queued stop at the
+    // tail. Bounded by the number of messages that can be on the bus.
+    var found_stop = false;
+    for (0..bus_mod.QUEUE_CAPACITY + 1) |_| {
+        var msg = (try eb.consumeInboundTimeout(5000)) orelse return error.TestExpectedEqual;
+        defer msg.deinit(alloc);
+        if (std.mem.eql(u8, msg.content, "/stop")) {
+            found_stop = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_stop);
+    ch.waitForInboundIdle();
 }
 
 test "slack slash command ignores an unknown command name" {
