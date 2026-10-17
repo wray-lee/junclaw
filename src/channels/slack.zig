@@ -4880,7 +4880,9 @@ test "typed /stop in a mention-only group is fast-pathed" {
     // enqueued it behind the very turn it was meant to interrupt.
     try std.testing.expect(ch.maybePublishStopMessage(parsed.value.object, "C1"));
 
-    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    // Bounded wait: if the fast path regresses the test fails instead of
+    // blocking the suite forever.
+    var msg = (try eb.consumeInboundTimeout(1000)) orelse return error.TestExpectedEqual;
     defer msg.deinit(alloc);
     try std.testing.expectEqualStrings("/stop", msg.content);
     try std.testing.expect(control_plane.isStopLikeCommand(msg.content));
