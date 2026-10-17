@@ -1361,6 +1361,46 @@ fn tryHandleStopCommandBeforeEnqueue(
     return true;
 }
 
+/// Route a message before it is queued on a session worker. Bus-routed
+/// channels (Slack and friends) otherwise reach `routeInbound` only after the
+/// running turn finishes, so a second message waits invisibly instead of
+/// steering and gets no acknowledgement at enqueue time. Returns true when the
+/// router consumed the message; the sender is acknowledged or told why it was
+/// dropped.
+fn tryHandleRoutedInboundBeforeEnqueue(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    event_bus: *bus_mod.Bus,
+    registry: *const dispatch.ChannelRegistry,
+    session_mgr: *@import("session.zig").SessionManager,
+    msg: *const bus_mod.InboundMessage,
+) bool {
+    var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+    defer parsed_meta.deinit();
+
+    var routing_plan = buildInboundRoutingPlan(allocator, config, msg, parsed_meta.fields);
+    defer routing_plan.deinit(allocator);
+
+    const action = session_mgr.routeInbound(routing_plan.session_key, msg.content);
+    if (!action.skipsTurn()) return false;
+
+    const outbound_channel = resolveOutboundChannel(registry, routing_plan.outbound_channel, routing_plan.outbound_account_id);
+    switch (action) {
+        .steered => setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted),
+        .dropped => {
+            var notice = if (routing_plan.outbound_account_id) |aid|
+                bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return true
+            else
+                bus_mod.makeOutbound(allocator, routing_plan.outbound_channel, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return true;
+            event_bus.publishOutbound(notice) catch {
+                notice.deinit(allocator);
+            };
+        },
+        .process, .skip => {},
+    }
+    return true;
+}
+
 fn publishInboundToWorkerQueue(
     allocator: std.mem.Allocator,
     config: *const Config,
@@ -1421,11 +1461,11 @@ fn processInboundMessage(
 
     const route_action = runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content);
     if (route_action.skipsTurn()) {
-        if (route_action == .skip) {
+        if (route_action == .steered) {
             // Acknowledge an enqueued mid-turn message so the sender sees it
             // was accepted by the active turn.
             setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted);
-        } else {
+        } else if (route_action == .dropped) {
             // Never drop silently: tell the sender the message was not delivered.
             var notice = if (routing_plan.outbound_account_id) |aid|
                 bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return
@@ -1703,6 +1743,10 @@ fn inboundDispatcherThread(
                 continue;
             }
             if (worker_count > 0) {
+                if (tryHandleRoutedInboundBeforeEnqueue(allocator, runtime.config, event_bus, registry, &runtime.session_mgr, &msg)) {
+                    msg.deinit(allocator);
+                    continue;
+                }
                 publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch |err| {
                     msg.deinit(allocator);
                     if (err == error.Closed) break;
@@ -1723,6 +1767,10 @@ fn inboundDispatcherThread(
             continue;
         }
         if (worker_count > 0) {
+            if (tryHandleRoutedInboundBeforeEnqueue(allocator, runtime.config, event_bus, registry, &runtime.session_mgr, &msg)) {
+                msg.deinit(allocator);
+                continue;
+            }
             publishInboundToWorkerQueue(allocator, runtime.config, worker_queues[0..worker_count], msg) catch {
                 msg.deinit(allocator);
             };
