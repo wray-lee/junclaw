@@ -751,14 +751,6 @@ fn telegramConversationContext(
     });
 }
 
-/// True when an interaction callback carries ordinary text that must run
-/// through the callback handler (which edits the originating message in
-/// place). Slash-command callbacks keep the normal message path when local
-/// handling misses, so an unknown slash callback still reaches the model.
-fn telegramCallbackRunsHandler(is_interaction_callback: bool, content: []const u8) bool {
-    return is_interaction_callback and control_plane.parseSlashCommand(content) == null;
-}
-
 fn handleTelegramInteractiveCallback(
     allocator: std.mem.Allocator,
     runtime: *ChannelRuntime,
@@ -770,22 +762,19 @@ fn handleTelegramInteractiveCallback(
     is_group: bool,
     message_sender_id: []const u8,
     heartbeat: ?*Atomic(i64),
-    run_turn: bool,
     turn_end: ?TurnEndHook,
 ) bool {
     if (heartbeat) |h| bumpProgress(h);
-    // The poller only handles slash-command callbacks locally. Ordinary
-    // callback submit_text must run on the session worker, under the shared
-    // turn slot: running it here would block the poller for the whole turn
-    // and let it bypass `max_concurrent_tasks`.
+    // Runs on a session worker (or the synchronous fallback), never on the
+    // poller: the local slash path waits on the session mutex, which a running
+    // turn holds for its whole duration, and ordinary submit_text runs a turn.
     const is_slash_command = control_plane.parseSlashCommand(content) != null;
-    if (!is_slash_command and !run_turn) return false;
-    defer if (turn_end) |hook| hook.run(hook.ctx);
     // Route before starting the typing/draft turn, mirroring processTelegramMessage:
     // a callback the router folds into the running turn must not start a new
     // draft turn and reset the running turn's live draft. Slash commands are
     // handled locally and never consult the router, so they keep the indicator.
     if (!is_slash_command and runtime.session_mgr.routeInbound(session_key, content).skipsTurn()) {
+        if (turn_end) |hook| hook.run(hook.ctx);
         return true;
     }
 
@@ -828,6 +817,11 @@ fn handleTelegramInteractiveCallback(
         response_owned = true;
         break :blk model_reply;
     };
+    // The local slash path has no turn of its own: release the worker's
+    // pre-turn marker before the edit is sent. The model path above already
+    // ran the hook (a second run is a no-op); a local miss returns false
+    // before this point so the caller's fallback turn keeps the marker.
+    if (turn_end) |hook| hook.run(hook.ctx);
     defer if (response_owned) allocator.free(response);
 
     if (shouldSuppressGroupReply(is_group, response)) return true;
@@ -1172,7 +1166,7 @@ const MessageTask = struct {
                 turn_end,
             ),
             .callback => {
-                _ = handleTelegramInteractiveCallback(
+                const handled = handleTelegramInteractiveCallback(
                     task.allocator,
                     task.runtime,
                     task.tg_ptr,
@@ -1183,9 +1177,28 @@ const MessageTask = struct {
                     task.is_group,
                     task.message_sender_id,
                     task.heartbeat,
-                    true,
                     turn_end,
                 );
+                if (!handled) {
+                    // A slash callback that local handling does not know
+                    // falls through to the normal message turn, as the poller
+                    // used to do after its inline attempt.
+                    processTelegramMessage(
+                        task.allocator,
+                        task.runtime,
+                        task.tg_ptr,
+                        task.session_key,
+                        task.content,
+                        task.sender,
+                        task.message_id,
+                        task.is_group,
+                        task.reply_to_id,
+                        task.message_sender_id,
+                        task.replace_message,
+                        task.heartbeat,
+                        turn_end,
+                    );
+                }
             },
         }
     }
@@ -1293,9 +1306,10 @@ const SessionWorker = struct {
     /// after it leaves the turn-slot wait, so /stop also cancels the message
     /// that had already been picked but had not started running.
     cancel_epoch: u64 = 0,
-    /// Task popped from `queue` that is currently waiting for a turn slot.
-    /// `discardQueued` counts it: it is no longer in `queue`, but the epoch
-    /// bump cancels it just the same.
+    /// Task popped from `queue` that has not started its turn yet (waiting for
+    /// a turn slot or about to pass its epoch check). `popOrStop` records it
+    /// under the same lock, so `discardQueued` counts it even when /stop lands
+    /// before the worker reaches the slot wait.
     waiting_task: ?*MessageTask = null,
     /// Task that passed its epoch check and is about to run, but whose turn
     /// has not set `turn_running` yet. `/stop` uses this to signal that window
@@ -1390,6 +1404,10 @@ const SessionWorker = struct {
         }
         const task = self.queue.orderedRemove(0);
         task.epoch = self.cancel_epoch;
+        // Record it while still holding the lock: a /stop that lands after
+        // this pop but before the slot wait must count the task as discarded,
+        // not report that nothing was found while the epoch bump cancels it.
+        self.waiting_task = task;
         return task;
     }
 
@@ -1436,17 +1454,6 @@ const SessionWorker = struct {
         session_mgr.clearTurnInterruptIfIdle(self.session_key);
     }
 
-    /// Record the popped task as slot-waiting so `/stop` counts it as
-    /// discarded (it is no longer in `queue`).
-    fn beginSlotWait(self: *SessionWorker, task: *MessageTask) void {
-        self.mu.lock();
-        defer self.mu.unlock();
-        // A /stop may have bumped the epoch after this task was popped; it is
-        // already cancelled, so do not record it as slot-waiting (a second
-        // /stop would count it again and claim another message was discarded).
-        if (task.epoch == self.cancel_epoch) self.waiting_task = task;
-    }
-
     fn discardTask(self: *SessionWorker, task: *MessageTask) void {
         task.deinit();
         self.allocator.destroy(task);
@@ -1459,10 +1466,10 @@ const SessionWorker = struct {
         self.mu.lock();
         defer self.mu.unlock();
         self.cancel_epoch +%= 1;
-        // A popped task blocked in `slots.acquire()` is not in `queue`, but
-        // the epoch bump cancels it too, so it counts as discarded. Clear it
-        // after counting: a second /stop must not count the same cancelled
-        // task again and claim it discarded another message.
+        // A popped task is not in `queue` but the epoch bump cancels it too,
+        // so it counts as discarded. Clear it after counting: a second /stop
+        // must not count the same cancelled task again and claim it discarded
+        // another message.
         const counted_waiting = self.waiting_task != null;
         self.waiting_task = null;
         const count = self.queue.items.len + @intFromBool(counted_waiting);
@@ -1475,6 +1482,7 @@ const SessionWorker = struct {
     fn runTask(self: *SessionWorker, task: *MessageTask) void {
         defer {
             self.mu.lock();
+            if (self.waiting_task == task) self.waiting_task = null;
             if (self.in_flight_task == task) self.in_flight_task = null;
             self.mu.unlock();
             task.deinit();
@@ -1493,10 +1501,7 @@ fn sessionWorkerLoop(worker: *SessionWorker) void {
         // Wait for a global turn slot on the worker thread, never on the
         // poller, so max_concurrent_tasks bounds running turns without
         // stalling message intake.
-        if (worker.slots) |slots| {
-            worker.beginSlotWait(task);
-            slots.acquire();
-        }
+        if (worker.slots) |slots| slots.acquire();
         if (worker.shouldRun(task)) {
             worker.runTask(task);
         } else {
@@ -1519,7 +1524,11 @@ fn drainSessionWorkerSynchronously(worker: *SessionWorker) void {
     worker.mu.unlock();
     while (worker.popOrStop()) |task| {
         if (worker.slots) |slots| slots.acquire();
-        worker.runTask(task);
+        if (worker.shouldRun(task)) {
+            worker.runTask(task);
+        } else {
+            worker.discardTask(task);
+        }
         if (worker.slots) |slots| slots.release();
     }
 }
@@ -2195,43 +2204,6 @@ pub fn runTelegramLoop(
             const use_reply_to = msg.is_group or tg_ptr.reply_in_private;
             const reply_to_id: ?i64 = if (use_reply_to) msg.message_id else null;
 
-            if (msg.is_interaction_callback and msg.message_id != null and
-                control_plane.parseSlashCommand(msg.content) != null)
-            {
-                const session_key = resolveTelegramSessionKey(
-                    allocator,
-                    &runtime.session_mgr,
-                    config,
-                    tg_ptr.account_id,
-                    msg.sender,
-                    msg.is_group,
-                ) catch |err| {
-                    log.err("failed to resolve telegram session key for interactive skill menu: {}", .{err});
-                    tg_ptr.sendMessageWithReply(msg.sender, "Failed to resolve session for this skill menu.", reply_to_id) catch |send_err| {
-                        log.err("failed to send telegram skill-menu session error reply: {}", .{send_err});
-                    };
-                    continue;
-                };
-                defer allocator.free(session_key);
-
-                if (handleTelegramInteractiveCallback(
-                    allocator,
-                    runtime,
-                    tg_ptr,
-                    session_key,
-                    msg.content,
-                    msg.sender,
-                    msg.message_id.?,
-                    msg.is_group,
-                    msg.id,
-                    &loop_state.progress,
-                    false,
-                    null,
-                )) {
-                    continue;
-                }
-            }
-
             if (handleTelegramBuiltinCommand(
                 allocator,
                 &runtime.session_mgr,
@@ -2249,7 +2221,7 @@ pub fn runTelegramLoop(
                 continue;
             }
 
-            if (!telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content))
+            if (!msg.is_interaction_callback)
                 tg_ptr.setTaskReaction(msg.sender, msg.message_id, .accepted);
 
             const session_key = resolveTelegramSessionKey(
@@ -2403,13 +2375,11 @@ pub fn runTelegramLoop(
                         .message_sender_id = task_message_sender_id,
                         .replace_message = msg.replace_message,
                         .heartbeat = &loop_state.turn_progress,
-                        // Only ordinary submit_text uses the callback
-                        // handler; a slash callback that missed local
-                        // handling keeps the normal model-turn path.
-                        .kind = if (telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content))
-                            .callback
-                        else
-                            .message,
+                        // Every interaction callback runs on the worker: the
+                        // local slash path locks the session, and the callback
+                        // handler falls through to the normal message turn
+                        // when local handling misses.
+                        .kind = if (msg.is_interaction_callback) .callback else .message,
                     };
 
                     const worker = worker_registry.getOrCreate(session_key) catch |err| {
@@ -2427,7 +2397,7 @@ pub fn runTelegramLoop(
                             "Too many queued messages for this chat; this one was dropped. Try again after the current turn finishes.",
                             reply_to_id,
                         ) catch {};
-                        if (!telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content))
+                        if (!msg.is_interaction_callback)
                             tg_ptr.setTaskReaction(msg.sender, msg.message_id, .failed);
                         task.deinit();
                         allocator.destroy(task);
@@ -2450,8 +2420,8 @@ pub fn runTelegramLoop(
             // still applies; this is an exceptional path, not the normal one.
             runtime.acquireTurnSlot();
             defer runtime.releaseTurnSlot();
-            if (msg.message_id != null and telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content)) {
-                _ = handleTelegramInteractiveCallback(
+            const handled_callback = msg.message_id != null and msg.is_interaction_callback and
+                handleTelegramInteractiveCallback(
                     allocator,
                     runtime,
                     tg_ptr,
@@ -2462,10 +2432,9 @@ pub fn runTelegramLoop(
                     msg.is_group,
                     msg.id,
                     &loop_state.progress,
-                    true,
                     null,
                 );
-            } else {
+            if (!handled_callback) {
                 processTelegramMessage(
                     allocator,
                     runtime,
@@ -4249,7 +4218,6 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
         false,
         "user_a",
         null,
-        true,
         null,
     );
 
@@ -4259,16 +4227,7 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
     try std.testing.expect(tg.draft_buffers.get("12345") == null);
 }
 
-test "slash callbacks keep the model-turn path when local handling misses" {
-    // Regression: routing every interaction callback through the callback
-    // handler made an unknown slash callback return false without running a
-    // turn, so the message vanished instead of reaching the model.
-    try std.testing.expect(!telegramCallbackRunsHandler(true, "/not-a-local-command"));
-    try std.testing.expect(telegramCallbackRunsHandler(true, "plain choice text"));
-    try std.testing.expect(!telegramCallbackRunsHandler(false, "plain choice text"));
-}
-
-test "telegram callback submit_text is dispatched to the session worker" {
+test "a slash callback that misses local handling keeps the pre-turn marker" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
@@ -4284,6 +4243,7 @@ test "telegram callback submit_text is dispatched to the session worker" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
             .backend = "none",
@@ -4305,30 +4265,47 @@ test "telegram callback submit_text is dispatched to the session worker" {
 
     var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
     defer tg.channel().stop();
-    const before_draft_counter = tg.draft_id_counter.load(.monotonic);
 
-    // Regression: the poller ran processMessageStreaming directly for
-    // ordinary callback submit_text, bypassing the shared turn slot (a second
-    // turn could run with max_concurrent_tasks=1) and blocking /stop reads
-    // for the whole turn. The poller now declines and the session worker runs
-    // the turn under the slot.
+    const session_key = "telegram:test:direct:slash-fallback";
+    _ = try runtime.session_mgr.getOrCreate(session_key);
+
+    var worker = SessionWorker{
+        .allocator = allocator,
+        .session_key = try allocator.dupe(u8, session_key),
+    };
+    defer {
+        worker.queue.deinit(allocator);
+        allocator.free(worker.session_key);
+    }
+
+    const task = try testQueuedTask(allocator, "/not-a-local-command");
+    defer {
+        task.deinit();
+        allocator.destroy(task);
+    }
+    task.runtime = runtime;
+    task.worker = &worker;
+    try std.testing.expect(worker.shouldRun(task));
+
+    // Regression: the callback handler ran the turn-end hook before returning
+    // false for a local miss, so the fallback model turn started with no
+    // in-flight marker and a /stop in that window reported nothing in flight.
     const handled = handleTelegramInteractiveCallback(
         allocator,
         runtime,
         &tg,
-        "telegram:default:direct:12345",
-        "plain choice text",
+        session_key,
+        "/not-a-local-command",
         "12345",
         77,
         false,
         "user_a",
         null,
-        false,
-        null,
+        .{ .ctx = task, .run = taskTurnEnded },
     );
-
     try std.testing.expect(!handled);
-    try std.testing.expectEqual(before_draft_counter, tg.draft_id_counter.load(.monotonic));
+    try std.testing.expect(worker.hasInFlight());
+    worker.clearInFlight(task, &runtime.session_mgr);
 }
 
 test "a /stop racing the end of a turn does not cancel the next message" {
@@ -4436,10 +4413,11 @@ test "a slot waiter cancelled by /stop is not recorded again" {
 
     try std.testing.expect(worker.push(try testQueuedTask(alloc, "first")));
     const task = worker.popOrStop() orelse return error.TestExpectedEqual;
-    try std.testing.expectEqual(@as(usize, 0), worker.discardQueued());
-    // Regression: beginSlotWait re-recorded an already-cancelled task, so a
-    // second /stop counted it and claimed it discarded another message.
-    worker.beginSlotWait(task);
+    // Regression: the popped task was only recorded at the slot wait, so a
+    // /stop in the gap after the pop counted nothing even though the epoch
+    // bump cancelled it, and the reply claimed no message was discarded.
+    try std.testing.expectEqual(@as(usize, 1), worker.discardQueued());
+    // A second /stop must not count the same cancelled task again.
     try std.testing.expect(worker.waiting_task == null);
     try std.testing.expectEqual(@as(usize, 0), worker.discardQueued());
     worker.discardTask(task);
