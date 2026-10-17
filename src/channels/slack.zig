@@ -984,6 +984,18 @@ pub const SlackChannel = struct {
         return true;
     }
 
+    /// True when this conversation already has an event in the inbound FIFO
+    /// (queued or claimed). The typed-/stop fast path must not overtake it;
+    /// see `maybePublishStopMessage`.
+    fn hasQueuedInboundFor(self: *SlackChannel, conversation_hash: u64) bool {
+        self.inbound_mu.lock();
+        defer self.inbound_mu.unlock();
+        for (self.inbound_queue.items) |event| {
+            if (event.conversation_hash == conversation_hash) return true;
+        }
+        return false;
+    }
+
     /// Pick the oldest event whose conversation has no in-flight event. Called
     /// with `inbound_mu` held; the event stays queued (claimed) until its worker
     /// finishes, so other workers can see the conversation is busy.
@@ -1408,6 +1420,14 @@ pub const SlackChannel = struct {
             .string => |v| if (v.len > 0) v else null,
             else => null,
         } else null;
+
+        // Do not overtake earlier work for this conversation. The dispatcher
+        // only treats a stop as an interrupt while a turn is running, so a stop
+        // published ahead of a queued message (for example one behind a claimed
+        // file download) would run as an ordinary turn first and reverse the
+        // reply order. Returning false lets the caller enqueue the stop on the
+        // FIFO, behind those events.
+        if (self.hasQueuedInboundFor(self.inboundConversationHash(sender_id, channel_id, thread_ts))) return false;
 
         self.publishInboundMessageTimeout(sender_id, channel_id, text, message_ts, thread_ts, STOP_PUBLISH_TIMEOUT_MS) catch |err| {
             if (err == error.Timeout) {
@@ -5295,6 +5315,51 @@ test "slack FIFO isolates threads of one channel" {
         .conversation_hash = hash_a,
     }) catch unreachable;
     try std.testing.expect(ch.takeInboundEventLocked() == null);
+}
+
+test "typed /stop does not overtake queued inbound work for the session" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        "{\"type\":\"message\",\"user\":\"U1\",\"channel\":\"C1\",\"text\":\"/stop\",\"ts\":\"1700000001.000\"}",
+        .{},
+    );
+    defer parsed.deinit();
+
+    // An earlier message for the same conversation is still in the FIFO (for
+    // example a text message behind a claimed file_share download).
+    ch.inbound_mu.lock();
+    try ch.inbound_queue.append(alloc, .{
+        .id = 1,
+        .kind = .message,
+        .payload = try alloc.dupe(u8, "{}"),
+        .channel_id = try alloc.dupe(u8, "C1"),
+        .conversation_hash = ch.inboundConversationHash("U1", "C1", null),
+    });
+    ch.inbound_mu.unlock();
+    defer {
+        ch.inbound_mu.lock();
+        for (ch.inbound_queue.items) |*event| event.deinit(alloc);
+        ch.inbound_queue.deinit(alloc);
+        ch.inbound_mu.unlock();
+    }
+
+    // Regression: the fast path published /stop immediately, ahead of the
+    // queued event. With no turn running yet the dispatcher ran /stop as an
+    // ordinary turn before the earlier message was even published, so the user
+    // got a spurious /stop reply first and the reply order was reversed.
+    try std.testing.expect(!ch.maybePublishStopMessage(parsed.value.object, "C1"));
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
 }
 
 test "slack slash command name match ignores leading slash and case" {
