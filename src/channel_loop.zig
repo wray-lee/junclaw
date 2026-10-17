@@ -751,6 +751,14 @@ fn telegramConversationContext(
     });
 }
 
+/// True when an interaction callback carries ordinary text that must run
+/// through the callback handler (which edits the originating message in
+/// place). Slash-command callbacks keep the normal message path when local
+/// handling misses, so an unknown slash callback still reaches the model.
+fn telegramCallbackRunsHandler(is_interaction_callback: bool, content: []const u8) bool {
+    return is_interaction_callback and control_plane.parseSlashCommand(content) == null;
+}
+
 fn handleTelegramInteractiveCallback(
     allocator: std.mem.Allocator,
     runtime: *ChannelRuntime,
@@ -2241,7 +2249,8 @@ pub fn runTelegramLoop(
                 continue;
             }
 
-            if (!msg.is_interaction_callback) tg_ptr.setTaskReaction(msg.sender, msg.message_id, .accepted);
+            if (!telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content))
+                tg_ptr.setTaskReaction(msg.sender, msg.message_id, .accepted);
 
             const session_key = resolveTelegramSessionKey(
                 allocator,
@@ -2394,7 +2403,13 @@ pub fn runTelegramLoop(
                         .message_sender_id = task_message_sender_id,
                         .replace_message = msg.replace_message,
                         .heartbeat = &loop_state.turn_progress,
-                        .kind = if (msg.is_interaction_callback) .callback else .message,
+                        // Only ordinary submit_text uses the callback
+                        // handler; a slash callback that missed local
+                        // handling keeps the normal model-turn path.
+                        .kind = if (telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content))
+                            .callback
+                        else
+                            .message,
                     };
 
                     const worker = worker_registry.getOrCreate(session_key) catch |err| {
@@ -2412,7 +2427,8 @@ pub fn runTelegramLoop(
                             "Too many queued messages for this chat; this one was dropped. Try again after the current turn finishes.",
                             reply_to_id,
                         ) catch {};
-                        if (!msg.is_interaction_callback) tg_ptr.setTaskReaction(msg.sender, msg.message_id, .failed);
+                        if (!telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content))
+                            tg_ptr.setTaskReaction(msg.sender, msg.message_id, .failed);
                         task.deinit();
                         allocator.destroy(task);
                         handled_in_worker = true;
@@ -2434,9 +2450,7 @@ pub fn runTelegramLoop(
             // still applies; this is an exceptional path, not the normal one.
             runtime.acquireTurnSlot();
             defer runtime.releaseTurnSlot();
-            if (msg.is_interaction_callback and msg.message_id != null and
-                control_plane.parseSlashCommand(msg.content) == null)
-            {
+            if (msg.message_id != null and telegramCallbackRunsHandler(msg.is_interaction_callback, msg.content)) {
                 _ = handleTelegramInteractiveCallback(
                     allocator,
                     runtime,
@@ -4243,6 +4257,15 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
     try std.testing.expectEqual(before_draft_counter + 1, tg.draft_id_counter.load(.monotonic));
     try std.testing.expect(tg.typing_handles.get("12345") == null);
     try std.testing.expect(tg.draft_buffers.get("12345") == null);
+}
+
+test "slash callbacks keep the model-turn path when local handling misses" {
+    // Regression: routing every interaction callback through the callback
+    // handler made an unknown slash callback return false without running a
+    // turn, so the message vanished instead of reaching the model.
+    try std.testing.expect(!telegramCallbackRunsHandler(true, "/not-a-local-command"));
+    try std.testing.expect(telegramCallbackRunsHandler(true, "plain choice text"));
+    try std.testing.expect(!telegramCallbackRunsHandler(false, "plain choice text"));
 }
 
 test "telegram callback submit_text is dispatched to the session worker" {
