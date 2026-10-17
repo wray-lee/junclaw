@@ -74,7 +74,7 @@ pub const ParsedMessage = struct {
     }
 };
 
-const OwnedOutboundPayload = struct {
+pub const OwnedOutboundPayload = struct {
     text: []u8,
     attachments: []root.Channel.OutboundAttachment,
     choices: []root.Channel.OutboundChoice,

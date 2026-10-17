@@ -1463,6 +1463,34 @@ fn curlRequestWithProxy(
     return response.body;
 }
 
+/// HTTP POST of a raw body with an explicit `Content-Type`.
+///
+/// Slack's external upload URL takes the file bytes directly, so the JSON
+/// helper above cannot be used. `body` is streamed over curl's stdin and never
+/// becomes part of the process argv.
+pub fn curlPostRawWithContentType(
+    allocator: Allocator,
+    url: []const u8,
+    body: []const u8,
+    content_type: []const u8,
+    headers: []const []const u8,
+    max_time: ?[]const u8,
+) ![]u8 {
+    const content_type_header = try std.fmt.allocPrint(allocator, "Content-Type: {s}", .{content_type});
+    defer allocator.free(content_type_header);
+    return curlRequestWithProxy(
+        allocator,
+        "POST",
+        content_type_header,
+        url,
+        body,
+        headers,
+        null,
+        max_time,
+        null,
+    );
+}
+
 /// HTTP POST via curl subprocess (no proxy, no timeout).
 pub fn curlPost(allocator: Allocator, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
     return curlPostWithProxy(allocator, url, body, headers, null, null);
@@ -3250,4 +3278,20 @@ test "bounded status request keeps the timeout for a credentialed get" {
 
     ctx.release.store(true, .release);
     thread.join();
+}
+
+test "curlPostRawWithContentType rejects header injection before any request" {
+    // The raw upload helper is the only caller that builds a Content-Type from
+    // data, so a CRLF must be rejected while validating headers.
+    try std.testing.expectError(
+        error.InvalidHeader,
+        curlPostRawWithContentType(
+            std.testing.allocator,
+            "https://example.com/upload",
+            "bytes",
+            "image/png\r\nX-Injected: 1",
+            &.{},
+            null,
+        ),
+    );
 }

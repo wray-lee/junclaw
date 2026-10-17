@@ -2,7 +2,12 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const voice = @import("../voice.zig");
+const fs_compat = @import("../fs_compat.zig");
+const platform = @import("../platform.zig");
+const net_security = @import("../net_security.zig");
 const config_types = @import("../config_types.zig");
+const telegram = @import("telegram.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
@@ -239,6 +244,12 @@ pub const SlackChannel = struct {
     last_ts_by_channel: std.StringHashMapUnmanaged([]u8) = .empty,
     thread_ts: ?[]const u8 = null,
     reply_to_mode: config_types.SlackReplyToMode = .off,
+    /// Shared audio transcription pipeline (tools.media.audio), installed by
+    /// ChannelManager. Slack has no poller of its own to install it per-loop.
+    audio_media: config_types.AudioMediaConfig = .{},
+    audio_provider_key: ?[]const u8 = null,
+    transcriber: ?voice.Transcriber = null,
+    owned_transcriber: ?*voice.WhisperTranscriber = null,
     /// Emit progressive replies through the streaming Web API / edited messages.
     streaming_enabled: bool = false,
     /// Set once a chat.startStream call proves this app/workspace can never
@@ -557,10 +568,15 @@ pub const SlackChannel = struct {
     const SlackApiResult = struct {
         ts: ?[]u8 = null,
         error_code: ?[]u8 = null,
+        /// files.getUploadURLExternal ticket fields.
+        upload_url: ?[]u8 = null,
+        file_id: ?[]u8 = null,
 
         pub fn deinit(self: *SlackApiResult, allocator: std.mem.Allocator) void {
             if (self.ts) |ts| allocator.free(ts);
             if (self.error_code) |code| allocator.free(code);
+            if (self.upload_url) |url| allocator.free(url);
+            if (self.file_id) |id| allocator.free(id);
             self.* = .{};
         }
 
@@ -782,9 +798,15 @@ pub const SlackChannel = struct {
         msg_obj: std.json.ObjectMap,
         channel_id: []const u8,
     ) !void {
-        if (msg_obj.get("subtype")) |sub_val| {
-            if (sub_val == .string and sub_val.string.len > 0) return;
-        }
+        const subtype = if (msg_obj.get("subtype")) |sub_val|
+            if (sub_val == .string) sub_val.string else ""
+        else
+            "";
+        // Regression: every subtype was dropped, so Slack `file_share` messages
+        // (images, audio clips, PDFs) never reached the agent at all. Other
+        // subtypes (edits, joins, deletions) still have no reply semantics.
+        const is_file_share = std.mem.eql(u8, subtype, "file_share");
+        if (subtype.len > 0 and !is_file_share) return;
 
         const user_val = msg_obj.get("user") orelse return;
         if (user_val != .string or user_val.string.len == 0) return;
@@ -793,10 +815,13 @@ pub const SlackChannel = struct {
             if (std.mem.eql(u8, sender_id, bot_uid)) return;
         }
 
-        const text_val = msg_obj.get("text") orelse return;
-        if (text_val != .string) return;
-        const text = std.mem.trim(u8, text_val.string, " \t\r\n");
-        if (text.len == 0) return;
+        const text = if (msg_obj.get("text")) |text_val|
+            if (text_val == .string) std.mem.trim(u8, text_val.string, " \t\r\n") else ""
+        else
+            "";
+        // Some integrations attach files without the `file_share` subtype.
+        const has_files = messageHasFiles(msg_obj);
+        if (text.len == 0 and !has_files) return;
         const message_ts = if (msg_obj.get("ts")) |ts_val| switch (ts_val) {
             .string => |s| if (s.len > 0) s else null,
             else => null,
@@ -809,7 +834,146 @@ pub const SlackChannel = struct {
         const is_dm = isDirectConversationId(channel_id);
         if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
 
-        try self.publishInboundMessage(sender_id, channel_id, text, message_ts, thread_ts);
+        const file_content = if (has_files)
+            try self.buildFileShareContent(self.allocator, msg_obj, text)
+        else
+            null;
+        defer if (file_content) |owned| self.allocator.free(owned);
+        const content = file_content orelse text;
+        if (content.len == 0) return;
+
+        try self.publishInboundMessage(sender_id, channel_id, content, message_ts, thread_ts);
+    }
+
+    /// Build inbound content for a `file_share` message. Each downloadable file
+    /// becomes the same marker the Telegram inbound pipeline emits (`[IMAGE:]`,
+    /// `[FILE:]`, `[Voice]:`); files that cannot be fetched stay as metadata so
+    /// the model still knows what was attached. The caption is appended.
+    fn buildFileShareContent(
+        self: *SlackChannel,
+        allocator: std.mem.Allocator,
+        msg_obj: std.json.ObjectMap,
+        text: []const u8,
+    ) !?[]u8 {
+        const files_val = msg_obj.get("files") orelse return null;
+        if (files_val != .array or files_val.array.items.len == 0) return null;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+
+        var count: usize = 0;
+        for (files_val.array.items) |file_val| {
+            if (count >= MAX_INBOUND_FILES) break;
+            if (file_val != .object) continue;
+            const info = parseSlackFileInfo(file_val.object) orelse continue;
+            count += 1;
+
+            const marker = try self.buildFileMarker(allocator, info);
+            defer allocator.free(marker);
+            if (out.items.len > 0) try out.append(allocator, '\n');
+            try out.appendSlice(allocator, marker);
+        }
+
+        const trimmed = std.mem.trim(u8, text, " \t\r\n");
+        if (trimmed.len > 0) {
+            if (out.items.len > 0) try out.append(allocator, '\n');
+            try out.appendSlice(allocator, trimmed);
+        }
+        if (out.items.len == 0) {
+            out.deinit(allocator);
+            return null;
+        }
+        return try out.toOwnedSlice(allocator);
+    }
+
+    fn buildFileMarker(self: *SlackChannel, allocator: std.mem.Allocator, info: SlackFileInfo) ![]u8 {
+        const kind = classifySlackFile(info);
+        if (self.downloadSlackFile(allocator, info)) |path| {
+            defer allocator.free(path);
+            switch (kind) {
+                .image => return std.fmt.allocPrint(allocator, "[IMAGE:{s}]", .{path}),
+                .file => return std.fmt.allocPrint(allocator, "[FILE:{s}]", .{path}),
+                .audio => {
+                    if (self.transcribeSlackAudio(allocator, path)) |transcript| {
+                        defer allocator.free(transcript);
+                        return std.fmt.allocPrint(allocator, "[Voice]: {s}", .{transcript});
+                    }
+                    return buildSlackAttachmentMetadata(allocator, "audio", info);
+                },
+            }
+        }
+        return buildSlackAttachmentMetadata(allocator, kindLabel(kind), info);
+    }
+
+    /// Download a Slack-hosted file with the bot token. `url_private` only
+    /// works with that token, so the host is pinned to Slack's own domains to
+    /// keep the credential from following an attacker-controlled URL.
+    fn downloadSlackFile(self: *SlackChannel, allocator: std.mem.Allocator, info: SlackFileInfo) ?[]u8 {
+        if (builtin.is_test) return null;
+        if (info.url_private.len == 0) return null;
+        if (!isAllowedSlackFileUrl(info.url_private)) {
+            log.warn("Slack inbound file skipped: untrusted url_private host", .{});
+            return null;
+        }
+        if (info.size) |size| {
+            if (size > MAX_INBOUND_FILE_BYTES) {
+                log.warn("Slack inbound file skipped: {d} bytes exceeds the {d}-byte cap", .{ size, MAX_INBOUND_FILE_BYTES });
+                return null;
+            }
+        }
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_writer: std.Io.Writer = .fixed(&auth_buf);
+        auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return null;
+        const auth_header = auth_writer.buffered();
+
+        const data = root.http_util.curlGetMaxBytes(
+            allocator,
+            info.url_private,
+            &.{auth_header},
+            "60",
+            MAX_INBOUND_FILE_BYTES,
+        ) catch |err| {
+            log.warn("Slack inbound file download failed: {}", .{err});
+            return null;
+        };
+        defer allocator.free(data);
+        if (data.len == 0) return null;
+        if (looksLikeHtml(data)) {
+            // A redirect or auth page is not the file; never hand HTML to the
+            // vision/transcription pipeline.
+            log.warn("Slack inbound file skipped: download returned HTML", .{});
+            return null;
+        }
+
+        return saveSlackTempFile(allocator, info, data);
+    }
+
+    fn transcribeSlackAudio(self: *SlackChannel, allocator: std.mem.Allocator, path: []const u8) ?[]const u8 {
+        const transcriber = self.transcriber orelse return null;
+        return transcriber.transcribe(allocator, path) catch |err| {
+            log.warn("Slack inbound audio transcription failed: {}", .{err});
+            return null;
+        };
+    }
+
+    /// Install the shared Whisper transcriber once, on start. Slack is not a
+    /// polling channel, so this cannot live in a poll loop like Telegram's.
+    fn ensureTranscriber(self: *SlackChannel) void {
+        if (self.transcriber != null) return;
+        if (!self.audio_media.enabled) return;
+        const key = self.audio_provider_key orelse return;
+        if (key.len == 0) return;
+
+        const transcriber = self.allocator.create(voice.WhisperTranscriber) catch return;
+        transcriber.* = .{
+            .endpoint = voice.resolveTranscriptionEndpoint(self.audio_media.provider, self.audio_media.base_url),
+            .api_key = key,
+            .model = self.audio_media.model,
+            .language = self.audio_media.language,
+        };
+        self.owned_transcriber = transcriber;
+        self.transcriber = transcriber.transcriber();
     }
 
     /// Build and publish an inbound Slack message onto the bus. Shared by the
@@ -1534,6 +1698,139 @@ pub const SlackChannel = struct {
         try body_list.appendSlice(self.allocator, "]}]}");
     }
 
+    /// Parse `[IMAGE:...]`/`[FILE:...]` markers out of a reply and return the
+    /// remaining text plus the attachments to upload. Reuses Telegram's marker
+    /// parser so both channels accept exactly the same syntax.
+    fn prepareOutbound(
+        self: *SlackChannel,
+        allocator: std.mem.Allocator,
+        message: []const u8,
+        media: []const []const u8,
+    ) !telegram.OwnedOutboundPayload {
+        _ = self;
+        return telegram.buildOwnedOutboundPayloadFromLegacy(allocator, message, media, false);
+    }
+
+    /// Deliver a final reply that may carry attachment markers. The text is
+    /// sent through the normal (streaming or plain) path with the markers
+    /// stripped; each attachment is then uploaded into the same channel/thread.
+    fn deliverFinal(self: *SlackChannel, target: []const u8, message: []const u8, media: []const []const u8) !void {
+        var payload = self.prepareOutbound(self.allocator, message, media) catch {
+            if (message.len == 0) {
+                self.finishStreamStateFor(target);
+                return;
+            }
+            return self.streamFinal(target, message, media, false);
+        };
+        defer payload.deinit(self.allocator);
+
+        if (payload.attachments.len == 0) {
+            if (message.len == 0) {
+                self.finishStreamStateFor(target);
+                return;
+            }
+            return self.streamFinal(target, message, media, false);
+        }
+
+        if (payload.text.len > 0) {
+            try self.streamFinal(target, payload.text, &.{}, true);
+        } else {
+            // A reply that is only an attachment streams the raw marker as its
+            // preview; remove it so the file is not preceded by `[IMAGE:...]`.
+            self.discardStreamPreview(target);
+        }
+
+        for (payload.attachments) |attachment| {
+            self.uploadAttachment(target, attachment) catch |err| {
+                log.warn("Slack attachment upload failed ({s}): {}", .{ attachment.target, err });
+            };
+        }
+    }
+
+    fn discardStreamPreview(self: *SlackChannel, target: []const u8) void {
+        self.stream_mu.lock();
+        defer self.stream_mu.unlock();
+
+        const now_ms = std_compat.time.milliTimestamp();
+        self.clearStreamCancelLocked(target);
+        const state = self.stream_states.getPtr(target) orelse return;
+        defer state.finishTurn(self.allocator, now_ms);
+        if (state.message_ts.len == 0) return;
+
+        const parsed = stream_presenter.resolveStreamTarget(target);
+        const body = buildDeleteMessageBody(self.allocator, parsed.channel_id, state.message_ts) catch return;
+        defer self.allocator.free(body);
+
+        var result = self.callSlackApi("chat.delete", body, parsed.channel_id) catch return;
+        result.deinit(self.allocator);
+    }
+
+    /// Upload one outbound attachment through Slack's external upload flow:
+    /// files.getUploadURLExternal -> raw POST -> files.completeUploadExternal.
+    fn uploadAttachment(self: *SlackChannel, target: []const u8, attachment: root.Channel.OutboundAttachment) !void {
+        if (builtin.is_test) return;
+        const parsed = stream_presenter.resolveStreamTarget(target);
+        const data = self.loadAttachmentBytes(attachment.target) catch |err| {
+            log.warn("Slack attachment read failed ({s}): {}", .{ attachment.target, err });
+            return err;
+        };
+        defer self.allocator.free(data);
+        if (data.len == 0) return error.SlackApiError;
+
+        const file_name = attachmentFileName(attachment.target);
+        try self.uploadExternal(parsed.channel_id, parsed.thread_ts, file_name, attachmentContentType(file_name), data);
+    }
+
+    fn loadAttachmentBytes(self: *SlackChannel, path_or_url: []const u8) ![]u8 {
+        if (asciiStartsWithIgnoreCase(path_or_url, "http://") or
+            asciiStartsWithIgnoreCase(path_or_url, "https://"))
+        {
+            return root.http_util.curlGetMaxBytes(
+                self.allocator,
+                path_or_url,
+                &.{},
+                "60",
+                MAX_OUTBOUND_FILE_BYTES,
+            );
+        }
+        return fs_compat.readFileAlloc(std_compat.fs.cwd(), self.allocator, path_or_url, MAX_OUTBOUND_FILE_BYTES);
+    }
+
+    fn uploadExternal(
+        self: *SlackChannel,
+        channel_id: []const u8,
+        thread_ts: ?[]const u8,
+        file_name: []const u8,
+        content_type: []const u8,
+        data: []const u8,
+    ) !void {
+        const ticket_body = try buildGetUploadUrlBody(self.allocator, file_name, data.len);
+        defer self.allocator.free(ticket_body);
+
+        var ticket = try self.callSlackApi("files.getUploadURLExternal", ticket_body, channel_id);
+        defer ticket.deinit(self.allocator);
+        if (ticket.error_code != null) return error.SlackApiError;
+        const upload_url = ticket.upload_url orelse return error.SlackApiError;
+        const file_id = ticket.file_id orelse return error.SlackApiError;
+
+        const upload_resp = try root.http_util.curlPostRawWithContentType(
+            self.allocator,
+            upload_url,
+            data,
+            content_type,
+            &.{},
+            "120",
+        );
+        self.allocator.free(upload_resp);
+
+        const complete_body = try buildCompleteUploadBody(self.allocator, file_id, file_name, channel_id, thread_ts);
+        defer self.allocator.free(complete_body);
+
+        var completed = try self.callSlackApi("files.completeUploadExternal", complete_body, channel_id);
+        defer completed.deinit(self.allocator);
+        if (completed.error_code != null) return error.SlackApiError;
+    }
+
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
@@ -1570,7 +1867,15 @@ pub const SlackChannel = struct {
     }
 
     pub fn sendRichPayload(self: *SlackChannel, target_channel: []const u8, payload: root.Channel.OutboundPayload) !void {
-        if (payload.attachments.len > 0) return error.NotSupported;
+        if (payload.attachments.len > 0) {
+            if (payload.text.len > 0) try self.sendMessage(target_channel, payload.text);
+            for (payload.attachments) |attachment| {
+                self.uploadAttachment(target_channel, attachment) catch |err| {
+                    log.warn("Slack attachment upload failed ({s}): {}", .{ attachment.target, err });
+                };
+            }
+            return;
+        }
         if (payload.choices.len == 0) return self.sendMessage(target_channel, payload.text);
         if (!validateChoices(payload.choices)) return error.InvalidChoices;
 
@@ -1651,6 +1956,7 @@ pub const SlackChannel = struct {
         if (self.running.load(.acquire)) return;
         if (!self.hasValidBotToken()) return error.SlackBotTokenRequired;
 
+        self.ensureTranscriber();
         self.running.store(true, .release);
         errdefer self.running.store(false, .release);
         self.connected.store(false, .release);
@@ -1725,6 +2031,11 @@ pub const SlackChannel = struct {
             self.allocator.free(api_app_id);
             self.bot_api_app_id = null;
         }
+        if (self.owned_transcriber) |transcriber| {
+            self.allocator.destroy(transcriber);
+            self.owned_transcriber = null;
+            self.transcriber = null;
+        }
         self.deinitPendingInteractions();
         self.clearChannelCursors();
         self.deinitStreamStates();
@@ -1735,9 +2046,20 @@ pub const SlackChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
-        try self.sendMessage(target, message);
+        var payload = self.prepareOutbound(self.allocator, message, media) catch {
+            return self.sendMessage(target, message);
+        };
+        defer payload.deinit(self.allocator);
+        if (payload.attachments.len == 0) return self.sendMessage(target, message);
+
+        if (payload.text.len > 0) try self.sendMessage(target, payload.text);
+        for (payload.attachments) |attachment| {
+            self.uploadAttachment(target, attachment) catch |err| {
+                log.warn("Slack attachment upload failed ({s}): {}", .{ attachment.target, err });
+            };
+        }
     }
 
     fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
@@ -1802,7 +2124,7 @@ pub const SlackChannel = struct {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
 
         if (!self.streaming_enabled) {
-            if (stage == .final and message.len > 0) return vtableSend(ptr, target, message, media);
+            if (stage == .final) return vtableSend(ptr, target, message, media);
             return;
         }
 
@@ -1811,13 +2133,7 @@ pub const SlackChannel = struct {
                 if (message.len == 0) return;
                 self.streamChunk(target, message);
             },
-            .final => {
-                if (message.len == 0) {
-                    self.finishStreamStateFor(target);
-                    return;
-                }
-                try self.streamFinal(target, message, media);
-            },
+            .final => try self.deliverFinal(target, message, media),
         }
     }
 
@@ -2211,6 +2527,7 @@ pub const SlackChannel = struct {
         target: []const u8,
         message: []const u8,
         media: []const []const u8,
+        force_rewrite: bool,
     ) !void {
         self.stream_mu.lock();
         defer self.stream_mu.unlock();
@@ -2244,7 +2561,7 @@ pub const SlackChannel = struct {
                 stream_presenter.finalAppendOverflowsBudget(state.sent.len, s.len)
             else
                 false;
-            const stream_completed = if (suffix != null and !over_budget) blk: {
+            const stream_completed = if (!force_rewrite and suffix != null and !over_budget) blk: {
                 self.appendNativeStreamLocked(parsed, state, suffix.?) catch |err| {
                     log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
                     break :blk false;
@@ -2256,6 +2573,12 @@ pub const SlackChannel = struct {
                 log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
             };
             if (stream_completed) return;
+            // The preview streamed the raw attachment marker, which the final
+            // text no longer contains. Rewrite the message in place instead of
+            // leaving `[IMAGE:...]` visible and posting a second copy.
+            if (force_rewrite) {
+                return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
+            }
             // A streamed reasoning quote is deliberately absent from the final
             // reply, so that turn's snapshot can never be a prefix of it.
             // Rewrite the stopped message in place rather than leaving the
@@ -2370,6 +2693,16 @@ pub const SlackChannel = struct {
                 result.ts = try self.allocator.dupe(u8, ts_val.string);
             }
         }
+        if (parsed.value.object.get("upload_url")) |upload_url_val| {
+            if (upload_url_val == .string and upload_url_val.string.len > 0) {
+                result.upload_url = try self.allocator.dupe(u8, upload_url_val.string);
+            }
+        }
+        if (parsed.value.object.get("file_id")) |file_id_val| {
+            if (file_id_val == .string and file_id_val.string.len > 0) {
+                result.file_id = try self.allocator.dupe(u8, file_id_val.string);
+            }
+        }
         if (slackApiErrorInfo(parsed.value.object)) |info| {
             logSlackApiError(endpoint, context, info);
             result.error_code = try self.allocator.dupe(u8, info.code);
@@ -2396,6 +2729,304 @@ pub const SlackChannel = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 };
+
+// ── Slack media helpers ─────────────────────────────────────────
+
+const MAX_INBOUND_FILES: usize = 8;
+const MAX_INBOUND_FILE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_OUTBOUND_FILE_BYTES: usize = 20 * 1024 * 1024;
+
+const InboundFileKind = enum { image, audio, file };
+
+const SlackFileInfo = struct {
+    id: []const u8 = "",
+    name: []const u8 = "",
+    mimetype: []const u8 = "",
+    subtype: []const u8 = "",
+    url_private: []const u8 = "",
+    size: ?i64 = null,
+};
+
+fn asciiStartsWithIgnoreCase(haystack: []const u8, prefix: []const u8) bool {
+    if (prefix.len > haystack.len) return false;
+    return std.ascii.eqlIgnoreCase(haystack[0..prefix.len], prefix);
+}
+
+fn jsonStringValue(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    const val = obj.get(key) orelse return null;
+    if (val != .string or val.string.len == 0) return null;
+    return val.string;
+}
+
+fn parseSlackFileInfo(obj: std.json.ObjectMap) ?SlackFileInfo {
+    const url_private = jsonStringValue(obj, "url_private") orelse "";
+    const id = jsonStringValue(obj, "id") orelse "";
+    const name = jsonStringValue(obj, "name") orelse "";
+    const mimetype = jsonStringValue(obj, "mimetype") orelse "";
+    const subtype = jsonStringValue(obj, "subtype") orelse "";
+    // An entry with no metadata at all cannot produce a useful marker.
+    if (url_private.len == 0 and id.len == 0 and name.len == 0 and mimetype.len == 0) return null;
+    return .{
+        .id = id,
+        .name = name,
+        .mimetype = mimetype,
+        .subtype = subtype,
+        .url_private = url_private,
+        .size = blk: {
+            const size_val = obj.get("size") orelse break :blk null;
+            break :blk switch (size_val) {
+                .integer => |n| if (n >= 0) n else null,
+                else => null,
+            };
+        },
+    };
+}
+
+fn looksLikeHtml(data: []const u8) bool {
+    const head = std.mem.trimStart(u8, data[0..@min(data.len, 512)], " \t\r\n");
+    return asciiStartsWithIgnoreCase(head, "<!doctype html") or asciiStartsWithIgnoreCase(head, "<html");
+}
+
+fn messageHasFiles(msg_obj: std.json.ObjectMap) bool {
+    const files_val = msg_obj.get("files") orelse return false;
+    return files_val == .array and files_val.array.items.len > 0;
+}
+
+fn slackFileExtension(name: []const u8) []const u8 {
+    const base = if (std.mem.lastIndexOfAny(u8, name, "/\\")) |idx| name[idx + 1 ..] else name;
+    const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return "";
+    if (dot + 1 >= base.len) return "";
+    return base[dot + 1 ..];
+}
+
+fn isImageExtension(ext: []const u8) bool {
+    const known = [_][]const u8{ "png", "jpg", "jpeg", "gif", "webp", "bmp", "heic", "heif", "tif", "tiff" };
+    for (known) |item| {
+        if (std.ascii.eqlIgnoreCase(ext, item)) return true;
+    }
+    return false;
+}
+
+fn isAudioExtension(ext: []const u8) bool {
+    const known = [_][]const u8{ "mp3", "m4a", "wav", "ogg", "oga", "opus", "flac", "aac" };
+    for (known) |item| {
+        if (std.ascii.eqlIgnoreCase(ext, item)) return true;
+    }
+    return false;
+}
+
+/// Slack audio clips report subtype `slack_audio` but are served as `video/*`.
+fn classifySlackFile(info: SlackFileInfo) InboundFileKind {
+    if (asciiStartsWithIgnoreCase(info.mimetype, "image/")) return .image;
+    if (std.mem.eql(u8, info.subtype, "slack_audio")) return .audio;
+    if (asciiStartsWithIgnoreCase(info.mimetype, "audio/")) return .audio;
+
+    const ext = slackFileExtension(info.name);
+    if (isImageExtension(ext)) return .image;
+    if (isAudioExtension(ext)) return .audio;
+    return .file;
+}
+
+fn kindLabel(kind: InboundFileKind) []const u8 {
+    return switch (kind) {
+        .image => "image",
+        .audio => "audio",
+        .file => "document",
+    };
+}
+
+/// Same fallback shape the Telegram inbound pipeline uses when a file cannot
+/// be fetched or transcribed.
+fn buildSlackAttachmentMetadata(allocator: std.mem.Allocator, kind: []const u8, info: SlackFileInfo) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &out);
+    errdefer writer.deinit();
+    const w = &writer.writer;
+
+    try w.print("[ATTACHMENT:{s}", .{kind});
+    if (info.name.len > 0) try w.print(" file_name={s}", .{info.name});
+    if (info.mimetype.len > 0) try w.print(" mime_type={s}", .{info.mimetype});
+    if (info.size) |size| try w.print(" file_size={d}", .{size});
+    try w.writeByte(']');
+
+    out = writer.toArrayList();
+    return try out.toOwnedSlice(allocator);
+}
+
+/// `url_private` is fetched with the bot token, so only Slack's own HTTPS
+/// hosts may receive it.
+fn isAllowedSlackFileUrl(raw: []const u8) bool {
+    if (raw.len == 0) return false;
+    const uri = std.Uri.parse(raw) catch return false;
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return false;
+    const host = net_security.extractHost(raw) orelse return false;
+
+    const allowed = [_][]const u8{ "slack.com", "slack-edge.com", "slack-files.com", "slack-gov.com" };
+    for (allowed) |suffix| {
+        if (std.ascii.eqlIgnoreCase(host, suffix)) return true;
+        if (host.len > suffix.len and
+            host[host.len - suffix.len - 1] == '.' and
+            std.ascii.eqlIgnoreCase(host[host.len - suffix.len ..], suffix))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn sanitizeSlackFileComponent(buf: []u8, raw: []const u8, max_len: usize) []const u8 {
+    var n: usize = 0;
+    for (raw) |ch| {
+        if (n >= buf.len or n >= max_len) break;
+        buf[n] = if (std.ascii.isAlphanumeric(ch) or ch == '.' or ch == '-' or ch == '_') ch else '_';
+        n += 1;
+    }
+    if (n == 0) {
+        if (buf.len == 0) return "";
+        buf[0] = '_';
+        return buf[0..1];
+    }
+    return buf[0..n];
+}
+
+fn trimTrailingSlashes(path: []const u8) []const u8 {
+    var end = path.len;
+    while (end > 1 and (path[end - 1] == '/' or path[end - 1] == '\\')) : (end -= 1) {}
+    return path[0..end];
+}
+
+/// Save an inbound attachment under a name the existing Telegram temp-media
+/// sweeper recognises (`nullclaw_photo_` / `nullclaw_doc_`), so Slack files are
+/// cleaned up by the same 24h TTL.
+fn saveSlackTempFile(allocator: std.mem.Allocator, info: SlackFileInfo, data: []const u8) ?[]u8 {
+    const tmp_dir = platform.getTempDir(allocator) catch return null;
+    defer allocator.free(tmp_dir);
+
+    var name_buf: [160]u8 = undefined;
+    const safe_id = sanitizeSlackFileComponent(&name_buf, if (info.id.len > 0) info.id else "file", 80);
+    const ext = slackFileExtension(info.name);
+    const prefix = switch (classifySlackFile(info)) {
+        .image => "nullclaw_photo_slack_",
+        .audio, .file => "nullclaw_doc_slack_",
+    };
+
+    var path_buf: [512]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&path_buf);
+    const base = trimTrailingSlashes(tmp_dir);
+    if (ext.len > 0) {
+        w.print("{s}/{s}{s}.{s}", .{ base, prefix, safe_id, ext }) catch return null;
+    } else {
+        w.print("{s}/{s}{s}", .{ base, prefix, safe_id }) catch return null;
+    }
+    const path = w.buffered();
+
+    const file = std_compat.fs.createFileAbsolute(path, .{}) catch |err| {
+        log.warn("Slack inbound file save failed: {}", .{err});
+        return null;
+    };
+    defer file.close();
+    file.writeAll(data) catch return null;
+    return allocator.dupe(u8, path) catch null;
+}
+
+fn attachmentFileName(target: []const u8) []const u8 {
+    var path = target;
+    if (std.mem.indexOf(u8, path, "://") != null) {
+        const uri = std.Uri.parse(path) catch return "upload.bin";
+        path = switch (uri.path) {
+            .raw => |p| p,
+            .percent_encoded => |p| p,
+        };
+    }
+    if (std.mem.lastIndexOfAny(u8, path, "/\\")) |idx| path = path[idx + 1 ..];
+    if (std.mem.indexOfAny(u8, path, "?#")) |idx| path = path[0..idx];
+    if (path.len == 0) return "upload.bin";
+    return path;
+}
+
+fn attachmentContentType(file_name: []const u8) []const u8 {
+    const ext = slackFileExtension(file_name);
+    const pairs = [_]struct { ext: []const u8, mime: []const u8 }{
+        .{ .ext = "png", .mime = "image/png" },
+        .{ .ext = "jpg", .mime = "image/jpeg" },
+        .{ .ext = "jpeg", .mime = "image/jpeg" },
+        .{ .ext = "gif", .mime = "image/gif" },
+        .{ .ext = "webp", .mime = "image/webp" },
+        .{ .ext = "pdf", .mime = "application/pdf" },
+        .{ .ext = "txt", .mime = "text/plain" },
+        .{ .ext = "csv", .mime = "text/csv" },
+        .{ .ext = "json", .mime = "application/json" },
+        .{ .ext = "zip", .mime = "application/zip" },
+        .{ .ext = "mp4", .mime = "video/mp4" },
+        .{ .ext = "mp3", .mime = "audio/mpeg" },
+        .{ .ext = "m4a", .mime = "audio/mp4" },
+        .{ .ext = "ogg", .mime = "audio/ogg" },
+        .{ .ext = "wav", .mime = "audio/wav" },
+    };
+    for (pairs) |pair| {
+        if (std.ascii.eqlIgnoreCase(ext, pair.ext)) return pair.mime;
+    }
+    return "application/octet-stream";
+}
+
+fn buildGetUploadUrlBody(allocator: std.mem.Allocator, file_name: []const u8, length: usize) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+
+    try bw.writeAll("{\"filename\":");
+    try root.appendJsonStringW(bw, file_name);
+    try bw.print(",\"length\":{d}}}", .{length});
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
+
+fn buildCompleteUploadBody(
+    allocator: std.mem.Allocator,
+    file_id: []const u8,
+    title: []const u8,
+    channel_id: []const u8,
+    thread_ts: ?[]const u8,
+) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+
+    try bw.writeAll("{\"files\":[{\"id\":");
+    try root.appendJsonStringW(bw, file_id);
+    try bw.writeAll(",\"title\":");
+    try root.appendJsonStringW(bw, title);
+    try bw.writeAll("}],\"channel_id\":");
+    try root.appendJsonStringW(bw, channel_id);
+    if (thread_ts) |ts| {
+        try bw.writeAll(",\"thread_ts\":");
+        try root.appendJsonStringW(bw, ts);
+    }
+    try bw.writeByte('}');
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
+
+fn buildDeleteMessageBody(allocator: std.mem.Allocator, channel_id: []const u8, ts: []const u8) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+
+    try bw.writeAll("{\"channel\":");
+    try root.appendJsonStringW(bw, channel_id);
+    try bw.writeAll(",\"ts\":");
+    try root.appendJsonStringW(bw, ts);
+    try bw.writeByte('}');
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
 
 /// Check if a message text contains a Slack mention of the given user ID.
 /// Slack mentions use the format `<@U12345>`.
@@ -4136,4 +4767,193 @@ test "slack slash envelope with retry_attempt is acked but not dispatched again"
         // A retried delivery is acked but must not run the command twice.
         try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Slack media tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "slack file_share subtype is processed instead of dropped" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C12345", &allowed);
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+
+    // Regression: a non-empty subtype returned early, so `file_share` messages
+    // (including their caption) were silently discarded.
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"subtype":"file_share","user":"U123","text":"see attached","ts":"1700000000.100","files":[{"id":"F1","name":"chart.png","mimetype":"image/png","size":42,"url_private":"https://files.slack.com/files-pri/T1-F1/chart.png"}]}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "C12345");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "see attached") != null);
+    // Downloads are disabled under `zig build test`; the metadata fallback must
+    // still tell the model what was attached.
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "[ATTACHMENT:image") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "file_name=chart.png") != null);
+}
+
+test "slack file_share without caption is still published" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "D12345", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"subtype":"file_share","user":"U123","ts":"1700000000.100","files":[{"id":"F2","name":"notes.pdf","mimetype":"application/pdf","size":99,"url_private":"https://files.slack.com/files-pri/T1-F2/notes.pdf"}]}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try ch.processHistoryMessage(parsed.value.object, "D12345");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, msg.content, "[ATTACHMENT:document") != null);
+}
+
+test "slack file classification covers images, audio clips, and documents" {
+    try std.testing.expectEqual(InboundFileKind.image, classifySlackFile(.{ .mimetype = "image/png" }));
+    try std.testing.expectEqual(InboundFileKind.image, classifySlackFile(.{ .name = "shot.JPG" }));
+    // Slack audio clips report subtype slack_audio but a video/* MIME.
+    try std.testing.expectEqual(InboundFileKind.audio, classifySlackFile(.{
+        .mimetype = "video/mp4",
+        .subtype = "slack_audio",
+    }));
+    try std.testing.expectEqual(InboundFileKind.audio, classifySlackFile(.{ .mimetype = "audio/ogg" }));
+    try std.testing.expectEqual(InboundFileKind.file, classifySlackFile(.{
+        .mimetype = "application/pdf",
+        .name = "report.pdf",
+    }));
+}
+
+test "slack inbound file URLs are pinned to Slack HTTPS hosts" {
+    try std.testing.expect(isAllowedSlackFileUrl("https://files.slack.com/files-pri/T1-F1/x.png"));
+    try std.testing.expect(isAllowedSlackFileUrl("https://files-origin.slack-edge.com/x"));
+    try std.testing.expect(!isAllowedSlackFileUrl("https://evil.example.com/x.png"));
+    try std.testing.expect(!isAllowedSlackFileUrl("http://files.slack.com/x.png"));
+    try std.testing.expect(!isAllowedSlackFileUrl("https://slack.com.evil.example/x"));
+}
+
+test "slack outbound markers are stripped and lifted into attachments" {
+    const alloc = std.testing.allocator;
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &.{});
+
+    var payload = try ch.prepareOutbound(alloc, "Look\n[IMAGE:/tmp/chart.png]\nthanks", &.{});
+    defer payload.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), payload.attachments.len);
+    try std.testing.expectEqual(root.Channel.OutboundAttachmentKind.image, payload.attachments[0].kind);
+    try std.testing.expectEqualStrings("/tmp/chart.png", payload.attachments[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, payload.text, "[IMAGE:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.text, "Look") != null);
+    try std.testing.expect(std.mem.indexOf(u8, payload.text, "thanks") != null);
+}
+
+test "slack outbound FILE marker maps to a document attachment" {
+    const alloc = std.testing.allocator;
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &.{});
+
+    var payload = try ch.prepareOutbound(alloc, "[FILE:/tmp/report.pdf]", &.{});
+    defer payload.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), payload.attachments.len);
+    try std.testing.expectEqual(root.Channel.OutboundAttachmentKind.document, payload.attachments[0].kind);
+    try std.testing.expectEqualStrings("", payload.text);
+}
+
+test "slack upload request bodies carry channel and thread" {
+    const alloc = std.testing.allocator;
+
+    const ticket = try buildGetUploadUrlBody(alloc, "chart.png", 1234);
+    defer alloc.free(ticket);
+    try std.testing.expectEqualStrings("{\"filename\":\"chart.png\",\"length\":1234}", ticket);
+
+    const complete = try buildCompleteUploadBody(alloc, "F123", "chart.png", "C1", "1700.1");
+    defer alloc.free(complete);
+    try std.testing.expectEqualStrings(
+        "{\"files\":[{\"id\":\"F123\",\"title\":\"chart.png\"}],\"channel_id\":\"C1\",\"thread_ts\":\"1700.1\"}",
+        complete,
+    );
+
+    const delete_body = try buildDeleteMessageBody(alloc, "C1", "1700.1");
+    defer alloc.free(delete_body);
+    try std.testing.expectEqualStrings("{\"channel\":\"C1\",\"ts\":\"1700.1\"}", delete_body);
+}
+
+const FakeSlackTranscriber = struct {
+    text: []const u8,
+
+    fn vtableTranscribe(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const u8) voice.TranscribeError!?[]const u8 {
+        const self: *FakeSlackTranscriber = @ptrCast(@alignCast(ptr));
+        return try alloc.dupe(u8, self.text);
+    }
+
+    const vtable = voice.Transcriber.VTable{ .transcribe = &vtableTranscribe };
+
+    fn transcriber(self: *FakeSlackTranscriber) voice.Transcriber {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
+test "slack inbound audio uses the shared transcription pipeline" {
+    const alloc = std.testing.allocator;
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &.{});
+    var fake = FakeSlackTranscriber{ .text = "spoken words" };
+    ch.transcriber = fake.transcriber();
+
+    const transcript = ch.transcribeSlackAudio(alloc, "/tmp/note.ogg") orelse return error.TestExpectedEqual;
+    defer alloc.free(transcript);
+    try std.testing.expectEqualStrings("spoken words", transcript);
+}
+
+test "slack ensureTranscriber installs a Whisper transcriber from audio config" {
+    const alloc = std.testing.allocator;
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &.{});
+    ch.audio_media = .{ .provider = "groq", .model = "whisper-large-v3" };
+    ch.audio_provider_key = "test-key";
+
+    ch.ensureTranscriber();
+    try std.testing.expect(ch.transcriber != null);
+
+    if (ch.owned_transcriber) |owned| alloc.destroy(owned);
+    ch.owned_transcriber = null;
+    ch.transcriber = null;
+}
+
+test "slack ensureTranscriber respects tools.media.audio.enabled" {
+    const alloc = std.testing.allocator;
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &.{});
+    ch.audio_media = .{ .enabled = false, .provider = "groq" };
+    ch.audio_provider_key = "test-key";
+
+    ch.ensureTranscriber();
+    try std.testing.expect(ch.transcriber == null);
+}
+
+test "slack inbound downloads reject HTML auth pages" {
+    try std.testing.expect(looksLikeHtml("<!DOCTYPE html><html></html>"));
+    try std.testing.expect(looksLikeHtml("\n  <html><body>login</body></html>"));
+    try std.testing.expect(!looksLikeHtml("\x89PNG\r\n\x1a\n"));
+    try std.testing.expect(!looksLikeHtml(""));
 }
