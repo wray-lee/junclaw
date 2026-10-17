@@ -1103,6 +1103,9 @@ const MessageTask = struct {
     message_sender_id: []const u8,
     replace_message: bool,
     heartbeat: ?*Atomic(i64),
+    /// SessionWorker.cancel_epoch when this task was popped. A /stop bumps the
+    /// epoch so a task already waiting for a turn slot is skipped.
+    epoch: u64 = 0,
 
     fn run(task: *MessageTask) void {
         processTelegramMessage(
@@ -1128,6 +1131,14 @@ const MessageTask = struct {
         self.allocator.free(self.message_sender_id);
     }
 };
+
+/// `session.max_concurrent_tasks` clamped to at least one.
+fn configuredTurnLimit(config: *const Config) usize {
+    return if (config.session.max_concurrent_tasks > 1)
+        @intCast(config.session.max_concurrent_tasks)
+    else
+        1;
+}
 
 /// Global cap on turns that are actually running across session workers.
 /// `session.max_concurrent_tasks` used to only gate whether workers were used
@@ -1198,6 +1209,10 @@ const SessionWorker = struct {
     queue: std.ArrayListUnmanaged(*MessageTask) = .empty,
     running: bool = false,
     thread: ?std.Thread = null,
+    /// Bumped by `discardQueued`. A task popped before the bump is skipped
+    /// after it leaves the turn-slot wait, so /stop also cancels the message
+    /// that had already been picked but had not started running.
+    cancel_epoch: u64 = 0,
 
     const RunHook = struct {
         run: *const fn (ctx: *anyopaque, task: *MessageTask) void,
@@ -1285,7 +1300,35 @@ const SessionWorker = struct {
             self.running = false;
             return null;
         }
-        return self.queue.orderedRemove(0);
+        const task = self.queue.orderedRemove(0);
+        task.epoch = self.cancel_epoch;
+        return task;
+    }
+
+    /// True when the task was popped before the last /stop. Called after
+    /// waiting for a turn slot, right before the turn would start.
+    fn shouldRun(self: *SessionWorker, task: *const MessageTask) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return task.epoch == self.cancel_epoch;
+    }
+
+    fn discardTask(self: *SessionWorker, task: *MessageTask) void {
+        task.deinit();
+        self.allocator.destroy(task);
+    }
+
+    /// Drop every message queued behind the running (or slot-waiting) turn and
+    /// invalidate the one that may already be waiting for a slot. Returns the
+    /// number of queued tasks freed.
+    fn discardQueued(self: *SessionWorker) usize {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.cancel_epoch +%= 1;
+        const count = self.queue.items.len;
+        for (self.queue.items) |task| self.discardTask(task);
+        self.queue.clearRetainingCapacity();
+        return count;
     }
 
     /// Run one queued task and release its allocations.
@@ -1308,7 +1351,13 @@ fn sessionWorkerLoop(worker: *SessionWorker) void {
         // poller, so max_concurrent_tasks bounds running turns without
         // stalling message intake.
         if (worker.slots) |slots| slots.acquire();
-        worker.runTask(task);
+        if (worker.shouldRun(task)) {
+            worker.runTask(task);
+        } else {
+            // An explicit /stop discarded this session's queue while the task
+            // was waiting for a slot; do not run it minutes later.
+            worker.discardTask(task);
+        }
         if (worker.slots) |slots| slots.release();
     }
 }
@@ -1633,6 +1682,11 @@ pub const ChannelRuntime = struct {
     subagent_manager: ?*subagent_mod.SubagentManager,
     policy_tracker: *security.RateTracker,
     security_policy: *security.SecurityPolicy,
+    /// Process-wide cap on turns that are actually running. Every polling
+    /// account's loop and the daemon's inbound workers share this instance, so
+    /// `session.max_concurrent_tasks` bounds provider calls for the process,
+    /// not once per account.
+    turn_slots: TurnSlots,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
     pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
@@ -1747,6 +1801,7 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
             .policy_tracker = policy_tracker,
             .security_policy = security_policy,
+            .turn_slots = TurnSlots.init(configuredTurnLimit(config)),
         };
         // Wire MemoryRuntime pointer into SessionManager for /doctor diagnostics
         // and into memory tools for retrieval pipeline + vector sync.
@@ -1756,6 +1811,16 @@ pub const ChannelRuntime = struct {
             tools_mod.bindMemoryRuntime(tools, rt);
         }
         return self;
+    }
+
+    /// Take a process-wide turn slot. Blocks the calling worker (never the
+    /// poller) while `session.max_concurrent_tasks` turns are already running.
+    pub fn acquireTurnSlot(self: *ChannelRuntime) void {
+        self.turn_slots.acquire();
+    }
+
+    pub fn releaseTurnSlot(self: *ChannelRuntime) void {
+        self.turn_slots.release();
     }
 
     pub fn deinit(self: *ChannelRuntime) void {
@@ -1934,18 +1999,21 @@ pub fn runTelegramLoop(
             const worker = self.workers.get(session_key) orelse return false;
             return worker.isRunning();
         }
+
+        fn discardQueued(self: @This(), session_key: []const u8) usize {
+            const worker = self.workers.get(session_key) orelse return 0;
+            return worker.discardQueued();
+        }
     };
-    const max_parallel_tasks: usize = if (config.session.max_concurrent_tasks > 1)
-        @intCast(config.session.max_concurrent_tasks)
-    else
-        1;
+    const max_parallel_tasks = configuredTurnLimit(config);
     const enable_parallel = max_parallel_tasks > 1;
 
-    var turn_slots = TurnSlots.init(max_parallel_tasks);
+    // Regression: this used to be a loop-local semaphore, so every configured
+    // Telegram account (and the daemon's inbound workers) got its own limit.
     const worker_registry = SessionWorkerRegistry{
         .allocator = allocator,
         .workers = &session_workers,
-        .slots = &turn_slots,
+        .slots = &runtime.turn_slots,
     };
 
     var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
@@ -2045,6 +2113,14 @@ pub fn runTelegramLoop(
                     if (control_plane.isStopLikeCommand(msg.content) and worker_registry.active(session_key)) {
                         var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
                         defer interrupt.deinit(allocator);
+                        // No turn_running yet means the worker is still waiting
+                        // for a turn slot. An explicit /stop cancels what is
+                        // queued for this chat instead of letting it run
+                        // minutes later, after other sessions' turns.
+                        const discarded_queued: usize = if (!interrupt.requested)
+                            worker_registry.discardQueued(session_key)
+                        else
+                            0;
                         var dynamic_notice: ?[]u8 = null;
                         defer if (dynamic_notice) |msg_alloc| allocator.free(msg_alloc);
                         const immediate_notice: []const u8 = blk_notice: {
@@ -2057,7 +2133,15 @@ pub fn runTelegramLoop(
                                 break :blk_notice dynamic_notice orelse "Stop requested. Sent hard-stop signal.";
                             }
                             if (interrupt.requested) break :blk_notice "Stop requested. Sent hard-stop signal to in-flight execution.";
-                            break :blk_notice "Stop requested, but no in-flight turn was found for interruption.";
+                            if (discarded_queued > 0) {
+                                dynamic_notice = std.fmt.allocPrint(
+                                    allocator,
+                                    "Stop requested. Discarded {d} queued message(s) for this chat.",
+                                    .{discarded_queued},
+                                ) catch null;
+                                break :blk_notice dynamic_notice orelse "Stop requested. Queued messages for this chat were discarded.";
+                            }
+                            break :blk_notice "Stop requested, but no in-flight turn or queued message was found.";
                         };
                         tg_ptr.sendMessageWithReply(
                             msg.sender,
@@ -3277,6 +3361,60 @@ test "session worker queue keeps FIFO, bounds backlog, and spawns no thread per 
     alloc.destroy(overflow);
 }
 
+test "discarding a session queue cancels the task waiting for a turn slot" {
+    const alloc = std.testing.allocator;
+    var slots = TurnSlots.init(1);
+    // Hold the only slot so the worker blocks after popping the first task.
+    slots.acquire();
+
+    const Probe = struct {
+        runs: usize = 0,
+        fn run(ctx: *anyopaque, _: *MessageTask) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.runs += 1;
+        }
+    };
+    var probe = Probe{};
+    var worker = SessionWorker{
+        .allocator = alloc,
+        .session_key = try alloc.dupe(u8, "session"),
+        .slots = &slots,
+        .run_hook = .{ .run = Probe.run, .ctx = @ptrCast(&probe) },
+    };
+    defer {
+        if (worker.thread) |thread| thread.join();
+        worker.thread = null;
+        for (worker.queue.items) |task| worker.discardTask(task);
+        worker.queue.deinit(alloc);
+        alloc.free(worker.session_key);
+    }
+
+    try std.testing.expect(worker.push(try testQueuedTask(alloc, "first")));
+    try std.testing.expect(worker.push(try testQueuedTask(alloc, "second")));
+    try worker.ensureRunning();
+
+    // Wait until the worker popped "first" and blocked on the turn slot.
+    slots.mu.lock();
+    while (slots.waiters == 0) slots.cond.wait(&slots.mu);
+    slots.mu.unlock();
+
+    // Regression: /stop saw a "running" worker but turn_running == false, so it
+    // reported "no in-flight turn" and both messages still ran later.
+    try std.testing.expectEqual(@as(usize, 1), worker.discardQueued());
+    slots.release();
+
+    // Let the worker drain and exit.
+    while (true) {
+        worker.mu.lock();
+        const stopped = !worker.running and worker.queue.items.len == 0;
+        worker.mu.unlock();
+        if (stopped) break;
+        std_compat.thread.sleep(1 * std.time.ns_per_ms);
+    }
+    try std.testing.expectEqual(@as(usize, 0), probe.runs);
+    try std.testing.expectEqual(@as(usize, 0), worker.queue.items.len);
+}
+
 test "turn slots block a third turn until one finishes" {
     var slots = TurnSlots.init(2);
     slots.acquire();
@@ -3494,10 +3632,24 @@ test "channel runtime wires security policy into session manager and shell tool"
         .autonomy = .{
             .allowed_paths = &allowed_paths,
         },
+        .session = .{
+            .max_concurrent_tasks = 2,
+        },
     };
 
     var runtime = try ChannelRuntime.init(allocator, &cfg);
     defer runtime.deinit();
+
+    // Regression: the turn cap used to be a loop-local variable, so each
+    // configured Telegram account (and the Slack inbound workers) could run
+    // `max_concurrent_tasks` turns independently. It now lives on the runtime.
+    try std.testing.expectEqual(@as(usize, 2), runtime.turn_slots.available);
+    runtime.acquireTurnSlot();
+    runtime.acquireTurnSlot();
+    try std.testing.expectEqual(@as(usize, 0), runtime.turn_slots.available);
+    runtime.releaseTurnSlot();
+    try std.testing.expectEqual(@as(usize, 1), runtime.turn_slots.available);
+    runtime.releaseTurnSlot();
 
     try std.testing.expect(runtime.session_mgr.policy != null);
     try std.testing.expect(runtime.session_mgr.policy.? == runtime.security_policy);

@@ -1670,6 +1670,11 @@ fn inboundWorkerThread(ctx: *InboundWorkerCtx) void {
     while (ctx.queue.consume()) |msg| {
         var inbound_msg = msg;
         defer inbound_msg.deinit(ctx.allocator);
+        // Regression: these workers (Slack Socket Mode, webhooks) ran turns
+        // outside the polling loop's semaphore, so max_concurrent_tasks did not
+        // bound provider concurrency. The cap lives on the shared runtime.
+        ctx.runtime.acquireTurnSlot();
+        defer ctx.runtime.releaseTurnSlot();
         processInboundMessage(
             ctx.allocator,
             ctx.event_bus,
