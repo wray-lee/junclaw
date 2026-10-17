@@ -2064,6 +2064,13 @@ pub const Agent = struct {
         commands.refreshSubagentToolContext(self);
 
         const turn_input = commands.planTurnInput(user_message);
+        // A /stop that landed before the turn started (requestTurnInterruptAtStart)
+        // must also stop a local slash command: the tool loop's interrupt check
+        // is never reached for commands handled here, so without this the stop
+        // was acknowledged but the command still ran.
+        if (turn_input.invoke_local_handler and self.isInterruptRequested()) {
+            return self.interruptedReply();
+        }
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
                 const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;

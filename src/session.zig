@@ -5594,6 +5594,26 @@ test "requestTurnInterruptAtStart stops a turn before it reaches the provider" {
     try testing.expectEqual(@as(usize, 0), mock.chat_calls);
 }
 
+test "a pre-turn stop also cancels a local slash command" {
+    var mock = MockProvider{ .response = "unused" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "stop:slash-command";
+    const session = try sm.getOrCreate(session_key);
+
+    // Regression: processMessageStreaming consumed the pre-turn stop into
+    // agent.interrupt_requested, but Agent.turn dispatched a local slash
+    // command before its first interrupt check, so /model still switched the
+    // model while the sender was told the stop was signaled.
+    try testing.expect(sm.requestTurnInterruptAtStart(session_key));
+    const reply = try sm.processMessageStreaming(session_key, "/model openai/gpt-5", null, null, null);
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "Interrupted by /stop") != null);
+    try testing.expectEqualStrings("test/mock-model", session.agent.model_name);
+}
+
 test "requestTurnInterruptAtStart reaches a session that does not exist yet" {
     var mock = MockProvider{ .response = "should not be sent" };
     const cfg = testConfig();
