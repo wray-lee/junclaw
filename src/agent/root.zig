@@ -479,6 +479,23 @@ pub const Agent = struct {
         }
     };
 
+    /// Remove the trailing user message a failed `turn` call appended to
+    /// history (`history_len` is the length observed before that turn). A
+    /// failed turn deliberately keeps its user message, but when the same text
+    /// is re-queued for a later retry the next turn appends it again: the model
+    /// would see two identical user messages in a row with no assistant reply
+    /// between them. Only a user message appended by that turn is dropped; a
+    /// turn that failed mid tool loop (assistant/tool tail) is left alone, and
+    /// a turn that failed before appending anything cannot remove older text.
+    /// Returns true when a message was removed.
+    pub fn dropTrailingUserMessageSince(self: *Agent, history_len: usize) bool {
+        if (self.history.items.len <= history_len) return false;
+        if (self.history.items[self.history.items.len - 1].role != .user) return false;
+        const removed = self.history.pop().?;
+        removed.deinit(self.allocator);
+        return true;
+    }
+
     /// Append a history message that owns its content.
     /// On append failure, the message is deinitialized to avoid leaks.
     fn appendOwnedHistoryMessage(self: *Agent, msg: OwnedMessage) !void {

@@ -2002,12 +2002,17 @@ pub const SessionManager = struct {
         const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse return .none;
         defer self.allocator.free(late_content);
 
+        const history_len = session.agent.history.items.len;
         const follow_up_response = session.agent.turn(late_content) catch |err| {
             // Regression: a failed tail-window follow-up dropped the acked
             // injection, so the user's steered message vanished. Keep the
             // completed primary reply, re-queue the injection for the next
             // turn, and say that it will be retried.
             log.warn("post-turn follow-up turn failed: {}", .{err});
+            // The failed turn kept its user message in history; drop it before
+            // re-queueing the same text, or the next turn appends a duplicate
+            // user message with no assistant reply in between.
+            _ = session.agent.dropTrailingUserMessageSince(history_len);
             const requeued = session.requeueInjection(self.allocator, late_content);
             var err_buf: [256]u8 = undefined;
             const notice = providers.userErrorMessage(&err_buf, err, true);
@@ -2059,11 +2064,17 @@ pub const SessionManager = struct {
             } orelse break;
             defer self.allocator.free(late_content);
 
+            const history_len = session.agent.history.items.len;
             const follow_up_response = session.agent.turn(late_content) catch |err| {
                 log.warn("post-turn injection after failed turn also failed session=0x{x} err={}", .{ session_hash, err });
                 // Re-queue rather than consume: the sender was already told the
                 // message was accepted. Stop here so the same text is not
                 // retried in a tight loop within this request.
+                //
+                // Drop the failed turn's trailing user message first, otherwise
+                // the retry appends the same text a second time and the model
+                // sees two consecutive identical user messages.
+                _ = session.agent.dropTrailingUserMessageSince(history_len);
                 requeued.* = session.requeueInjection(self.allocator, late_content);
                 if (reply) |previous| {
                     var err_buf: [256]u8 = undefined;
@@ -5644,6 +5655,16 @@ test "requeued failed-turn injection is not retried in the same request" {
     const pending = (try session.drainInjection(alloc, alloc)) orelse return error.TestExpectedEqual;
     defer alloc.free(pending);
     try testing.expectEqualStrings("second", pending);
+
+    // Regression: the failed attempt's user message stayed in history, so the
+    // retry appended the same text again (two consecutive user messages).
+    var retried_user_messages: usize = 0;
+    for (session.agent.history.items) |msg| {
+        if (msg.role == .user and std.mem.eql(u8, msg.content, "second")) {
+            retried_user_messages += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), retried_user_messages);
 }
 
 test "failed-turn follow-up reply is filtered and persisted" {
