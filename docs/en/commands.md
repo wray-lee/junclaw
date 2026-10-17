@@ -63,6 +63,11 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 - Starting `nullclaw agent` with `--skill <name>` activates that skill before the first message or REPL turn.
 - `nullclaw acp` speaks newline-delimited JSON-RPC on stdio. Editors create ACP sessions with an absolute `cwd`; NullClaw forwards that cwd as the workspace for `agent invoke`.
 
+### Session context
+
+- `/status` shows `📚 Context: used/window (pct%)` and `🧹 Compactions: N`, so you can see how full the session context window is and how many times history has been compacted.
+- `/context` shows the same numbers plus message, tool, and per-role counts; `/context json` exposes `context_window` and `compactions` for scripts.
+
 ## Runtime and operations
 
 | Command | Purpose |
