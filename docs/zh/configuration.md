@@ -835,7 +835,7 @@ Telegram forum topics：
 
 - 首行显示已经过的秒数和目前的工具调用次数。下面最多展示 5 条最近的工具行；裁剪时失败行（`❌`）优先保留、成功行先被丢弃。每行最多约 60 个字符。
 - hint 刻意保守：`web_fetch`/`http_request` 只显示 host，`web_search` 显示截断后的查询（≤40 字符），文件类工具显示文件 basename，shell/exec 及未知工具只显示工具名——绝不显示原始命令。所有 hint 都会按 Telegram 的 HTML parse mode 做 HTML 转义。
-- 新的工具事件可以比 12s 心跳更早刷新 draft，但不会快于现有的 draft flush 节流（4s），因此不会触发 `sendMessageDraft` 限流。
+- turn 内第一个工具调用会立即刷新 draft（即使还没有任何文本或推理流出），让用户马上看到 agent 开始做什么。同一批次后续的工具事件仍遵守现有的 draft flush 节流（4s），因此不会触发 `sendMessageDraft` 限流；落在节流窗口内的事件会被保留，并在下一次 typing 心跳时补渲染，不会丢失。
 - 一旦有真正的回答文本开始流式输出，draft 会像以前一样只显示该文本；工具行绝不会混入回答文本、最终回复或会话历史。turn 结束时 draft 仍会被清除。
 - 流式推理引用（`/reasoning stream`）不算回答文本：工具运行时 draft 会用工具区块替代该引用，等真正的回答文本到达后再照常切换为文本。
 - 该区块在 Telegram 的两条投递路径上都会渲染——轮询循环与 gateway/webhook 路径。

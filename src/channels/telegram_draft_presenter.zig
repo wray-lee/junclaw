@@ -281,15 +281,49 @@ pub fn heartbeatDraft(
     now_ms: i64,
 ) !?DraftFlush {
     if (draftSuppressed(state, now_ms)) return null;
-    if (millisSinceLastFlush(state, now_ms) < DRAFT_HEARTBEAT_INTERVAL_MS) return null;
+
+    const since_last_flush = millisSinceLastFlush(state, now_ms);
+
+    // A tool event that landed inside the chunk flush throttle stays dirty and
+    // is retried on every typing tick. Waiting for the 12s heartbeat starved it:
+    // streamed reasoning/answer chunks reset `last_flush_time` every ≤4s, so the
+    // 12s gate never opened and the tool block never reached the draft.
+    if (state.tool_progress.dirty and since_last_flush >= DRAFT_FLUSH_MIN_INTERVAL_MS) {
+        if (try hasVisibleAnswerText(allocator, state.buffer.items)) {
+            // The answer text owns the draft now; tool lines must not cover it.
+            state.tool_progress.markRendered();
+        } else {
+            const text = try buildHeartbeatText(allocator, state, now_ms);
+            state.tool_progress.markRendered();
+            markDraftFlushed(state, now_ms);
+            return .{
+                .draft_id = state.draft_id,
+                .text = text,
+                .started_at_ms = state.started_at_ms,
+                .html = true,
+            };
+        }
+    }
+
+    if (since_last_flush < DRAFT_HEARTBEAT_INTERVAL_MS) return null;
 
     if (hasPendingVisibleDraft(state)) {
-        const text = try snapshotDraftText(allocator, state);
+        // While tools run, a pending reasoning excerpt is rendered together with
+        // the tool block. Sending the reasoning-only snapshot would hide the
+        // tool lines that are already on screen.
+        const with_tools = state.tool_progress.hasContent() and
+            !(try hasVisibleAnswerText(allocator, state.buffer.items));
+        const text = if (with_tools)
+            try buildHeartbeatText(allocator, state, now_ms)
+        else
+            try snapshotDraftText(allocator, state);
+        if (state.tool_progress.hasContent()) state.tool_progress.markRendered();
         markDraftFlushed(state, now_ms);
         return .{
             .draft_id = state.draft_id,
             .text = text,
             .started_at_ms = state.started_at_ms,
+            .html = with_tools,
         };
     }
 
@@ -311,10 +345,14 @@ pub fn heartbeatDraft(
 }
 
 /// Refresh the draft when a new tool event arrives sooner than the heartbeat
-/// interval. Honours the same flush throttle as text chunks (so a burst of tool
-/// calls cannot rate-limit sendMessageDraft) and only fires while the draft has
-/// no visible answer text: once real text streams, the draft shows the text
-/// exactly as before.
+/// interval. Only fires while the draft has no visible answer text: once real
+/// text streams, the draft shows the text exactly as before.
+///
+/// The first tool event of a turn bypasses the flush throttle (OpenClaw's
+/// `startImmediately`), so the user sees which tool started even when no
+/// text/reasoning has streamed yet. Later events in a parallel batch honour the
+/// throttle so they cannot rate-limit sendMessageDraft; they stay dirty and are
+/// retried by the next heartbeat instead of being dropped.
 pub fn progressDraft(
     allocator: std.mem.Allocator,
     state: *DraftState,
@@ -323,10 +361,16 @@ pub fn progressDraft(
     if (draftSuppressed(state, now_ms)) return null;
     if (!state.tool_progress.hasContent()) return null;
     if (try hasVisibleAnswerText(allocator, state.buffer.items)) return null;
-    if (millisSinceLastFlush(state, now_ms) < DRAFT_FLUSH_MIN_INTERVAL_MS) return null;
+
+    const first_render = !state.tool_progress.rendered;
+    if (!first_render and millisSinceLastFlush(state, now_ms) < DRAFT_FLUSH_MIN_INTERVAL_MS) return null;
 
     const text = try buildHeartbeatText(allocator, state, now_ms);
-    state.last_flush_time = now_ms;
+    state.tool_progress.markRendered();
+    // Marking the reasoning as flushed too: the progress draft already carries
+    // it, so a later heartbeat must not fall back to a reasoning-only snapshot
+    // that would hide the tool block.
+    markDraftFlushed(state, now_ms);
     return .{
         .draft_id = state.draft_id,
         .text = text,
@@ -501,7 +545,7 @@ test "buildHeartbeatText shows the tool-progress block once tools run" {
     try std.testing.expect(std.mem.indexOf(u8, heartbeat, "Interim result is still being prepared.") == null);
 }
 
-test "progressDraft respects the flush throttle and needs tool content" {
+test "progressDraft flushes the first tool event and throttles later ones" {
     var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 1_000, .last_flush_time = 1_000 };
     defer draft.deinit(std.testing.allocator);
 
@@ -510,17 +554,33 @@ test "progressDraft respects the flush throttle and needs tool content" {
 
     _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
 
-    // Inside the throttle window: suppressed.
-    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS - 1)) == null);
-
-    const flush = (try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) orelse
+    // The first tool event of a turn bypasses the chunk throttle.
+    const first = (try progressDraft(std.testing.allocator, &draft, 1_000)) orelse
         return error.TestUnexpectedResult;
     defer {
-        var tmp = flush;
+        var tmp = first;
         tmp.deinit(std.testing.allocator);
     }
-    try std.testing.expect(flush.html);
-    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+    try std.testing.expect(first.html);
+    try std.testing.expect(std.mem.indexOf(u8, first.text, "shell") != null);
+    try std.testing.expect(!draft.tool_progress.dirty);
+
+    // A later event inside the throttle window is deferred, not dropped.
+    _ = try draft.tool_progress.record(std.testing.allocator, .{
+        .tool = "web_fetch",
+        .arguments_json = "{\"url\":\"https://example.com\"}",
+    }, 1_000);
+    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS - 1)) == null);
+    try std.testing.expect(draft.tool_progress.dirty);
+
+    const later = (try progressDraft(std.testing.allocator, &draft, 1_000 + DRAFT_FLUSH_MIN_INTERVAL_MS)) orelse
+        return error.TestUnexpectedResult;
+    defer {
+        var tmp = later;
+        tmp.deinit(std.testing.allocator);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, later.text, "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, later.text, "web_fetch") != null);
 }
 
 test "progressDraft stays quiet once answer text is visible" {
@@ -733,4 +793,111 @@ test "heartbeatDraft emits heartbeat when no visible draft is available" {
     try std.testing.expect(std.mem.indexOf(u8, flush.text, "Interim result is still being prepared.") != null);
     try std.testing.expectEqual(@as(usize, 0), draft.last_flush_len);
     try std.testing.expectEqual(@as(i64, 5_000 + DRAFT_HEARTBEAT_INTERVAL_MS + 1), draft.last_flush_time);
+}
+
+test "progressDraft shows the first tool call immediately after a reasoning flush" {
+    // Regression: a tool batch that started right after a streamed reasoning
+    // flush landed inside the 4s chunk throttle; progressDraft returned null and
+    // the tool block never reached the draft for the rest of the turn.
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 0, .last_flush_time = 0 };
+    defer draft.deinit(std.testing.allocator);
+
+    const reasoning = "<think>" ++ ("r" ** 600) ++ "</think>";
+    var chunk_flush = (try appendDraftChunk(std.testing.allocator, &draft, reasoning, 3_500)) orelse
+        return error.TestUnexpectedResult;
+    chunk_flush.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(i64, 3_500), draft.last_flush_time);
+
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 4_000);
+    var flush = (try progressDraft(std.testing.allocator, &draft, 4_000)) orelse
+        return error.TestUnexpectedResult;
+    defer flush.deinit(std.testing.allocator);
+
+    try std.testing.expect(flush.html);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "1 tool call") != null);
+    try std.testing.expect(!draft.tool_progress.dirty);
+}
+
+test "heartbeatDraft retries tool events deferred by the chunk throttle" {
+    // Regression: the 4s chunk throttle dropped later calls of a parallel batch
+    // with no retry, and the 12s heartbeat was starved by continuous reasoning
+    // flushes, so only the first tool call ever appeared (if any).
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 0, .last_flush_time = 0 };
+    defer draft.deinit(std.testing.allocator);
+
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    var first = (try progressDraft(std.testing.allocator, &draft, 1_000)) orelse
+        return error.TestUnexpectedResult;
+    first.deinit(std.testing.allocator);
+
+    // Reasoning keeps flushing, keeping last_flush_time fresh.
+    const reasoning = "<think>" ++ ("r" ** 600) ++ "</think>";
+    var chunk_flush = (try appendDraftChunk(std.testing.allocator, &draft, reasoning, 5_000)) orelse
+        return error.TestUnexpectedResult;
+    chunk_flush.deinit(std.testing.allocator);
+
+    // Calls 2 and 3 of the batch arrive 500ms after the reasoning flush.
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_search", .arguments_json = "{\"query\":\"q\"}" }, 5_500);
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "file_read", .arguments_json = "{\"path\":\"/tmp/a.txt\"}" }, 5_500);
+    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 5_500)) == null);
+    try std.testing.expect(draft.tool_progress.dirty);
+
+    // The next typing tick renders them even though the 12s heartbeat gate has
+    // not opened (only 4s since the reasoning flush).
+    var flush = (try heartbeatDraft(std.testing.allocator, &draft, 9_000)) orelse
+        return error.TestUnexpectedResult;
+    defer flush.deinit(std.testing.allocator);
+
+    try std.testing.expect(flush.html);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "web_search") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "file_read a.txt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "3 tool calls") != null);
+    try std.testing.expect(!draft.tool_progress.dirty);
+}
+
+test "heartbeatDraft keeps the tool block when reasoning is pending" {
+    // Regression: after a progress render, the pending-reasoning branch sent a
+    // reasoning-only snapshot and hid the tool lines that were already on
+    // screen (progressDraft did not update last_flush_len either).
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 0, .last_flush_time = 0 };
+    defer draft.deinit(std.testing.allocator);
+
+    try draft.buffer.appendSlice(std.testing.allocator, "<think>pondering");
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    var progress = (try progressDraft(std.testing.allocator, &draft, 4_000)) orelse
+        return error.TestUnexpectedResult;
+    progress.deinit(std.testing.allocator);
+    // The progress draft already carries the reasoning, so it is not pending.
+    try std.testing.expectEqual(draft.buffer.items.len, draft.last_flush_len);
+
+    // More reasoning arrives without a flush, then the 12s heartbeat fires.
+    try draft.buffer.appendSlice(std.testing.allocator, " more</think>");
+    var flush = (try heartbeatDraft(std.testing.allocator, &draft, 16_000)) orelse
+        return error.TestUnexpectedResult;
+    defer flush.deinit(std.testing.allocator);
+
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, flush.text, "pondering") != null);
+}
+
+test "tool lines yield to answer text instead of covering it" {
+    // Guard for the deferred retry: a pending tool event must never be rendered
+    // after the answer text starts streaming; the answer replaces the draft
+    // until the turn ends.
+    var draft: DraftState = .{ .draft_id = 9, .started_at_ms = 0, .last_flush_time = 0 };
+    defer draft.deinit(std.testing.allocator);
+
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    var first = (try progressDraft(std.testing.allocator, &draft, 1_000)) orelse
+        return error.TestUnexpectedResult;
+    first.deinit(std.testing.allocator);
+
+    _ = try draft.tool_progress.record(std.testing.allocator, .{ .tool = "web_fetch" }, 1_500);
+    try draft.buffer.appendSlice(std.testing.allocator, "real answer");
+
+    try std.testing.expect((try progressDraft(std.testing.allocator, &draft, 8_000)) == null);
+    try std.testing.expect((try heartbeatDraft(std.testing.allocator, &draft, 8_000)) == null);
+    // The deferred flag is cleared: no later heartbeat retries the tool block.
+    try std.testing.expect(!draft.tool_progress.dirty);
 }

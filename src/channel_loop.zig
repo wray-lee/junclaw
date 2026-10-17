@@ -3684,3 +3684,36 @@ test "telegramToolProgressUpdate maps hint phase, success and arguments" {
     try std.testing.expect(!end.success);
     try std.testing.expect(end.arguments_json == null);
 }
+
+test "gateway tool-progress wiring renders the first tool call immediately" {
+    // Regression: the gateway runtime serves Telegram through this polling
+    // callback, and the presenter dropped the first tool event inside the chunk
+    // flush throttle, so the draft showed no tool lines for the whole turn.
+    const allocator = std.testing.allocator;
+    var ch = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    const draft_id = try ch.beginDraftTurn("12345");
+    defer {
+        ch.finishDraftTurn("12345", draft_id) catch {};
+        ch.draft_buffers.deinit(allocator);
+    }
+
+    var ctx = TelegramToolProgressCtx{
+        .tg_ptr = &ch,
+        .chat_id = "12345",
+        .draft_id = draft_id,
+        .heartbeat = null,
+    };
+    // The turn just claimed the draft, so the 4s chunk throttle is active.
+    telegramToolProgressCallback(@ptrCast(&ctx), .{ .text = "shell", .phase = .start });
+
+    const state = ch.draft_buffers.getPtr("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.tool_progress.hasContent());
+    // `rendered` proves the callback produced a draft flush (sendDraft is a
+    // no-op under test): the first tool event bypasses the throttle.
+    try std.testing.expect(state.tool_progress.rendered);
+    try std.testing.expect(!state.tool_progress.dirty);
+
+    const block = try state.tool_progress.renderBlockHtml(allocator, std_compat.time.milliTimestamp());
+    defer allocator.free(block);
+    try std.testing.expect(std.mem.indexOf(u8, block, "shell") != null);
+}

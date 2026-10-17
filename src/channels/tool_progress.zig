@@ -44,6 +44,14 @@ pub const ToolProgress = struct {
     started_at_ms: i64 = 0,
     tool_calls: u32 = 0,
     lines: std.ArrayListUnmanaged(Line) = .empty,
+    /// The visible log changed since the last draft render. A presenter that
+    /// cannot flush right now (chunk throttle) leaves this set and retries on
+    /// the next heartbeat, so a tool event is never dropped.
+    dirty: bool = false,
+    /// The tool block has been rendered at least once this turn. The first
+    /// render bypasses the chunk throttle (OpenClaw's `startImmediately`), so
+    /// the first tool call is visible as soon as it starts.
+    rendered: bool = false,
 
     pub fn deinit(self: *ToolProgress, allocator: std.mem.Allocator) void {
         for (self.lines.items) |line| allocator.free(line.text);
@@ -61,6 +69,14 @@ pub const ToolProgress = struct {
         return self.lines.items.len > 0;
     }
 
+    /// Mark the current log as rendered. Clears `dirty` so the heartbeat stops
+    /// retrying it; also records that the first (throttle-bypassing) render has
+    /// happened.
+    pub fn markRendered(self: *ToolProgress) void {
+        self.dirty = false;
+        self.rendered = true;
+    }
+
     /// Record one tool event. Returns true when the visible log changed (a
     /// start line, or a failure line); a successful `.end` is a no-op so callers
     /// can skip a redundant draft re-render.
@@ -72,6 +88,7 @@ pub const ToolProgress = struct {
                 const line = try buildStartLine(allocator, update.tool, update.arguments_json);
                 errdefer allocator.free(line);
                 try self.appendLine(allocator, .{ .text = line, .failed = false });
+                self.dirty = true;
                 return true;
             },
             .end => {
@@ -81,6 +98,7 @@ pub const ToolProgress = struct {
                 const line = try buildFailureLine(allocator, update.tool);
                 errdefer allocator.free(line);
                 try self.appendLine(allocator, .{ .text = line, .failed = true });
+                self.dirty = true;
                 return true;
             },
         }
@@ -481,4 +499,29 @@ test "reset frees lines and restarts the clock" {
     try std.testing.expectEqual(@as(usize, 0), state.lines.items.len);
     try std.testing.expectEqual(@as(u32, 0), state.tool_calls);
     try std.testing.expectEqual(@as(i64, 5_000), state.started_at_ms);
+}
+
+test "dirty tracks visible changes until the presenter renders them" {
+    var state: ToolProgress = .{};
+    defer state.deinit(std.testing.allocator);
+
+    _ = try state.record(std.testing.allocator, .{ .tool = "shell" }, 1_000);
+    try std.testing.expect(state.dirty);
+    try std.testing.expect(!state.rendered);
+
+    state.markRendered();
+    try std.testing.expect(!state.dirty);
+    try std.testing.expect(state.rendered);
+
+    // A successful end changes nothing on screen.
+    _ = try state.record(std.testing.allocator, .{ .tool = "shell", .phase = .end, .success = true }, 1_000);
+    try std.testing.expect(!state.dirty);
+
+    // A failure adds a line, so it must be rendered.
+    _ = try state.record(std.testing.allocator, .{ .tool = "shell", .phase = .end, .success = false }, 1_000);
+    try std.testing.expect(state.dirty);
+
+    state.reset(std.testing.allocator, 5_000);
+    try std.testing.expect(!state.dirty);
+    try std.testing.expect(!state.rendered);
 }

@@ -902,7 +902,7 @@ About `tool_progress`:
 
 - The header shows elapsed seconds and the number of tool calls so far. Below it, up to five recent tool lines are shown; failures (`❌`) are kept visible over successes when the list is trimmed. Every line is capped at ~60 characters.
 - Hints are deliberately conservative: `web_fetch`/`http_request` show the host only, `web_search` shows a truncated query (≤40 chars), file tools show the file's basename, and shell/exec and unknown tools show the tool name only — never the raw command. Every hint is HTML-escaped for Telegram's HTML parse mode.
-- A new tool event may refresh the draft sooner than the 12s heartbeat, but never faster than the existing draft flush throttle (4s), so `sendMessageDraft` is not rate-limited.
+- The first tool call of a turn refreshes the draft immediately, even if no text or reasoning has streamed yet, so the user sees what the agent started doing right away. Later tool events in the same batch honour the existing draft flush throttle (4s) so `sendMessageDraft` is not rate-limited; an event that lands inside the throttle is kept pending and rendered on the next typing heartbeat instead of being dropped.
 - Once real answer text streams, the draft shows that text exactly as before; tool lines are never mixed into the answer text, the final reply, or session history. The draft is still cleared when the turn ends.
 - A streamed reasoning quote (`/reasoning stream`) is not answer text: while tools run the draft shows the tool block in place of the quote, and switches to the answer text once it arrives.
 - The block renders on both Telegram delivery paths - the polling loop and the gateway/webhook path.
