@@ -139,8 +139,9 @@ const InboundEvent = struct {
     channel_id: []u8,
     /// Slash commands only: the invoking user.
     sender_id: ?[]u8 = null,
-    /// Hash of channel (+ thread for messages). Events sharing it are processed
-    /// in FIFO order while other conversations proceed concurrently.
+    /// Hash of the session key (see `inboundConversationHash`). Events sharing
+    /// it are processed in FIFO order while other sessions proceed
+    /// concurrently.
     conversation_hash: u64,
     /// Assigned under `inbound_mu` by the producer.
     id: u64 = 0,
@@ -1298,6 +1299,75 @@ pub const SlackChannel = struct {
         }
     }
 
+    /// Conversation FIFO key for an inbound event. It mirrors the session key
+    /// `publishInboundMessage` derives, because events that share a session
+    /// must not run concurrently: with reply_to_mode=.off a thread reply and a
+    /// top-level post map to the same session (and chat target), so keying by
+    /// thread_ts let them reorder.
+    fn inboundConversationHash(self: *const SlackChannel, sender_id: []const u8, channel_id: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        if (isDirectConversationId(channel_id)) {
+            hasher.update("slack:");
+            hasher.update(self.account_id);
+            hasher.update(":direct:");
+            hasher.update(sender_id);
+        } else {
+            hasher.update("slack:");
+            hasher.update(self.account_id);
+            hasher.update(":channel:");
+            hasher.update(channel_id);
+        }
+        return hasher.final();
+    }
+
+    /// A typed `/stop` has to interrupt the turn that is blocking this
+    /// conversation's FIFO, so it cannot wait behind that turn like an ordinary
+    /// message. Publish it immediately from the socket reader, exactly as the
+    /// slash-command `/stop` path does, after the same sender/bot/policy checks
+    /// `processHistoryMessage` applies. Returns true when the event was
+    /// handled.
+    fn maybePublishStopMessage(self: *SlackChannel, msg_obj: std.json.ObjectMap, channel_id: []const u8) bool {
+        // Subtyped events (edits, joins, file_share, ...) never carry a
+        // command; keep them on the normal path.
+        const subtype = if (msg_obj.get("subtype")) |sub_val|
+            if (sub_val == .string) sub_val.string else ""
+        else
+            "";
+        if (subtype.len > 0) return false;
+        // Messages carrying files need the normal attachment pipeline.
+        if (messageHasFiles(msg_obj)) return false;
+
+        const user_val = msg_obj.get("user") orelse return false;
+        if (user_val != .string or user_val.string.len == 0) return false;
+        const sender_id = user_val.string;
+        if (self.bot_user_id) |bot_uid| {
+            if (std.mem.eql(u8, sender_id, bot_uid)) return false;
+        }
+
+        const text = if (msg_obj.get("text")) |text_val|
+            if (text_val == .string) std.mem.trim(u8, text_val.string, " \t\r\n") else ""
+        else
+            "";
+        if (!control_plane.isStopLikeCommand(text)) return false;
+
+        const is_dm = isDirectConversationId(channel_id);
+        if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return false;
+
+        const message_ts = if (msg_obj.get("ts")) |ts_val| switch (ts_val) {
+            .string => |v| if (v.len > 0) v else null,
+            else => null,
+        } else null;
+        const thread_ts = if (msg_obj.get("thread_ts")) |tts_val| switch (tts_val) {
+            .string => |v| if (v.len > 0) v else null,
+            else => null,
+        } else null;
+
+        self.publishInboundMessage(sender_id, channel_id, text, message_ts, thread_ts) catch |err| {
+            log.warn("Slack stop message publish failed: {}", .{err});
+        };
+        return true;
+    }
+
     /// Handle a Slack `slash_commands` Socket Mode envelope for the single
     /// configured command. The envelope is already acked by the caller.
     pub fn handleSlashCommand(self: *SlackChannel, payload_obj: std.json.ObjectMap) void {
@@ -1381,14 +1451,12 @@ pub const SlackChannel = struct {
             self.allocator.free(channel_copy);
             return;
         };
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(channel_id);
         self.enqueueInboundEvent(.{
             .kind = .slash,
             .payload = text_copy,
             .channel_id = channel_copy,
             .sender_id = sender_copy,
-            .conversation_hash = hasher.final(),
+            .conversation_hash = self.inboundConversationHash(sender_id, channel_id),
         }) catch |err| {
             if (err == error.SlackInboundQueueFull) return;
             self.publishInboundMessage(sender_id, channel_id, text, null, null) catch |publish_err| {
@@ -1670,6 +1738,10 @@ pub const SlackChannel = struct {
         // duplicates the turn (and its file downloads).
         if (self.inboundEventAlreadySeen(payload_val.object, event_val.object)) return;
 
+        // A typed `/stop` must not wait behind the per-conversation FIFO it is
+        // meant to interrupt (the slash-command `/stop` path is immediate).
+        if (self.maybePublishStopMessage(event_val.object, channel_val.string)) return;
+
         // Never run file downloads on the socket reader thread: it must keep
         // reading pongs and acking queued envelopes. A stalled download (up to
         // 60s x MAX_INBOUND_FILES) used to cause Slack redelivery and dropped
@@ -1680,19 +1752,18 @@ pub const SlackChannel = struct {
             self.allocator.free(event_json);
             return self.processHistoryMessage(event_val.object, channel_val.string);
         };
-        // One conversation = channel (+ thread). Events of the same
-        // conversation run FIFO; different conversations run concurrently.
-        var hasher = std.hash.Wyhash.init(0);
-        hasher.update(channel_val.string);
-        if (jsonStringValue(event_val.object, "thread_ts")) |thread_ts| {
-            hasher.update(":");
-            hasher.update(thread_ts);
-        }
+        // Events of the same session run FIFO; different sessions run
+        // concurrently. Keying by session (not thread_ts) keeps a thread reply
+        // and a top-level post of the same channel ordered: with
+        // reply_to_mode=.off they reach the same session.
         self.enqueueInboundEvent(.{
             .kind = .message,
             .payload = event_json,
             .channel_id = channel_id,
-            .conversation_hash = hasher.final(),
+            .conversation_hash = self.inboundConversationHash(
+                jsonStringValue(event_val.object, "user") orelse "",
+                channel_val.string,
+            ),
         }) catch |err| {
             // The queue is bounded; a full queue drops the event with a log
             // rather than blocking the socket reader on a slow turn.
@@ -4938,6 +5009,119 @@ fn slashCommandTestPayload(alloc: std.mem.Allocator, command: []const u8, text: 
     );
     defer alloc.free(json);
     return std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+}
+
+test "slack typed /stop is published without joining the conversation FIFO" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const alloc = std.testing.allocator;
+        var eb = bus_mod.Bus.init();
+        defer eb.close();
+
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        const allowed = [_][]const u8{"*"};
+        var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+        ch.account_id = "sl-main";
+        ch.policy = .{ .dm = .allow, .group = .open };
+        ch.setBus(&eb);
+        defer ch.channel().stop();
+
+        var ws = websocket.WsClient{
+            .allocator = alloc,
+            .stream = .{ .handle = sockets[0] },
+            .tls = null,
+            .write_mu = .{},
+        };
+
+        const envelope =
+            \\{"type":"events_api","envelope_id":"e1","payload":{"event":{"type":"message","user":"U1","text":"/stop","ts":"1700000001.000","channel":"C1"}}}
+        ;
+        try ch.handleSocketPayload(&ws, envelope);
+
+        // Regression: a typed stop waited behind the per-conversation FIFO, so
+        // the very turn it was meant to interrupt had to finish first.
+        var msg = (eb.consumeInboundTimeout(0) catch return error.TestExpectedEqual) orelse
+            return error.TestExpectedEqual;
+        defer msg.deinit(alloc);
+        try std.testing.expectEqualStrings("/stop", msg.content);
+        try std.testing.expectEqualStrings("slack:sl-main:channel:C1", msg.session_key);
+        // It never entered the FIFO.
+        try std.testing.expectEqual(@as(usize, 0), ch.inbound_queue.items.len);
+    }
+}
+
+test "slack non-stop messages stay on the inbound FIFO" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"user":"U1","text":"hello","ts":"1700000001.000","channel":"C1"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    try std.testing.expect(!ch.maybePublishStopMessage(parsed.value.object, "C1"));
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+}
+
+test "slack FIFO key follows the session, not the thread" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C1", &allowed);
+    ch.account_id = "sl-main";
+
+    const session_key = ch.inboundConversationHash("U1", "C1");
+    // The old key mixed in thread_ts, so a thread reply and a top-level post
+    // of the same session got different keys and could reorder.
+    var old_hasher = std.hash.Wyhash.init(0);
+    old_hasher.update("C1");
+    old_hasher.update(":1700000000.000");
+    try std.testing.expect(session_key != old_hasher.final());
+
+    // Different channels and DMs are different sessions.
+    try std.testing.expect(session_key != ch.inboundConversationHash("U1", "C2"));
+    try std.testing.expect(session_key != ch.inboundConversationHash("U2", "D1"));
+
+    // Two events for the same session: the second waits while the first is
+    // claimed, even though one came from a thread.
+    ch.inbound_queue.append(alloc, .{
+        .kind = .message,
+        .payload = try alloc.dupe(u8, "{}"),
+        .channel_id = try alloc.dupe(u8, "C1"),
+        .conversation_hash = session_key,
+    }) catch unreachable;
+    ch.inbound_queue.append(alloc, .{
+        .kind = .message,
+        .payload = try alloc.dupe(u8, "{}"),
+        .channel_id = try alloc.dupe(u8, "C1"),
+        .conversation_hash = ch.inboundConversationHash("U1", "C1"),
+    }) catch unreachable;
+    defer {
+        for (ch.inbound_queue.items) |*event| event.deinit(alloc);
+        ch.inbound_queue.deinit(alloc);
+    }
+
+    const first = ch.takeInboundEventLocked() orelse return error.TestExpectedEqual;
+    var first_owned = first;
+    defer first_owned.deinit(alloc);
+    defer ch.removeInboundEventLocked(first.id);
+    try std.testing.expect(ch.takeInboundEventLocked() == null);
 }
 
 test "slack slash command name match ignores leading slash and case" {
