@@ -1217,6 +1217,10 @@ const SessionWorker = struct {
     /// `discardQueued` counts it: it is no longer in `queue`, but the epoch
     /// bump cancels it just the same.
     waiting_task: ?*MessageTask = null,
+    /// Task that passed its epoch check and is about to run, but whose turn
+    /// has not set `turn_running` yet. `/stop` uses this to signal that window
+    /// instead of reporting that nothing is in flight.
+    in_flight_task: ?*MessageTask = null,
 
     const RunHook = struct {
         run: *const fn (ctx: *anyopaque, task: *MessageTask) void,
@@ -1311,13 +1315,22 @@ const SessionWorker = struct {
 
     /// True when the task was popped before the last /stop. Called after
     /// waiting for a turn slot, right before the turn would start.
-    fn shouldRun(self: *SessionWorker, task: *const MessageTask) bool {
+    fn shouldRun(self: *SessionWorker, task: *MessageTask) bool {
         self.mu.lock();
         defer self.mu.unlock();
-        // The slot wait is over; from here the task runs (or is discarded just
-        // below), so /stop counts it through the running-turn interrupt.
+        // The slot wait is over. Mark the task in flight while still holding
+        // the lock, so /stop can signal the window before the turn sets
+        // turn_running instead of reporting that nothing is in flight.
         self.waiting_task = null;
-        return task.epoch == self.cancel_epoch;
+        if (task.epoch != self.cancel_epoch) return false;
+        self.in_flight_task = task;
+        return true;
+    }
+
+    fn hasInFlight(self: *SessionWorker) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.in_flight_task != null;
     }
 
     /// Record the popped task as slot-waiting so `/stop` counts it as
@@ -1341,8 +1354,12 @@ const SessionWorker = struct {
         defer self.mu.unlock();
         self.cancel_epoch +%= 1;
         // A popped task blocked in `slots.acquire()` is not in `queue`, but
-        // the epoch bump cancels it too, so it counts as discarded.
-        const count = self.queue.items.len + @intFromBool(self.waiting_task != null);
+        // the epoch bump cancels it too, so it counts as discarded. Clear it
+        // after counting: a second /stop must not count the same cancelled
+        // task again and claim it discarded another message.
+        const counted_waiting = self.waiting_task != null;
+        self.waiting_task = null;
+        const count = self.queue.items.len + @intFromBool(counted_waiting);
         for (self.queue.items) |task| self.discardTask(task);
         self.queue.clearRetainingCapacity();
         return count;
@@ -1351,6 +1368,9 @@ const SessionWorker = struct {
     /// Run one queued task and release its allocations.
     fn runTask(self: *SessionWorker, task: *MessageTask) void {
         defer {
+            self.mu.lock();
+            if (self.in_flight_task == task) self.in_flight_task = null;
+            self.mu.unlock();
             task.deinit();
             self.allocator.destroy(task);
         }
@@ -1384,14 +1404,17 @@ fn sessionWorkerLoop(worker: *SessionWorker) void {
 
 /// Spawn failure fallback: drain the session queue on the poller rather than
 /// losing the messages. This is the old synchronous behaviour, only used when
-/// a thread cannot be created at all.
+/// a thread cannot be created at all. It still waits for the shared turn slot:
+/// running outside the cap here would let another channel's worker exceed
+/// `max_concurrent_tasks`.
 fn drainSessionWorkerSynchronously(worker: *SessionWorker) void {
     worker.mu.lock();
     worker.running = false;
     worker.mu.unlock();
     while (worker.popOrStop()) |task| {
-        // This runs on the poller, which must never wait for a turn slot.
+        if (worker.slots) |slots| slots.acquire();
         worker.runTask(task);
+        if (worker.slots) |slots| slots.release();
     }
 }
 
@@ -2024,9 +2047,17 @@ pub fn runTelegramLoop(
             const worker = self.workers.get(session_key) orelse return 0;
             return worker.discardQueued();
         }
+
+        fn hasInFlight(self: @This(), session_key: []const u8) bool {
+            const worker = self.workers.get(session_key) orelse return false;
+            return worker.hasInFlight();
+        }
     };
-    const max_parallel_tasks = configuredTurnLimit(config);
-    const enable_parallel = max_parallel_tasks > 1;
+    // Always route inbound messages through a SessionWorker, even when the
+    // configured cap is 1. The worker waits on the shared turn slot, so the
+    // poller never runs a turn outside the cap and stays free to read new
+    // messages and /stop while a turn is in flight.
+    const enable_parallel = true;
 
     // Regression: this used to be a loop-local semaphore, so every configured
     // Telegram account (and the daemon's inbound workers) got its own limit.
@@ -2134,9 +2165,16 @@ pub fn runTelegramLoop(
                         var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
                         defer interrupt.deinit(allocator);
                         // No turn_running yet means the worker is still waiting
-                        // for a turn slot. An explicit /stop cancels what is
-                        // queued for this chat instead of letting it run
-                        // minutes later, after other sessions' turns.
+                        // for a turn slot, or the task passed its epoch check
+                        // and is about to set turn_running. A task marked in
+                        // flight gets the interrupt set directly; otherwise an
+                        // explicit /stop cancels what is queued for this chat
+                        // instead of letting it run minutes later.
+                        if (!interrupt.requested and worker_registry.hasInFlight(session_key) and
+                            runtime.session_mgr.requestTurnInterruptAtStart(session_key))
+                        {
+                            interrupt.requested = true;
+                        }
                         const discarded_queued: usize = if (!interrupt.requested)
                             worker_registry.discardQueued(session_key)
                         else
@@ -2275,7 +2313,11 @@ pub fn runTelegramLoop(
                 if (handled_in_worker) continue;
             }
 
-            // Synchronous processing
+            // Synchronous processing (only when a worker could not be
+            // allocated). Hold the shared turn slot so the configured cap
+            // still applies; this is an exceptional path, not the normal one.
+            runtime.acquireTurnSlot();
+            defer runtime.releaseTurnSlot();
             processTelegramMessage(
                 allocator,
                 runtime,
@@ -3428,6 +3470,10 @@ test "discarding a session queue cancels the task waiting for a turn slot" {
     // message already popped and waiting for a slot is cancelled too, so it
     // must be counted (the reply otherwise said nothing was discarded).
     try std.testing.expectEqual(@as(usize, 2), worker.discardQueued());
+    // Regression: the same slot-waiting task was counted again on a second
+    // /stop, claiming another message was discarded when none was left.
+    try std.testing.expect(worker.waiting_task == null);
+    try std.testing.expectEqual(@as(usize, 0), worker.discardQueued());
     slots.release();
     slot_released = true;
 
@@ -3441,6 +3487,38 @@ test "discarding a session queue cancels the task waiting for a turn slot" {
     }
     try std.testing.expectEqual(@as(usize, 0), probe.runs);
     try std.testing.expectEqual(@as(usize, 0), worker.queue.items.len);
+}
+
+test "a task is marked in flight before it starts running" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        ran: bool = false,
+        fn run(ctx: *anyopaque, _: *MessageTask) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.ran = true;
+        }
+    };
+    var probe = Probe{};
+    var worker = SessionWorker{
+        .allocator = alloc,
+        .session_key = try alloc.dupe(u8, "session"),
+        .run_hook = .{ .run = Probe.run, .ctx = @ptrCast(&probe) },
+    };
+    defer {
+        worker.queue.deinit(alloc);
+        alloc.free(worker.session_key);
+    }
+
+    const task = try testQueuedTask(alloc, "first");
+    task.epoch = worker.cancel_epoch;
+    try std.testing.expect(worker.shouldRun(task));
+    // Regression: /stop in the window between the epoch check and the turn
+    // setting turn_running saw neither a running turn nor a queued task and
+    // reported "nothing found" while the message still ran.
+    try std.testing.expect(worker.hasInFlight());
+    worker.runTask(task);
+    try std.testing.expect(probe.ran);
+    try std.testing.expect(!worker.hasInFlight());
 }
 
 test "turn slots block a third turn until one finishes" {
