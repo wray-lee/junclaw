@@ -303,6 +303,8 @@ pub const SlackChannel = struct {
     inbound_seen: [SEEN_INBOUND_EVENTS]u64 = [_]u64{0} ** SEEN_INBOUND_EVENTS,
     inbound_seen_count: usize = 0,
     inbound_seen_next: usize = 0,
+    /// Test seam: counts native chat.stopStream calls (the API is stubbed).
+    test_native_stop_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
     bot_team_id: ?[]u8 = null,
@@ -2435,7 +2437,18 @@ pub const SlackChannel = struct {
         defer self.stream_mu.unlock();
 
         const now_ms = std_compat.time.milliTimestamp();
-        if (self.stream_states.getPtr(target)) |state| state.finishTurn(self.allocator, now_ms);
+        if (self.stream_states.getPtr(target)) |state| {
+            // Regression: an empty `.final` freed the state without closing a
+            // native stream, leaving the message stuck in Slack's streaming
+            // state. Finalize it the same way discardStreamPreview does.
+            if (state.mode == .native and state.message_ts.len > 0) {
+                const parsed = stream_presenter.resolveStreamTarget(target);
+                self.stopNativeStream(parsed, state.message_ts) catch |err| {
+                    log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
+                };
+            }
+            state.finishTurn(self.allocator, now_ms);
+        }
         self.clearStreamCancelLocked(target);
     }
 
@@ -2869,6 +2882,7 @@ pub const SlackChannel = struct {
 
         var result = try self.callSlackApi("chat.stopStream", body, parsed.channel_id);
         defer result.deinit(self.allocator);
+        if (builtin.is_test) self.test_native_stop_calls += 1;
         if (result.error_code) |code| try self.recordNativeStreamFailure(code);
     }
 
@@ -5448,6 +5462,9 @@ test "slack empty final without attachments closes the turn" {
     const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
     try std.testing.expect(state.finished_at_ms != 0);
     try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
+    // Regression: the state was freed without chat.stopStream, so Slack kept
+    // the message in its streaming state.
+    try std.testing.expectEqual(@as(u32, 1), ch.test_native_stop_calls);
 }
 
 test "slack marker-only final stops and discards the stream preview" {
