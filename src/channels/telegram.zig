@@ -3657,6 +3657,10 @@ pub const TelegramChannel = struct {
     fn vtableRecordToolProgress(ptr: *anyopaque, target: []const u8, update: root.Channel.ToolProgressUpdate) void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
         self.recordToolProgressForTarget(target, .{
+            .kind = switch (update.kind) {
+                .tool => .tool,
+                .retry => .retry,
+            },
             .tool = update.tool,
             .arguments_json = update.arguments_json,
             .phase = switch (update.phase) {
@@ -3664,6 +3668,10 @@ pub const TelegramChannel = struct {
                 .end => .end,
             },
             .success = update.success,
+            .retry = .{
+                .attempt = update.retry.attempt,
+                .max = update.retry.max,
+            },
         });
     }
 

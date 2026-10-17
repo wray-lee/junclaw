@@ -73,9 +73,23 @@ pub fn estimate_text_tokens(text: []const u8) u32 {
 /// Phase of a tool-call progress hint.
 pub const ProgressPhase = enum { start, end };
 
+/// What a progress hint describes. Retry hints are live-draft only: they never
+/// enter the reply text or session history.
+pub const ProgressKind = enum { tool, retry };
+
+pub const RetryProgress = struct {
+    /// 1-based retry number.
+    attempt: u32,
+    /// Total retries allowed by the provider wrapper.
+    max: u32,
+};
+
 /// Progress hint emitted during a turn. For tool-call starts, text is the tool name.
 pub const ProgressHint = struct {
-    text: []const u8,
+    /// `.tool` hints describe a tool call; `.retry` hints report a provider
+    /// retry attempt and carry no tool information.
+    kind: ProgressKind = .tool,
+    text: []const u8 = "",
     /// Raw JSON arguments of a tool call (tool-call hints only). Borrowed for the
     /// duration of the callback; a channel derives a short, safe hint from it and
     /// must never render the raw blob.
@@ -83,6 +97,8 @@ pub const ProgressHint = struct {
     phase: ProgressPhase = .start,
     /// Whether the tool call succeeded (only meaningful for `.end` hints).
     success: bool = true,
+    /// Retry numbers for `.retry` hints; null clears the indicator.
+    retry: ?RetryProgress = null,
 };
 
 /// Callback invoked for each progress hint. Same lifetime rules as StreamCallback.
@@ -795,6 +811,31 @@ pub const Agent = struct {
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         return msg;
+    }
+
+    /// Forward a provider retry notice to the live draft. Retry text is built
+    /// here and borrowed only for the synchronous callback; a null `retry`
+    /// clears the indicator after the retried call resumes.
+    fn emitRetryProgress(ctx: *anyopaque, notice: providers.reliable.RetryNotice) void {
+        const self: *Agent = @ptrCast(@alignCast(ctx));
+        const callback = self.progress_callback orelse return;
+        const progress_ctx = self.progress_ctx orelse return;
+
+        if (notice.attempt == 0) {
+            callback(progress_ctx, .{ .kind = .retry, .retry = null });
+            return;
+        }
+
+        var buf: [40]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "Retrying ({d}/{d})\u{2026}", .{
+            notice.attempt,
+            notice.max,
+        }) catch "Retrying\u{2026}";
+        callback(progress_ctx, .{
+            .kind = .retry,
+            .text = text,
+            .retry = .{ .attempt = notice.attempt, .max = notice.max },
+        });
     }
 
     /// Estimate total tokens in conversation history.
@@ -2006,6 +2047,12 @@ pub const Agent = struct {
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        // Provider retries run synchronously on this thread; route their
+        // notices to this turn's live-draft sink and restore any outer observer.
+        const prev_retry_observer = providers.reliable.retryObserver();
+        providers.reliable.setRetryObserver(.{ .callback = emitRetryProgress, .ctx = self });
+        defer providers.reliable.setRetryObserver(prev_retry_observer);
+
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 

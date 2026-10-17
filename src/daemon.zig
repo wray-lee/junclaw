@@ -39,6 +39,7 @@ const tunnel_mod = @import("tunnel.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 const observability = @import("observability.zig");
 const control_plane = @import("control_plane.zig");
+const providers = @import("providers/root.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -1087,7 +1088,17 @@ const DaemonToolProgressCtx = struct {
 /// tool progress is disabled, so this is a no-op for those channels.
 fn daemonToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
     const ctx: *DaemonToolProgressCtx = @ptrCast(@alignCast(ctx_ptr));
-    ctx.channel.recordToolProgress(ctx.chat_id, .{
+    ctx.channel.recordToolProgress(ctx.chat_id, daemonToolProgressUpdate(hint));
+}
+
+/// Map an agent progress hint onto the channel update. Kept pure so retry and
+/// tool hints stay testable without a live channel.
+fn daemonToolProgressUpdate(hint: agent_mod.ProgressHint) channels_mod.Channel.ToolProgressUpdate {
+    return .{
+        .kind = switch (hint.kind) {
+            .tool => .tool,
+            .retry => .retry,
+        },
         .tool = hint.text,
         .arguments_json = hint.arguments_json,
         .phase = switch (hint.phase) {
@@ -1095,7 +1106,11 @@ fn daemonToolProgressCallback(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint)
             .end => .end,
         },
         .success = hint.success,
-    });
+        .retry = if (hint.retry) |retry| .{
+            .attempt = retry.attempt,
+            .max = retry.max,
+        } else .{},
+    };
 }
 
 fn nextOutboundDraftId() u64 {
@@ -1505,13 +1520,8 @@ fn processInboundMessage(
         setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
 
         // Send user-visible error reply back to the originating channel
-        const err_msg: []const u8 = switch (err) {
-            error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-            error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-            error.NoResponseContent => "Model returned an empty response. Please try again.",
-            error.OutOfMemory => "Out of memory.",
-            else => "An error occurred. Try again.",
-        };
+        var err_buf: [256]u8 = undefined;
+        const err_msg = providers.userErrorMessage(&err_buf, err, false);
         var err_out = if (routing_plan.outbound_account_id) |aid|
             bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, err_msg) catch return
         else
@@ -4189,4 +4199,15 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
 
     try std.testing.expect(tryHandleStopCommandBeforeEnqueue(allocator, &config, &registry, &sm, &msg));
     try std.testing.expect(thread_session.agent.interrupt_requested.load(.acquire));
+}
+
+test "daemonToolProgressUpdate maps retry hints" {
+    const update = daemonToolProgressUpdate(.{
+        .kind = .retry,
+        .text = "Retrying (1/2)\u{2026}",
+        .retry = .{ .attempt = 1, .max = 2 },
+    });
+    try std.testing.expectEqual(channels_mod.Channel.ToolProgressKind.retry, update.kind);
+    try std.testing.expectEqual(@as(u32, 1), update.retry.attempt);
+    try std.testing.expectEqual(@as(u32, 2), update.retry.max);
 }

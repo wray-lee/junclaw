@@ -9,6 +9,66 @@ const Provider = root.Provider;
 const ChatRequest = root.ChatRequest;
 const ChatResponse = root.ChatResponse;
 
+/// One retry that is about to run, reported to the current turn.
+pub const RetryNotice = struct {
+    /// 1-based retry number. 0 means the retried call resumed; clear the UI.
+    attempt: u32,
+    /// Total retries allowed by the provider wrapper.
+    max: u32,
+};
+
+pub const RetryObserver = struct {
+    callback: *const fn (ctx: *anyopaque, notice: RetryNotice) void,
+    ctx: *anyopaque,
+};
+
+/// Retry counters for the last provider loop on this thread.
+pub const RetryStats = struct {
+    used: u32 = 0,
+    max: u32 = 0,
+};
+
+// Provider calls are synchronous on the turn's thread, so a thread-local
+// observer reaches the live draft without sharing state across sessions.
+threadlocal var tls_retry_observer: ?RetryObserver = null;
+threadlocal var tls_retry_stats: RetryStats = .{};
+
+/// Install the per-turn retry observer. Passing null restores no observer.
+pub fn setRetryObserver(observer: ?RetryObserver) void {
+    tls_retry_observer = observer;
+}
+
+pub fn retryObserver() ?RetryObserver {
+    return tls_retry_observer;
+}
+
+/// Retries used by the most recent provider retry loop on this thread.
+pub fn lastRetryStats() RetryStats {
+    return tls_retry_stats;
+}
+
+/// Clear retry counters on this thread. Used between independent requests and
+/// by tests so stale counters cannot leak into a later failure message.
+pub fn resetRetryStats() void {
+    tls_retry_stats = .{};
+}
+
+fn beginRetryLoop(max_retries: u32) void {
+    tls_retry_stats = .{ .used = 0, .max = max_retries };
+}
+
+fn emitRetryNotice(attempt: u32, max: u32) void {
+    if (tls_retry_observer) |observer| {
+        observer.callback(observer.ctx, .{ .attempt = attempt, .max = max });
+    }
+}
+
+fn emitRetryCleared() void {
+    if (tls_retry_observer) |observer| {
+        observer.callback(observer.ctx, .{ .attempt = 0, .max = 0 });
+    }
+}
+
 /// Check if an error message indicates a non-retryable client error (4xx except 429/408).
 pub fn isNonRetryable(err_msg: []const u8) bool {
     // Look for 4xx status codes
@@ -434,9 +494,12 @@ pub const ReliableProvider = struct {
     ) ?[]const u8 {
         var backoff_ms = self.base_backoff_ms;
         var attempt: u32 = 0;
+        var retried = false;
+        beginRetryLoop(self.max_retries);
         while (attempt <= self.max_retries) : (attempt += 1) {
             root.clearLastApiErrorDetail();
             if (prov.chatWithSystem(allocator, system_prompt, message, current_model, 0.7)) |result| {
+                if (retried) emitRetryCleared();
                 return result;
             } else |err| {
                 maybeRecordFallbackErrorDetail(prov, err);
@@ -452,11 +515,15 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
+                    tls_retry_stats.used += 1;
+                    retried = true;
+                    emitRetryNotice(tls_retry_stats.used, self.max_retries);
                     std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }
         }
+        if (retried) emitRetryCleared();
         return null;
     }
 
@@ -470,6 +537,8 @@ pub const ReliableProvider = struct {
     ) error{Interrupted}!?ChatResponse {
         var backoff_ms = self.base_backoff_ms;
         var attempt: u32 = 0;
+        var retried = false;
+        beginRetryLoop(self.max_retries);
         while (attempt <= self.max_retries) : (attempt += 1) {
             root.clearLastApiErrorDetail();
             var resolved_request = request;
@@ -482,6 +551,7 @@ pub const ReliableProvider = struct {
                 if (annotated.model.len == 0) {
                     annotated.model = allocator.dupe(u8, current_model) catch "";
                 }
+                if (retried) emitRetryCleared();
                 return annotated;
             } else |err| {
                 // A user /stop aborted the in-flight request. It must end the
@@ -501,11 +571,15 @@ pub const ReliableProvider = struct {
 
                 if (attempt < self.max_retries) {
                     const wait = self.computeBackoff(backoff_ms, err_slice);
+                    tls_retry_stats.used += 1;
+                    retried = true;
+                    emitRetryNotice(tls_retry_stats.used, self.max_retries);
                     std_compat.thread.sleep(wait * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms *| 2, 10_000);
                 }
             }
         }
+        if (retried) emitRetryCleared();
         return null;
     }
 
@@ -1836,4 +1910,59 @@ test "streamChatImpl returns ProviderDoesNotSupportVision when all providers lac
         prov.streamChat(std.testing.allocator, request, "codex", 0.7, NoopCtx.cb, &dummy),
     );
     try std.testing.expect(inner.call_count == 0);
+}
+
+const RetryNoticeCollector = struct {
+    count: usize = 0,
+    clear_count: usize = 0,
+    last_attempt: u32 = 0,
+    last_max: u32 = 0,
+
+    fn onNotice(ctx: *anyopaque, notice: RetryNotice) void {
+        const self: *RetryNoticeCollector = @ptrCast(@alignCast(ctx));
+        if (notice.attempt == 0) {
+            self.clear_count += 1;
+            return;
+        }
+        self.count += 1;
+        self.last_attempt = notice.attempt;
+        self.last_max = notice.max;
+    }
+};
+
+test "ReliableProvider reports retry attempts and clears the indicator" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 2, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 3, 50);
+    var collector = RetryNoticeCollector{};
+    setRetryObserver(.{ .callback = RetryNoticeCollector.onNotice, .ctx = @ptrCast(&collector) });
+    defer setRetryObserver(null);
+
+    const prov = reliable.provider();
+    const result = try prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5);
+    try std.testing.expectEqualStrings("mock response", result);
+
+    try std.testing.expectEqual(@as(usize, 2), collector.count);
+    try std.testing.expectEqual(@as(u32, 2), collector.last_attempt);
+    try std.testing.expectEqual(@as(u32, 3), collector.last_max);
+    try std.testing.expectEqual(@as(usize, 1), collector.clear_count);
+    try std.testing.expectEqual(@as(u32, 2), lastRetryStats().used);
+    try std.testing.expectEqual(@as(u32, 3), lastRetryStats().max);
+}
+
+test "ReliableProvider records exhausted retry stats" {
+    var mock = MockInnerProvider{ .call_count = 0, .fail_until = 100, .supports_tools = false };
+    var reliable = ReliableProvider.initWithProvider(mock.toProvider(), 2, 50);
+    var collector = RetryNoticeCollector{};
+    setRetryObserver(.{ .callback = RetryNoticeCollector.onNotice, .ctx = @ptrCast(&collector) });
+    defer setRetryObserver(null);
+
+    const prov = reliable.provider();
+    try std.testing.expectError(error.AllProvidersFailed, prov.chatWithSystem(std.testing.allocator, null, "hello", "model", 0.5));
+
+    // Regression: retry exhaustion used to be invisible to the user; the
+    // counters now let the error reply say how many retries ran.
+    try std.testing.expectEqual(@as(u32, 2), lastRetryStats().used);
+    try std.testing.expectEqual(@as(u32, 2), lastRetryStats().max);
+    try std.testing.expectEqual(@as(usize, 2), collector.count);
+    try std.testing.expectEqual(@as(usize, 1), collector.clear_count);
 }

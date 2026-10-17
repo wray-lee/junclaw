@@ -139,14 +139,25 @@ pub const Channel = struct {
     };
     /// Phase of a tool-call progress hint (see agent.ProgressHint).
     pub const ToolPhase = enum { start, end };
-    /// One per-turn tool event forwarded to a channel's live preview. `tool` is
-    /// the tool name only; `arguments_json` is the raw call arguments, from
-    /// which the channel derives a short, safe hint and never renders the blob.
+    /// What a progress update describes.
+    pub const ToolProgressKind = enum { tool, retry };
+    pub const ToolRetryProgress = struct {
+        /// 1-based retry number; 0 clears the indicator.
+        attempt: u32 = 0,
+        /// Total retries allowed by the provider wrapper.
+        max: u32 = 0,
+    };
+    /// One per-turn progress event forwarded to a channel's live preview.
+    /// `tool` is the tool name only; `arguments_json` is the raw call
+    /// arguments, from which the channel derives a short, safe hint and never
+    /// renders the blob. `.retry` updates carry no tool information.
     pub const ToolProgressUpdate = struct {
-        tool: []const u8,
+        kind: ToolProgressKind = .tool,
+        tool: []const u8 = "",
         arguments_json: ?[]const u8 = null,
         phase: ToolPhase = .start,
         success: bool = true,
+        retry: ToolRetryProgress = .{},
     };
 
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}

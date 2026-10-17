@@ -2544,6 +2544,8 @@ const testing = std.testing;
 const MockProvider = struct {
     response: []const u8,
     chat_error: ?anyerror = null,
+    /// Fail this many initial calls, then succeed (exercises provider retries).
+    fail_first: usize = 0,
     chat_calls: usize = 0,
     supports_vision: bool = true,
     vision_model: ?[]const u8 = null,
@@ -2594,6 +2596,7 @@ const MockProvider = struct {
         @memcpy(self.last_chat_model_buf[0..self.last_chat_model_len], request.model[0..self.last_chat_model_len]);
         self.last_request_timeout_secs = request.timeout_secs;
         if (self.chat_error) |err| return err;
+        if (self.chat_calls <= self.fail_first) return error.ProviderError;
         var resp = providers.ChatResponse{ .content = try allocator.dupe(u8, self.response) };
         if (self.annotate) {
             resp.provider = try allocator.dupe(u8, "mock");
@@ -2923,15 +2926,26 @@ const ProgressCollector = struct {
     count: usize = 0,
     starts: usize = 0,
     ends: usize = 0,
+    retries: usize = 0,
+    retry_clears: usize = 0,
     last_text_buf: [64]u8 = undefined,
     last_text_len: usize = 0,
 
     fn onEvent(ctx_ptr: *anyopaque, hint: agent_mod.ProgressHint) void {
         const self: *ProgressCollector = @ptrCast(@alignCast(ctx_ptr));
         self.count += 1;
-        switch (hint.phase) {
-            .start => self.starts += 1,
-            .end => self.ends += 1,
+        switch (hint.kind) {
+            .retry => {
+                if (hint.retry == null) {
+                    self.retry_clears += 1;
+                    return;
+                }
+                self.retries += 1;
+            },
+            .tool => switch (hint.phase) {
+                .start => self.starts += 1,
+                .end => self.ends += 1,
+            },
         }
         self.last_text_len = @min(hint.text.len, self.last_text_buf.len);
         @memcpy(self.last_text_buf[0..self.last_text_len], hint.text[0..self.last_text_len]);
@@ -4926,6 +4940,46 @@ test "processMessageStreaming forwards tool progress hints" {
     try testing.expectEqual(@as(usize, 1), collector.starts);
     try testing.expectEqual(@as(usize, 1), collector.ends);
     try testing.expectEqualStrings("probe", collector.lastText());
+}
+
+test "processMessageStreaming forwards provider retry hints" {
+    var mock = MockProvider{ .response = "ok", .fail_first = 1 };
+    var reliable = providers.reliable.ReliableProvider.initWithProvider(mock.provider(), 1, 50);
+    const cfg = testConfig();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        reliable.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = ProgressCollector{};
+    const resp = try sm.processMessageStreaming(
+        "progress:retry",
+        "hello",
+        null,
+        null,
+        .{
+            .callback = ProgressCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+    );
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqualStrings("ok", resp);
+    // Regression: provider retries used to be silent for the whole backoff.
+    try testing.expectEqual(@as(usize, 1), collector.retries);
+    try testing.expectEqual(@as(usize, 1), collector.retry_clears);
+    try testing.expectEqualStrings("Retrying (1/1)\u{2026}", collector.lastText());
+    // The indicator is live-draft only and never becomes reply text.
+    try testing.expect(std.mem.indexOf(u8, resp, "Retrying") == null);
 }
 
 test "tool progress hints never enter the reply or history" {

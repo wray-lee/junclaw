@@ -154,6 +154,11 @@ nullclaw onboard --interactive
 - service 模式下查看 `~/.nullclaw/logs/daemon.stdout.log` 与 `~/.nullclaw/logs/daemon.stderr.log`。
 - 跑一次 `nullclaw status`，确认当前实际使用的 provider / model。
 
+如果 provider 调用最终失败，回复会说明失败类型，而不再是一句通用错误：
+限流（并说明用掉了多少次重试）、过载/5xx、鉴权失败或缺少 key、超时/网络、
+上下文超限。重试期间，Telegram 的实时草稿会显示一行 `Retrying (n/m)…`，
+它不会进入最终回复。
+
 如果 plan 本身可用但限流很严，建议保守调整 reliability：
 
 ```json

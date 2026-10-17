@@ -3007,15 +3007,13 @@ test "telegram reply body escapes text and includes thread" {
     try std.testing.expectEqualStrings("{\"chat_id\":42,\"text\":\"hello \\\"there\\\"\\nnext\",\"message_thread_id\":7}", body);
 }
 
+/// Scratch space for the classified error copy. `userFacingAgentError` is
+/// called synchronously on the dispatching thread and the slice is consumed
+/// before the next call, so one buffer per thread is enough.
+threadlocal var user_facing_error_buf: [256]u8 = undefined;
+
 fn userFacingAgentError(err: anyerror) []const u8 {
-    return switch (err) {
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-        error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-        error.AllProvidersFailed => "All configured providers failed for this request. Check model/provider compatibility and credentials.",
-        error.NoResponseContent => "Model returned an empty response. Please try again.",
-        error.OutOfMemory => "Out of memory.",
-        else => "An error occurred. Try again.",
-    };
+    return providers.userErrorMessage(&user_facing_error_buf, err, false);
 }
 
 fn userFacingAgentErrorJson(err: anyerror) []const u8 {
@@ -3024,6 +3022,8 @@ fn userFacingAgentErrorJson(err: anyerror) []const u8 {
         error.ProviderDoesNotSupportVision => "{\"error\":\"provider does not support image input\"}",
         error.AllProvidersFailed => "{\"error\":\"all providers failed for this request\"}",
         error.NoResponseContent => "{\"error\":\"model returned empty response\"}",
+        error.RateLimited => "{\"error\":\"provider rate limit\"}",
+        error.ContextLengthExceeded => "{\"error\":\"context length exceeded\"}",
         error.OutOfMemory => "{\"error\":\"out of memory\"}",
         else => "{\"error\":\"agent failure\"}",
     };
@@ -10041,15 +10041,28 @@ test "local agent runtime keeps policy and memory pointers stable" {
 
 test "userFacingAgentError maps ProviderDoesNotSupportVision" {
     try std.testing.expectEqualStrings(
-        "The current provider does not support image input.",
+        "The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.",
         userFacingAgentError(error.ProviderDoesNotSupportVision),
     );
 }
 
 test "userFacingAgentError maps NoResponseContent" {
     try std.testing.expectEqualStrings(
-        "Model returned an empty response. Please try again.",
+        "Model returned an empty response. Please retry or /new for a fresh session.",
         userFacingAgentError(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentError maps rate limit and context overflow" {
+    providers.clearLastApiErrorDetail();
+    providers.reliable.resetRetryStats();
+    try std.testing.expectEqualStrings(
+        "Rate limited by the provider. Wait a minute and try again.",
+        userFacingAgentError(error.RateLimited),
+    );
+    try std.testing.expectEqualStrings(
+        "This conversation exceeded the model's context window. Use /new to start a fresh session or send a shorter message.",
+        userFacingAgentError(error.ContextLengthExceeded),
     );
 }
 
@@ -10078,6 +10091,17 @@ test "userFacingAgentErrorJson maps NoResponseContent" {
     try std.testing.expectEqualStrings(
         "{\"error\":\"model returned empty response\"}",
         userFacingAgentErrorJson(error.NoResponseContent),
+    );
+}
+
+test "userFacingAgentErrorJson maps rate limit and context overflow" {
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"provider rate limit\"}",
+        userFacingAgentErrorJson(error.RateLimited),
+    );
+    try std.testing.expectEqualStrings(
+        "{\"error\":\"context length exceeded\"}",
+        userFacingAgentErrorJson(error.ContextLengthExceeded),
     );
 }
 

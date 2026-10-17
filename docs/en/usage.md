@@ -168,6 +168,12 @@ Checks:
 - For service mode, inspect `~/.nullclaw/logs/daemon.stdout.log` and `~/.nullclaw/logs/daemon.stderr.log`.
 - Run `nullclaw status` to confirm the current provider/model pair.
 
+When a provider call still fails, the reply names the failure class instead of
+showing a generic error: rate limit (including how many retries were used),
+overload/5xx, authentication or a missing key, timeout/network, or context
+length exceeded. While retries run, Telegram's live draft shows a single
+`Retrying (n/m)…` line; it never appears in the final answer.
+
 If the plan is valid but fragile, tune reliability conservatively:
 
 ```json
