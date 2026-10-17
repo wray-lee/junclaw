@@ -405,6 +405,11 @@ pub const SessionManager = struct {
     verified_bindings: std.StringHashMapUnmanaged(VerifiedBinding),
     used_claim_nonces: std.StringHashMapUnmanaged(i64),
     claim_attempts: std.StringHashMapUnmanaged(ClaimAttempt),
+    /// Pre-turn /stop requests recorded before the session existed. Sessions
+    /// are created lazily by `processMessageStreaming`, so a stop that lands
+    /// in that window has no Agent to flag yet; the turn that creates the
+    /// session consumes the entry before its first provider call.
+    pending_start_interrupts: std.StringHashMapUnmanaged(void),
 
     pub fn init(
         allocator: Allocator,
@@ -450,6 +455,7 @@ pub const SessionManager = struct {
             .verified_bindings = .{},
             .used_claim_nonces = .{},
             .claim_attempts = .{},
+            .pending_start_interrupts = .{},
             .cost_tracker = if (config.cost.enabled) cost_mod.CostTracker.init(allocator, config.workspace_dir, config.cost.enabled, config.cost.daily_limit_usd, config.cost.monthly_limit_usd, config.cost.warn_at_percent) else null,
         };
         manager.loadClaimState();
@@ -490,6 +496,12 @@ pub const SessionManager = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.claim_attempts.deinit(self.allocator);
+
+        var pending_it = self.pending_start_interrupts.iterator();
+        while (pending_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.pending_start_interrupts.deinit(self.allocator);
 
         if (self.claim_state_path) |path| self.allocator.free(path);
     }
@@ -2188,6 +2200,17 @@ pub const SessionManager = struct {
 
         const session = try self.getOrCreate(session_key);
 
+        // A /stop that landed before this session existed recorded a pre-turn
+        // interrupt in the manager; consume it before the turn lock so the
+        // turn sees it at its first provider call instead of running to
+        // completion.
+        {
+            self.mutex.lock();
+            const pending_start = self.takePendingStartInterruptLocked(session_key);
+            self.mutex.unlock();
+            if (pending_start) session.agent.requestInterrupt();
+        }
+
         lockSessionForTurn(session);
         defer session.mutex.unlock();
         session.turn_closing.store(false, .release);
@@ -2550,14 +2573,54 @@ pub const SessionManager = struct {
     /// Set the interrupt flag even though the turn has not published
     /// `turn_running` yet. Used by `/stop` when a worker task passed its epoch
     /// check and is about to start: `Agent.turn` checks the flag before the
-    /// first provider call, so the message is never sent. Returns false when
-    /// the session no longer exists.
+    /// first provider call, so the message is never sent. When the session
+    /// does not exist yet (a stop right after the first message in a new
+    /// chat), the request is recorded and consumed by the turn that creates
+    /// it. Returns false only when the request cannot be recorded.
     pub fn requestTurnInterruptAtStart(self: *SessionManager, session_key: []const u8) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const session = self.sessions.get(session_key) orelse return false;
-        session.agent.requestInterrupt();
+        if (self.sessions.get(session_key)) |session| {
+            session.agent.requestInterrupt();
+            return true;
+        }
+        if (!self.pending_start_interrupts.contains(session_key)) {
+            const owned_key = self.allocator.dupe(u8, session_key) catch return false;
+            self.pending_start_interrupts.put(self.allocator, owned_key, {}) catch {
+                self.allocator.free(owned_key);
+                return false;
+            };
+        }
         return true;
+    }
+
+    fn takePendingStartInterruptLocked(self: *SessionManager, session_key: []const u8) bool {
+        if (self.pending_start_interrupts.fetchRemove(session_key)) |entry| {
+            self.allocator.free(entry.key);
+            return true;
+        }
+        return false;
+    }
+
+    /// Drop a pre-turn interrupt that no turn consumed. The channel worker
+    /// calls this when its task ends without reaching the turn, so the next
+    /// message is not interrupted by a stop meant for a turn that never ran.
+    pub fn clearPendingStartInterrupt(self: *SessionManager, session_key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        _ = self.takePendingStartInterruptLocked(session_key);
+    }
+
+    /// Clear an interrupt flag that no turn consumed. Called when a worker's
+    /// turn has ended: a /stop that landed after the turn cleared its flag but
+    /// before the reply was delivered must not interrupt the next message in
+    /// the chat.
+    pub fn clearTurnInterruptIfIdle(self: *SessionManager, session_key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = self.sessions.get(session_key) orelse return;
+        if (session.turn_running.load(.acquire)) return;
+        session.agent.clearInterruptRequest();
     }
 
     /// Request interruption of a running turn for `session_key` together with
@@ -5529,6 +5592,64 @@ test "requestTurnInterruptAtStart stops a turn before it reaches the provider" {
     defer testing.allocator.free(reply);
     try testing.expect(std.mem.indexOf(u8, reply, "Interrupted by /stop") != null);
     try testing.expectEqual(@as(usize, 0), mock.chat_calls);
+}
+
+test "requestTurnInterruptAtStart reaches a session that does not exist yet" {
+    var mock = MockProvider{ .response = "should not be sent" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "stop:new-session";
+    // Regression: a /stop sent right after the first message in a brand-new
+    // chat found no session yet, so the fast path fell through and the turn
+    // ran to completion despite the "no in-flight turn" reply.
+    try testing.expect(sm.requestTurnInterruptAtStart(session_key));
+    const reply = try sm.processMessageStreaming(session_key, "hello", null, null, null);
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "Interrupted by /stop") != null);
+    try testing.expectEqual(@as(usize, 0), mock.chat_calls);
+}
+
+test "a cleared pre-turn stop does not interrupt the next turn" {
+    var mock = MockProvider{ .response = "answered" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "stop:cleared";
+    try testing.expect(sm.requestTurnInterruptAtStart(session_key));
+    // Regression: a stop recorded while no turn could consume it stayed
+    // pending and cancelled the next message in the chat.
+    sm.clearPendingStartInterrupt(session_key);
+    const reply = try sm.processMessageStreaming(session_key, "hello", null, null, null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("answered", reply);
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+}
+
+test "clearTurnInterruptIfIdle drops a stale stop flag but keeps a running one" {
+    var mock = MockProvider{ .response = "answered" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "stop:idle-cleanup";
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(sm.requestTurnInterruptAtStart(session_key));
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+    // Regression: a /stop that landed after the turn ended armed the flag
+    // with no turn left to consume it, cancelling the next message.
+    sm.clearTurnInterruptIfIdle(session_key);
+    try testing.expect(!session.agent.interrupt_requested.load(.acquire));
+
+    // A running turn keeps the interrupt it was signaled with.
+    session.turn_running.store(true, .release);
+    try testing.expect(sm.requestTurnInterruptAtStart(session_key));
+    sm.clearTurnInterruptIfIdle(session_key);
+    try testing.expect(session.agent.interrupt_requested.load(.acquire));
+    session.turn_running.store(false, .release);
+    session.agent.clearInterruptRequest();
 }
 
 test "drainLateInjection keeps the primary reply and asks the sender to resend" {
