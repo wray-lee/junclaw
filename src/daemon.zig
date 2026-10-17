@@ -826,10 +826,15 @@ fn resolveInboundRouteSessionKeyWithMetadata(
     }, config.agent_bindings, config.agents, config.session) catch return null;
     allocator.free(route.main_session_key);
 
-    if (meta.thread_id) |thread_id| {
-        const threaded = agent_routing.buildThreadSessionKey(allocator, route.session_key, thread_id) catch return route.session_key;
-        allocator.free(route.session_key);
-        return threaded;
+    // Slack DMs use one conversation session even when reply_to_mode puts a
+    // message in a thread. Channel threads remain isolated sessions.
+    const is_slack_dm = std.mem.eql(u8, msg.channel, "slack") and (meta.is_dm orelse false);
+    if (!is_slack_dm) {
+        if (meta.thread_id) |thread_id| {
+            const threaded = agent_routing.buildThreadSessionKey(allocator, route.session_key, thread_id) catch return route.session_key;
+            allocator.free(route.session_key);
+            return threaded;
+        }
     }
     return route.session_key;
 }
@@ -3106,6 +3111,46 @@ test "resolveInboundRouteSessionKey routes slack direct messages by sender" {
     try std.testing.expect(routed != null);
     defer allocator.free(routed.?);
     try std.testing.expectEqualStrings("agent:slack-dm-agent:slack:direct:U777", routed.?);
+}
+
+test "resolveInboundRouteSessionKey keeps Slack DM thread replies in one session" {
+    const allocator = std.testing.allocator;
+    const bindings = [_]agent_routing.AgentBinding{.{
+        .agent_id = "slack-dm-agent",
+        .match = .{ .channel = "slack", .account_id = "sl-main", .peer = .{ .kind = .direct, .id = "U777" } },
+    }};
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .agent_bindings = &bindings,
+        .channels = .{ .slack = &[_]@import("config_types.zig").SlackConfig{
+            .{ .account_id = "sl-main", .bot_token = "test-token", .channel_id = "D22222" },
+        } },
+    };
+    const top = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "D22222",
+        .content = "top",
+        .session_key = "slack:sl-main:direct:U777",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":true}",
+    };
+    const reply = bus_mod.InboundMessage{
+        .channel = "slack",
+        .sender_id = "U777",
+        .chat_id = "D22222:1700.0",
+        .content = "reply",
+        .session_key = "slack:sl-main:direct:U777",
+        .metadata_json = "{\"account_id\":\"sl-main\",\"is_dm\":true,\"thread_id\":\"1700.0\"}",
+    };
+    const top_key = resolveInboundRouteSessionKey(allocator, &config, &top) orelse return error.TestUnexpectedResult;
+    defer allocator.free(top_key);
+    const reply_key = resolveInboundRouteSessionKey(allocator, &config, &reply) orelse return error.TestUnexpectedResult;
+    defer allocator.free(reply_key);
+    // Regression: a thread reply used to become `:thread:<ts>` and start a
+    // concurrent turn instead of steering the active DM turn.
+    try std.testing.expectEqualStrings(top_key, reply_key);
 }
 
 test "resolveInboundRouteSessionKey routes qq dm messages by sender id" {

@@ -231,10 +231,14 @@ pub fn planTaskReaction(
 ) ReactionPlan {
     var plan = ReactionPlan{};
     const add = reactionEmoji(emojis, reaction);
+    var add_already_present = false;
     for (supersededReactions(reaction)) |previous| {
         const emoji = reactionEmoji(emojis, previous) orelse continue;
         if (add) |next| {
-            if (std.mem.eql(u8, next, emoji)) continue;
+            if (std.mem.eql(u8, next, emoji)) {
+                add_already_present = true;
+                continue;
+            }
         }
         var seen = false;
         for (plan.removals[0..plan.removals_len]) |existing| {
@@ -246,7 +250,7 @@ pub fn planTaskReaction(
         plan.removals[plan.removals_len] = emoji;
         plan.removals_len += 1;
     }
-    plan.add = add;
+    plan.add = if (add_already_present) null else add;
     return plan;
 }
 
@@ -1384,9 +1388,11 @@ pub const SlackChannel = struct {
             hasher.update(":channel:");
             hasher.update(channel_id);
         }
-        if (thread_ts) |tts| {
-            hasher.update(":thread:");
-            hasher.update(tts);
+        if (!isDirectConversationId(channel_id)) {
+            if (thread_ts) |tts| {
+                hasher.update(":thread:");
+                hasher.update(tts);
+            }
         }
         return hasher.final();
     }
@@ -4892,7 +4898,7 @@ test "slack reaction plan reuses an emoji two states share" {
     // Same emoji as the state being left, so the reaction stays put.
     const running = planTaskReaction(emojis, .running);
     try std.testing.expectEqual(@as(u8, 0), running.removals_len);
-    try std.testing.expectEqualStrings("hourglass_flowing_sand", running.add.?);
+    try std.testing.expect(running.add == null);
 
     // Empty string clears the state instead of setting one.
     const done = planTaskReaction(emojis, .done);
@@ -5364,6 +5370,20 @@ test "slack FIFO key follows the daemon session, including the thread" {
     // Different channels and DMs are different sessions.
     try std.testing.expect(top_level != ch.inboundConversationHash("U1", "C2", null));
     try std.testing.expect(top_level != ch.inboundConversationHash("U2", "D1", null));
+}
+
+test "slack FIFO hash keeps a DM thread in the base conversation" {
+    const alloc = std.testing.allocator;
+    var ch = SlackChannel.init(alloc, "tok", null, "D1", &.{});
+    ch.account_id = "sl-main";
+
+    // Regression: the daemon now routes DM thread replies to the base DM
+    // session, so the Slack FIFO must use the same key and prevent a second
+    // worker from starting a concurrent turn.
+    try std.testing.expectEqual(
+        ch.inboundConversationHash("U1", "D1", null),
+        ch.inboundConversationHash("U1", "D1", "1700.0"),
+    );
 }
 
 test "slack FIFO hash follows the routed DM session" {
