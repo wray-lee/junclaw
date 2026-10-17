@@ -9,7 +9,7 @@
 //!       .process           => session_mgr.processMessageStreaming(...),
 //!       .inject            => session_mgr.injectMidTurn(session_key, text),
 //!       .replace_injection => session_mgr.injectMidTurn(session_key, text),  // same effect
-//!       .append_injection  => session_mgr.appendMidTurn(session_key, text),  // keeps earlier text
+//!       .append_injection  => append to the running turn's injection buffer,  // keeps earlier text
 //!       .queue             => session_mgr.processMessageStreaming(...),      // waits on session lock
 //!       .drop              => {},                                            // tell the user
 //!   }
@@ -29,7 +29,9 @@ pub const QueueMode = config_types.QueueMode;
 /// Snapshot of the state needed to make a routing decision.
 /// Obtained via SessionManager.routeInput().
 pub const RouteInput = struct {
-    /// True when agent.turn() is currently executing for this session.
+    /// True when a turn is running and still accepting mid-turn input. A turn
+    /// that is tearing down reports false so the message waits for a fresh turn
+    /// instead of being injected into a buffer nobody will drain.
     turn_running: bool,
     /// The session's configured inbound queue policy.
     queue_mode: QueueMode,

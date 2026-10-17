@@ -197,10 +197,11 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 ### `agent.default_queue_mode`
 
 - 设置新建会话的入站队列模式。可选值为 `steer`、`off`、`serial`、`latest` 和 `debounce`，默认值为 `steer`。
-- `steer`（默认）会把正在执行回合时到达的消息按到达顺序注入当前活动回合，在下一个工具或模型边界交给模型，因此不会静默丢弃。发送者会立即收到可见确认（typing 指示或 accepted 反应）。
+- `steer`（默认）会把正在执行回合时到达的消息按到达顺序注入当前活动回合，在下一个工具或模型边界交给模型，因此不会静默丢弃。发送者会立即收到可见确认（typing 指示、accepted 反应，或在不支持前两者的通道上收到一条简短提示）。steer 会保留每一条消息，不受队列容量上限限制。
 - `off` 会丢弃正在执行回合时到达的消息，并告知发送者消息未送达。`serial` 会等待当前回合结束，`latest` 只保留最新的待注入消息（替换较早的消息），`debounce` 选择现有的运行时 debounce 模式；此字段不配置其时长、容量或丢弃策略。
 - `/queue` 可以覆盖当前会话的模式（如 `/queue steer`、`/queue latest`）。`/queue reset`、`/restart` 和 `/debug reset` 会恢复这里配置的默认值。
 - 修改后需要重启，确保 session manager 与后续新建会话使用同一个默认值。
+- 旧版本写出的配置会包含 `"default_queue_mode": "off"`，从而保留旧的丢弃行为。要使用新的默认值，请删除该字段或将其设为 `steer`。
 
 示例：
 

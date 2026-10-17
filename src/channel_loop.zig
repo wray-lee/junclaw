@@ -1013,11 +1013,11 @@ fn processTelegramMessage(
     // and reset the running turn's live draft.
     const route_action = runtime.session_mgr.routeInbound(session_key, content);
     if (route_action.skipsTurn()) {
-        if (route_action == .skip) {
+        if (route_action == .steered) {
             // Acknowledge an enqueued mid-turn message so the sender sees it
             // was accepted by the active turn.
             tg_ptr.startTyping(sender) catch {};
-        } else {
+        } else if (route_action == .dropped) {
             // Never drop silently: say why the message was not delivered.
             tg_ptr.sendMessageWithReply(sender, inbound_router.dropped_notice, reply_to_id) catch {};
             tg_ptr.setTaskReaction(sender, message_id, .failed);
@@ -1906,11 +1906,11 @@ pub fn runTelegramLoop(
                     if (active_worker_threads.get(session_key) != null) {
                         const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
                         if (route_action.skipsTurn()) {
-                            if (route_action == .skip) {
+                            if (route_action == .steered) {
                                 // Acknowledge an enqueued mid-turn message so the
                                 // sender sees it was accepted by the active turn.
                                 tg_ptr.startTyping(msg.sender) catch {};
-                            } else {
+                            } else if (route_action == .dropped) {
                                 // Never drop silently: say why it was not delivered.
                                 tg_ptr.sendMessageWithReply(msg.sender, inbound_router.dropped_notice, reply_to_id) catch {};
                                 tg_ptr.setTaskReaction(msg.sender, msg.message_id, .failed);
@@ -2233,11 +2233,13 @@ pub fn runSignalLoop(
 
             const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
             if (route_action.skipsTurn()) {
-                if (route_action == .skip) {
+                if (route_action == .steered) {
                     // Acknowledge the enqueued message with a typing indicator.
                     if (msg.reply_target) |target| sg_ptr.startTyping(target) catch {};
-                } else if (msg.reply_target) |target| {
-                    sg_ptr.sendMessage(target, inbound_router.dropped_notice, &.{}) catch {};
+                } else if (route_action == .dropped) {
+                    if (msg.reply_target) |target| {
+                        sg_ptr.sendMessage(target, inbound_router.dropped_notice, &.{}) catch {};
+                    }
                 }
                 continue;
             }
@@ -2372,10 +2374,11 @@ pub fn runWeixinLoop(
             if (route_action.skipsTurn()) {
                 // Weixin has no typing indicator; acknowledge with a short
                 // message so an enqueued mid-turn message is never invisible.
-                wx_ptr.sendMessage(
-                    reply_target,
-                    if (route_action == .skip) inbound_router.queued_notice else inbound_router.dropped_notice,
-                ) catch {};
+                if (route_action == .steered) {
+                    wx_ptr.sendMessage(reply_target, inbound_router.queued_notice) catch {};
+                } else if (route_action == .dropped) {
+                    wx_ptr.sendMessage(reply_target, inbound_router.dropped_notice) catch {};
+                }
                 continue;
             }
 
@@ -2687,10 +2690,10 @@ pub fn runMatrixLoop(
             const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
             if (route_action.skipsTurn()) {
                 const ack_target = msg.reply_target orelse msg.sender;
-                if (route_action == .skip) {
+                if (route_action == .steered) {
                     // Acknowledge the enqueued message with a typing indicator.
                     mx_ptr.startTyping(ack_target) catch {};
-                } else {
+                } else if (route_action == .dropped) {
                     mx_ptr.sendMessage(ack_target, inbound_router.dropped_notice) catch {};
                 }
                 continue;
@@ -2860,10 +2863,10 @@ pub fn runMaxLoop(
 
             const route_action = runtime.session_mgr.routeInbound(session_key, msg.content);
             if (route_action.skipsTurn()) {
-                if (route_action == .skip) {
+                if (route_action == .steered) {
                     // Acknowledge the enqueued message with a typing indicator.
                     mx_ptr.startTyping(reply_target) catch {};
-                } else {
+                } else if (route_action == .dropped) {
                     mx_ptr.sendMessage(reply_target, inbound_router.dropped_notice) catch {};
                 }
                 continue;
