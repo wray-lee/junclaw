@@ -1203,10 +1203,13 @@ Replies can attach files with the same markers the Telegram channel uses:
 `AUDIO`, `VOICE`). Slack uploads each marker through
 `files.getUploadURLExternal` -> raw upload -> `files.completeUploadExternal`,
 posts the file into the same channel and thread, and removes the marker from the
-text. Local paths and `http(s)` URLs are accepted; each file is capped at 20 MB.
+text. Only local paths are accepted; each file is capped at 20 MB. Unlike
+Telegram, Slack requires nullclaw to read the file itself, so `http(s)` URLs in
+markers are rejected instead of being fetched server-side.
 
-Inbound `file_share` messages are no longer dropped. With the bot token,
-nullclaw downloads `url_private` files up to 20 MB:
+Inbound `file_share` messages are no longer dropped in Socket Mode (including
+the history-polling fallback). With the bot token, nullclaw downloads
+`url_private` files up to 20 MB:
 
 - images are saved to a temp file and passed to the vision path as
   `[IMAGE:/tmp/...]`
@@ -1219,7 +1222,13 @@ nullclaw downloads `url_private` files up to 20 MB:
 
 Required bot scopes: add `files:read` for inbound downloads and `files:write`
 for outbound uploads (plus `chat:write`). Downloads are pinned to Slack's own
-HTTPS hosts so the bot token is never sent elsewhere.
+HTTPS hosts and do not follow redirects, so the bot token is never sent
+elsewhere.
+
+The webhook path (`mode = http`) does not process attachments: Slack expects an
+acknowledgement within three seconds, which a download cannot meet, so
+`file_share` events are acknowledged and skipped there, caption included. Use
+`mode = socket` when inbound media matters.
 
 #### Slack slash command
 

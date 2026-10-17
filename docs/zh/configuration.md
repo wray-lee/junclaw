@@ -1001,16 +1001,18 @@ Slack 示例：
 
 #### Slack 媒体
 
-回复可以用与 Telegram 相同的附件标记：`[IMAGE:/abs/path.png]`、`[FILE:/abs/path.pdf]`（也支持 `DOCUMENT`、`VIDEO`、`AUDIO`、`VOICE`）。nullclaw 依次调用 `files.getUploadURLExternal`、上传文件、`files.completeUploadExternal`，把文件发到同一频道/线程，并从文本中移除标记。支持本地路径和 `http(s)` URL；单个文件上限 20 MB。
+回复可以用与 Telegram 相同的附件标记：`[IMAGE:/abs/path.png]`、`[FILE:/abs/path.pdf]`（也支持 `DOCUMENT`、`VIDEO`、`AUDIO`、`VOICE`）。nullclaw 依次调用 `files.getUploadURLExternal`、上传文件、`files.completeUploadExternal`，把文件发到同一频道/线程，并从文本中移除标记。仅接受本地路径；单个文件上限 20 MB。与 Telegram 不同，Slack 需要 nullclaw 自己读取文件，因此标记中的 `http(s)` URL 会被拒绝，不会在服务端抓取。
 
-入站 `file_share` 消息不再被丢弃。nullclaw 用 bot token 下载 `url_private`（上限 20 MB）：
+入站 `file_share` 消息在 Socket Mode 下不再被丢弃（history 轮询回退同样生效）。nullclaw 用 bot token 下载 `url_private`（上限 20 MB）：
 
 - 图片保存到临时文件，并以 `[IMAGE:/tmp/...]` 交给 vision 通路
 - 音频（包括 Slack 语音剪辑：其 subtype 为 `slack_audio`、MIME 却是 `video/*`）走共享的 `tools.media.audio` 转写管线，以 `[Voice]: <转写文本>` 进入对话；未配置转写 provider 时降级为 `[ATTACHMENT:audio ...]` 标记
 - 其他文件保存后以 `[FILE:/tmp/...]` 传入
 - 消息文字（caption）照常处理
 
-所需 bot scopes：入站下载需要 `files:read`，出站上传需要 `files:write`（外加 `chat:write`）。下载只允许 Slack 自己的 HTTPS 域名，bot token 不会发往其他主机。
+所需 bot scopes：入站下载需要 `files:read`，出站上传需要 `files:write`（外加 `chat:write`）。下载只允许 Slack 自己的 HTTPS 域名且不跟随重定向，bot token 不会发往其他主机。
+
+webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答，下载无法满足该时限，因此该模式下 `file_share` 事件只会被确认并跳过（caption 也不会处理）。需要入站媒体时请使用 `mode = socket`。
 
 #### Slack 斜杠命令
 

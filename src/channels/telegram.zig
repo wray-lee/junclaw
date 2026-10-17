@@ -20,7 +20,7 @@ const util = @import("../util.zig");
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
-const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
+pub const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
 const TOPIC_TARGET_SEPARATOR = "#topic:";
 const THREAD_TARGET_SEPARATOR = ":thread:";
 
@@ -368,7 +368,7 @@ fn nextPendingMediaDeadline(group_ids: []const ?[]const u8, received_at: []const
     return if (seen) next_deadline else null;
 }
 
-fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
+pub fn sweepTempMediaFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
     var dir = std_compat.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
     defer dir.close();
 
