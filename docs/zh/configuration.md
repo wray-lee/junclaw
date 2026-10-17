@@ -1001,6 +1001,21 @@ Slack 示例：
 - `slash_command`（默认关闭）——单命令 Slack 集成：注册一个斜杠命令，并把其后的文本当作普通消息处理。见下文
 - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
 
+#### Slack 媒体
+
+回复可以用与 Telegram 相同的附件标记：`[IMAGE:/abs/path.png]`、`[FILE:/abs/path.pdf]`（也支持 `DOCUMENT`、`VIDEO`、`AUDIO`、`VOICE`）。nullclaw 依次调用 `files.getUploadURLExternal`、上传文件、`files.completeUploadExternal`，把文件发到同一频道/线程，并从文本中移除标记。仅接受本地路径；单个文件上限 20 MB。与 Telegram 不同，Slack 需要 nullclaw 自己读取文件，因此标记中的 `http(s)` URL 会被拒绝，不会在服务端抓取。
+
+入站 `file_share` 消息在 Socket Mode 下不再被丢弃（history 轮询回退同样生效）。nullclaw 用 bot token 下载 `url_private`（上限 20 MB）：
+
+- 图片保存到临时文件，并以 `[IMAGE:/tmp/...]` 交给 vision 通路
+- 音频（包括 Slack 语音剪辑：其 subtype 为 `slack_audio`、MIME 却是 `video/*`）走共享的 `tools.media.audio` 转写管线，以 `[Voice]: <转写文本>` 进入对话；未配置转写 provider 时降级为 `[ATTACHMENT:audio ...]` 标记
+- 其他文件保存后以 `[FILE:/tmp/...]` 传入
+- 消息文字（caption）照常处理
+
+所需 bot scopes：入站下载需要 `files:read`，出站上传需要 `files:write`（外加 `chat:write`）。下载只允许 Slack 自己的 HTTPS 域名且不跟随重定向，bot token 不会发往其他主机。
+
+webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答，下载无法满足该时限，因此该模式下 `file_share` 事件只会被确认并跳过（caption 也不会处理）。需要入站媒体时请使用 `mode = socket`。
+
 #### Slack 斜杠命令
 
 只有应用注册了斜杠命令，Slack 才会投递它，且 Slack 界面每次注册只支持一个命令。设置 `slash_command.enabled = true`，并在 Slack 应用里注册同名命令：
@@ -1073,7 +1088,7 @@ Slack 示例：
 Slack 应用侧必需配置：
 
 1. 在应用设置的 *Features* 中启用 **Agents & AI Apps**（界面可能只显示 **Agents**）。这是 `chat.startStream` 的功能开关，且需要付费 Slack 套餐。
-2. Bot token scopes：`chat:write`（所有出站回复必需），以及 `assistant:write`（把应用声明为 agent 时会自动添加）。如果依赖 history 轮询，再加 `im:history` 与 `channels:history`。
+2. Bot token scopes：`chat:write`（所有出站回复必需），以及 `assistant:write`（把应用声明为 agent 时会自动添加）。如果依赖 history 轮询，再加 `im:history` 与 `channels:history`；媒体收发需要 `files:read` 与 `files:write`。
 3. Events：`app_mention`、`message.im`、`message.channels`（assistant thread 另需 `assistant_thread_started` / `assistant_thread_context_changed`）。
 4. 修改 scope 后需重新安装应用，然后重启 nullclaw。
 

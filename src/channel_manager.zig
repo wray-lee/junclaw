@@ -389,6 +389,12 @@ pub const ChannelManager = struct {
                 self.config.messages.inbound.debounce_ms,
             );
         }
+        if (comptime std.mem.eql(u8, field_name, "slack")) {
+            // Slack has no poll loop of its own, so hand it the shared audio
+            // transcription config; `vtableStart` builds the transcriber.
+            ch_ptr.audio_media = self.config.audio_media;
+            ch_ptr.audio_provider_key = self.config.getProviderKey(self.config.audio_media.provider);
+        }
         self.maybeAttachBus(ch_ptr);
 
         const ch = ch_ptr.channel();

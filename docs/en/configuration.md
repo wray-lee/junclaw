@@ -1198,6 +1198,40 @@ Parameters:
 - `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
 - `slash_command` (default: disabled) - Single-command Slack integration: register one slash command and handle its text like a normal message. See below
 
+#### Slack media
+
+Replies can attach files with the same markers the Telegram channel uses:
+`[IMAGE:/abs/path.png]`, `[FILE:/abs/path.pdf]` (also `DOCUMENT`, `VIDEO`,
+`AUDIO`, `VOICE`). Slack uploads each marker through
+`files.getUploadURLExternal` -> raw upload -> `files.completeUploadExternal`,
+posts the file into the same channel and thread, and removes the marker from the
+text. Only local paths are accepted; each file is capped at 20 MB. Unlike
+Telegram, Slack requires nullclaw to read the file itself, so `http(s)` URLs in
+markers are rejected instead of being fetched server-side.
+
+Inbound `file_share` messages are no longer dropped in Socket Mode (including
+the history-polling fallback). With the bot token, nullclaw downloads
+`url_private` files up to 20 MB:
+
+- images are saved to a temp file and passed to the vision path as
+  `[IMAGE:/tmp/...]`
+- audio clips (including Slack clips, which report `subtype: "slack_audio"` with
+  a `video/*` MIME) go through the shared `tools.media.audio` transcription
+  pipeline and arrive as `[Voice]: <transcript>`; without a configured
+  transcription provider they degrade to an `[ATTACHMENT:audio ...]` marker
+- every other file is saved and passed as `[FILE:/tmp/...]`
+- the message caption is processed as usual
+
+Required bot scopes: add `files:read` for inbound downloads and `files:write`
+for outbound uploads (plus `chat:write`). Downloads are pinned to Slack's own
+HTTPS hosts and do not follow redirects, so the bot token is never sent
+elsewhere.
+
+The webhook path (`mode = http`) does not process attachments: Slack expects an
+acknowledgement within three seconds, which a download cannot meet, so
+`file_share` events are acknowledged and skipped there, caption included. Use
+`mode = socket` when inbound media matters.
+
 #### Slack slash command
 
 Slack only delivers a slash command when the app registers it, and Slack's UI
@@ -1320,7 +1354,8 @@ Required Slack app settings:
    This is the feature gate for `chat.startStream` and requires a paid Slack plan.
 2. Bot token scopes: `chat:write` (required for all outbound replies) plus `assistant:write`
    (added automatically when the app is declared as an agent). Add `im:history` and
-   `channels:history` if you rely on history polling.
+   `channels:history` if you rely on history polling, and `files:read`/`files:write`
+   for inbound/outbound media.
 3. Events: `app_mention`, `message.im`, `message.channels` (and
    `assistant_thread_started` / `assistant_thread_context_changed` for assistant threads).
 4. Reinstall the app after changing scopes, then restart nullclaw.
