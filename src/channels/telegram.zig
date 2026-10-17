@@ -3844,10 +3844,42 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
             try appendRichLine(&out, allocator, line);
         }
 
-        if (i + 1 < lines.items.len) try out.append(allocator, '\n');
+        if (i + 1 < lines.items.len) {
+            const next_line = lines.items[i + 1];
+            const current_is_block = richLineStartsBlock(trimmed) or isIndentedCodeLine(line);
+            const next_trimmed = std.mem.trim(u8, next_line, " \t\r");
+            const next_is_block = richLineStartsBlock(next_trimmed) or isIndentedCodeLine(next_line);
+            // GFM treats a bare newline inside a paragraph as a soft break.
+            // Rich Telegram clients render that as a space, so preserve visual
+            // line breaks for ordinary multi-line text with a GFM hard break.
+            if (!current_is_block and !next_is_block and lineHasNoHardBreak(line)) {
+                try out.appendSlice(allocator, "  ");
+            }
+            try out.append(allocator, '\n');
+        }
     }
 
     return out.toOwnedSlice(allocator);
+}
+
+/// True when a line starts a GFM block whose newline must remain structural
+/// rather than become a paragraph hard break.
+fn richLineStartsBlock(trimmed: []const u8) bool {
+    if (trimmed.len == 0) return true;
+    const first = trimmed[0];
+    if (first == '#' or first == '>' or first == '-' or first == '*' or
+        first == '+' or first == '_' or first == '=' or first == '`' or
+        first == '~' or first == '|' or first == '<') return true;
+    if (first >= '0' and first <= '9') return true;
+    return false;
+}
+
+/// A trailing odd backslash already requests a GFM hard break.
+fn lineHasNoHardBreak(line: []const u8) bool {
+    var count: usize = 0;
+    var i = line.len;
+    while (i > 0 and line[i - 1] == '\\') : (i -= 1) count += 1;
+    return count % 2 == 0;
 }
 
 /// Fence character for a line that opens a fenced code block, else null.
@@ -6895,6 +6927,20 @@ test "telegram escapeRichMarkdown preserves the documented backslash escape" {
     // The Bot API shows `\#hashtag` as the way to suppress hashtag detection,
     // so the escaper must not double that backslash.
     try expectRichEscaped("\\#hashtag and a \\ backslash", "\\#hashtag and a \\ backslash");
+}
+
+test "telegram rich markdown preserves ordinary line breaks" {
+    // Regression: rich Markdown treated /status's single newlines as GFM soft
+    // breaks, and Telegram clients rendered every status field on one line.
+    try expectRichEscaped(
+        "🌊 NullClaw 0.6.0  \n🧠 Model: test-model  \n📚 Context: 100/1000 (10%)  \n🧹 Compactions: 2",
+        "🌊 NullClaw 0.6.0\n🧠 Model: test-model\n📚 Context: 100/1000 (10%)\n🧹 Compactions: 2",
+    );
+}
+
+test "telegram rich markdown keeps block and code line structure" {
+    const input = "# Heading\n- item\n```\ncode <x>\n```\n    indented";
+    try expectRichEscaped(input, input);
 }
 
 test "telegram escapeRichMarkdown preserves GFM structure" {
