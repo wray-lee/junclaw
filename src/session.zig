@@ -221,6 +221,76 @@ const SessionProviderContext = struct {
     }
 };
 
+/// Channel identity of a message that was steered into a running turn.
+/// Borrowed by the router at call time; the Session stores owned copies.
+pub const ConsumedRef = struct {
+    channel: []const u8,
+    account_id: ?[]const u8 = null,
+    target: []const u8,
+    message_id: []const u8,
+};
+
+/// Terminal outcome applied to a steered message's lifecycle reaction.
+pub const SteerOutcome = enum { done, failed };
+
+/// Transport hook that finalizes a steered message's reaction once the turn
+/// (or post-turn follow-up) that consumed it finishes.
+pub const SteerReactionSink = struct {
+    ctx: *anyopaque,
+    finalize: *const fn (ctx: *anyopaque, ref: ConsumedRef, outcome: SteerOutcome) void,
+    /// Called after reserving the injection, before its text becomes visible to
+    /// the turn. Must not re-enter the session manager.
+    accepted: ?*const fn (ctx: *anyopaque, ref: ConsumedRef) void = null,
+};
+
+fn acknowledgeSteerRef(sink: ?SteerReactionSink, ref: ?ConsumedRef) void {
+    const s = sink orelse return;
+    const r = ref orelse return;
+    if (s.accepted) |accept| accept(s.ctx, r);
+}
+
+fn dupeConsumedRef(allocator: Allocator, ref: ConsumedRef) !ConsumedRef {
+    const channel = try allocator.dupe(u8, ref.channel);
+    errdefer allocator.free(channel);
+    const account_id = if (ref.account_id) |aid| try allocator.dupe(u8, aid) else null;
+    errdefer if (account_id) |aid| allocator.free(aid);
+    const target = try allocator.dupe(u8, ref.target);
+    errdefer allocator.free(target);
+    const message_id = try allocator.dupe(u8, ref.message_id);
+    return .{
+        .channel = channel,
+        .account_id = account_id,
+        .target = target,
+        .message_id = message_id,
+    };
+}
+
+fn freeConsumedRef(allocator: Allocator, ref: ConsumedRef) void {
+    allocator.free(ref.channel);
+    if (ref.account_id) |aid| allocator.free(aid);
+    allocator.free(ref.target);
+    allocator.free(ref.message_id);
+}
+
+fn freeConsumedRefs(allocator: Allocator, refs: *std.ArrayListUnmanaged(ConsumedRef)) void {
+    for (refs.items) |ref| freeConsumedRef(allocator, ref);
+    refs.deinit(allocator);
+    refs.* = .empty;
+}
+
+/// Deliver every collected ref to the transport sink, then free them.
+fn finalizeSteerRefs(
+    sink: ?SteerReactionSink,
+    allocator: Allocator,
+    refs: *std.ArrayListUnmanaged(ConsumedRef),
+    outcome: SteerOutcome,
+) void {
+    if (sink) |s| {
+        for (refs.items) |ref| s.finalize(s.ctx, ref, outcome);
+    }
+    freeConsumedRefs(allocator, refs);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
 // ═══════════════════════════════════════════════════════════════════════════
@@ -244,12 +314,21 @@ pub const Session = struct {
     injection_mu: std_compat.sync.Mutex = .{},
     /// Pending mid-turn messages in arrival order; owned by the SessionManager allocator.
     injection_pending: std.ArrayListUnmanaged(u8) = .empty,
+    /// Channel refs for the pending injection text, in the same arrival order
+    /// as the appended text. Owned and guarded by `injection_mu`.
+    injection_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty,
+    /// Refs whose text a `latest` replacement displaced. The running turn
+    /// finalizes them `.failed` so their acknowledgement reaction is not left
+    /// stuck.
+    discarded_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty,
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
         if (self.provider_holder) |*holder| holder.deinit();
         if (self.owned_provider_api_key) |key| allocator.free(key);
         if (self.owned_memory_session_id) |sid| allocator.free(sid);
+        freeConsumedRefs(allocator, &self.injection_refs);
+        freeConsumedRefs(allocator, &self.discarded_refs);
         self.injection_pending.deinit(allocator);
         allocator.free(self.session_key);
     }
@@ -261,10 +340,33 @@ pub const Session = struct {
         errdefer allocator.free(duped);
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
+        try self.replaceInjectionLocked(allocator, duped, null, null);
+    }
+
+    /// Replace the pending text and its ref. Must be called with `injection_mu`
+    /// held. Takes ownership of `duped` and `owned_ref` on success; on error
+    /// the caller keeps ownership. Every buffer is reserved before mutating, so
+    /// a failed allocation leaves the pending injection intact.
+    fn replaceInjectionLocked(
+        self: *Session,
+        allocator: Allocator,
+        duped: []u8,
+        owned_ref: ?ConsumedRef,
+        sink: ?SteerReactionSink,
+    ) !void {
         try self.injection_pending.ensureUnusedCapacity(allocator, duped.len);
+        try self.discarded_refs.ensureUnusedCapacity(allocator, self.injection_refs.items.len);
+        try self.injection_refs.ensureUnusedCapacity(allocator, if (owned_ref != null) 1 else 0);
+        acknowledgeSteerRef(sink, owned_ref);
+        // The displaced text is gone, so its refs can never be consumed by a
+        // turn: hand them to the turn-end `.failed` finalizer instead of
+        // leaving their reaction stuck.
+        for (self.injection_refs.items) |old| self.discarded_refs.appendAssumeCapacity(old);
+        self.injection_refs.clearRetainingCapacity();
         self.injection_pending.clearRetainingCapacity();
         self.injection_pending.appendSliceAssumeCapacity(duped);
         allocator.free(duped);
+        if (owned_ref) |ref| self.injection_refs.appendAssumeCapacity(ref);
     }
 
     /// True while a running turn can still accept mid-turn deposits.
@@ -283,32 +385,65 @@ pub const Session = struct {
 
     /// Append only if a turn is still accepting input after the injection lock is held.
     pub fn appendMidTurnIfRunning(self: *Session, allocator: Allocator, text: []const u8) !bool {
+        return self.appendMidTurnIfRunningWithRef(allocator, text, null, null);
+    }
+
+    /// Append only if a turn is still accepting input after the injection lock
+    /// is held, registering the steered message's channel ref atomically with
+    /// its text.
+    pub fn appendMidTurnIfRunningWithRef(
+        self: *Session,
+        allocator: Allocator,
+        text: []const u8,
+        ref: ?ConsumedRef,
+        sink: ?SteerReactionSink,
+    ) !bool {
         if (!self.acceptsInjection()) return false;
+        const owned_ref = if (ref) |r| try dupeConsumedRef(allocator, r) else null;
+        errdefer if (owned_ref) |r| freeConsumedRef(allocator, r);
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
-        if (!self.acceptsInjection()) return false;
+        if (!self.acceptsInjection()) {
+            if (owned_ref) |r| freeConsumedRef(allocator, r);
+            return false;
+        }
         const separator: []const u8 = if (self.injection_pending.items.len > 0) "\n\n" else "";
         try self.injection_pending.ensureUnusedCapacity(allocator, separator.len + text.len);
+        try self.injection_refs.ensureUnusedCapacity(allocator, if (owned_ref != null) 1 else 0);
+        acknowledgeSteerRef(sink, owned_ref);
         self.injection_pending.appendSliceAssumeCapacity(separator);
         self.injection_pending.appendSliceAssumeCapacity(text);
+        if (owned_ref) |r| self.injection_refs.appendAssumeCapacity(r);
         return true;
     }
 
     /// Deposit text only if a turn is still accepting input after the injection lock is held.
     pub fn injectMidTurnIfRunning(self: *Session, allocator: Allocator, text: []const u8) !bool {
+        return self.injectMidTurnIfRunningWithRef(allocator, text, null, null);
+    }
+
+    /// Deposit text only if a turn is still accepting input after the injection
+    /// lock is held, registering the steered message's channel ref atomically.
+    pub fn injectMidTurnIfRunningWithRef(
+        self: *Session,
+        allocator: Allocator,
+        text: []const u8,
+        ref: ?ConsumedRef,
+        sink: ?SteerReactionSink,
+    ) !bool {
         if (!self.acceptsInjection()) return false;
         const duped = try allocator.dupe(u8, text);
         errdefer allocator.free(duped);
+        const owned_ref = if (ref) |r| try dupeConsumedRef(allocator, r) else null;
+        errdefer if (owned_ref) |r| freeConsumedRef(allocator, r);
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
         if (!self.acceptsInjection()) {
             allocator.free(duped);
+            if (owned_ref) |r| freeConsumedRef(allocator, r);
             return false;
         }
-        try self.injection_pending.ensureUnusedCapacity(allocator, duped.len);
-        self.injection_pending.clearRetainingCapacity();
-        self.injection_pending.appendSliceAssumeCapacity(duped);
-        allocator.free(duped);
+        try self.replaceInjectionLocked(allocator, duped, owned_ref, sink);
         return true;
     }
 
@@ -321,14 +456,43 @@ pub const Session = struct {
 
     /// Drain and duplicate the pending injection into dst_allocator.
     /// On allocation failure the pending message stays buffered for a later retry.
-    pub fn drainInjection(self: *Session, _: Allocator, dst_allocator: Allocator) !?[]u8 {
+    pub fn drainInjection(self: *Session, sm_allocator: Allocator, dst_allocator: Allocator) !?[]u8 {
+        var refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
+        defer freeConsumedRefs(sm_allocator, &refs);
+        return self.drainInjectionWithRefs(sm_allocator, dst_allocator, &refs);
+    }
+
+    /// Drain the pending text together with the refs of the messages that
+    /// produced it. `refs_out` receives owned refs (SM allocator) in arrival
+    /// order; on allocation failure nothing is drained and both stay buffered
+    /// for a later retry.
+    pub fn drainInjectionWithRefs(
+        self: *Session,
+        sm_allocator: Allocator,
+        dst_allocator: Allocator,
+        refs_out: *std.ArrayListUnmanaged(ConsumedRef),
+    ) !?[]u8 {
         self.injection_mu.lock();
         defer self.injection_mu.unlock();
 
         if (self.injection_pending.items.len == 0) return null;
         const duped = try dst_allocator.dupe(u8, self.injection_pending.items);
+        errdefer dst_allocator.free(duped);
+        try refs_out.ensureUnusedCapacity(sm_allocator, self.injection_refs.items.len);
+        for (self.injection_refs.items) |ref| refs_out.appendAssumeCapacity(ref);
+        self.injection_refs.clearRetainingCapacity();
         self.injection_pending.clearRetainingCapacity();
         return duped;
+    }
+
+    /// Take the refs displaced by `latest` replacements so the running turn can
+    /// finalize them `.failed` outside the injection lock.
+    pub fn takeDiscardedRefs(self: *Session) std.ArrayListUnmanaged(ConsumedRef) {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        const taken = self.discarded_refs;
+        self.discarded_refs = .empty;
+        return taken;
     }
 };
 
@@ -1976,6 +2140,47 @@ pub const SessionManager = struct {
         return filtered;
     }
 
+    const SteerDrainContext = struct {
+        session: *Session,
+        allocator: Allocator,
+        refs: *std.ArrayListUnmanaged(ConsumedRef),
+
+        fn callback(ctx: *anyopaque, agent_allocator: Allocator) !?[]u8 {
+            const dc: *@This() = @ptrCast(@alignCast(ctx));
+            return dc.session.drainInjectionWithRefs(dc.allocator, agent_allocator, dc.refs);
+        }
+    };
+
+    /// Track every message consumed by one Agent.turn, including messages
+    /// drained while a post-turn follow-up is itself running.
+    fn runTurnWithSteerSink(
+        self: *SessionManager,
+        session: *Session,
+        content: []const u8,
+        refs: *std.ArrayListUnmanaged(ConsumedRef),
+        sink: ?SteerReactionSink,
+    ) ![]const u8 {
+        var ctx = SteerDrainContext{ .session = session, .allocator = self.allocator, .refs = refs };
+        const previous_callback = session.agent.drain_injection_cb;
+        const previous_ctx = session.agent.drain_injection_ctx;
+        // A standalone drain helper has no in-turn drain installed. Preserve
+        // that contract; the streaming entry point installs it for real turns.
+        if (previous_callback != null) {
+            session.agent.drain_injection_cb = SteerDrainContext.callback;
+            session.agent.drain_injection_ctx = @ptrCast(&ctx);
+        }
+        defer {
+            session.agent.drain_injection_cb = previous_callback;
+            session.agent.drain_injection_ctx = previous_ctx;
+        }
+        const response = session.agent.turn(content) catch |err| {
+            finalizeSteerRefs(sink, self.allocator, refs, .failed);
+            return err;
+        };
+        finalizeSteerRefs(sink, self.allocator, refs, .done);
+        return response;
+    }
+
     /// Drain one pending post-turn injection and run it as a follow-up turn.
     /// Returns true when a pending injection was consumed. A failed follow-up
     /// is reported in the reply and never re-queued: the sender is asked to
@@ -1986,11 +2191,14 @@ pub const SessionManager = struct {
         session_key: []const u8,
         response: *[]const u8,
         completed_turns: *u64,
+        steer_sink: ?SteerReactionSink,
     ) !bool {
-        const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse return false;
+        var refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
+        defer freeConsumedRefs(self.allocator, &refs);
+        const late_content = (try session.drainInjectionWithRefs(self.allocator, self.allocator, &refs)) orelse return false;
         defer self.allocator.free(late_content);
 
-        const follow_up_response = session.agent.turn(late_content) catch |err| {
+        const follow_up_response = self.runTurnWithSteerSink(session, late_content, &refs, steer_sink) catch |err| {
             // Regression: a failed tail-window follow-up dropped the acked
             // injection, so the user's steered message vanished. Keep the
             // completed primary reply and tell the sender to resend it.
@@ -2037,6 +2245,7 @@ pub const SessionManager = struct {
         session_key: []const u8,
         completed_turns: *u64,
         session_hash: u64,
+        steer_sink: ?SteerReactionSink,
     ) !?[]const u8 {
         var reply: ?[]const u8 = null;
         // Notices for failed follow-ups. Held separately so they are only
@@ -2044,7 +2253,9 @@ pub const SessionManager = struct {
         var failures: ?[]const u8 = null;
         var drain_count: u32 = 0;
         while (drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (drain_count += 1) {
-            const late_content = session.drainInjection(self.allocator, self.allocator) catch |err| {
+            var refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
+            defer freeConsumedRefs(self.allocator, &refs);
+            const late_content = session.drainInjectionWithRefs(self.allocator, self.allocator, &refs) catch |err| {
                 // Preserve the primary turn error: the caller returns it when
                 // no follow-up reply exists.
                 log.warn("post-turn injection drain failed session=0x{x} err={}", .{ session_hash, err });
@@ -2052,7 +2263,7 @@ pub const SessionManager = struct {
             } orelse break;
             defer self.allocator.free(late_content);
 
-            const follow_up_response = session.agent.turn(late_content) catch |err| {
+            const follow_up_response = self.runTurnWithSteerSink(session, late_content, &refs, steer_sink) catch |err| {
                 log.warn("post-turn injection after failed turn also failed session=0x{x} err={}", .{ session_hash, err });
                 self.persistTurnResult(session, session_key, late_content, null);
                 var err_buf: [256]u8 = undefined;
@@ -2159,6 +2370,28 @@ pub const SessionManager = struct {
         stream_sink: ?streaming.Sink,
         progress_sink: ?agent_mod.ProgressSink,
     ) ![]const u8 {
+        return self.processMessageStreamingWithSteerSink(
+            session_key,
+            content,
+            conversation_context,
+            stream_sink,
+            progress_sink,
+            null,
+        );
+    }
+
+    /// Streaming turn with an optional sink that finalizes the lifecycle
+    /// reactions of messages steered into this turn (or into a post-turn
+    /// follow-up), using the outcome of the turn that consumed them.
+    pub fn processMessageStreamingWithSteerSink(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        conversation_context: ?ConversationContext,
+        stream_sink: ?streaming.Sink,
+        progress_sink: ?agent_mod.ProgressSink,
+        steer_sink: ?SteerReactionSink,
+    ) ![]const u8 {
         const channel = if (conversation_context) |ctx| (ctx.channel orelse "unknown") else "unknown";
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
@@ -2223,6 +2456,14 @@ pub const SessionManager = struct {
             session.agent.clearInterruptRequest();
         }
 
+        // Keep the handoff under the turn mutex, after closing injections, so
+        // cleanup cannot take refs belonging to the next turn.
+        defer {
+            session.closeInjectionWindow();
+            var discarded = session.takeDiscardedRefs();
+            finalizeSteerRefs(steer_sink, self.allocator, &discarded, .failed);
+        }
+
         // Set conversation context for this turn.
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
@@ -2262,25 +2503,6 @@ pub const SessionManager = struct {
             session.agent.progress_ctx = null;
         }
 
-        const DrainCtx = struct {
-            session: *Session,
-            sm_allocator: Allocator,
-
-            fn callback(ctx: *anyopaque, agent_alloc: std.mem.Allocator) !?[]u8 {
-                const dc: *@This() = @ptrCast(@alignCast(ctx));
-                return dc.session.drainInjection(dc.sm_allocator, agent_alloc);
-            }
-        };
-        var drain_ctx = DrainCtx{ .session = session, .sm_allocator = self.allocator };
-        const prev_drain_cb = session.agent.drain_injection_cb;
-        const prev_drain_ctx_val = session.agent.drain_injection_ctx;
-        defer {
-            session.agent.drain_injection_cb = prev_drain_cb;
-            session.agent.drain_injection_ctx = prev_drain_ctx_val;
-        }
-        session.agent.drain_injection_cb = DrainCtx.callback;
-        session.agent.drain_injection_ctx = @ptrCast(&drain_ctx);
-
         // Record agent start event with channel attribution
         const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
             .provider = session.agent.provider.getName(),
@@ -2292,7 +2514,18 @@ pub const SessionManager = struct {
 
         var completed_turns: u64 = 0;
         var primary_failed = false;
-        var response = session.agent.turn(content) catch |turn_err| blk: {
+        var primary_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
+        defer freeConsumedRefs(self.allocator, &primary_refs);
+        var drain_ctx = SteerDrainContext{ .session = session, .allocator = self.allocator, .refs = &primary_refs };
+        const previous_drain_callback = session.agent.drain_injection_cb;
+        const previous_drain_ctx = session.agent.drain_injection_ctx;
+        session.agent.drain_injection_cb = SteerDrainContext.callback;
+        session.agent.drain_injection_ctx = @ptrCast(&drain_ctx);
+        defer {
+            session.agent.drain_injection_cb = previous_drain_callback;
+            session.agent.drain_injection_ctx = previous_drain_ctx;
+        }
+        var response = self.runTurnWithSteerSink(session, content, &primary_refs, steer_sink) catch |turn_err| blk: {
             log.warn("session turn failed session=0x{x}: {}", .{ session_hash, turn_err });
             // Regression: both post-turn drain loops were skipped on error, so
             // a message the router had already acknowledged as steered stayed
@@ -2306,7 +2539,7 @@ pub const SessionManager = struct {
             // Persist the failed prompt before any follow-up runs: otherwise a
             // follow-up reply would be stored as the answer to this message.
             self.persistTurnResult(session, session_key, content, null);
-            break :blk (try self.drainInjectionsAfterFailedTurn(session, session_key, &completed_turns, session_hash)) orelse return turn_err;
+            break :blk (try self.drainInjectionsAfterFailedTurn(session, session_key, &completed_turns, session_hash, steer_sink)) orelse return turn_err;
         };
         if (!primary_failed) {
             completed_turns += 1;
@@ -2319,7 +2552,7 @@ pub const SessionManager = struct {
         // must not be left pending (a slash-command turn never drains them).
         var late_drain_count: u32 = 0;
         while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-            if (!try self.drainLateInjection(session, session_key, &response, &completed_turns)) break;
+            if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
         }
 
         // Regression: a message that arrived after the last drain but before the
@@ -2332,7 +2565,7 @@ pub const SessionManager = struct {
         session.closeInjectionWindow();
         late_drain_count = 0;
         while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-            if (!try self.drainLateInjection(session, session_key, &response, &completed_turns)) break;
+            if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
         }
         if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
             log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
@@ -2422,19 +2655,19 @@ pub const SessionManager = struct {
     }
 
     /// Deposit a mid-turn injection only if the session is still running.
-    fn injectMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8) !bool {
+    fn injectMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8, ref: ?ConsumedRef, sink: ?SteerReactionSink) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return false;
-        return try session.injectMidTurnIfRunning(self.allocator, text);
+        return try session.injectMidTurnIfRunningWithRef(self.allocator, text, ref, sink);
     }
 
     /// Append a mid-turn injection only if the session is still running.
-    fn appendMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8) !bool {
+    fn appendMidTurnIfRunning(self: *SessionManager, session_key: []const u8, text: []const u8, ref: ?ConsumedRef, sink: ?SteerReactionSink) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return false;
-        return try session.appendMidTurnIfRunning(self.allocator, text);
+        return try session.appendMidTurnIfRunningWithRef(self.allocator, text, ref, sink);
     }
 
     fn isSessionTurnRunning(self: *SessionManager, session_key: []const u8) bool {
@@ -2492,6 +2725,20 @@ pub const SessionManager = struct {
     /// .skip when the turn consumed it without new text (/stop), and .dropped
     /// when the message was discarded and the caller should notify the sender.
     pub fn routeInbound(self: *SessionManager, session_key: []const u8, content: []const u8) InboundRouteAction {
+        return self.routeInboundWithRef(session_key, content, null, null);
+    }
+
+    /// Route an inbound message. When the router steers it into the running
+    /// turn, `ref` (the message's channel identity) is stored atomically with
+    /// the injected text so the turn can finalize the message's lifecycle
+    /// reaction when it finishes.
+    pub fn routeInboundWithRef(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        ref: ?ConsumedRef,
+        sink: ?SteerReactionSink,
+    ) InboundRouteAction {
         const session_hash = std.hash.Wyhash.hash(0, session_key);
 
         // A stop command must reach a busy session even when the queue policy
@@ -2522,14 +2769,14 @@ pub const SessionManager = struct {
 
         return switch (inbound_router.route(self.routeInput(session_key))) {
             .inject, .replace_injection => blk: {
-                const injected = self.injectMidTurnIfRunning(session_key, content) catch |err| {
+                const injected = self.injectMidTurnIfRunning(session_key, content, ref, sink) catch |err| {
                     log.warn("mid-turn inject failed session=0x{x} err={}", .{ session_hash, err });
                     break :blk .process;
                 };
                 break :blk if (injected) .steered else .process;
             },
             .append_injection => blk: {
-                const injected = self.appendMidTurnIfRunning(session_key, content) catch |err| {
+                const injected = self.appendMidTurnIfRunning(session_key, content, ref, sink) catch |err| {
                     log.warn("mid-turn append failed session=0x{x} err={}", .{ session_hash, err });
                     break :blk .process;
                 };
@@ -5688,7 +5935,7 @@ test "drainLateInjection keeps the primary reply and asks the sender to resend" 
 
     // Regression: a failed tail-window follow-up freed the completed primary
     // reply and propagated the error, so the user lost the main answer.
-    try testing.expect(try sm.drainLateInjection(session, "failed:follow-up:reply", &response, &completed_turns));
+    try testing.expect(try sm.drainLateInjection(session, "failed:follow-up:reply", &response, &completed_turns, null));
     defer testing.allocator.free(response);
     try testing.expect(std.mem.startsWith(u8, response, "primary answer"));
     try testing.expect(std.mem.indexOf(u8, response, "Follow-up turn failed") != null);
@@ -5742,7 +5989,7 @@ test "failed-turn injection drain combines successes and reports the failure" {
     mock.on_chat_ctx = @ptrCast(&inject);
 
     var completed_turns: u64 = 0;
-    const reply = (try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:mixed", &completed_turns, 0xabc)) orelse
+    const reply = (try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:mixed", &completed_turns, 0xabc, null)) orelse
         return error.TestExpectedEqual;
     defer alloc.free(reply);
 
@@ -5773,7 +6020,7 @@ test "failed-turn injection drain returns the primary error when every follow-up
     // Regression: a notice-only reply replaced the original primary error when
     // every follow-up failed, so the sender never learned why the primary turn
     // failed.
-    try testing.expect((try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:all-failed", &completed_turns, 0xdef)) == null);
+    try testing.expect((try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:all-failed", &completed_turns, 0xdef, null)) == null);
     try testing.expectEqual(@as(u64, 0), completed_turns);
     // The failed follow-up is consumed exactly once and never re-queued.
     try testing.expect(!session.hasInjection());
@@ -7393,4 +7640,192 @@ test "reloadSkillsAll does not affect session count" {
 
     _ = sm.reloadSkillsAll();
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Steered message reaction finalization
+// ═══════════════════════════════════════════════════════════════════════════
+
+const SteerSinkProbe = struct {
+    calls: [8]Call = undefined,
+    count: usize = 0,
+
+    const Call = struct {
+        message_id: [32]u8 = undefined,
+        len: usize = 0,
+        outcome: SteerOutcome = .done,
+    };
+
+    fn sink(self: *SteerSinkProbe) SteerReactionSink {
+        return .{ .ctx = @ptrCast(self), .finalize = finalize };
+    }
+
+    fn finalize(ctx: *anyopaque, ref: ConsumedRef, outcome: SteerOutcome) void {
+        const self: *SteerSinkProbe = @ptrCast(@alignCast(ctx));
+        if (self.count == self.calls.len) return;
+        var call = &self.calls[self.count];
+        call.len = @min(ref.message_id.len, call.message_id.len);
+        @memcpy(call.message_id[0..call.len], ref.message_id[0..call.len]);
+        call.outcome = outcome;
+        self.count += 1;
+    }
+
+    fn outcomeFor(self: *const SteerSinkProbe, message_id: []const u8) ?SteerOutcome {
+        for (self.calls[0..self.count]) |call| {
+            if (std.mem.eql(u8, call.message_id[0..call.len], message_id)) return call.outcome;
+        }
+        return null;
+    }
+};
+
+test "steered refs are finalized done when the consuming turn succeeds" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "steer:refs:done";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    // Regression: the steer path dropped the message ref, so the accepted
+    // reaction (the same emoji as running in production) was never finalized.
+    const ref = ConsumedRef{ .channel = "telegram", .account_id = "main", .target = "123", .message_id = "42" };
+    try testing.expectEqual(
+        SessionManager.InboundRouteAction.steered,
+        sm.routeInboundWithRef(session_key, "steer me", ref, null),
+    );
+
+    var probe = SteerSinkProbe{};
+    const reply = try sm.processMessageStreamingWithSteerSink(session_key, "hello", null, null, null, probe.sink());
+    defer testing.allocator.free(reply);
+
+    try testing.expectEqualStrings("ok", reply);
+    try testing.expectEqual(SteerOutcome.done, probe.outcomeFor("42").?);
+    try testing.expect(!session.hasInjection());
+}
+
+test "two steered refs are finalized in arrival order" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "steer:refs:order";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try testing.expectEqual(SessionManager.InboundRouteAction.steered, sm.routeInboundWithRef(
+        session_key,
+        "first",
+        .{ .channel = "slack", .target = "C1", .message_id = "1" },
+        null,
+    ));
+    try testing.expectEqual(SessionManager.InboundRouteAction.steered, sm.routeInboundWithRef(
+        session_key,
+        "second",
+        .{ .channel = "slack", .target = "C1", .message_id = "2" },
+        null,
+    ));
+
+    var probe = SteerSinkProbe{};
+    const reply = try sm.processMessageStreamingWithSteerSink(session_key, "hello", null, null, null, probe.sink());
+    defer testing.allocator.free(reply);
+
+    try testing.expectEqual(@as(usize, 2), probe.count);
+    try testing.expectEqualStrings("1", probe.calls[0].message_id[0..probe.calls[0].len]);
+    try testing.expectEqualStrings("2", probe.calls[1].message_id[0..probe.calls[1].len]);
+    try testing.expectEqual(SteerOutcome.done, probe.calls[0].outcome);
+    try testing.expectEqual(SteerOutcome.done, probe.calls[1].outcome);
+}
+
+test "a latest replacement finalizes the displaced ref as failed" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "steer:refs:latest";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .latest;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try testing.expectEqual(SessionManager.InboundRouteAction.steered, sm.routeInboundWithRef(
+        session_key,
+        "old",
+        .{ .channel = "telegram", .target = "123", .message_id = "old-id" },
+        null,
+    ));
+    try testing.expectEqual(SessionManager.InboundRouteAction.steered, sm.routeInboundWithRef(
+        session_key,
+        "new",
+        .{ .channel = "telegram", .target = "123", .message_id = "new-id" },
+        null,
+    ));
+
+    var probe = SteerSinkProbe{};
+    const reply = try sm.processMessageStreamingWithSteerSink(session_key, "hello", null, null, null, probe.sink());
+    defer testing.allocator.free(reply);
+
+    // The displaced message's text was discarded, so its reaction is failed;
+    // the replacement is the one the turn consumed.
+    try testing.expectEqual(SteerOutcome.failed, probe.outcomeFor("old-id").?);
+    try testing.expectEqual(SteerOutcome.done, probe.outcomeFor("new-id").?);
+}
+
+test "a failed primary turn finalizes steered refs as failed" {
+    var mock = MockProvider{ .response = "unused", .chat_error = error.ProviderError };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "steer:refs:primary-failed";
+    const session = try sm.getOrCreate(session_key);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    try testing.expectEqual(SessionManager.InboundRouteAction.steered, sm.routeInboundWithRef(
+        session_key,
+        "steer me",
+        .{ .channel = "slack", .target = "C1", .message_id = "1700.1" },
+        null,
+    ));
+
+    var probe = SteerSinkProbe{};
+    try testing.expectError(
+        error.ProviderError,
+        sm.processMessageStreamingWithSteerSink(session_key, "hello", null, null, null, probe.sink()),
+    );
+    try testing.expectEqual(SteerOutcome.failed, probe.outcomeFor("1700.1").?);
+}
+
+test "a failed post-turn follow-up finalizes its steered ref as failed" {
+    var mock = MockProvider{ .response = "unused", .chat_error = error.ProviderError };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "steer:refs:follow-up-failed";
+    const session = try sm.getOrCreate(session_key);
+    session.turn_running.store(true, .release);
+    try testing.expectEqual(SessionManager.InboundRouteAction.steered, sm.routeInboundWithRef(
+        session_key,
+        "steered while busy",
+        .{ .channel = "slack", .target = "C1", .message_id = "1700.2" },
+        null,
+    ));
+    session.turn_running.store(false, .release);
+
+    var response: []const u8 = try testing.allocator.dupe(u8, "primary answer");
+    var completed_turns: u64 = 1;
+    var probe = SteerSinkProbe{};
+    try testing.expect(try sm.drainLateInjection(session, session_key, &response, &completed_turns, probe.sink()));
+    defer testing.allocator.free(response);
+    try testing.expectEqual(SteerOutcome.failed, probe.outcomeFor("1700.2").?);
 }

@@ -1167,9 +1167,26 @@ pub const TelegramChannel = struct {
         self.api().sendTypingIndicator(parsed_target.chat_id, parsed_target.message_thread_id) catch return;
     }
 
+    /// Test seam: records lifecycle reaction calls so tests can observe which
+    /// message ids get an accepted/running/done/failed reaction (the API is
+    /// stubbed under `zig build test`).
+    pub const TestReactionCall = struct {
+        message_id: i64,
+        cleared: bool,
+    };
+    pub var test_reaction_log: ?*std.ArrayListUnmanaged(TestReactionCall) = null;
+
     pub fn setTaskReaction(self: *TelegramChannel, target: []const u8, message_id: ?i64, reaction: TaskReaction) void {
         if (!self.status_reactions_enabled or target.len == 0) return;
         const msg_id = message_id orelse return;
+        if (builtin.is_test) {
+            if (test_reaction_log) |calls| {
+                calls.append(std.testing.allocator, .{
+                    .message_id = msg_id,
+                    .cleared = self.taskReactionEmoji(reaction) == null,
+                }) catch {};
+            }
+        }
         var message_id_buf: [32]u8 = undefined;
         const message_id_text = std.fmt.bufPrint(&message_id_buf, "{d}", .{msg_id}) catch return;
         self.channel().setReaction(.{

@@ -41,6 +41,7 @@ const observability = @import("observability.zig");
 const control_plane = @import("control_plane.zig");
 const providers = @import("providers/root.zig");
 const inbound_router = @import("inbound_router.zig");
+const session_mod = @import("session.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -940,6 +941,45 @@ fn buildInboundRoutingPlan(
     };
 }
 
+/// Channel identity of a message that may be steered into a running turn, so
+/// the consuming turn can finalize its lifecycle reaction. Borrowed; the
+/// Session copies it synchronously.
+fn buildSteerRef(
+    meta: channel_adapters.InboundMetadata,
+    plan: InboundRoutingPlan,
+) ?session_mod.ConsumedRef {
+    const message_id = meta.message_id orelse return null;
+    if (plan.outbound_chat_id.len == 0 or message_id.len == 0) return null;
+    return .{
+        .channel = plan.outbound_channel,
+        .account_id = plan.outbound_account_id,
+        .target = plan.outbound_chat_id,
+        .message_id = message_id,
+    };
+}
+
+const SteerReactionCtx = struct {
+    registry: *const dispatch.ChannelRegistry,
+};
+
+/// Acknowledge before the injection becomes visible to the running turn.
+fn acceptSteerReaction(ctx: *anyopaque, ref: session_mod.ConsumedRef) void {
+    const steer_ctx: *SteerReactionCtx = @ptrCast(@alignCast(ctx));
+    const channel = resolveOutboundChannel(steer_ctx.registry, ref.channel, ref.account_id);
+    setInboundTaskReaction(channel, ref.target, ref.message_id, .accepted);
+}
+
+/// Apply the consuming turn's outcome to the steered message's reaction.
+fn finalizeSteerReaction(
+    ctx: *anyopaque,
+    ref: session_mod.ConsumedRef,
+    outcome: session_mod.SteerOutcome,
+) void {
+    const steer_ctx: *SteerReactionCtx = @ptrCast(@alignCast(ctx));
+    const channel = resolveOutboundChannel(steer_ctx.registry, ref.channel, ref.account_id);
+    setInboundTaskReaction(channel, ref.target, ref.message_id, if (outcome == .done) .done else .failed);
+}
+
 const SlackStatusTarget = struct {
     channel_id: []const u8,
     thread_ts: []const u8,
@@ -1396,12 +1436,16 @@ fn tryHandleRoutedInboundBeforeEnqueue(
     var routing_plan = buildInboundRoutingPlan(allocator, config, msg, parsed_meta.fields);
     defer routing_plan.deinit(allocator);
 
-    const action = session_mgr.routeInbound(routing_plan.session_key, msg.content);
+    var steer_ctx = SteerReactionCtx{ .registry = registry };
+    const action = session_mgr.routeInboundWithRef(
+        routing_plan.session_key,
+        msg.content,
+        buildSteerRef(parsed_meta.fields, routing_plan),
+        .{ .ctx = @ptrCast(&steer_ctx), .finalize = finalizeSteerReaction, .accepted = acceptSteerReaction },
+    );
     if (!action.skipsTurn()) return false;
 
-    const outbound_channel = resolveOutboundChannel(registry, routing_plan.outbound_channel, routing_plan.outbound_account_id);
     switch (action) {
-        .steered => setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted),
         .dropped => {
             var notice = if (routing_plan.outbound_account_id) |aid|
                 bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return true
@@ -1411,7 +1455,7 @@ fn tryHandleRoutedInboundBeforeEnqueue(
                 notice.deinit(allocator);
             };
         },
-        .process, .skip => {},
+        .process, .steered, .skip => {},
     }
     return true;
 }
@@ -1474,13 +1518,15 @@ fn processInboundMessage(
         markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
     }
 
-    const route_action = runtime.session_mgr.routeInbound(routing_plan.session_key, msg.content);
+    var steer_ctx = SteerReactionCtx{ .registry = registry };
+    const route_action = runtime.session_mgr.routeInboundWithRef(
+        routing_plan.session_key,
+        msg.content,
+        buildSteerRef(parsed_meta.fields, routing_plan),
+        .{ .ctx = @ptrCast(&steer_ctx), .finalize = finalizeSteerReaction, .accepted = acceptSteerReaction },
+    );
     if (route_action.skipsTurn()) {
-        if (route_action == .steered) {
-            // Acknowledge an enqueued mid-turn message so the sender sees it
-            // was accepted by the active turn.
-            setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .accepted);
-        } else if (route_action == .dropped) {
+        if (route_action == .dropped) {
             // Never drop silently: tell the sender the message was not delivered.
             var notice = if (routing_plan.outbound_account_id) |aid|
                 bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, inbound_router.dropped_notice) catch return
@@ -1567,12 +1613,14 @@ fn processInboundMessage(
         break :blk .{ .callback = daemonToolProgressCallback, .ctx = @ptrCast(&tool_progress_ctx) };
     };
 
-    const reply = runtime.session_mgr.processMessageStreaming(
+    var steer_reaction_ctx = SteerReactionCtx{ .registry = registry };
+    const reply = runtime.session_mgr.processMessageStreamingWithSteerSink(
         routing_plan.session_key,
         msg.content,
         routing_plan.conversation_context,
         stream_sink,
         tool_progress_sink,
+        .{ .ctx = @ptrCast(&steer_reaction_ctx), .finalize = finalizeSteerReaction },
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
         setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
@@ -2352,7 +2400,6 @@ test "inboundDispatchShardIndex keeps routed session on same worker" {
 test "dispatcher interrupts a busy session for /stop before enqueue" {
     const allocator = std.testing.allocator;
     const providers_mod = @import("providers/root.zig");
-    const session_mod = @import("session.zig");
 
     const StopMockProvider = struct {
         fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
@@ -2461,7 +2508,6 @@ test "publishStreamingChunk drops a preview instead of blocking on a full outbou
 test "dispatcher cancels the stopped turn's queued stream chunks before enqueue" {
     const allocator = std.testing.allocator;
     const providers_mod = @import("providers/root.zig");
-    const session_mod = @import("session.zig");
 
     const StopMockProvider = struct {
         fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
@@ -4197,7 +4243,6 @@ fn produceSlashStopMessage(allocator: std.mem.Allocator) !bus_mod.InboundMessage
 test "Slack slash /stop interrupts the busy channel and thread sessions before enqueue" {
     const allocator = std.testing.allocator;
     const providers_mod = @import("providers/root.zig");
-    const session_mod = @import("session.zig");
 
     const MockProvider = struct {
         fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
@@ -4281,4 +4326,142 @@ test "daemonToolProgressUpdate maps retry hints" {
     try std.testing.expectEqual(channels_mod.Channel.ToolProgressKind.retry, update.kind);
     try std.testing.expectEqual(@as(u32, 1), update.retry.attempt);
     try std.testing.expectEqual(@as(u32, 2), update.retry.max);
+}
+
+test "a steered daemon message is finalized when the consuming turn ends" {
+    // Regression: the dispatcher acknowledged a steered message with .accepted
+    // and dropped its ref, so the turn's completion only cleared the reaction
+    // on the message that started the turn.
+    const allocator = std.testing.allocator;
+    const providers_mod = @import("providers/root.zig");
+
+    const MockProvider = struct {
+        fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return a.dupe(u8, "ok");
+        }
+        fn chat(_: *anyopaque, a: std.mem.Allocator, _: providers_mod.ChatRequest, _: []const u8, _: f64) anyerror!providers_mod.ChatResponse {
+            return .{ .content = try a.dupe(u8, "ok") };
+        }
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return false;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "steer-mock";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+    var provider_state: u8 = 0;
+    const provider_vtable = providers_mod.Provider.VTable{
+        .chatWithSystem = MockProvider.chatWithSystem,
+        .chat = MockProvider.chat,
+        .supportsNativeTools = MockProvider.supportsNativeTools,
+        .getName = MockProvider.getName,
+        .deinit = MockProvider.deinitFn,
+    };
+    const provider = providers_mod.Provider{ .ptr = @ptrCast(&provider_state), .vtable = &provider_vtable };
+
+    const ReactionCall = struct {
+        target: [32]u8 = undefined,
+        target_len: usize = 0,
+        message_id: [32]u8 = undefined,
+        message_id_len: usize = 0,
+        reaction: channels_mod.Channel.TaskReaction = .accepted,
+    };
+    const RecordingChannel = struct {
+        var calls: [8]ReactionCall = undefined;
+        var call_count: usize = 0;
+
+        fn record(update: channels_mod.Channel.TaskReactionUpdate) void {
+            if (call_count == calls.len) return;
+            var call: ReactionCall = .{ .reaction = update.reaction };
+            call.target_len = @min(update.target.len, call.target.len);
+            @memcpy(call.target[0..call.target_len], update.target[0..call.target_len]);
+            call.message_id_len = @min(update.message_id.len, call.message_id.len);
+            @memcpy(call.message_id[0..call.message_id_len], update.message_id[0..call.message_id_len]);
+            calls[call_count] = call;
+            call_count += 1;
+        }
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "test-channel";
+        }
+        fn healthCheck(_: *anyopaque) bool {
+            return true;
+        }
+        fn setTaskReaction(_: *anyopaque, update: channels_mod.Channel.TaskReactionUpdate) anyerror!void {
+            record(update);
+        }
+    };
+    RecordingChannel.call_count = 0;
+
+    var noop = observability.NoopObserver{};
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .default_model = "test/mock-model",
+        .allocator = allocator,
+    };
+    var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
+    defer sm.deinit();
+
+    var ch_state: u8 = 0;
+    const ch_vtable = channels_mod.Channel.VTable{
+        .start = RecordingChannel.start,
+        .stop = RecordingChannel.stop,
+        .send = RecordingChannel.send,
+        .name = RecordingChannel.name,
+        .healthCheck = RecordingChannel.healthCheck,
+        .setTaskReaction = RecordingChannel.setTaskReaction,
+    };
+    const channel = channels_mod.Channel{ .ptr = @ptrCast(&ch_state), .vtable = &ch_vtable };
+    var registry = dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.register(channel);
+
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    const session_key = "daemon:steer-reaction";
+    const session = try sm.getOrCreate(session_key);
+    defer session.turn_running.store(false, .release);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+
+    // A follow-up arrives while the turn runs: the dispatcher folds it into the
+    // turn and acknowledges it with .accepted.
+    var steer_msg = bus_mod.InboundMessage{
+        .channel = "test-channel",
+        .sender_id = "user-1",
+        .chat_id = "C1",
+        .content = "steer me",
+        .session_key = session_key,
+        .metadata_json = "{\"message_id\":\"steer-ts\"}",
+    };
+    try std.testing.expect(tryHandleRoutedInboundBeforeEnqueue(allocator, &config, &event_bus, &registry, &sm, &steer_msg));
+    try std.testing.expectEqual(@as(usize, 1), RecordingChannel.call_count);
+    try std.testing.expectEqual(channels_mod.Channel.TaskReaction.accepted, RecordingChannel.calls[0].reaction);
+    try std.testing.expectEqualStrings("steer-ts", RecordingChannel.calls[0].message_id[0..RecordingChannel.calls[0].message_id_len]);
+    try std.testing.expect(session.hasInjection());
+
+    // The turn that consumed it finishes; the sink must finalize the steered
+    // message, not just the turn-owning one.
+    var steer_ctx = SteerReactionCtx{ .registry = &registry };
+    const reply = try sm.processMessageStreamingWithSteerSink(
+        session_key,
+        "hello",
+        null,
+        null,
+        null,
+        .{ .ctx = @ptrCast(&steer_ctx), .finalize = finalizeSteerReaction },
+    );
+    defer allocator.free(reply);
+
+    var steered_done = false;
+    for (RecordingChannel.calls[0..RecordingChannel.call_count]) |call| {
+        if (!std.mem.eql(u8, call.message_id[0..call.message_id_len], "steer-ts")) continue;
+        if (call.reaction == .done) steered_done = true;
+    }
+    try std.testing.expect(steered_done);
 }
