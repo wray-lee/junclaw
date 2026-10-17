@@ -479,30 +479,6 @@ pub const Agent = struct {
         }
     };
 
-    /// Remove the initial user message a failed `turn` call appended to
-    /// history (`history_len` is the length observed before that turn). A
-    /// failed turn deliberately keeps its user message, but when the same text
-    /// is re-queued for a later retry the next turn appends it again: the model
-    /// would see two identical user messages in a row with no assistant reply
-    /// between them. Only that initial message is dropped, and only when the
-    /// turn appended nothing else. A turn that failed mid tool loop left an
-    /// assistant tool-call message plus its role=.user tool-results message:
-    /// popping the latter would strip the results (the model may then re-run a
-    /// side-effecting tool) and leave a tool call without a result. A drained
-    /// mid-turn injection is a role=.user entry too and must stay in history
-    /// (it is already acked and is not re-queued). A turn that failed before
-    /// appending anything cannot remove older text.
-    /// Returns true when a message was removed.
-    pub fn dropTrailingUserMessageSince(self: *Agent, history_len: usize) bool {
-        // A turn appends its initial user message first, so `history_len + 1`
-        // means that message is the only entry the turn added.
-        if (self.history.items.len != history_len + 1) return false;
-        if (self.history.items[history_len].role != .user) return false;
-        const removed = self.history.pop().?;
-        removed.deinit(self.allocator);
-        return true;
-    }
-
     /// Append a history message that owns its content.
     /// On append failure, the message is deinitialized to avoid leaks.
     fn appendOwnedHistoryMessage(self: *Agent, msg: OwnedMessage) !void {
@@ -5113,45 +5089,6 @@ test "Agent clearHistory then add messages" {
 }
 
 // ── Slash Command Tests ──────────────────────────────────────────
-
-test "dropTrailingUserMessageSince only drops the turn's initial user message" {
-    const allocator = std.testing.allocator;
-    var agent = try makeTestAgent(allocator);
-    defer agent.deinit();
-
-    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "earlier reply") });
-
-    // The turn appended only its initial user message: drop it so re-queueing
-    // the text does not put two identical user messages back to back.
-    var history_len = agent.history.items.len;
-    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "retry me") });
-    try std.testing.expect(agent.dropTrailingUserMessageSince(history_len));
-    try std.testing.expectEqual(history_len, agent.history.items.len);
-
-    // A turn that failed before appending anything cannot remove older text.
-    history_len = agent.history.items.len;
-    try std.testing.expect(!agent.dropTrailingUserMessageSince(history_len));
-    try std.testing.expectEqual(history_len, agent.history.items.len);
-
-    // Regression: a turn that ran a tool left an assistant tool-call message
-    // followed by the role=.user tool-results message. Popping that trailing
-    // user entry stripped the results from context (the model could re-run a
-    // side-effecting tool) and left a tool call without a result.
-    history_len = agent.history.items.len;
-    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "retry me") });
-    try agent.history.append(allocator, .{ .role = .assistant, .content = try allocator.dupe(u8, "<tool_call/>") });
-    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "tool results") });
-    try std.testing.expect(!agent.dropTrailingUserMessageSince(history_len));
-    try std.testing.expectEqual(history_len + 3, agent.history.items.len);
-
-    // Regression: a mid-turn injection drained during the failed turn is also
-    // role=.user and is not re-queued by the caller; it must not be popped.
-    history_len = agent.history.items.len;
-    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "retry me") });
-    try agent.history.append(allocator, .{ .role = .user, .content = try allocator.dupe(u8, "steered while busy") });
-    try std.testing.expect(!agent.dropTrailingUserMessageSince(history_len));
-    try std.testing.expectEqual(history_len + 2, agent.history.items.len);
-}
 
 fn makeTestAgent(allocator: std.mem.Allocator) !Agent {
     const DummyProvider = struct {

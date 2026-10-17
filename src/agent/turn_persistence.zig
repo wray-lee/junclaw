@@ -20,7 +20,10 @@ pub fn persistTurn(
     state: TurnPersistenceState,
     session_key: []const u8,
     content: []const u8,
-    response: []const u8,
+    /// The rendered reply, or null when the turn failed before producing one.
+    /// A failed turn still persists its user message so a later follow-up's
+    /// answer is never stored as the reply to an earlier prompt.
+    response: ?[]const u8,
 ) void {
     const turn_input = commands.planTurnInput(content);
 
@@ -45,9 +48,11 @@ pub fn persistTurn(
         // appending a final assistant history entry; in that case we
         // must persist the actual response instead of stale tool-step
         // assistant text from earlier in the turn.
-        const persisted_assistant = persistedAssistantReply(state.history, response);
         store.saveMessage(session_key, "user", persisted_user) catch {};
-        store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
+        if (response) |reply| {
+            const persisted_assistant = persistedAssistantReply(state.history, reply);
+            store.saveMessage(session_key, "assistant", persisted_assistant) catch {};
+        }
         store.saveUsage(session_key, state.total_tokens) catch {};
     }
 }
@@ -138,6 +143,34 @@ test "persistTurn falls back to rendered response when assistant history is abse
     try std.testing.expectEqual(@as(usize, 2), detailed.len);
     try std.testing.expectEqualStrings("assistant", detailed[1].role);
     try std.testing.expectEqualStrings("fallback reply", detailed[1].content);
+}
+
+test "persistTurn stores only the user message when the turn failed" {
+    const allocator = std.testing.allocator;
+    var mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    var history: std.ArrayListUnmanaged(Agent.OwnedMessage) = .empty;
+    defer {
+        for (history.items) |msg| msg.deinit(allocator);
+        history.deinit(allocator);
+    }
+    try history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "failed prompt"),
+    });
+
+    // Regression: a failed primary turn must keep its prompt in the store
+    // without an assistant reply; otherwise the next follow-up's answer is
+    // persisted as the answer to this prompt.
+    persistTurn(store, .{ .history = history.items, .total_tokens = 3 }, "failed-turn-session", "failed prompt", null);
+
+    const detailed = try store.loadMessagesDetailed(allocator, "failed-turn-session", 10, 0);
+    defer memory_mod.freeDetailedMessages(allocator, detailed);
+    try std.testing.expectEqual(@as(usize, 1), detailed.len);
+    try std.testing.expectEqualStrings("user", detailed[0].role);
+    try std.testing.expectEqualStrings("failed prompt", detailed[0].content);
 }
 
 test "persistTurn does not persist system prompt history entries" {
