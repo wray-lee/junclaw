@@ -315,6 +315,20 @@ pub const Session = struct {
         return self.injection_pending.items.len > 0;
     }
 
+    /// Put drained text back into the pending buffer so the next turn retries
+    /// it. Used when a follow-up turn fails: the message was already acked to
+    /// the sender, so dropping it would lose it silently. Appends after any
+    /// newer message that arrived in the meantime, and ignores the closed
+    /// injection window because this text predates it.
+    pub fn requeueInjection(self: *Session, allocator: Allocator, text: []const u8) void {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        const separator: []const u8 = if (self.injection_pending.items.len > 0) "\n\n" else "";
+        self.injection_pending.ensureUnusedCapacity(allocator, separator.len + text.len) catch return;
+        self.injection_pending.appendSliceAssumeCapacity(separator);
+        self.injection_pending.appendSliceAssumeCapacity(text);
+    }
+
     /// Drain and duplicate the pending injection into dst_allocator.
     /// On allocation failure the pending message stays buffered for a later retry.
     pub fn drainInjection(self: *Session, _: Allocator, dst_allocator: Allocator) !?[]u8 {
@@ -1960,61 +1974,109 @@ pub const SessionManager = struct {
         return filtered;
     }
 
+    const LateInjectionOutcome = enum { none, drained, failed };
+
     /// Drain one pending post-turn injection and run it as a follow-up turn.
-    /// Returns false when no injection is pending.
     fn drainLateInjection(
         self: *SessionManager,
         session: *Session,
         response: *[]const u8,
         completed_turns: *u64,
-    ) !bool {
-        const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse return false;
+    ) !LateInjectionOutcome {
+        const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse return .none;
         defer self.allocator.free(late_content);
 
-        const previous_response = response.*;
         const follow_up_response = session.agent.turn(late_content) catch |err| {
-            // Regression: a failed tail-window follow-up freed the completed
-            // primary reply and propagated, so the user lost the main answer.
-            // Keep the primary and report the follow-up failure separately.
+            // Regression: a failed tail-window follow-up dropped the acked
+            // injection, so the user's steered message vanished. Keep the
+            // completed primary reply, re-queue the injection for the next
+            // turn, and say that it will be retried.
             log.warn("post-turn follow-up turn failed: {}", .{err});
+            session.requeueInjection(self.allocator, late_content);
             var err_buf: [256]u8 = undefined;
             const notice = providers.userErrorMessage(&err_buf, err, true);
             const combined = std.fmt.allocPrint(
                 self.allocator,
-                "{s}\n\n[Follow-up turn failed: {s}]",
-                .{ previous_response, notice },
-            ) catch return false;
-            self.allocator.free(previous_response);
+                "{s}\n\n[Follow-up turn failed: {s} It will be retried on the next turn.]",
+                .{ response.*, notice },
+            ) catch return .failed;
+            self.allocator.free(response.*);
             response.* = combined;
-            return true;
+            return .failed;
         };
-        self.allocator.free(previous_response);
-        response.* = follow_up_response;
+        // Combine both answers instead of replacing the primary reply with the
+        // follow-up's.
+        const combined = std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ response.*, follow_up_response }) catch {
+            log.warn("post-turn follow-up reply could not be combined; keeping the primary reply", .{});
+            self.allocator.free(follow_up_response);
+            completed_turns.* += 1;
+            return .drained;
+        };
+        self.allocator.free(response.*);
+        self.allocator.free(follow_up_response);
+        response.* = combined;
         completed_turns.* += 1;
-        return true;
+        return .drained;
     }
 
     /// Run acknowledged mid-turn injections after the primary turn failed.
-    /// Returns the last successful follow-up reply (owned by the session
+    /// Returns the combined successful follow-up replies (owned by the session
     /// manager allocator), or null when none was pending or every follow-up
-    /// failed.
+    /// failed. A failed follow-up is re-queued for the next turn instead of
+    /// being dropped, and drain errors never replace the original turn error.
     fn drainInjectionsAfterFailedTurn(
         self: *SessionManager,
         session: *Session,
+        completed_turns: *u64,
         session_hash: u64,
     ) !?[]const u8 {
         var reply: ?[]const u8 = null;
         var drain_count: u32 = 0;
         while (drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (drain_count += 1) {
-            const late_content = (try session.drainInjection(self.allocator, self.allocator)) orelse break;
+            const late_content = session.drainInjection(self.allocator, self.allocator) catch |err| {
+                // Preserve the primary turn error: the caller returns it when
+                // no follow-up reply exists, and the buffered injection stays
+                // pending for the next turn.
+                log.warn("post-turn injection drain failed session=0x{x} err={}", .{ session_hash, err });
+                break;
+            } orelse break;
             defer self.allocator.free(late_content);
 
             const follow_up_response = session.agent.turn(late_content) catch |err| {
                 log.warn("post-turn injection after failed turn also failed session=0x{x} err={}", .{ session_hash, err });
-                continue;
+                // Re-queue rather than consume: the sender was already told the
+                // message was accepted. Stop here so the same text is not
+                // retried in a tight loop within this request.
+                session.requeueInjection(self.allocator, late_content);
+                if (reply) |previous| {
+                    var err_buf: [256]u8 = undefined;
+                    const notice = providers.userErrorMessage(&err_buf, err, true);
+                    const combined = std.fmt.allocPrint(
+                        self.allocator,
+                        "{s}\n\n[Follow-up turn failed: {s} It will be retried on the next turn.]",
+                        .{ previous, notice },
+                    ) catch break;
+                    self.allocator.free(previous);
+                    reply = combined;
+                }
+                break;
             };
-            if (reply) |previous| self.allocator.free(previous);
-            reply = follow_up_response;
+            // Keep every successful reply instead of delivering only the last.
+            const combined = if (reply) |previous|
+                std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ previous, follow_up_response }) catch {
+                    self.allocator.free(follow_up_response);
+                    break;
+                }
+            else
+                follow_up_response;
+            if (reply) |previous| {
+                self.allocator.free(previous);
+                // `combined` is a fresh copy; the follow-up reply itself is
+                // no longer referenced.
+                self.allocator.free(follow_up_response);
+            }
+            reply = combined;
+            completed_turns.* += 1;
         }
         if (drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
             log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
@@ -2152,24 +2214,36 @@ pub const SessionManager = struct {
         } };
         session.agent.observer.recordEvent(&start_event);
 
-        var response = session.agent.turn(content) catch |turn_err| {
+        var completed_turns: u64 = 0;
+        var primary_failed = false;
+        var response = session.agent.turn(content) catch |turn_err| blk: {
             log.warn("session turn failed session=0x{x}: {}", .{ session_hash, turn_err });
             // Regression: both post-turn drain loops were skipped on error, so
             // a message the router had already acknowledged as steered stayed
             // in injection_pending and never ran. Run the pending injections as
-            // follow-up turns; deliver their reply when one succeeds, otherwise
-            // surface the original error.
+            // follow-up turns; when one succeeds, fall through to the normal
+            // tail so scope checks, rehydration, persistence and counters still
+            // apply to its reply. Only surface the original error when every
+            // follow-up failed too.
             session.closeInjectionWindow();
-            if (try self.drainInjectionsAfterFailedTurn(session, session_hash)) |reply| {
-                return reply;
-            }
-            return turn_err;
+            primary_failed = true;
+            break :blk (try self.drainInjectionsAfterFailedTurn(session, &completed_turns, session_hash)) orelse return turn_err;
         };
-        var completed_turns: u64 = 1;
+        if (!primary_failed) completed_turns += 1;
 
         var late_drain_count: u32 = 0;
+        var late_drain_failed = false;
         while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-            if (!try self.drainLateInjection(session, &response, &completed_turns)) break;
+            switch (try self.drainLateInjection(session, &response, &completed_turns)) {
+                .none => break,
+                .drained => {},
+                .failed => {
+                    // The injection was re-queued for the next turn; do not
+                    // drain it again in this request.
+                    late_drain_failed = true;
+                    break;
+                },
+            }
         }
 
         // Regression: a message that arrived after the last drain but before the
@@ -2180,12 +2254,19 @@ pub const SessionManager = struct {
         // below with turn_running still set so /stop can interrupt these
         // follow-up turns.
         session.closeInjectionWindow();
-        late_drain_count = 0;
-        while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-            if (!try self.drainLateInjection(session, &response, &completed_turns)) break;
-        }
-        if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
-            log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
+        if (!late_drain_failed) {
+            late_drain_count = 0;
+            while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
+                switch (try self.drainLateInjection(session, &response, &completed_turns)) {
+                    .none => break,
+                    .drained => {},
+                    // Re-queued for the next turn; do not retry in this request.
+                    .failed => break,
+                }
+            }
+            if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
+                log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
+            }
         }
 
         session.turn_count += completed_turns;
@@ -2721,9 +2802,14 @@ const testing = std.testing;
 
 const MockProvider = struct {
     response: []const u8,
+    /// Per-call responses; the last entry repeats. When null, `response` is
+    /// returned for every call.
+    responses: ?[]const []const u8 = null,
     chat_error: ?anyerror = null,
     /// Fail this many initial calls, then succeed (exercises provider retries).
     fail_first: usize = 0,
+    /// Fail exactly these 1-based call numbers (e.g. both attempts of one turn).
+    fail_calls: []const usize = &.{},
     /// Test hook invoked from chat() so a test can simulate a mid-turn message
     /// arriving while the provider request is in flight.
     on_chat: ?*const fn (*anyopaque) void = null,
@@ -2782,7 +2868,12 @@ const MockProvider = struct {
         }
         if (self.chat_error) |err| return err;
         if (self.chat_calls <= self.fail_first) return error.ProviderError;
-        var resp = providers.ChatResponse{ .content = try allocator.dupe(u8, self.response) };
+        if (std.mem.indexOfScalar(usize, self.fail_calls, self.chat_calls) != null) return error.ProviderError;
+        const body = if (self.responses) |responses|
+            responses[@min(self.chat_calls - 1, responses.len - 1)]
+        else
+            self.response;
+        var resp = providers.ChatResponse{ .content = try allocator.dupe(u8, body) };
         if (self.annotate) {
             resp.provider = try allocator.dupe(u8, "mock");
             resp.model = try allocator.dupe(u8, request.model);
@@ -5394,12 +5485,137 @@ test "drainLateInjection keeps the primary reply when the follow-up turn fails" 
 
     // Regression: a failed tail-window follow-up freed the completed primary
     // reply and propagated the error, so the user lost the main answer.
-    try testing.expect(try sm.drainLateInjection(session, &response, &completed_turns));
+    try testing.expectEqual(
+        SessionManager.LateInjectionOutcome.failed,
+        try sm.drainLateInjection(session, &response, &completed_turns),
+    );
     defer testing.allocator.free(response);
     try testing.expect(std.mem.startsWith(u8, response, "primary answer"));
     try testing.expect(std.mem.indexOf(u8, response, "Follow-up turn failed") != null);
+    try testing.expect(std.mem.indexOf(u8, response, "retried") != null);
     try testing.expectEqual(@as(u64, 1), completed_turns);
-    try testing.expect(!session.hasInjection());
+    // Regression: the acked injection was consumed and dropped. It must stay
+    // pending so the next turn retries it.
+    try testing.expect(session.hasInjection());
+}
+
+test "failed-turn injection drain combines successes and requeues the failure" {
+    const alloc = testing.allocator;
+    var mock = MockProvider{
+        .response = "unused",
+        .responses = &.{ "reply one", "reply two", "reply three" },
+        // Calls 3 and 4 are the two attempts of the third follow-up turn.
+        .fail_calls = &.{ 3, 4 },
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(alloc, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("failed:inject:mixed");
+    session.turn_running.store(true, .release);
+    try testing.expect(try session.appendMidTurnIfRunning(alloc, "first"));
+    session.turn_running.store(false, .release);
+    // The failed-turn path has already closed the injection window; the drain
+    // must still run what was accepted before that.
+    session.closeInjectionWindow();
+
+    const InjectNext = struct {
+        session: *Session,
+        fired: usize = 0,
+
+        fn hook(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.fired += 1;
+            const next: []const u8 = switch (self.fired) {
+                1 => "second",
+                2 => "third",
+                else => return,
+            };
+            self.session.requeueInjection(testing.allocator, next);
+        }
+    };
+    var inject = InjectNext{ .session = session };
+    mock.on_chat = InjectNext.hook;
+    mock.on_chat_ctx = @ptrCast(&inject);
+
+    var completed_turns: u64 = 0;
+    const reply = (try sm.drainInjectionsAfterFailedTurn(session, &completed_turns, 0xabc)) orelse
+        return error.TestExpectedEqual;
+    defer alloc.free(reply);
+
+    // Regression: mixed results delivered only the last success.
+    try testing.expect(std.mem.startsWith(u8, reply, "reply one\n\nreply two"));
+    // The failed third follow-up is reported as retried, not dropped.
+    try testing.expect(std.mem.indexOf(u8, reply, "Follow-up turn failed") != null);
+    try testing.expectEqual(@as(u64, 2), completed_turns);
+    // Regression: the failed follow-up consumed the acked injection. It stays
+    // pending for the next turn instead.
+    try testing.expect(session.hasInjection());
+    const pending = (try session.drainInjection(alloc, alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(pending);
+    try testing.expectEqualStrings("third", pending);
+}
+
+test "failed-turn follow-up reply is filtered and persisted" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_dir = std_compat.fs.Dir.wrap(tmp.dir);
+    const base = try tmp_dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var mock = MockProvider{ .response = "answer [DOCUMENT:/etc/passwd]", .fail_first = 2 };
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const session_key = "failed:primary:filter";
+    const session = try sm.getOrCreate(session_key);
+    // Simulate a named agent that carries its own autonomy.
+    session.agent.has_own_autonomy = true;
+
+    const InjectOnChat = struct {
+        session: *Session,
+        fired: bool = false,
+
+        fn hook(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.fired) return;
+            self.fired = true;
+            _ = self.session.appendMidTurnIfRunning(testing.allocator, "steered while busy") catch return;
+        }
+    };
+    var inject = InjectOnChat{ .session = session };
+    mock.on_chat = InjectOnChat.hook;
+    mock.on_chat_ctx = @ptrCast(&inject);
+
+    const resp = try sm.processMessageStreaming(session_key, "hello", null, null, null);
+    defer testing.allocator.free(resp);
+    try testing.expect(inject.fired);
+    // Regression: the failed-turn follow-up reply returned before the outbound
+    // attachment filter, so an escaping marker reached the channel.
+    try testing.expect(std.mem.indexOf(u8, resp, "/etc/passwd") == null);
+    try testing.expect(std.mem.indexOf(u8, resp, "answer") != null);
+
+    // Regression: the early return also skipped persistence and counters.
+    try testing.expectEqual(@as(u64, 1), session.turn_count);
+    const store = sqlite_mem.sessionStore();
+    const messages = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, messages);
+    var saw_assistant = false;
+    for (messages) |entry| {
+        if (std.mem.eql(u8, entry.role, "assistant")) saw_assistant = true;
+    }
+    try testing.expect(saw_assistant);
 }
 
 test "tool progress hints never enter the reply or history" {
