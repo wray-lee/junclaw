@@ -1222,6 +1222,10 @@ the history-polling fallback). With the bot token, nullclaw downloads
 - every other file is saved and passed as `[FILE:/tmp/...]`
 - the message caption is processed as usual
 
+Socket Mode downloads run on an inbound worker so the websocket reader keeps
+acknowledging envelopes and answering pings, and a redelivered event (same
+`event_id`) is processed only once.
+
 Required bot scopes: add `files:read` for inbound downloads and `files:write`
 for outbound uploads (plus `chat:write`). Downloads are pinned to Slack's own
 HTTPS hosts and do not follow redirects, so the bot token is never sent

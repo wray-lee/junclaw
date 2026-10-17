@@ -1012,6 +1012,8 @@ Slack 示例：
 - 其他文件保存后以 `[FILE:/tmp/...]` 传入
 - 消息文字（caption）照常处理
 
+Socket Mode 的下载在独立的入站 worker 上执行，websocket 读取线程可继续确认 envelope 并响应 ping；重复投递的事件（相同 `event_id`）只处理一次。
+
 所需 bot scopes：入站下载需要 `files:read`，出站上传需要 `files:write`（外加 `chat:write`）。下载只允许 Slack 自己的 HTTPS 域名且不跟随重定向，bot token 不会发往其他主机。
 
 webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答，下载无法满足该时限，因此该模式下 `file_share` 事件只会被确认并跳过（caption 也不会处理）。需要入站媒体时请使用 `mode = socket`。
