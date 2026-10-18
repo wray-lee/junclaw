@@ -305,6 +305,8 @@ pub const SlackChannel = struct {
     file_fetch_override: ?*const fn (std.mem.Allocator, SlackFileInfo) ?[]u8 = null,
     /// Emit progressive replies through the streaming Web API / edited messages.
     streaming_enabled: bool = false,
+    /// See config_types.SlackConfig.long_reply_file_threshold_chunks.
+    long_reply_file_threshold_chunks: usize = stream_presenter.STREAM_MAX_FOLLOWUPS + 1,
     /// Set once a chat.startStream call proves this app/workspace can never
     /// stream; every later turn uses the chat.postMessage + chat.update path.
     native_stream_disabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
@@ -447,6 +449,7 @@ pub const SlackChannel = struct {
         ch.slash_command_enabled = cfg.slash_command.enabled;
         ch.slash_command_name = if (cfg.slash_command.name.len == 0) "nullclaw" else cfg.slash_command.name;
         ch.streaming_enabled = cfg.streaming;
+        ch.long_reply_file_threshold_chunks = cfg.long_reply_file_threshold_chunks;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
         return ch;
@@ -2322,15 +2325,19 @@ pub const SlackChannel = struct {
         const upload_url = ticket.upload_url orelse return error.SlackApiError;
         const file_id = ticket.file_id orelse return error.SlackApiError;
 
-        const upload_resp = try root.http_util.curlPostRawWithContentType(
-            self.allocator,
-            upload_url,
-            data,
-            content_type,
-            &.{},
-            "120",
-        );
-        self.allocator.free(upload_resp);
+        // Tests cover the upload through the callSlackApi stub; the raw POST
+        // has no seam, so skip it under `zig build test`.
+        if (!builtin.is_test) {
+            const upload_resp = try root.http_util.curlPostRawWithContentType(
+                self.allocator,
+                upload_url,
+                data,
+                content_type,
+                &.{},
+                "120",
+            );
+            self.allocator.free(upload_resp);
+        }
 
         const complete_body = try buildCompleteUploadBody(self.allocator, file_id, file_name, channel_id, thread_ts);
         defer self.allocator.free(complete_body);
@@ -3218,6 +3225,24 @@ pub const SlackChannel = struct {
         const chunks = try chunkFinalFallbackReply(self.allocator, message);
         defer stream_presenter.freeChunks(self.allocator, chunks);
 
+        // Over-budget replies become one markdown file so nothing is dropped.
+        // The readable first chunk still replaces the live preview.
+        var first_delivered = false;
+        if (self.long_reply_file_threshold_chunks != 0 and
+            chunks.len > self.long_reply_file_threshold_chunks)
+        {
+            if (self.updateStreamMessageMrkdwn(parsed, ts, chunks[0])) |_| {
+                first_delivered = true;
+                if (self.uploadExternal(parsed.channel_id, parsed.thread_ts, "reply.md", "text/markdown", message)) |_| {
+                    return;
+                } else |err| {
+                    log.warn("Slack long reply file upload failed ({s}); falling back to chunked delivery", .{@errorName(err)});
+                }
+            } else |err| {
+                log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
+            }
+        }
+
         // Anything past the first chat.update-able slice goes out as follow-up
         // messages in the same thread.
         const followups = @min(chunks.len - 1, stream_presenter.STREAM_MAX_FOLLOWUPS);
@@ -3234,10 +3259,12 @@ pub const SlackChannel = struct {
             if (first_marked) |m| first_chunk = m;
         }
 
-        self.updateStreamMessageMrkdwn(parsed, ts, first_chunk) catch |err| {
-            log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
-            return vtableSend(@ptrCast(self), target, message, media);
-        };
+        if (!first_delivered) {
+            self.updateStreamMessageMrkdwn(parsed, ts, first_chunk) catch |err| {
+                log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
+                return vtableSend(@ptrCast(self), target, message, media);
+            };
+        }
 
         var i: usize = 1;
         while (i <= followups) : (i += 1) {
@@ -6720,6 +6747,8 @@ test "slack fallback final appends truncation marker when overflow chunks are dr
     defer if (probe.last_chunk) |c| allocator.free(c);
     ch.test_api_ctx = &probe;
     ch.test_api_call = TruncationProbe.call;
+    // Disable the file upload so this test keeps covering the overflow path.
+    ch.long_reply_file_threshold_chunks = 0;
 
     var message: std.ArrayListUnmanaged(u8) = .empty;
     defer message.deinit(allocator);
@@ -6732,6 +6761,152 @@ test "slack fallback final appends truncation marker when overflow chunks are dr
     try std.testing.expect(probe.last_chunk != null);
     try std.testing.expect(std.mem.endsWith(u8, probe.last_chunk.?, stream_presenter.FINAL_TRUNCATED_MARKER));
     try std.testing.expect(stream_presenter.slackEscapedLen(probe.last_chunk.?) <= stream_presenter.STREAM_UPDATE_MAX_BYTES);
+}
+
+test "slack long reply file threshold defaults to the follow-up budget" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{ .bot_token = "xoxb-test" });
+    defer ch.channel().stop();
+    try std.testing.expectEqual(stream_presenter.STREAM_MAX_FOLLOWUPS + 1, ch.long_reply_file_threshold_chunks);
+
+    var disabled = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "xoxb-test",
+        .long_reply_file_threshold_chunks = 0,
+    });
+    defer disabled.channel().stop();
+    try std.testing.expectEqual(@as(usize, 0), disabled.long_reply_file_threshold_chunks);
+}
+
+const SlackLongReplyProbe = struct {
+    updates: usize = 0,
+    posts: usize = 0,
+    files_calls: usize = 0,
+    fail_upload: bool = false,
+    update_text: ?[]u8 = null,
+    last_post: ?[]u8 = null,
+    upload_length: ?usize = null,
+    complete_channel: ?[]u8 = null,
+    complete_thread: ?[]u8 = null,
+
+    fn call(ctx: *anyopaque, allocator: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        if (std.mem.eql(u8, endpoint, "chat.update")) {
+            self.updates += 1;
+            if (self.update_text) |prev| allocator.free(prev);
+            self.update_text = try allocator.dupe(u8, obj.get("text").?.string);
+            return .{};
+        }
+        if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+            self.posts += 1;
+            if (self.last_post) |prev| allocator.free(prev);
+            self.last_post = try allocator.dupe(u8, obj.get("text").?.string);
+            return .{ .ts = try allocator.dupe(u8, "1700.2") };
+        }
+        if (std.mem.eql(u8, endpoint, "files.getUploadURLExternal")) {
+            self.files_calls += 1;
+            self.upload_length = @intCast(obj.get("length").?.integer);
+            if (self.fail_upload) return .{ .error_code = try allocator.dupe(u8, "invalid_arguments") };
+            return .{
+                .upload_url = try allocator.dupe(u8, "https://example.com/upload"),
+                .file_id = try allocator.dupe(u8, "F_TEST"),
+            };
+        }
+        if (std.mem.eql(u8, endpoint, "files.completeUploadExternal")) {
+            self.files_calls += 1;
+            if (self.complete_channel) |prev| allocator.free(prev);
+            self.complete_channel = try allocator.dupe(u8, obj.get("channel_id").?.string);
+            if (obj.get("thread_ts")) |ts| {
+                if (self.complete_thread) |prev| allocator.free(prev);
+                self.complete_thread = try allocator.dupe(u8, ts.string);
+            }
+            return .{};
+        }
+        return error.UnexpectedEndpoint;
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        if (self.update_text) |v| allocator.free(v);
+        if (self.last_post) |v| allocator.free(v);
+        if (self.complete_channel) |v| allocator.free(v);
+        if (self.complete_thread) |v| allocator.free(v);
+    }
+};
+
+test "slack long reply within threshold posts chunks without uploading" {
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackLongReplyProbe{};
+    defer probe.deinit(allocator);
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackLongReplyProbe.call;
+
+    var message: std.ArrayListUnmanaged(u8) = .empty;
+    defer message.deinit(allocator);
+    for (0..250) |_| try message.appendSlice(allocator, "if (a < b && c > d) { ret = 1; }\n");
+    const chunks = try chunkFinalFallbackReply(allocator, message.items);
+    defer stream_presenter.freeChunks(allocator, chunks);
+    try std.testing.expect(chunks.len > 1);
+    try std.testing.expect(chunks.len <= ch.long_reply_file_threshold_chunks);
+
+    try ch.deliverFallbackFinal(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "1700.2", message.items, &.{}, "C_TEST:1700.1");
+
+    try std.testing.expectEqual(@as(usize, 1), probe.updates);
+    try std.testing.expectEqual(chunks.len - 1, probe.posts);
+    try std.testing.expectEqual(@as(usize, 0), probe.files_calls);
+    try std.testing.expectEqualStrings(chunks[0], probe.update_text.?);
+}
+
+test "slack long reply over threshold uploads the full markdown file" {
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackLongReplyProbe{};
+    defer probe.deinit(allocator);
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackLongReplyProbe.call;
+
+    var message: std.ArrayListUnmanaged(u8) = .empty;
+    defer message.deinit(allocator);
+    for (0..1200) |i| try message.print(allocator, "item {d}: detailed response line with text\n", .{i});
+    const chunks = try chunkFinalFallbackReply(allocator, message.items);
+    defer stream_presenter.freeChunks(allocator, chunks);
+    try std.testing.expect(chunks.len > ch.long_reply_file_threshold_chunks);
+
+    try ch.deliverFallbackFinal(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "1700.2", message.items, &.{}, "C_TEST:1700.1");
+
+    try std.testing.expectEqual(@as(usize, 1), probe.updates);
+    try std.testing.expectEqual(@as(usize, 0), probe.posts);
+    try std.testing.expectEqual(@as(usize, 2), probe.files_calls);
+    try std.testing.expectEqualStrings(chunks[0], probe.update_text.?);
+    try std.testing.expect(std.mem.indexOf(u8, probe.update_text.?, stream_presenter.FINAL_TRUNCATED_MARKER) == null);
+    try std.testing.expectEqual(message.items.len, probe.upload_length.?);
+    try std.testing.expectEqualStrings("C_TEST", probe.complete_channel.?);
+    try std.testing.expectEqualStrings("1700.1", probe.complete_thread.?);
+}
+
+test "slack long reply file upload failure falls back to chunked delivery" {
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackLongReplyProbe{ .fail_upload = true };
+    defer probe.deinit(allocator);
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackLongReplyProbe.call;
+
+    var message: std.ArrayListUnmanaged(u8) = .empty;
+    defer message.deinit(allocator);
+    for (0..1200) |i| try message.print(allocator, "item {d}: detailed response line with text\n", .{i});
+
+    try ch.deliverFallbackFinal(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "1700.2", message.items, &.{}, "C_TEST:1700.1");
+
+    try std.testing.expectEqual(@as(usize, 1), probe.updates);
+    try std.testing.expectEqual(@as(usize, 1), probe.files_calls);
+    try std.testing.expectEqual(stream_presenter.STREAM_MAX_FOLLOWUPS, probe.posts);
+    try std.testing.expect(probe.last_post != null);
+    try std.testing.expect(std.mem.endsWith(u8, probe.last_post.?, stream_presenter.FINAL_TRUNCATED_MARKER));
 }
 
 const SlackNativeRecoveryProbe = struct {

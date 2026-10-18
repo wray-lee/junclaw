@@ -1001,6 +1001,7 @@ Slack 示例：
 - `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
 - `slash_command`（默认关闭）——单命令 Slack 集成：注册一个斜杠命令，并把其后的文本当作普通消息处理。见下文
 - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
+- `long_reply_file_threshold_chunks`（默认 `9`）——最终回复所需分片超过该值时，只发送可读的首片，并把完整回复作为 `reply.md` 上传到同一线程/DM。`0` 表示禁用上传。见下文
 
 #### Slack 媒体
 
@@ -1075,6 +1076,7 @@ webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答�
 - **编辑消息**——顶层目标，或 Slack 拒绝原生方法时，nullclaw 用 `chat.postMessage` 发一条消息，再用限流的 `chat.update` 更新它。
 
 增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。若追加调用返回 `msg_too_long`，实时更新会切换到编辑消息并继续推送受限预览。预览按 Slack 转义后的文本长度保留最新内容；最终分片均按转义预算适配 Slack 限制，发送首条消息与最多八条后续消息（超出上限部分会被记录告警并在最后一个分片标注截断提示）。
+当最终回复超过 `long_reply_file_threshold_chunks`（默认 9）片时，nullclaw 只发送可读的首片，并把完整 Markdown 回复作为 `reply.md` 上传到同一线程/DM，不再发送后续消息。上传失败则回退为上述分片投递。上传沿用现有的 `files:write` 权限，无需新增 scope。
 
 关于 Slack 的 `tool_progress`：为与 Telegram 保持对称而接受该配置，但当前不生效——Slack 在任何模式下都不渲染工具进度区块。原生通路（thread 目标上的 `chat.startStream`/`chat.appendStream`）是只追加的，无法展示滚动日志。编辑消息通路（顶层目标的 `chat.postMessage` + `chat.update`）持有一条可变的预览消息，但 nullclaw 只从流式内容启动它：通常是第一个可见回答增量，使用 `/reasoning stream` 时则是第一段流式推理引用——因此预览可能在出现任何回答文本之前就已存在，但工具进度仍不会渲染进去。nullclaw 不会为了显示进度而额外发一条消息，该配置预留给未来的 pre-text 预览。
 

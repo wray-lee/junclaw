@@ -758,6 +758,11 @@ pub const SlackConfig = struct {
     /// elsewhere it falls back to a chat.postMessage that is edited with chat.update.
     /// Off by default: it needs the app's "Agents & AI Apps" feature and paid-plan scopes.
     streaming: bool = false,
+    /// Upload the complete reply as a markdown file to the same thread instead
+    /// of posting follow-up messages when the reply needs more chunks than
+    /// this. 9 = STREAM_MAX_FOLLOWUPS + 1, the 1 chat.update plus 8 follow-ups
+    /// the chunked path can carry; 0 disables the upload.
+    long_reply_file_threshold_chunks: usize = 9,
     /// Accepted for parity with Telegram. Currently inert on Slack: Slack only
     /// creates its live preview on the first visible answer delta, so there is
     /// no pre-text preview to render tool activity into, and posting an extra

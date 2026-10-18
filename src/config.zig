@@ -7374,6 +7374,51 @@ test "parse slack status reactions from config" {
     allocator.free(cfg.channels.slack);
 }
 
+test "parse slack long reply file threshold defaults to 9" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expectEqual(@as(usize, 9), cfg.channels.slack[0].long_reply_file_threshold_chunks);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
+test "parse slack long reply file threshold from config" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "long_reply_file_threshold_chunks": 3}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expectEqual(@as(usize, 3), cfg.channels.slack[0].long_reply_file_threshold_chunks);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
+test "parse slack long reply file threshold zero disables" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "long_reply_file_threshold_chunks": 0}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expectEqual(@as(usize, 0), cfg.channels.slack[0].long_reply_file_threshold_chunks);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
 test "save writes slack streaming" {
     const allocator = std.testing.allocator;
     const accounts = [_]SlackConfig{.{

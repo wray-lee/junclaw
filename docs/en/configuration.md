@@ -1195,6 +1195,7 @@ Parameters:
 - `group_policy` (default: `mention_only`) - `open`, `allowlist`, `mention_only`
 - `reply_to_mode` (default: `off`) - `off` threads only when the triggering message is already a thread reply; `all` always replies in a thread
 - `streaming` (default: `false`) - Show the reply while it is still being generated. See below
+- `long_reply_file_threshold_chunks` (default: `9`) - When a final reply needs more chunks than this, send only the readable first chunk and upload the complete reply as `reply.md` to the same thread/DM. `0` disables the upload. See below
 - `status_reactions` (default: `false`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
 - `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
 - `slash_command` (default: disabled) - Single-command Slack integration: register one slash command and handle its text like a normal message. See below
@@ -1331,7 +1332,12 @@ that account and uses edited messages from then on. If an append returns
 bounded preview. The preview retains the newest text within Slack's escaped-text
 budget; each final chunk is entity-budgeted to fit Slack's limits, delivering the
 initial message and up to eight follow-ups (overflow beyond the follow-up cap is
-logged and marked with a truncation notice on the final chunk).
+logged and marked with a truncation notice on the final chunk). When the final
+reply needs more than `long_reply_file_threshold_chunks` chunks (default 9),
+nullclaw sends only the readable first chunk and uploads the full Markdown reply
+as `reply.md` to the same thread/DM instead of posting follow-ups. If the upload
+fails it falls back to the chunked delivery above. The upload reuses the
+existing `files:write` scope; no new scope is required.
 
 About `tool_progress` on Slack: accepted for parity with Telegram, but currently inert -
 Slack renders no tool-progress block in any mode. The native transport
