@@ -637,6 +637,17 @@ pub const SmartSplitIterator = struct {
             split_at = sp_pos + 1;
         }
 
+        // The hard-cut fallback can land inside a multi-byte code point (long
+        // CJK or base64 text without a newline/space), which Telegram rejects
+        // with 400 Bad Request. Back off over continuation bytes (0b10xxxxxx)
+        // so every chunk is valid UTF-8; if one code point alone exceeds the
+        // limit, keep it whole rather than emitting invalid bytes.
+        while (split_at > 0 and (self.remaining[split_at] & 0xC0) == 0x80) split_at -= 1;
+        if (split_at == 0) {
+            split_at = std.unicode.utf8ByteSequenceLength(self.remaining[0]) catch 1;
+            split_at = @min(split_at, self.remaining.len);
+        }
+
         const chunk = self.remaining[0..split_at];
         self.remaining = self.remaining[split_at..];
         return chunk;
@@ -4870,6 +4881,44 @@ test "telegram smartSplitMessage no word boundary falls back to hard cut" {
     var it = smartSplitMessage(msg, 10);
     const chunk1 = it.next().?;
     try std.testing.expectEqual(@as(usize, 10), chunk1.len);
+}
+
+test "telegram smartSplitMessage hard cut never splits a UTF-8 code point" {
+    // Regression: the no-boundary fallback cut at exactly `max`, landing inside
+    // a 3-byte CJK code point. Telegram answered 400 Bad Request and the tail
+    // of the message was lost.
+    const msg = "中文测试消息内容" ** 3; // 24 code points, 72 bytes
+    for ([_]usize{ 3, 4, 5 }) |max| {
+        var it = smartSplitMessage(msg, max);
+        var joined: std.ArrayListUnmanaged(u8) = .empty;
+        defer joined.deinit(std.testing.allocator);
+
+        var chunks: usize = 0;
+        while (it.next()) |chunk| {
+            try std.testing.expect(std.unicode.utf8ValidateSlice(chunk));
+            try std.testing.expect(chunk.len <= max);
+            try joined.appendSlice(std.testing.allocator, chunk);
+            chunks += 1;
+        }
+        try std.testing.expect(chunks > 1);
+        try std.testing.expectEqualStrings(msg, joined.items);
+    }
+}
+
+test "telegram smartSplitMessage hard cut keeps base64-like text intact" {
+    // Regression: long base64 payloads have no newline or space, so every cut
+    // is a hard cut; each chunk must still be valid UTF-8 and lossless.
+    const msg = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ejAxMjM0NTY3ODk=";
+    var it = smartSplitMessage(msg, 10);
+    var joined: std.ArrayListUnmanaged(u8) = .empty;
+    defer joined.deinit(std.testing.allocator);
+
+    while (it.next()) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk));
+        try std.testing.expect(chunk.len <= 10);
+        try joined.appendSlice(std.testing.allocator, chunk);
+    }
+    try std.testing.expectEqualStrings(msg, joined.items);
 }
 
 test "telegram smartSplitMessage preserves total content" {
