@@ -4104,6 +4104,14 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
         };
 
         var callback_channel = channels.slack.SlackChannel.initFromConfig(ctx.req_allocator, slack_cfg.*);
+        const interactive_is_dm = callback_channel_val.string.len > 0 and callback_channel_val.string[0] == 'D';
+        // Regression: same policy gap as the Socket Mode path — a click from a sender the
+        // channel policy denies published an agent turn. Check before consuming so an
+        // allowed user can still answer later.
+        if (!channels.checkPolicyScoped("slack channel", callback_channel.policy, sender_id_val.string, interactive_is_dm, true)) {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        }
         switch (callback_channel.consumeInteractionSelection(parsed_callback.token, parsed_callback.option_index, sender_id_val.string)) {
             .ok => |selection| {
                 defer ctx.req_allocator.free(selection.submit_text);
@@ -5361,6 +5369,103 @@ test "handleWhatsAppWebhookRoute rejects malformed JSON before sender extraction
     handleWhatsAppWebhookRoute(&ctx);
     try std.testing.expectEqualStrings("400 Bad Request", ctx.response_status);
     try std.testing.expectEqualStrings("{\"error\":\"invalid json payload\"}", ctx.response_body);
+}
+
+test "slack webhook block action from a denied sender publishes nothing" {
+    if (!build_options.enable_channel_slack) return error.SkipZigTest;
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const slack_accounts = [_]config_types.SlackConfig{
+        .{
+            .account_id = "default",
+            .mode = .http,
+            .signing_secret = "test-secret",
+            .webhook_path = "/slack/events",
+            .allow_from = &.{"U777"},
+            .group_policy = "allowlist",
+            .bot_token = "xoxb-test",
+        },
+    };
+
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = allocator,
+        .channels = .{ .slack = &slack_accounts },
+    };
+
+    var registering_channel = channels.slack.SlackChannel.initFromConfig(allocator, slack_accounts[0]);
+    defer registering_channel.deinitPendingInteractions();
+    const choices = [_]channels.Channel.OutboundChoice{
+        .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
+    };
+    try registering_channel.registerPendingInteraction("tok-gw-1", "C123:1700.1", null, &choices);
+
+    const body = "{\"type\":\"block_actions\",\"user\":{\"id\":\"U123\"},\"channel\":{\"id\":\"C123\"},\"actions\":[{\"value\":\"ncslack:tok-gw-1:0\"}]}";
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std_compat.time.timestamp()}) catch unreachable;
+
+    var signed: std.ArrayListUnmanaged(u8) = .empty;
+    defer signed.deinit(allocator);
+    var signed_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &signed);
+    const sw = &signed_writer.writer;
+    try sw.print("v0:{s}:", .{ts});
+    try sw.writeAll(body);
+    signed = signed_writer.toArrayList();
+
+    const HmacSha256 = std.crypto.auth.hmac.sha2.HmacSha256;
+    var mac: [HmacSha256.mac_length]u8 = undefined;
+    HmacSha256.create(&mac, signed.items, "test-secret");
+
+    var sig_buf: [67]u8 = undefined;
+    @memcpy(sig_buf[0..3], "v0=");
+    for (0..32) |i| {
+        const byte = mac[i];
+        sig_buf[3 + i * 2] = "0123456789abcdef"[byte >> 4];
+        sig_buf[3 + i * 2 + 1] = "0123456789abcdef"[byte & 0x0f];
+    }
+
+    const raw_request = try std.fmt.allocPrint(
+        allocator,
+        "POST /slack/events HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nX-Slack-Request-Timestamp: {s}\r\nX-Slack-Signature: {s}\r\n\r\n{s}",
+        .{ body.len, ts, sig_buf[0..], body },
+    );
+
+    var state = GatewayState.init(std.testing.allocator);
+    defer state.deinit();
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+    state.event_bus = &eb;
+
+    var ctx = WebhookHandlerContext{
+        .root_allocator = allocator,
+        .req_allocator = allocator,
+        .raw_request = raw_request,
+        .method = "POST",
+        .target = "/slack/events",
+        .config_opt = &cfg,
+        .state = &state,
+        .session_mgr_opt = null,
+    };
+
+    handleSlackWebhookRoute(&ctx);
+
+    // Regression: same policy gap as the Socket Mode path — a click from a sender the
+    // channel policy denies published an agent turn. Check before consuming so an
+    // allowed user can still answer later.
+    try std.testing.expectEqualStrings("{\"status\":\"ok\"}", ctx.response_body);
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+    switch (registering_channel.consumeInteractionSelection("tok-gw-1", 0, "U777")) {
+        .ok => |selection| {
+            defer allocator.free(selection.submit_text);
+            defer allocator.free(selection.target);
+            try std.testing.expectEqualStrings("Confirm action", selection.submit_text);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 fn handleTeamsWebhookRoute(ctx: *WebhookHandlerContext) void {

@@ -1578,11 +1578,17 @@ pub const SlackChannel = struct {
         const value = jsonStringValue(first_action.object, "value") orelse return;
         const parsed_callback = parseCallbackValue(value) orelse return;
 
+        const callback_channel_id = jsonStringValue(channel_val.object, "id") orelse "";
+        // A button click is an explicit bot-directed action, so it counts as a mention.
+        // Regression: a click from a sender the channel policy denies (not on the allowlist,
+        // or blocked by dm/group policy) published an agent turn. The check must run before
+        // the selection is consumed so an allowed user can still answer later.
+        if (!root.checkPolicyScoped("slack channel", self.policy, sender_id, isDirectConversationId(callback_channel_id), true)) return;
+
         switch (self.consumeInteractionSelection(parsed_callback.token, parsed_callback.option_index, sender_id)) {
             .ok => |selection| {
                 defer self.allocator.free(selection.submit_text);
                 defer self.allocator.free(selection.target);
-                const callback_channel_id = jsonStringValue(channel_val.object, "id") orelse "";
                 self.publishInteractionSelection(sender_id, selection.target, callback_channel_id, selection.submit_text);
             },
             else => {},
@@ -2158,7 +2164,7 @@ pub const SlackChannel = struct {
         return self.allocator.dupe(u8, token);
     }
 
-    fn registerPendingInteraction(
+    pub fn registerPendingInteraction(
         self: *SlackChannel,
         token: []const u8,
         target: []const u8,
@@ -2278,7 +2284,7 @@ pub const SlackChannel = struct {
         } };
     }
 
-    fn deinitPendingInteractions(self: *SlackChannel) void {
+    pub fn deinitPendingInteractions(self: *SlackChannel) void {
         shared_interactions_mu.lock();
         defer shared_interactions_mu.unlock();
 
@@ -5148,6 +5154,71 @@ test "slack socket interactive unknown token is acked and publishes nothing" {
 
         // An expired/unknown token still acks, but nothing reaches the agent.
         try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+    }
+}
+
+test "slack socket interactive block action from a denied sender publishes nothing" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const alloc = std.testing.allocator;
+        var eb = bus_mod.Bus.init();
+        defer eb.close();
+
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        const allowed = [_][]const u8{"U777"};
+        var ch = SlackChannel.initWithPolicy(alloc, "tok", null, "C123", &allowed, .{
+            .dm = .allow,
+            .group = .allowlist,
+            .allowlist = &allowed,
+        });
+        ch.account_id = "sl-sec-interactive";
+        ch.setBus(&eb);
+        defer ch.deinitPendingInteractions();
+
+        const choices = [_]root.Channel.OutboundChoice{
+            .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
+        };
+        try ch.registerPendingInteraction("tok-sec-1", "C123:1700.1", null, &choices);
+
+        var ws = websocket.WsClient{
+            .allocator = alloc,
+            .stream = .{ .handle = sockets[0] },
+            .tls = null,
+            .write_mu = .{},
+        };
+        const envelope =
+            \\{"type":"interactive","envelope_id":"EnvSec1","payload":{"type":"block_actions","user":{"id":"U123"},"channel":{"id":"C123"},"actions":[{"value":"ncslack:tok-sec-1:0"}]}}
+        ;
+        try ch.handleSocketPayload(&ws, envelope);
+
+        // The envelope is still acked even though the click is dropped.
+        var pollfds = [_]std.posix.pollfd{.{ .fd = sockets[1], .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = try std.posix.poll(&pollfds, 1000);
+        try std.testing.expect(ready > 0);
+        var ack_buf: [64]u8 = undefined;
+        const ack_len = try std.posix.read(sockets[1], &ack_buf);
+        try std.testing.expect(ack_len > 0);
+        try std.testing.expectEqual(@as(u8, 0x81), ack_buf[0]);
+
+        // Regression: a click from a sender the channel policy denies (not on the
+        // allowlist, or blocked by dm/group policy) published an agent turn. The check
+        // runs before the selection is consumed so an allowed user can still answer later.
+        try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+
+        switch (ch.consumeInteractionSelection("tok-sec-1", 0, "U777")) {
+            .ok => |selection| {
+                defer alloc.free(selection.submit_text);
+                defer alloc.free(selection.target);
+                try std.testing.expectEqualStrings("Confirm action", selection.submit_text);
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
