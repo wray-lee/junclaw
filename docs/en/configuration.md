@@ -1330,7 +1330,8 @@ that account and uses edited messages from then on. If an append returns
 `msg_too_long`, live updates continue through the edited-message transport with a
 bounded preview. The preview retains the newest text within Slack's escaped-text
 budget; the final reply delivers every chunk in order, including replies needing
-more than eight follow-ups. A failed follow-up is reported as a delivery failure
+more than eight follow-ups, with follow-ups threaded under the first message when
+answering in a top-level channel. A failed follow-up is reported as a delivery failure
 so the durable outbox can retry it. Final follow-ups and edited preview creation
 share a one-message-per-second budget per channel, including across threads. Partial
 final delivery keeps its own outbox job ID, preview message, and next unsent chunk;
