@@ -1639,7 +1639,7 @@ fn processInboundMessage(
             err_kind,
         );
         const cooldown_ms: i64 = @as(i64, err_policy.cooldown_mins) * 60_000;
-        switch (error_reply_policy.decide(&error_reply_store, err_policy.policy, err_key, inbound_debounce.nowMs(), cooldown_ms)) {
+        switch (error_reply_store.decide(err_policy.policy, err_key, inbound_debounce.nowMs(), cooldown_ms)) {
             .suppress => {
                 log.info("error reply suppressed by policy ({s}) for {s}:{s}", .{
                     @tagName(err_policy.policy),
