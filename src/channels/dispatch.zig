@@ -489,12 +489,12 @@ fn dispatchClaimedOutboundDirect(channel: root.Channel, job: channel_outbox.Deli
             .text = job.content,
             .choices = job.choices,
         }) catch |err| switch (err) {
-            error.NotSupported => return channel.sendEvent(job.chat_id, job.content, &.{}, .final),
+            error.NotSupported => return channel.sendFinalDelivery(job.chat_id, job.content, &.{}, job.id),
             else => return err,
         };
         return;
     }
-    return channel.sendEvent(job.chat_id, job.content, job.media, .final);
+    return channel.sendFinalDelivery(job.chat_id, job.content, job.media, job.id);
 }
 
 fn shouldPersistFinalOutbound(msg: bus.OutboundMessage) bool {
@@ -671,12 +671,14 @@ const MockChannel = struct {
     should_fail: bool = false,
     fail_first_final: bool = false,
     final_attempts: Atomic(u64) = Atomic(u64).init(0),
+    last_delivery_id: u64 = 0,
 
     const vtable = root.Channel.VTable{
         .start = mockStart,
         .stop = mockStop,
         .send = mockSend,
         .sendEvent = mockSendEvent,
+        .sendFinalDelivery = mockSendFinalDelivery,
         .name = mockName,
         .healthCheck = mockHealthCheck,
     };
@@ -711,6 +713,11 @@ const MockChannel = struct {
                 _ = self.sent_count.fetchAdd(1, .monotonic);
             },
         }
+    }
+    fn mockSendFinalDelivery(ctx: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8, delivery_id: u64) anyerror!void {
+        const self: *MockChannel = @ptrCast(@alignCast(ctx));
+        self.last_delivery_id = delivery_id;
+        return mockSendEvent(ctx, target, message, media, .final);
     }
     fn mockName(ctx: *anyopaque) []const u8 {
         const self: *const MockChannel = @ptrCast(@alignCast(ctx));
@@ -1504,13 +1511,17 @@ test "durable outbound worker retries persisted final delivery" {
 
     var msg = try bus.makeOutbound(allocator, "telegram", "chat1", "hello");
     defer msg.deinit(allocator);
-    _ = try outbox.enqueueFinal(msg);
+    const id = try outbox.enqueueFinal(msg);
 
     try std.testing.expect(try drainDurableOutboundOutboxOnce(allocator, &outbox, &reg));
+    // Regression: the transport previously saw only target and content, so
+    // partial delivery state could not remain bound to the claimed outbox job.
+    try std.testing.expectEqual(id, mock_tg.last_delivery_id);
     try std.testing.expectEqual(@as(usize, 1), outbox.pendingCount());
     try std.testing.expectEqual(@as(u64, 1), mock_tg.final_attempts.load(.monotonic));
 
     try std.testing.expect(try drainDurableOutboundOutboxOnce(allocator, &outbox, &reg));
+    try std.testing.expectEqual(id, mock_tg.last_delivery_id);
     try std.testing.expectEqual(@as(usize, 0), outbox.pendingCount());
     try std.testing.expectEqual(@as(u64, 2), mock_tg.final_attempts.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), mock_tg.sent_count.load(.monotonic));

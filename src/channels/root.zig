@@ -198,6 +198,15 @@ pub const Channel = struct {
             media: []const []const u8,
             stage: OutboundStage,
         ) anyerror!void = null,
+        /// Optional durable final delivery. The outbox ID is stable across
+        /// retries, allowing transports to keep partial progress per job.
+        sendFinalDelivery: ?*const fn (
+            ptr: *anyopaque,
+            target: []const u8,
+            message: []const u8,
+            media: []const []const u8,
+            delivery_id: u64,
+        ) anyerror!void = null,
         /// Optional structured outbound delivery for channels that support
         /// richer semantics than raw text + generic media paths.
         sendRich: ?*const fn (
@@ -256,6 +265,13 @@ pub const Channel = struct {
             return fn_send_event(self.ptr, target, message, media, stage);
         }
         if (stage == .final) return self.send(target, message, media);
+    }
+
+    pub fn sendFinalDelivery(self: Channel, target: []const u8, message: []const u8, media: []const []const u8, delivery_id: u64) !void {
+        if (self.vtable.sendFinalDelivery) |send_final| {
+            return send_final(self.ptr, target, message, media, delivery_id);
+        }
+        return self.sendEvent(target, message, media, .final);
     }
 
     pub fn sendRich(self: Channel, target: []const u8, payload: OutboundPayload) !void {

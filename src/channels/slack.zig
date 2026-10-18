@@ -317,6 +317,11 @@ pub const SlackChannel = struct {
     /// Guards `stream_states` and the API calls made from it.
     stream_mu: std_compat.sync.Mutex = .{},
     stream_states: std.StringHashMapUnmanaged(stream_presenter.StreamState) = .empty,
+    /// Final deliveries own their chunk cursor and preview ts separately from
+    /// the next turn's live preview. Guarded by stream_mu.
+    final_deliveries: std.StringHashMapUnmanaged(FinalDelivery) = .empty,
+    /// chat.postMessage has one shared budget for all threads in a channel.
+    post_message_times: std.StringHashMapUnmanaged(i64) = .empty,
     /// Targets whose current turn was stopped. Queued `.chunk` events for them
     /// are dropped so a stopped turn's leftovers cannot replay once the
     /// outbound dispatcher catches up. Keyed by the exact outbound target and
@@ -350,6 +355,7 @@ pub const SlackChannel = struct {
     inbound_seen_count: usize = 0,
     inbound_seen_next: usize = 0,
     /// Test seam: counts native chat.stopStream calls (the API is stubbed).
+    test_post_now_ms: if (builtin.is_test) i64 else void = if (builtin.is_test) 1 else {},
     test_native_stop_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     test_api_ctx: if (builtin.is_test) ?*anyopaque else void = if (builtin.is_test) null else {},
     test_api_call: if (builtin.is_test) ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!SlackApiResult else void = if (builtin.is_test) null else {},
@@ -2210,13 +2216,13 @@ pub const SlackChannel = struct {
     /// Deliver a final reply that may carry attachment markers. The text is
     /// sent through the normal (streaming or plain) path with the markers
     /// stripped; each attachment is then uploaded into the same channel/thread.
-    fn deliverFinal(self: *SlackChannel, target: []const u8, message: []const u8, media: []const []const u8) !void {
+    fn deliverFinal(self: *SlackChannel, target: []const u8, message: []const u8, media: []const []const u8, delivery_id: u64) !void {
         var payload = self.prepareOutbound(self.allocator, message, media) catch {
             if (message.len == 0) {
                 self.finishStreamStateFor(target);
                 return;
             }
-            return self.streamFinal(target, message, media, false);
+            return self.streamFinalDelivery(target, message, media, false, delivery_id);
         };
         defer payload.deinit(self.allocator);
 
@@ -2225,11 +2231,11 @@ pub const SlackChannel = struct {
                 self.finishStreamStateFor(target);
                 return;
             }
-            return self.streamFinal(target, message, media, false);
+            return self.streamFinalDelivery(target, message, media, false, delivery_id);
         }
 
         if (payload.text.len > 0) {
-            try self.streamFinal(target, payload.text, &.{}, true);
+            try self.streamFinalDelivery(target, payload.text, &.{}, true, delivery_id);
         } else {
             // A reply that is only an attachment streams the raw marker as its
             // preview; remove it so the file is not preceded by `[IMAGE:...]`.
@@ -2699,15 +2705,36 @@ pub const SlackChannel = struct {
                     self.finishStreamStateFor(target);
                     return;
                 }
-                try self.deliverFinal(target, message, media);
+                try self.deliverFinal(target, message, media, 0);
             },
         }
+    }
+
+    fn vtableSendFinalDelivery(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8, delivery_id: u64) anyerror!void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        if (!self.streaming_enabled) return vtableSendEvent(ptr, target, message, media, .final);
+        if (message.len == 0 and media.len == 0) {
+            self.finishStreamStateFor(target);
+            return;
+        }
+        return self.deliverFinal(target, message, media, delivery_id);
     }
 
     fn deinitStreamStates(self: *SlackChannel) void {
         self.stream_mu.lock();
         defer self.stream_mu.unlock();
         stream_presenter.deinitStreamStates(self.allocator, &self.stream_states);
+        var finals = self.final_deliveries.iterator();
+        while (finals.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.final_deliveries.deinit(self.allocator);
+        self.final_deliveries = .empty;
+        var post_times = self.post_message_times.keyIterator();
+        while (post_times.next()) |key| self.allocator.free(key.*);
+        self.post_message_times.deinit(self.allocator);
+        self.post_message_times = .empty;
         var it = self.stream_cancels.iterator();
         while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
         self.stream_cancels.deinit(self.allocator);
@@ -3115,85 +3142,112 @@ pub const SlackChannel = struct {
     /// the message already shows the final reply. Otherwise the stream is
     /// stopped and the final reply is posted as its own message, which is what
     /// Telegram does for every turn.
-    fn streamFinal(
+    fn streamFinalDelivery(
         self: *SlackChannel,
         target: []const u8,
         message: []const u8,
         media: []const []const u8,
         force_rewrite: bool,
+        delivery_id: u64,
     ) !void {
         self.stream_mu.lock();
         defer self.stream_mu.unlock();
+        _ = media;
+
+        const key = try finalDeliveryKey(self.allocator, target, message, delivery_id);
+        defer self.allocator.free(key);
+        const parsed = stream_presenter.resolveStreamTarget(target);
+        // A retry must not inspect, finish, or overwrite another turn's preview.
+        if (self.final_deliveries.getPtr(key)) |delivery| {
+            return self.resumeFinalDelivery(parsed, key, delivery);
+        }
 
         const now_ms = std_compat.time.milliTimestamp();
-        // Every queued delta was dequeued ahead of this final, so the stop marker
-        // has done its job and must not leak into the next turn -- including a
-        // turn that streamed nothing and returns early below without a state.
         self.clearStreamCancelLocked(target);
-        const state = self.stream_states.getPtr(target) orelse
-            return vtableSend(@ptrCast(self), target, message, media);
-        // Only retire a successfully delivered final. A partial failure must
-        // retain the message ts so an outbox retry uses the chunked path again.
-        var delivery_failed = false;
-        defer if (!delivery_failed) state.finishTurn(self.allocator, now_ms);
-        errdefer {
-            delivery_failed = true;
-            state.mode = .fallback;
-            state.send_failed = true;
-        }
+        const state = self.stream_states.getPtr(target);
+        var failed = false;
+        defer if (state) |active| active.finishTurn(self.allocator, if (failed) 0 else now_ms);
+        errdefer failed = true;
 
-        if (state.message_ts.len == 0) {
-            // Nothing was ever flushed (short reply inside the throttle window),
-            // or the fallback message could not be created.
-            return vtableSend(@ptrCast(self), target, message, media);
-        }
-
-        const parsed = stream_presenter.resolveStreamTarget(target);
-
-        if (state.mode == .native) {
-            const suffix = stream_presenter.pendingFinalSuffix(message, state.sent);
-            // The closing append must respect the same cumulative budget as the
-            // live flushes: when the answer lands inside one throttle window the
-            // whole remainder is appended in a single call, and chat.appendStream
-            // would answer `msg_too_long` past Slack's message cap. Finish on the
-            // edited-message transport instead so the answer is delivered intact.
-            const over_budget = if (suffix) |s|
-                stream_presenter.finalAppendOverflowsEscapedBudget(state.sent, s)
-            else
-                false;
-            const stream_completed = if (!force_rewrite and suffix != null and !over_budget) blk: {
-                self.appendNativeStreamLocked(parsed, state, suffix.?) catch |err| {
-                    log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
-                    break :blk false;
+        if (state) |active| {
+            if (active.mode == .native and active.message_ts.len > 0) {
+                const suffix = stream_presenter.pendingFinalSuffix(message, active.sent);
+                const over_budget = if (suffix) |tail|
+                    stream_presenter.finalAppendOverflowsEscapedBudget(active.sent, tail)
+                else
+                    false;
+                const completed = if (!force_rewrite and suffix != null and !over_budget) blk: {
+                    self.appendNativeStreamLocked(parsed, active, suffix.?) catch break :blk false;
+                    break :blk true;
+                } else false;
+                self.stopNativeStream(parsed, active.message_ts) catch |err| {
+                    log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
                 };
-                break :blk true;
-            } else false;
-
-            self.stopNativeStream(parsed, state.message_ts) catch |err| {
-                log.warn("Slack chat.stopStream failed ({s})", .{@errorName(err)});
-            };
-            if (stream_completed) return;
-            // The preview streamed the raw attachment marker, which the final
-            // text no longer contains. Rewrite the message in place instead of
-            // leaving `[IMAGE:...]` visible and posting a second copy.
-            if (force_rewrite) {
-                return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
+                if (completed) return;
+                // A divergent draft stays as an intermediate message, except
+                // when it contains reasoning/markers or overflowed the budget.
+                if (!force_rewrite and !active.rendered_reasoning and !over_budget) {
+                    try self.beginFinalDelivery(parsed, key, "", message);
+                    return;
+                }
             }
-            // A streamed reasoning quote is deliberately absent from the final
-            // reply, so that turn's snapshot can never be a prefix of it.
-            // Rewrite the stopped message in place rather than leaving the
-            // thinking behind and posting the reply a second time. The same
-            // rewrite carries a final message that would overflow the stream
-            // budget.
-            if (state.rendered_reasoning or over_budget) {
-                return self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
-            }
-            // When the stream could not be completed the streamed message keeps
-            // an intermediate prefix, so the reply is posted again in full.
-            return vtableSend(@ptrCast(self), target, message, media);
         }
+        const ts: []const u8 = if (state) |active| active.message_ts else "";
+        try self.beginFinalDelivery(parsed, key, ts, message);
+    }
 
-        try self.deliverFallbackFinal(parsed, state.message_ts, message, media, target);
+    const FinalDelivery = struct {
+        message_ts: []u8,
+        chunks: [][]const u8,
+        next_chunk: usize = 0,
+        rebound: bool = false,
+        failures: usize = 0,
+
+        fn deinit(self: *FinalDelivery, allocator: std.mem.Allocator) void {
+            allocator.free(self.message_ts);
+            stream_presenter.freeChunks(allocator, self.chunks);
+        }
+    };
+
+    /// Durable IDs disambiguate even identical replies. Direct callers have no
+    /// job ID, so their exact target and reply digest identify a pending retry.
+    fn finalDeliveryKey(allocator: std.mem.Allocator, target: []const u8, message: []const u8, delivery_id: u64) ![]u8 {
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(message, &digest, .{});
+        return std.fmt.allocPrint(allocator, "{s}:{d}:{x}", .{ target, delivery_id, digest });
+    }
+
+    fn beginFinalDelivery(self: *SlackChannel, parsed: stream_presenter.StreamTarget, key: []const u8, ts: []const u8, message: []const u8) !void {
+        {
+            const owned_key = try self.allocator.dupe(u8, key);
+            errdefer self.allocator.free(owned_key);
+            const owned_ts = try self.allocator.dupe(u8, ts);
+            errdefer self.allocator.free(owned_ts);
+            const chunks = try chunkFinalFallbackReply(self.allocator, message);
+            errdefer stream_presenter.freeChunks(self.allocator, chunks);
+            try self.final_deliveries.put(self.allocator, owned_key, .{ .message_ts = owned_ts, .chunks = chunks });
+        }
+        // Ownership has transferred to the map; failures retain the cursor.
+        return self.resumeFinalDelivery(parsed, key, self.final_deliveries.getPtr(key).?);
+    }
+
+    fn resumeFinalDelivery(self: *SlackChannel, parsed: stream_presenter.StreamTarget, key: []const u8, delivery: *FinalDelivery) !void {
+        self.deliverFinalChunks(parsed, delivery) catch |err| {
+            delivery.failures += 1;
+            // Matches the durable outbox's maximum attempts, bounding retained
+            // abandoned replies while allowing every scheduled retry to resume.
+            if (delivery.failures >= @import("outbox.zig").MAX_DELIVERY_ATTEMPTS) self.removeFinalDelivery(key);
+            return err;
+        };
+        self.removeFinalDelivery(key);
+    }
+
+    fn removeFinalDelivery(self: *SlackChannel, key: []const u8) void {
+        if (self.final_deliveries.fetchRemove(key)) |entry| {
+            self.allocator.free(entry.key);
+            var delivery = entry.value;
+            delivery.deinit(self.allocator);
+        }
     }
 
     fn deliverFallbackFinal(
@@ -3204,43 +3258,34 @@ pub const SlackChannel = struct {
         media: []const []const u8,
         target: []const u8,
     ) !void {
-        const chunks = try chunkFinalFallbackReply(self.allocator, message);
-        defer stream_presenter.freeChunks(self.allocator, chunks);
-        var final_chunks = chunks;
-        var rebound_chunks: ?[][]const u8 = null;
-        defer if (rebound_chunks) |smaller| stream_presenter.freeChunks(self.allocator, smaller);
+        _ = media;
+        const key = try finalDeliveryKey(self.allocator, target, message, 0);
+        defer self.allocator.free(key);
+        if (self.final_deliveries.getPtr(key)) |delivery| return self.resumeFinalDelivery(parsed, key, delivery);
+        return self.beginFinalDelivery(parsed, key, ts, message);
+    }
 
-        self.updateStreamMessageMrkdwn(parsed, ts, final_chunks[0]) catch |err| {
-            if (err == error.SlackMessageTooLong) {
-                const smaller_mrkdwn = markdownToSlackMrkdwn(self.allocator, message) catch {
-                    log.warn("Slack streaming final chat.update conversion failed", .{});
-                    return vtableSend(@ptrCast(self), target, message, media);
-                };
-                defer self.allocator.free(smaller_mrkdwn);
-                rebound_chunks = stream_presenter.splitForSlackLimit(
-                    self.allocator,
-                    smaller_mrkdwn,
-                    stream_presenter.STREAM_UPDATE_MAX_BYTES / 2,
-                ) catch {
-                    log.warn("Slack streaming final chat.update could not be rebound", .{});
-                    return vtableSend(@ptrCast(self), target, message, media);
-                };
-                final_chunks = rebound_chunks.?;
-                self.updateStreamMessageMrkdwn(parsed, ts, final_chunks[0]) catch |retry_err| {
-                    log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(retry_err)});
-                    return vtableSend(@ptrCast(self), target, message, media);
-                };
-            } else {
-                log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
-                return vtableSend(@ptrCast(self), target, message, media);
-            }
-        };
-
-        // The authoritative reply must survive in full, regardless of how many
-        // chunks entity escaping or the smaller retry budget requires. Surface
-        // failures so the durable outbox can retry an incomplete delivery.
-        for (final_chunks[1..]) |chunk| {
-            try self.postStreamFollowup(parsed, chunk);
+    fn deliverFinalChunks(self: *SlackChannel, parsed: stream_presenter.StreamTarget, delivery: *FinalDelivery) !void {
+        if (delivery.next_chunk == 0 and delivery.message_ts.len > 0) {
+            self.updateStreamMessageMrkdwn(parsed, delivery.message_ts, delivery.chunks[0]) catch |err| {
+                if (err != error.SlackMessageTooLong or delivery.rebound) return err;
+                // No chunk has been accepted yet: halve the budget once and
+                // retain that exact split for all future delivery attempts.
+                const mrkdwn = try std.mem.concat(self.allocator, u8, delivery.chunks);
+                defer self.allocator.free(mrkdwn);
+                const smaller = try stream_presenter.splitForSlackLimit(self.allocator, mrkdwn, stream_presenter.STREAM_UPDATE_MAX_BYTES / 2);
+                stream_presenter.freeChunks(self.allocator, delivery.chunks);
+                delivery.chunks = smaller;
+                delivery.rebound = true;
+                try self.updateStreamMessageMrkdwn(parsed, delivery.message_ts, delivery.chunks[0]);
+            };
+            delivery.next_chunk = 1;
+        }
+        while (delivery.next_chunk < delivery.chunks.len) {
+            try self.postStreamFollowup(parsed, delivery.chunks[delivery.next_chunk]);
+            // Advance only after Slack accepts the chunk. A 429 or a transport
+            // error resumes here, without editing or posting the earlier chunks.
+            delivery.next_chunk += 1;
         }
     }
 
@@ -3272,6 +3317,26 @@ pub const SlackChannel = struct {
         if (result.error_code) |code| try self.recordNativeStreamFailure(code);
     }
 
+    /// Called under stream_mu; threads in the same channel share this budget.
+    fn pacePostMessage(self: *SlackChannel, channel_id: []const u8) !void {
+        const gop = try self.post_message_times.getOrPut(self.allocator, channel_id);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, channel_id) catch |err| {
+                _ = self.post_message_times.remove(channel_id);
+                return err;
+            };
+            gop.value_ptr.* = 0;
+        }
+        const now_ms = if (builtin.is_test) self.test_post_now_ms else std_compat.time.milliTimestamp();
+        const wait_ms = @max(@as(i64, 0), gop.value_ptr.* + std.time.ms_per_s - now_ms);
+        if (builtin.is_test) {
+            self.test_post_now_ms += wait_ms;
+        } else if (wait_ms > 0) {
+            std_compat.thread.sleep(@as(u64, @intCast(wait_ms)) * std.time.ns_per_ms);
+        }
+        gop.value_ptr.* = if (builtin.is_test) self.test_post_now_ms else std_compat.time.milliTimestamp();
+    }
+
     /// POST a Slack Web API method and return the parsed `ts` / `error` fields.
     /// Transport and JSON failures surface as errors; API-level failures are
     /// reported through `error_code` so callers can apply a retry policy.
@@ -3281,6 +3346,9 @@ pub const SlackChannel = struct {
         body: []const u8,
         context: ?[]const u8,
     ) !SlackApiResult {
+        if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+            if (context) |channel_id| try self.pacePostMessage(channel_id);
+        }
         // Streaming outbound must never touch the network under `zig build test`;
         // the throttling/fallback state machine is covered through this stub.
         if (builtin.is_test) {
@@ -3336,6 +3404,7 @@ pub const SlackChannel = struct {
         .stop = &vtableStop,
         .send = &vtableSend,
         .sendEvent = &vtableSendEvent,
+        .sendFinalDelivery = &vtableSendFinalDelivery,
         .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
@@ -3867,7 +3936,7 @@ test "slack native stream finishes on the fallback transport past the message bu
     const allocator = std.testing.allocator;
     const allowed = [_][]const u8{"U123"};
     var ch = SlackChannel.init(allocator, "xoxb-test", null, "C123", &allowed);
-    defer stream_presenter.deinitStreamStates(allocator, &ch.stream_states);
+    defer ch.deinitStreamStates();
 
     const target = "C123:1700000000.000100";
     const big = "x" ** (stream_presenter.STREAM_TOTAL_MAX_BYTES + 1);
@@ -3885,7 +3954,7 @@ test "slack native stream leaves for the fallback transport when a later flush c
     const allocator = std.testing.allocator;
     const allowed = [_][]const u8{"U123"};
     var ch = SlackChannel.init(allocator, "xoxb-test", null, "C123", &allowed);
-    defer stream_presenter.deinitStreamStates(allocator, &ch.stream_states);
+    defer ch.deinitStreamStates();
 
     const target = "C123:1700000000.000100";
     const part = "x" ** 7_000;
@@ -6785,16 +6854,173 @@ test "slack final retry retains the chunked delivery path after a partial failur
     try state.setMessageTs(allocator, "1700.2");
     const message = "if (a < b && c > d) {}\n" ** 1000 ++ "Final answer.";
     try std.testing.expectError(error.SlackStreamRejected, ch.channel().sendEvent(target, message, &.{}, .final));
-    try std.testing.expectEqualStrings("1700.2", state.message_ts);
+    try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
     try std.testing.expectEqual(@as(i64, 0), state.finished_at_ms);
+    try std.testing.expectEqual(@as(usize, 1), ch.final_deliveries.count());
+    const accepted_posts = probe.posts;
     probe.fail_post_at = null;
-    probe.delivered.clearRetainingCapacity();
-    probe.posts = 0;
     try ch.channel().sendEvent(target, message, &.{}, .final);
     const expected = try markdownToSlackMrkdwn(allocator, message);
     defer allocator.free(expected);
     try std.testing.expectEqualStrings(expected, probe.delivered.items);
     try std.testing.expect(probe.posts > 8);
     try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
-    try std.testing.expect(state.finished_at_ms != 0);
+    try std.testing.expect(probe.posts > accepted_posts);
+    try std.testing.expectEqual(@as(usize, 0), ch.final_deliveries.count());
+}
+
+const P0cDeliveryProbe = struct {
+    channel: *SlackChannel,
+    a: std.ArrayListUnmanaged(u8) = .empty,
+    b: std.ArrayListUnmanaged(u8) = .empty,
+    posts: usize = 0,
+    updates: usize = 0,
+    fail_post_at: ?usize = null,
+    enforce_rate: bool = false,
+    last_post_ms: ?i64 = null,
+    overwritten: bool = false,
+
+    fn deinit(self: *@This()) void {
+        self.a.deinit(std.testing.allocator);
+        self.b.deinit(std.testing.allocator);
+    }
+
+    fn call(ctx: *anyopaque, allocator: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const obj = parsed.value.object;
+        const text = obj.get("text").?.string;
+        try std.testing.expect(stream_presenter.slackEscapedLen(text) <= stream_presenter.STREAM_UPDATE_MAX_BYTES);
+        const is_b = std.mem.indexOfScalar(u8, text, 'B') != null;
+        if (std.mem.eql(u8, endpoint, "chat.update")) {
+            self.updates += 1;
+            if (is_b and std.mem.eql(u8, obj.get("ts").?.string, "1700.2")) self.overwritten = true;
+        } else if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+            self.posts += 1;
+            if (self.fail_post_at == self.posts) {
+                self.fail_post_at = null;
+                return .{ .error_code = try allocator.dupe(u8, "ratelimited") };
+            }
+            if (self.enforce_rate) {
+                const now = self.channel.test_post_now_ms;
+                if (self.last_post_ms) |last| {
+                    if (now - last < 1000) return .{ .error_code = try allocator.dupe(u8, "ratelimited") };
+                }
+                self.last_post_ms = now;
+            }
+        } else return error.UnexpectedEndpoint;
+        if (is_b) {
+            // B's preview is reconciled in place, so retain only its final body.
+            if (std.mem.eql(u8, endpoint, "chat.update")) self.b.clearRetainingCapacity();
+            try self.b.appendSlice(allocator, text);
+        } else try self.a.appendSlice(allocator, text);
+        return .{ .ts = try allocator.dupe(u8, "1700.3") };
+    }
+};
+
+test "p0c slack partial final stays isolated from the next turn" {
+    // Regression: B overwrote A's preview during outbox backoff, then A retried
+    // as a single 50,000-byte send after B cleared the shared target state.
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = P0cDeliveryProbe{ .channel = &ch, .fail_post_at = 2 };
+    defer probe.deinit();
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = P0cDeliveryProbe.call;
+    const target = "C_TEST:1700.1";
+    const state = try ch.ensureStreamStateLocked(target, 1);
+    state.mode = .fallback;
+    try state.setMessageTs(allocator, "1700.2");
+    const a = "A" ** 50_000;
+    try std.testing.expectError(error.SlackStreamRejected, ch.channel().sendEvent(target, a, &.{}, .final));
+    // Move past the pre-existing late-delta grace window without waiting.
+    if (ch.stream_states.getPtr(target)) |active| active.finished_at_ms -= stream_presenter.STREAM_LATE_CHUNK_GRACE_MS + 1;
+    ch.native_stream_disabled.store(true, .release);
+    try ch.channel().sendEvent(target, "B" ** 200, &.{}, .chunk);
+    try ch.channel().sendEvent(target, "B final", &.{}, .final);
+    try std.testing.expect(!probe.overwritten);
+    try ch.channel().sendEvent(target, a, &.{}, .final);
+    try std.testing.expectEqualStrings(a, probe.a.items);
+    try std.testing.expectEqualStrings("B final", probe.b.items);
+}
+
+test "p0c slack final chunks obey channel pacing and resume after a rejection" {
+    // Regression: retries repeated the first successful follow-up, then hit the
+    // same per-channel rate limit again, never delivering the tail in 5 tries.
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = P0cDeliveryProbe{ .channel = &ch, .fail_post_at = 2, .enforce_rate = true };
+    defer probe.deinit();
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = P0cDeliveryProbe.call;
+    const target = "C_TEST:1700.1";
+    const state = try ch.ensureStreamStateLocked(target, 1);
+    state.mode = .fallback;
+    try state.setMessageTs(allocator, "1700.2");
+    const message = "A" ** 50_000;
+    var complete = false;
+    for (0..5) |_| {
+        ch.channel().sendEvent(target, message, &.{}, .final) catch {
+            ch.test_post_now_ms += 10_000;
+            continue;
+        };
+        complete = true;
+        break;
+    }
+    try std.testing.expect(complete);
+    try std.testing.expectEqualStrings(message, probe.a.items);
+    try std.testing.expectEqual(@as(usize, 1), probe.updates);
+}
+
+test "p0c slack durable identity separates identical replies while retry preserves another preview" {
+    // Regression: target-only state let even a later final consume the earlier
+    // job's preview; durable IDs must distinguish two byte-identical replies.
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = P0cDeliveryProbe{ .channel = &ch, .fail_post_at = 2, .enforce_rate = true };
+    defer probe.deinit();
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = P0cDeliveryProbe.call;
+    const target = "C_TEST:1700.1";
+    const state = try ch.ensureStreamStateLocked(target, 1);
+    state.mode = .fallback;
+    try state.setMessageTs(allocator, "1700.2");
+    const message = "A" ** 50_000;
+    try std.testing.expectError(error.SlackStreamRejected, ch.channel().sendFinalDelivery(target, message, &.{}, 1));
+    // An identical reply is a separate job and must start its own message.
+    try ch.channel().sendFinalDelivery(target, message, &.{}, 2);
+    if (ch.stream_states.getPtr(target)) |active| active.finished_at_ms -= stream_presenter.STREAM_LATE_CHUNK_GRACE_MS + 1;
+    ch.native_stream_disabled.store(true, .release);
+    try ch.channel().sendEvent(target, "B" ** 200, &.{}, .chunk);
+    const b_state = ch.stream_states.getPtr(target).?;
+    try std.testing.expectEqualStrings("1700.3", b_state.message_ts);
+    const b_buffer_len = b_state.buffer.items.len;
+    try ch.channel().sendFinalDelivery(target, message, &.{}, 1);
+    try std.testing.expectEqualStrings("1700.3", b_state.message_ts);
+    try std.testing.expectEqual(b_buffer_len, b_state.buffer.items.len);
+    try ch.channel().sendFinalDelivery(target, "B final", &.{}, 3);
+    try std.testing.expect(!probe.overwritten);
+    try std.testing.expectEqualStrings(message ++ message, probe.a.items);
+    try std.testing.expectEqualStrings("B final", probe.b.items);
+    try std.testing.expectEqual(@as(usize, 0), ch.final_deliveries.count());
+}
+
+test "p0c slack posting budget is shared across threads but separate across channels" {
+    // Regression: consecutive final follow-ups in different threads still share
+    // Slack's channel quota. Simulated time proves pacing without a wall clock.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    ch.stream_mu.lock();
+    defer ch.stream_mu.unlock();
+    try ch.postStreamFollowup(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "first");
+    const first = ch.test_post_now_ms;
+    try ch.postStreamFollowup(.{ .channel_id = "C_TEST", .thread_ts = "1700.2" }, "second");
+    try std.testing.expectEqual(first + 1000, ch.test_post_now_ms);
+    const second = ch.test_post_now_ms;
+    try ch.postStreamFollowup(.{ .channel_id = "C_OTHER" }, "other channel");
+    try std.testing.expectEqual(second, ch.test_post_now_ms);
 }
