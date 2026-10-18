@@ -509,7 +509,86 @@ fn escapedSafeTailStart(text: []const u8, limit: usize) usize {
     return start;
 }
 
+/// Fence state carried across chunks: the language tag of an open ``` block.
+const FenceState = struct {
+    lang: ?[]const u8 = null,
+};
+
+/// Advance the fence state over the complete lines in `text[from..to]`. A
+/// newline at `to` also completes the line. `next_pos` receives the start of
+/// the first line left unscanned; the caller passes it back as `from`.
+fn advanceFenceState(
+    state_in: FenceState,
+    text: []const u8,
+    from: usize,
+    to: usize,
+    next_pos: *usize,
+) FenceState {
+    var state = state_in;
+    var pos = from;
+    var end = to;
+    if (end < text.len and text[end] == '\n') end += 1;
+    while (pos < end) {
+        const nl = std.mem.indexOfScalarPos(u8, text, pos, '\n') orelse break;
+        if (nl >= end) break;
+        const trimmed = std.mem.trimStart(u8, text[pos..nl], " \t");
+        if (std.mem.startsWith(u8, trimmed, "```")) {
+            state.lang = if (state.lang == null)
+                std.mem.trim(u8, trimmed[3..], " \t\r")
+            else
+                null;
+        }
+        pos = nl + 1;
+    }
+    next_pos.* = pos;
+    return state;
+}
+
+/// True when the chunk window can touch a fence line, so the chunker reserves
+/// room for a closing/reopening fence. No chunk consumes more than `limit`.
+fn windowMayContainFence(state: FenceState, rest: []const u8, limit: usize) bool {
+    return state.lang != null or
+        std.mem.indexOf(u8, rest[0..@min(rest.len, limit)], "```") != null;
+}
+
+/// Build one chunk, reopening `reopen_lang` at the start and closing the block
+/// at the end when the cut falls inside a fence.
+fn buildFencedChunk(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    reopen_lang: ?[]const u8,
+    close_fence: bool,
+) ![]u8 {
+    const prefix_len: usize = if (reopen_lang) |lang| 3 + lang.len + 1 else 0;
+    const needs_newline = close_fence and (body.len == 0 or body[body.len - 1] != '\n');
+    const close_len: usize = if (close_fence) 3 + @as(usize, @intFromBool(needs_newline)) else 0;
+    const out = try allocator.alloc(u8, prefix_len + body.len + close_len);
+    var w: usize = 0;
+    if (reopen_lang) |lang| {
+        @memcpy(out[w..][0..3], "```");
+        w += 3;
+        @memcpy(out[w..][0..lang.len], lang);
+        w += lang.len;
+        out[w] = '\n';
+        w += 1;
+    }
+    @memcpy(out[w..][0..body.len], body);
+    w += body.len;
+    if (close_fence) {
+        if (needs_newline) {
+            out[w] = '\n';
+            w += 1;
+        }
+        @memcpy(out[w..][0..3], "```");
+        w += 3;
+    }
+    std.debug.assert(w == out.len);
+    return out;
+}
+
 /// Split text so each chunk's escaped mrkdwn length fits Slack's limit.
+/// A code fence open at a cut is closed at the end of the chunk and reopened
+/// with the same language tag at the start of the next one.
 pub fn splitForSlackLimit(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -522,7 +601,14 @@ pub fn splitForSlackLimit(
         chunks.deinit(allocator);
     }
     var rest = text;
-    while (slackEscapedLen(rest) > limit) {
+    var fence = FenceState{};
+    var scan_pos: usize = 0;
+    var reopen_lang: ?[]const u8 = null;
+    while (true) {
+        const prefix_len: usize = if (reopen_lang) |lang| 3 + lang.len + 1 else 0;
+        if (slackEscapedLen(rest) + prefix_len <= limit) break;
+        const reserve: usize = prefix_len + (if (windowMayContainFence(fence, rest, limit)) @as(usize, 4) else 0);
+        const budget = if (limit > reserve) limit - reserve else limit;
         var cost: usize = 0;
         var cut: usize = 0;
         var i: usize = 0;
@@ -534,7 +620,7 @@ pub fn splitForSlackLimit(
                 '<', '>' => 4,
                 else => next - i,
             };
-            if (cost + cp_cost > limit) break;
+            if (cost + cp_cost > budget) break;
             cost += cp_cost;
             cut = next;
             i = next;
@@ -545,10 +631,17 @@ pub fn splitForSlackLimit(
             // preserve code lines as well as every byte of the answer.
             cut = nl + 1;
         }
-        try chunks.append(allocator, try allocator.dupe(u8, rest[0..cut]));
+        const base = text.len - rest.len;
+        var next_scan_pos: usize = undefined;
+        fence = advanceFenceState(fence, text, scan_pos, base + cut, &next_scan_pos);
+        scan_pos = next_scan_pos;
+        try chunks.append(allocator, try buildFencedChunk(allocator, rest[0..cut], reopen_lang, fence.lang != null));
+        reopen_lang = fence.lang;
         rest = rest[cut..];
     }
-    if (rest.len > 0 or chunks.items.len == 0) try chunks.append(allocator, try allocator.dupe(u8, rest));
+    if (rest.len > 0 or chunks.items.len == 0) {
+        try chunks.append(allocator, try buildFencedChunk(allocator, rest, reopen_lang, false));
+    }
     return chunks.toOwnedSlice(allocator);
 }
 
@@ -578,7 +671,8 @@ pub fn boundUpdatePreview(allocator: std.mem.Allocator, text: []const u8, limit:
 
 /// Split `text` into pieces of at most `limit` bytes, preferring a newline
 /// boundary so code blocks and lists stay readable. Caller frees each piece
-/// and the returned slice via `freeChunks`.
+/// and the returned slice via `freeChunks`. Code fences are closed and
+/// reopened across cuts the same way as `splitForSlackLimit`.
 pub fn splitForLimit(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -592,17 +686,30 @@ pub fn splitForLimit(
     }
 
     var rest = text;
-    while (rest.len > limit) {
-        var cut = utf8SafeCut(rest, limit);
+    var fence = FenceState{};
+    var scan_pos: usize = 0;
+    var reopen_lang: ?[]const u8 = null;
+    while (true) {
+        const prefix_len: usize = if (reopen_lang) |lang| 3 + lang.len + 1 else 0;
+        if (rest.len + prefix_len <= limit) break;
+        const reserve: usize = prefix_len + (if (windowMayContainFence(fence, rest, limit)) @as(usize, 4) else 0);
+        const budget = if (limit > reserve) limit - reserve else limit;
+        var cut = utf8SafeCut(rest, budget);
         if (std.mem.lastIndexOfScalar(u8, rest[0..cut], '\n')) |nl| {
             if (nl > 0) cut = nl;
         }
-        try chunks.append(allocator, try allocator.dupe(u8, rest[0..cut]));
+        if (cut == 0) cut = @min(std.unicode.utf8ByteSequenceLength(rest[0]) catch 1, rest.len);
+        const base = text.len - rest.len;
+        var next_scan_pos: usize = undefined;
+        fence = advanceFenceState(fence, text, scan_pos, base + cut, &next_scan_pos);
+        scan_pos = next_scan_pos;
+        try chunks.append(allocator, try buildFencedChunk(allocator, rest[0..cut], reopen_lang, fence.lang != null));
+        reopen_lang = fence.lang;
         rest = rest[cut..];
         // Drop the boundary newline so the next chunk does not start blank.
         if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
     }
-    if (rest.len > 0) try chunks.append(allocator, try allocator.dupe(u8, rest));
+    if (rest.len > 0) try chunks.append(allocator, try buildFencedChunk(allocator, rest, reopen_lang, false));
     return chunks.toOwnedSlice(allocator);
 }
 
@@ -1027,6 +1134,79 @@ test "splitForLimit handles text without newlines" {
     try std.testing.expectEqual(@as(usize, 3), chunks.len);
     try std.testing.expectEqual(@as(usize, 10), chunks[0].len);
     try std.testing.expectEqual(@as(usize, 5), chunks[2].len);
+}
+
+test "splitForSlackLimit closes and reopens a code fence across chunks" {
+    // Regression: a single-line fenced code block longer than the cap was cut
+    // mid-block, so the chunk rendered as plain text and the next chunk lost
+    // its language tag.
+    const text = "```zig\n" ++ ("x" ** 3696) ++ "\n```";
+    const limit = 1_000;
+    const chunks = try splitForSlackLimit(std.testing.allocator, text, limit);
+    defer freeChunks(std.testing.allocator, chunks);
+
+    try std.testing.expect(chunks.len > 2);
+    try std.testing.expect(std.mem.startsWith(u8, chunks[0], "```zig\n"));
+    for (chunks) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk));
+        try std.testing.expect(slackEscapedLen(chunk) <= limit);
+    }
+    for (chunks[0 .. chunks.len - 1]) |chunk| {
+        try std.testing.expect(std.mem.endsWith(u8, chunk, "```"));
+    }
+    for (chunks[1..]) |chunk| {
+        try std.testing.expect(std.mem.startsWith(u8, chunk, "```zig\n"));
+    }
+    try std.testing.expect(std.mem.endsWith(u8, chunks[chunks.len - 1], "```"));
+}
+
+test "splitForLimit closes and reopens a code fence across chunks" {
+    const text = "```zig\n" ++ ("x" ** 3696) ++ "\n```";
+    const limit = 1_000;
+    const chunks = try splitForLimit(std.testing.allocator, text, limit);
+    defer freeChunks(std.testing.allocator, chunks);
+
+    try std.testing.expect(chunks.len > 2);
+    for (chunks) |chunk| {
+        try std.testing.expect(std.unicode.utf8ValidateSlice(chunk));
+        try std.testing.expect(chunk.len <= limit);
+    }
+    for (chunks[0 .. chunks.len - 1]) |chunk| {
+        try std.testing.expect(std.mem.endsWith(u8, chunk, "```"));
+    }
+    for (chunks[1..]) |chunk| {
+        try std.testing.expect(std.mem.startsWith(u8, chunk, "```zig\n"));
+    }
+}
+
+test "splitForSlackLimit keeps fences balanced around multi-chunk code and prose" {
+    const text = "Intro\n```python\n" ++ ("y" ** 2500) ++ "\n```\nOutro " ++ ("z" ** 2000);
+    const limit = 600;
+    const chunks = try splitForSlackLimit(std.testing.allocator, text, limit);
+    defer freeChunks(std.testing.allocator, chunks);
+
+    try std.testing.expect(chunks.len > 4);
+    for (chunks) |chunk| try std.testing.expect(std.unicode.utf8ValidateSlice(chunk));
+    // Only the original language tag is ever used to reopen a block.
+    for (chunks[1..]) |chunk| {
+        if (std.mem.startsWith(u8, chunk, "```")) {
+            try std.testing.expect(std.mem.startsWith(u8, chunk, "```python\n"));
+        }
+    }
+    // Prose after the closed block never grows a fence.
+    const last = chunks[chunks.len - 1];
+    try std.testing.expect(!std.mem.startsWith(u8, last, "```"));
+    try std.testing.expect(std.mem.endsWith(u8, last, "z"));
+}
+
+test "splitForSlackLimit leaves already-closed fences untouched" {
+    const code_block = "```js\n" ++ ("a" ** 20) ++ "\n```\n";
+    const text = code_block ++ ("b" ** 100);
+    const chunks = try splitForSlackLimit(std.testing.allocator, text, 60);
+    defer freeChunks(std.testing.allocator, chunks);
+
+    try std.testing.expectEqualStrings(code_block, chunks[0]);
+    for (chunks[1..]) |chunk| try std.testing.expect(!std.mem.startsWith(u8, chunk, "```"));
 }
 
 test "slackEscapedLen counts mrkdwn entity expansion" {
