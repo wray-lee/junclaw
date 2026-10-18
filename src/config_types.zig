@@ -751,6 +751,11 @@ pub const SlackConfig = struct {
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
+    /// A reply in a channel thread the bot has already posted into counts as
+    /// a mention, so the conversation can continue without re-mentioning the
+    /// bot under `group_policy = mention_only`. On by default (OpenClaw
+    /// parity). Top-level messages and DMs are unaffected.
+    implicit_thread_mention: bool = true,
     /// Single-command slash integration. See SlackSlashCommandConfig.
     slash_command: SlackSlashCommandConfig = .{},
     /// Stream replies while the model is still generating them.

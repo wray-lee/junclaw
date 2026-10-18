@@ -1898,16 +1898,6 @@ fn slackDecodeInteractivePayload(allocator: std.mem.Allocator, body: []const u8)
     return null;
 }
 
-fn slackParseCallbackValue(value: []const u8) ?struct { token: []const u8, option_index: usize } {
-    if (!std.mem.startsWith(u8, value, "ncslack:")) return null;
-    const rest = value["ncslack:".len..];
-    const sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
-    const token = rest[0..sep];
-    if (token.len == 0) return null;
-    const option_index = std.fmt.parseUnsigned(usize, rest[sep + 1 ..], 10) catch return null;
-    return .{ .token = token, .option_index = option_index };
-}
-
 const SlackInteractiveTarget = struct {
     channel_id: []const u8,
     thread_id: ?[]const u8 = null,
@@ -4108,7 +4098,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         }
-        const parsed_callback = slackParseCallbackValue(value_val.string) orelse {
+        const parsed_callback = channels.slack.parseCallbackValue(value_val.string) orelse {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         };
@@ -7650,8 +7640,8 @@ test "slackDecodeInteractivePayload finds payload after other form fields" {
     try std.testing.expectEqualStrings("{\"type\":\"block_actions\"}", decoded);
 }
 
-test "slackParseCallbackValue parses token and option index" {
-    const parsed = slackParseCallbackValue("ncslack:abc123:2") orelse return error.TestUnexpectedResult;
+test "slack parseCallbackValue parses token and option index" {
+    const parsed = channels.slack.parseCallbackValue("ncslack:abc123:2") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("abc123", parsed.token);
     try std.testing.expectEqual(@as(usize, 2), parsed.option_index);
 }
