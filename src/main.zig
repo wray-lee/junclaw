@@ -5360,9 +5360,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     var runtime_telegram_config = telegram_config;
     runtime_telegram_config.allow_from = allowed;
     var tg = yc.channels.telegram.TelegramChannel.initFromConfig(allocator, runtime_telegram_config);
-    tg.text_debounce_secs = yc.channels.telegram.TelegramChannel.textDebounceSecsFromMs(
-        config.messages.inbound.debounce_ms,
-    );
+    tg.text_debounce_ms = config.messages.inbound.debounce_ms;
     const runtime = yc.channel_loop.ChannelRuntime.init(allocator, &config) catch |err| {
         std.debug.print("Runtime init failed: {}\n", .{err});
         std_compat.process.exit(1);

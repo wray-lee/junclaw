@@ -476,11 +476,11 @@ For an untrusted guest prefer `"level": "read_only"`: it disables all tool calls
 ### `messages.inbound`
 
 - `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.
-- Default: `3000`.
+- Default: `300`.
 - Applies to daemon-routed inbound text and the Agent CLI REPL.
 - Set `0` to disable it.
 - Slash commands and media-bearing inbound messages bypass debounce.
-- Telegram keeps its channel-specific split-message merge path; this setting becomes the base debounce window for that path.
+- Telegram keeps its channel-specific split-message merge path: this value is the base window (default 300 ms) for merging split Telegram messages, and near-limit pastes (4000+ bytes or 4+ fragments) wait at least 1500 ms.
 
 Example:
 

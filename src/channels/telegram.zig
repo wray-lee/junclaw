@@ -668,7 +668,7 @@ pub const TelegramChannel = struct {
     pending_media_received_at: std.ArrayListUnmanaged(u64) = .empty,
     pending_text_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
     pending_text_received_at: std.ArrayListUnmanaged(u64) = .empty,
-    text_debounce_secs: u64 = telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS,
+    text_debounce_ms: u64 = telegram_ingress.TEXT_MESSAGE_DEBOUNCE_MS,
     polls_since_temp_sweep: u32 = 0,
 
     typing_mu: std_compat.sync.Mutex = .{},
@@ -745,11 +745,6 @@ pub const TelegramChannel = struct {
             .last_update_id = 0,
             .proxy = null,
         };
-    }
-
-    pub fn textDebounceSecsFromMs(debounce_ms: u32) u64 {
-        if (debounce_ms == 0) return 0;
-        return @divFloor(@as(u64, debounce_ms) + 999, 1000);
     }
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.TelegramConfig) TelegramChannel {
@@ -2721,7 +2716,7 @@ pub const TelegramChannel = struct {
             return;
         }
 
-        const now = root.nowEpochSecs();
+        const now = root.nowEpochMs();
 
         var i: usize = 0;
         while (i < self.pending_text_messages.items.len) {
@@ -2730,7 +2725,7 @@ pub const TelegramChannel = struct {
                 self.pending_text_messages.items,
                 self.pending_text_received_at.items,
                 i,
-                self.text_debounce_secs,
+                self.text_debounce_ms,
             )) {
                 i += 1;
                 continue;
@@ -2782,21 +2777,25 @@ pub const TelegramChannel = struct {
         // If pending media/text debounced buffers exist, cap timeout to nearest deadline.
         var poll_timeout: u64 = 30;
         {
-            const t_now = root.nowEpochSecs();
-            var next_deadline: ?u64 = null;
+            var next_deadline_secs: ?u64 = null;
 
             if (nextPendingMediaDeadline(self.pending_media_group_ids.items, self.pending_media_received_at.items)) |deadline| {
-                next_deadline = deadline;
+                next_deadline_secs = deadline;
             }
-            if (telegram_ingress.nextPendingTextDeadlineWithBase(
+            if (telegram_ingress.nextPendingTextDeadlineMsWithBase(
                 self.pending_text_messages.items,
                 self.pending_text_received_at.items,
-                self.text_debounce_secs,
-            )) |deadline| {
-                if (next_deadline == null or deadline < next_deadline.?) next_deadline = deadline;
+                self.text_debounce_ms,
+            )) |deadline_ms| {
+                // getUpdates takes whole seconds; round up so we never wake early.
+                const now_ms = root.nowEpochMs();
+                const remaining_ms = if (deadline_ms > now_ms) deadline_ms - now_ms else 0;
+                const deadline_secs = now_ms / 1000 + (remaining_ms + 999) / 1000;
+                if (next_deadline_secs == null or deadline_secs < next_deadline_secs.?) next_deadline_secs = deadline_secs;
             }
 
-            if (next_deadline) |deadline| {
+            if (next_deadline_secs) |deadline| {
+                const t_now = root.nowEpochSecs();
                 if (t_now >= deadline) {
                     poll_timeout = 0;
                 } else {
@@ -2920,11 +2919,11 @@ pub const TelegramChannel = struct {
             var i: usize = 0;
             while (i < messages.items.len) {
                 if (!telegram_ingress.shouldDebounceTextMessageWithBase(
-                    root.nowEpochSecs(),
+                    root.nowEpochMs(),
                     self.pending_text_messages.items,
                     self.pending_text_received_at.items,
                     messages.items[i],
-                    self.text_debounce_secs,
+                    self.text_debounce_ms,
                 )) {
                     // Explicitly cancel stale chain fragments for this sender/chat
                     // so a fresh message is not blocked by old pending chunks.
@@ -2950,7 +2949,7 @@ pub const TelegramChannel = struct {
                     rollback.deinit(self.allocator);
                     continue;
                 };
-                self.pending_text_received_at.append(self.allocator, root.nowEpochSecs()) catch {
+                self.pending_text_received_at.append(self.allocator, root.nowEpochMs()) catch {
                     const popped_msg = self.pending_text_messages.pop().?;
                     var rollback = popped_msg;
                     rollback.deinit(self.allocator);
@@ -5644,7 +5643,7 @@ test "telegram persistableUpdateOffset waits until pending text flushes" {
         .timestamp = now,
         .message_id = 1,
     });
-    try ch.pending_text_received_at.append(alloc, now);
+    try ch.pending_text_received_at.append(alloc, root.nowEpochMs());
 
     try std.testing.expect(ch.persistableUpdateOffset() == null);
 
@@ -5657,7 +5656,7 @@ test "telegram flushMaturedPendingTextMessages waits for newest chain message" {
     const alloc = std.testing.allocator;
     var ch = TelegramChannel.init(alloc, "123:ABC", &.{"*"}, &.{}, "allowlist");
 
-    const now = root.nowEpochSecs();
+    const now = root.nowEpochMs();
 
     try ch.pending_text_messages.append(alloc, .{
         .id = try alloc.dupe(u8, "user-a"),
@@ -5667,7 +5666,7 @@ test "telegram flushMaturedPendingTextMessages waits for newest chain message" {
         .timestamp = now - 10,
         .message_id = 1,
     });
-    try ch.pending_text_received_at.append(alloc, now - 10);
+    try ch.pending_text_received_at.append(alloc, now - 10_000);
 
     try ch.pending_text_messages.append(alloc, .{
         .id = try alloc.dupe(u8, "user-a"),
@@ -5700,7 +5699,7 @@ test "telegram flushMaturedPendingTextMessages waits for newest chain message" {
     try std.testing.expectEqual(@as(usize, 2), ch.pending_text_messages.items.len);
 
     // Force chain maturity by moving the newest timestamp back.
-    ch.pending_text_received_at.items[1] = now - (telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS + 1);
+    ch.pending_text_received_at.items[1] = now - (telegram_ingress.TEXT_MESSAGE_DEBOUNCE_MS + 1);
     ch.flushMaturedPendingTextMessages(alloc, &out_messages, &out_group_ids);
 
     try std.testing.expectEqual(@as(usize, 2), out_messages.items.len);
@@ -6839,13 +6838,6 @@ test "parseTelegramTarget accepts canonical thread suffix" {
     const parsed = parseTelegramTarget("-100123:thread:77");
     try std.testing.expectEqualStrings("-100123", parsed.chat_id);
     try std.testing.expectEqual(@as(?i64, 77), parsed.message_thread_id);
-}
-
-test "TelegramChannel textDebounceSecsFromMs rounds up milliseconds" {
-    try std.testing.expectEqual(@as(u64, 0), TelegramChannel.textDebounceSecsFromMs(0));
-    try std.testing.expectEqual(@as(u64, 1), TelegramChannel.textDebounceSecsFromMs(1));
-    try std.testing.expectEqual(@as(u64, 3), TelegramChannel.textDebounceSecsFromMs(3000));
-    try std.testing.expectEqual(@as(u64, 4), TelegramChannel.textDebounceSecsFromMs(3001));
 }
 
 test "supportsDraftPreviewTarget disables draft preview for topic targets" {

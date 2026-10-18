@@ -342,7 +342,7 @@ pub const ReliabilityConfig = struct {
 };
 
 pub const InboundMessagesConfig = struct {
-    debounce_ms: u32 = 3_000,
+    debounce_ms: u32 = 300,
 };
 
 pub const MessagesConfig = struct {

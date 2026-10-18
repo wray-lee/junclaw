@@ -412,11 +412,11 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 ### `messages.inbound`
 
 - `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。
-- 默认值：`3000`。
+- 默认值：`300`。
 - 作用范围包括 daemon 路由的入站文本和 Agent CLI REPL。
 - 设为 `0` 可关闭。
 - slash 命令和带媒体的入站消息会跳过 debounce。
-- Telegram 仍保留自己的长消息分段合并逻辑；这里的值会作为那条逻辑的基础 debounce 窗口。
+- Telegram 仍保留自己的长消息分段合并逻辑：该值作为基础窗口（默认 300ms），接近单条上限的长文本（≥4000 字节或 ≥4 个片段）至少等待 1500ms 后再合并。
 
 示例：
 

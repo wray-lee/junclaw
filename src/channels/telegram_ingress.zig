@@ -1,10 +1,11 @@
 const std = @import("std");
 const root = @import("root.zig");
 
-pub const TEXT_MESSAGE_DEBOUNCE_SECS: u64 = 3;
-pub const LARGE_TEXT_CHAIN_DEBOUNCE_SECS: u64 = 8;
+pub const TEXT_MESSAGE_DEBOUNCE_MS: u64 = 300;
+pub const LARGE_TEXT_CHAIN_DEBOUNCE_MS: u64 = 1_500;
 pub const LARGE_TEXT_CHAIN_MIN_PARTS: usize = 4;
-pub const LARGE_TEXT_CHAIN_MIN_BYTES: usize = 16 * 1024;
+// Near Telegram's 4096-char limit; matches OpenClaw's long-paste cap.
+pub const LARGE_TEXT_CHAIN_MIN_BYTES: usize = 4_000;
 pub const TEXT_SPLIT_LIKELY_MIN_LEN: usize = 500;
 
 pub const PendingTextChainStats = struct {
@@ -61,30 +62,30 @@ pub fn pendingTextChainStatsForKey(
     return .{ .latest = latest, .parts = parts, .total_bytes = total_bytes };
 }
 
-pub fn textDebounceSecsForChainWithBase(parts: usize, total_bytes: usize, base_debounce_secs: u64) u64 {
-    if (base_debounce_secs == 0) return 0;
+pub fn textDebounceMsForChainWithBase(parts: usize, total_bytes: usize, base_debounce_ms: u64) u64 {
+    if (base_debounce_ms == 0) return 0;
     if (parts >= LARGE_TEXT_CHAIN_MIN_PARTS or total_bytes >= LARGE_TEXT_CHAIN_MIN_BYTES) {
-        return @max(base_debounce_secs, LARGE_TEXT_CHAIN_DEBOUNCE_SECS);
+        return @max(base_debounce_ms, LARGE_TEXT_CHAIN_DEBOUNCE_MS);
     }
-    return base_debounce_secs;
+    return base_debounce_ms;
 }
 
-pub fn textDebounceSecsForChain(parts: usize, total_bytes: usize) u64 {
-    return textDebounceSecsForChainWithBase(parts, total_bytes, TEXT_MESSAGE_DEBOUNCE_SECS);
+pub fn textDebounceMsForChain(parts: usize, total_bytes: usize) u64 {
+    return textDebounceMsForChainWithBase(parts, total_bytes, TEXT_MESSAGE_DEBOUNCE_MS);
 }
 
-fn chainStillWarm(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
-    const debounce_secs = textDebounceSecsForChainWithBase(
+fn chainStillWarm(now_ms: u64, stats: PendingTextChainStats, base_debounce_ms: u64) bool {
+    const debounce_ms = textDebounceMsForChainWithBase(
         stats.parts,
         stats.total_bytes,
-        base_debounce_secs,
+        base_debounce_ms,
     );
-    if (debounce_secs == 0) return false;
-    return now <= stats.latest + debounce_secs;
+    if (debounce_ms == 0) return false;
+    return now_ms <= stats.latest + debounce_ms;
 }
 
-fn chainIsMature(now: u64, stats: PendingTextChainStats, base_debounce_secs: u64) bool {
-    return !chainStillWarm(now, stats, base_debounce_secs);
+fn chainIsMature(now_ms: u64, stats: PendingTextChainStats, base_debounce_ms: u64) bool {
+    return !chainStillWarm(now_ms, stats, base_debounce_ms);
 }
 
 pub fn pendingTextBuffersInSync(
@@ -94,19 +95,19 @@ pub fn pendingTextBuffersInSync(
     return pending_messages.len == received_at.len;
 }
 
-pub fn nextPendingTextDeadline(
+pub fn nextPendingTextDeadlineMs(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
 ) ?u64 {
-    return nextPendingTextDeadlineWithBase(pending_messages, received_at, TEXT_MESSAGE_DEBOUNCE_SECS);
+    return nextPendingTextDeadlineMsWithBase(pending_messages, received_at, TEXT_MESSAGE_DEBOUNCE_MS);
 }
 
-pub fn nextPendingTextDeadlineWithBase(
+pub fn nextPendingTextDeadlineMsWithBase(
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
-    base_debounce_secs: u64,
+    base_debounce_ms: u64,
 ) ?u64 {
-    if (base_debounce_secs == 0) return null;
+    if (base_debounce_ms == 0) return null;
 
     const n = @min(pending_messages.len, received_at.len);
     var seen = false;
@@ -118,10 +119,10 @@ pub fn nextPendingTextDeadlineWithBase(
             pending_messages,
             received_at,
         ) orelse continue;
-        const deadline = stats.latest + textDebounceSecsForChainWithBase(
+        const deadline = stats.latest + textDebounceMsForChainWithBase(
             stats.parts,
             stats.total_bytes,
-            base_debounce_secs,
+            base_debounce_ms,
         );
         if (!seen or deadline < next_deadline) next_deadline = deadline;
         seen = true;
@@ -130,28 +131,28 @@ pub fn nextPendingTextDeadlineWithBase(
 }
 
 pub fn shouldDebounceTextMessage(
-    now: u64,
+    now_ms: u64,
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
     msg: root.ChannelMessage,
 ) bool {
     return shouldDebounceTextMessageWithBase(
-        now,
+        now_ms,
         pending_messages,
         received_at,
         msg,
-        TEXT_MESSAGE_DEBOUNCE_SECS,
+        TEXT_MESSAGE_DEBOUNCE_MS,
     );
 }
 
 pub fn shouldDebounceTextMessageWithBase(
-    now: u64,
+    now_ms: u64,
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
     msg: root.ChannelMessage,
-    base_debounce_secs: u64,
+    base_debounce_ms: u64,
 ) bool {
-    if (base_debounce_secs == 0) return false;
+    if (base_debounce_ms == 0) return false;
     if (!hasMessageId(msg)) return false;
     if (msg.is_interaction) return false;
     if (isSlashCommandMessage(msg.content)) return false;
@@ -163,30 +164,30 @@ pub fn shouldDebounceTextMessageWithBase(
         pending_messages,
         received_at,
     ) orelse return false;
-    return chainStillWarm(now, stats, base_debounce_secs);
+    return chainStillWarm(now_ms, stats, base_debounce_ms);
 }
 
 pub fn pendingTextChainMatureAtIndex(
-    now: u64,
+    now_ms: u64,
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
     index: usize,
 ) bool {
     return pendingTextChainMatureAtIndexWithBase(
-        now,
+        now_ms,
         pending_messages,
         received_at,
         index,
-        TEXT_MESSAGE_DEBOUNCE_SECS,
+        TEXT_MESSAGE_DEBOUNCE_MS,
     );
 }
 
 pub fn pendingTextChainMatureAtIndexWithBase(
-    now: u64,
+    now_ms: u64,
     pending_messages: []const root.ChannelMessage,
     received_at: []const u64,
     index: usize,
-    base_debounce_secs: u64,
+    base_debounce_ms: u64,
 ) bool {
     if (index >= pending_messages.len or index >= received_at.len) return false;
 
@@ -197,7 +198,7 @@ pub fn pendingTextChainMatureAtIndexWithBase(
         pending_messages,
         received_at,
     ) orelse return false;
-    return chainIsMature(now, stats, base_debounce_secs);
+    return chainIsMature(now_ms, stats, base_debounce_ms);
 }
 
 pub fn cancelPendingTextChainForKey(
@@ -520,7 +521,7 @@ test "telegram ingress shouldDebounceTextMessage handles long chunk and active c
     var received_at: std.ArrayListUnmanaged(u64) = .empty;
     defer received_at.deinit(alloc);
 
-    const now = root.nowEpochSecs();
+    const now: u64 = 1_700_000_000_000;
     const long_content = try alloc.alloc(u8, TEXT_SPLIT_LIKELY_MIN_LEN);
     defer alloc.free(long_content);
     @memset(long_content, 'x');
@@ -544,17 +545,17 @@ test "telegram ingress shouldDebounceTextMessage does not debounce stale pending
     var received_at: std.ArrayListUnmanaged(u64) = .empty;
     defer received_at.deinit(alloc);
 
-    const now = root.nowEpochSecs();
+    const now: u64 = 1_700_000_000_000;
     const short_msg = testMessage("user-a", "chat-a", "oi", now, 77);
 
     try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "pending old", 0);
-    try received_at.append(alloc, now - (TEXT_MESSAGE_DEBOUNCE_SECS + 5));
+    try received_at.append(alloc, now - (TEXT_MESSAGE_DEBOUNCE_MS + 5));
 
     try std.testing.expect(!shouldDebounceTextMessage(now, pending_messages.items, received_at.items, short_msg));
 }
 
 test "telegram ingress shouldDebounceTextMessage skips interaction messages" {
-    const now = root.nowEpochSecs();
+    const now: u64 = 1_700_000_000_000;
     const interaction_msg = root.ChannelMessage{
         .id = "user-a",
         .sender = "chat-a",
@@ -575,7 +576,7 @@ test "telegram ingress shouldDebounceTextMessage catches real-world ~3.4k split 
     var received_at: std.ArrayListUnmanaged(u64) = .empty;
     defer received_at.deinit(alloc);
 
-    const now = root.nowEpochSecs();
+    const now: u64 = 1_700_000_000_000;
     const split_like_content = try alloc.alloc(u8, 3414);
     defer alloc.free(split_like_content);
     @memset(split_like_content, 'x');
@@ -584,16 +585,18 @@ test "telegram ingress shouldDebounceTextMessage catches real-world ~3.4k split 
     try std.testing.expect(shouldDebounceTextMessage(now, pending_messages.items, received_at.items, msg));
 }
 
-test "telegram ingress textDebounceSecsForChain extends window for large chains" {
-    try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_SECS), textDebounceSecsForChain(1, 900));
-    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(4, 900));
-    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_SECS), textDebounceSecsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
+test "telegram ingress textDebounceMsForChain extends window for large chains" {
+    // Regression: pasting a long message used to wait 3-8s before the turn started.
+    try std.testing.expectEqual(@as(u64, TEXT_MESSAGE_DEBOUNCE_MS), textDebounceMsForChain(1, 900));
+    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_MS), textDebounceMsForChain(4, 900));
+    try std.testing.expectEqual(@as(u64, LARGE_TEXT_CHAIN_DEBOUNCE_MS), textDebounceMsForChain(2, LARGE_TEXT_CHAIN_MIN_BYTES));
 }
 
-test "telegram ingress textDebounceSecsForChainWithBase honors configured debounce" {
-    try std.testing.expectEqual(@as(u64, 5), textDebounceSecsForChainWithBase(1, 900, 5));
-    try std.testing.expectEqual(@as(u64, 8), textDebounceSecsForChainWithBase(4, 900, 5));
-    try std.testing.expectEqual(@as(u64, 0), textDebounceSecsForChainWithBase(1, 900, 0));
+test "telegram ingress textDebounceMsForChainWithBase honors configured debounce" {
+    try std.testing.expectEqual(@as(u64, 1_000), textDebounceMsForChainWithBase(1, 900, 1_000));
+    try std.testing.expectEqual(@as(u64, 1_500), textDebounceMsForChainWithBase(4, 900, 1_000));
+    try std.testing.expectEqual(@as(u64, 0), textDebounceMsForChainWithBase(1, 900, 0));
+    try std.testing.expectEqual(@as(u64, 300), textDebounceMsForChainWithBase(1, 900, 300));
 }
 
 test "telegram ingress shouldDebounceTextMessage debounces medium chunk (~900 bytes)" {
@@ -603,7 +606,7 @@ test "telegram ingress shouldDebounceTextMessage debounces medium chunk (~900 by
     var received_at: std.ArrayListUnmanaged(u64) = .empty;
     defer received_at.deinit(alloc);
 
-    const now = root.nowEpochSecs();
+    const now: u64 = 1_700_000_000_000;
     const medium_content = try alloc.alloc(u8, 900);
     defer alloc.free(medium_content);
     @memset(medium_content, 'x');
@@ -689,7 +692,7 @@ test "telegram ingress cancelPendingTextChainForKey removes only matching sender
     var received_at: std.ArrayListUnmanaged(u64) = .empty;
     defer received_at.deinit(alloc);
 
-    const now = root.nowEpochSecs();
+    const now: u64 = 1_700_000_000_000;
     try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "old-part-a1", 1);
     try received_at.append(alloc, now - 30);
     try appendOwnedTestMessage(alloc, &pending_messages, "user-a", "chat-a", "old-part-a2", 2);
@@ -705,7 +708,7 @@ test "telegram ingress cancelPendingTextChainForKey removes only matching sender
     try std.testing.expectEqual(@as(usize, 1), received_at.items.len);
 }
 
-test "telegram ingress nextPendingTextDeadline returns earliest chain deadline" {
+test "telegram ingress nextPendingTextDeadlineMs returns earliest chain deadline" {
     const messages = [_]root.ChannelMessage{
         .{
             .id = "user-a",
@@ -732,9 +735,9 @@ test "telegram ingress nextPendingTextDeadline returns earliest chain deadline" 
             .message_id = 2,
         },
     };
-    const received_at = [_]u64{ 10, 9, 12 };
+    const received_at = [_]u64{ 10_000, 9_000, 12_000 };
 
-    const deadline = nextPendingTextDeadline(messages[0..], received_at[0..]);
+    const deadline = nextPendingTextDeadlineMs(messages[0..], received_at[0..]);
     try std.testing.expect(deadline != null);
-    try std.testing.expectEqual(@as(u64, 12), deadline.?);
+    try std.testing.expectEqual(@as(u64, 9_000 + TEXT_MESSAGE_DEBOUNCE_MS), deadline.?);
 }

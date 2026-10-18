@@ -385,9 +385,7 @@ pub const ChannelManager = struct {
         const ch_ptr = try self.allocator.create(ChannelType);
         ch_ptr.* = ChannelType.initFromConfig(self.allocator, cfg);
         if (comptime std.mem.eql(u8, field_name, "telegram")) {
-            ch_ptr.text_debounce_secs = telegram.TelegramChannel.textDebounceSecsFromMs(
-                self.config.messages.inbound.debounce_ms,
-            );
+            ch_ptr.text_debounce_ms = self.config.messages.inbound.debounce_ms;
         }
         if (comptime std.mem.eql(u8, field_name, "slack")) {
             // Slack has no poll loop of its own, so hand it the shared audio

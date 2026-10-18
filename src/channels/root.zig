@@ -566,6 +566,13 @@ pub fn nowEpochSecs() u64 {
     return @intCast(@as(u128, @intCast(ns)) / 1_000_000_000);
 }
 
+/// Get current UNIX epoch milliseconds.
+pub fn nowEpochMs() u64 {
+    const ns = std_compat.time.nanoTimestamp();
+    if (ns < 0) return 0;
+    return @intCast(@as(u128, @intCast(ns)) / 1_000_000);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Shared Utilities (re-exported from top-level modules)
 // ════════════════════════════════════════════════════════════════════════════
