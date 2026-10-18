@@ -1552,6 +1552,41 @@ const SessionWorker = struct {
     }
 };
 
+const StopWorkerOutcome = struct {
+    interrupt: session_mod.SessionManager.InterruptRequestResult,
+    discarded_queued: usize,
+};
+
+/// Apply a /stop to a session with an active worker: signal the in-flight turn
+/// when there is one and drop the session's queued follow-ups.
+fn stopSessionWorker(
+    session_mgr: *session_mod.SessionManager,
+    registry: anytype,
+    session_key: []const u8,
+) StopWorkerOutcome {
+    var interrupt = session_mgr.requestTurnInterrupt(session_key);
+    // No turn_running yet means the worker is still waiting for a turn slot, or
+    // the task passed its epoch check and is about to set turn_running. The
+    // check and the flag set share the worker lock with the turn-end cleanup,
+    // so a stop that races a finishing turn either signals that turn or reports
+    // nothing in flight; it never arms an interrupt for the next message.
+    if (!interrupt.requested and registry.requestInterruptInFlight(session_key, session_mgr)) {
+        interrupt.requested = true;
+    }
+    const discarded_queued: usize = if (!interrupt.requested)
+        registry.discardQueued(session_key)
+    else
+        0;
+    // The worker may have passed its epoch check and marked the task in flight
+    // while discardQueued was acquiring the lock. Any shouldRun after the epoch
+    // bump is cancelled, so this re-check closes the remaining window instead
+    // of reporting that nothing was found while the message still runs.
+    if (!interrupt.requested and registry.requestInterruptInFlight(session_key, session_mgr)) {
+        interrupt.requested = true;
+    }
+    return .{ .interrupt = interrupt, .discarded_queued = discarded_queued };
+}
+
 fn sessionWorkerLoop(worker: *SessionWorker) void {
     while (worker.popOrStop()) |task| {
         // Wait for a global turn slot on the worker thread, never on the
@@ -2301,35 +2336,10 @@ pub fn runTelegramLoop(
                 var handled_in_worker = false;
                 parallel_attempt: {
                     if (control_plane.isStopLikeCommand(msg.content) and worker_registry.active(session_key)) {
-                        var interrupt = runtime.session_mgr.requestTurnInterrupt(session_key);
+                        const stop = stopSessionWorker(&runtime.session_mgr, worker_registry, session_key);
+                        var interrupt = stop.interrupt;
                         defer interrupt.deinit(allocator);
-                        // No turn_running yet means the worker is still waiting
-                        // for a turn slot, or the task passed its epoch check
-                        // and is about to set turn_running. The check and the
-                        // flag set share the worker lock with the turn-end
-                        // cleanup, so a stop that races a finishing turn either
-                        // signals that turn or reports nothing in flight; it
-                        // never arms an interrupt for the next message.
-                        if (!interrupt.requested and
-                            worker_registry.requestInterruptInFlight(session_key, &runtime.session_mgr))
-                        {
-                            interrupt.requested = true;
-                        }
-                        const discarded_queued: usize = if (!interrupt.requested)
-                            worker_registry.discardQueued(session_key)
-                        else
-                            0;
-                        // The worker may have passed its epoch check and marked
-                        // the task in flight while discardQueued was acquiring
-                        // the lock. Any shouldRun after the epoch bump is
-                        // cancelled, so this re-check closes the remaining
-                        // window instead of reporting that nothing was found
-                        // while the message still runs.
-                        if (!interrupt.requested and
-                            worker_registry.requestInterruptInFlight(session_key, &runtime.session_mgr))
-                        {
-                            interrupt.requested = true;
-                        }
+                        const discarded_queued = stop.discarded_queued;
                         var dynamic_notice: ?[]u8 = null;
                         defer if (dynamic_notice) |msg_alloc| allocator.free(msg_alloc);
                         const immediate_notice: []const u8 = blk_notice: {
@@ -4483,6 +4493,85 @@ test "a slot waiter cancelled by /stop is not recorded again" {
     try std.testing.expect(worker.waiting_task == null);
     try std.testing.expectEqual(@as(usize, 0), worker.discardQueued());
     worker.discardTask(task);
+}
+
+test "a /stop with a running turn also discards queued messages" {
+    // Regression: one /stop during a tool call does not end the turn.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    const session_key = "stop:tool-once";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.turn_running.store(true, .release);
+    defer {
+        session.turn_running.store(false, .release);
+        session.agent.clearInterruptRequest();
+    }
+
+    var worker = SessionWorker{
+        .allocator = allocator,
+        .session_key = try allocator.dupe(u8, session_key),
+    };
+    defer {
+        worker.queue.deinit(allocator);
+        allocator.free(worker.session_key);
+    }
+    try std.testing.expect(worker.push(try testQueuedTask(allocator, "queued one")));
+    try std.testing.expect(worker.push(try testQueuedTask(allocator, "queued two")));
+
+    const TestRegistry = struct {
+        worker: *SessionWorker,
+
+        fn requestInterruptInFlight(self: @This(), _: []const u8, session_mgr: *session_mod.SessionManager) bool {
+            return self.worker.requestInterruptInFlight(session_mgr);
+        }
+
+        fn discardQueued(self: @This(), _: []const u8) usize {
+            return self.worker.discardQueued();
+        }
+    };
+
+    var stop = stopSessionWorker(&runtime.session_mgr, TestRegistry{ .worker = &worker }, session_key);
+    defer stop.interrupt.deinit(allocator);
+
+    // The running turn was signaled, and the queued follow-ups were dropped
+    // anyway: one /stop ends the session's whole queue, not just the turn that
+    // happened to be running.
+    try std.testing.expect(stop.interrupt.requested);
+    try std.testing.expectEqual(@as(usize, 2), stop.discarded_queued);
+    try std.testing.expectEqual(@as(usize, 0), worker.queue.items.len);
 }
 
 test "userErrorMessage distinguishes timeout from network errors" {

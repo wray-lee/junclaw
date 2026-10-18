@@ -3674,6 +3674,30 @@ const ProbeTool = struct {
     }
 };
 
+const StopDuringToolProbe = struct {
+    session: ?*Session = null,
+    executions: usize = 0,
+
+    pub const tool_name = "stop_probe";
+    pub const tool_description = "Test tool that reproduces a /stop killing a tool call";
+    pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+    const vtable = tools_mod.ToolVTable(@This());
+
+    fn tool(self: *@This()) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(self: *@This(), _: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        self.executions += 1;
+        // Deposit while turn_running is still true, exactly as the router does
+        // for a message that arrives during the tool call, then reproduce the
+        // state a real /stop leaves behind when it kills the tool.
+        _ = try self.session.?.appendMidTurnIfRunning(testing.allocator, "steered while busy");
+        self.session.?.agent.requestInterrupt();
+        return .{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
+    }
+};
+
 const SummaryFailureProvider = struct {
     call_count: usize = 0,
 
@@ -5967,6 +5991,87 @@ test "a cleared pre-turn stop does not interrupt the next turn" {
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("answered", reply);
     try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+}
+
+test "one /stop during a tool call ends the turn without running steered follow-ups" {
+    // Regression: one /stop during a tool call does not end the turn.
+    var mock = MockProvider{
+        .response = "unused",
+        .responses = &.{
+            "<tool_call>{\"name\":\"stop_probe\",\"arguments\":{}}</tool_call>",
+            "follow-up answer",
+        },
+    };
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    var probe = StopDuringToolProbe{};
+    var tools = [_]Tool{probe.tool()};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "stop:tool-once";
+    const session = try sm.getOrCreate(session_key);
+    probe.session = session;
+
+    const reply = try sm.processMessageStreamingWithSteerSink(session_key, "run the tool", null, null, null, null);
+    defer testing.allocator.free(reply);
+
+    try testing.expect(std.mem.indexOf(u8, reply, "Interrupted by /stop") != null);
+    // The steered message must not become a full follow-up turn after the
+    // interrupted primary; one /stop ends the whole turn.
+    try testing.expectEqual(@as(usize, 1), mock.chat_calls);
+    try testing.expectEqual(@as(usize, 1), probe.executions);
+    try testing.expect(!session.hasInjection());
+    try testing.expect(std.mem.indexOf(u8, reply, "Pending message(s) discarded by /stop") != null);
+}
+
+test "a normal message after an interrupted tool turn is not stopped" {
+    // Regression: one /stop during a tool call does not end the turn.
+    var mock = MockProvider{
+        .response = "unused",
+        .responses = &.{
+            "<tool_call>{\"name\":\"stop_probe\",\"arguments\":{}}</tool_call>",
+            "next answer",
+        },
+    };
+    const cfg = testConfig();
+    var noop = observability.NoopObserver{};
+    var probe = StopDuringToolProbe{};
+    var tools = [_]Tool{probe.tool()};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "stop:tool-once";
+    const session = try sm.getOrCreate(session_key);
+    probe.session = session;
+
+    const interrupted = try sm.processMessageStreamingWithSteerSink(session_key, "run the tool", null, null, null, null);
+    defer testing.allocator.free(interrupted);
+    try testing.expect(std.mem.indexOf(u8, interrupted, "Interrupted by /stop") != null);
+
+    // The next message is a normal turn: the stop must not leak into it.
+    const reply = try sm.processMessageStreamingWithSteerSink(session_key, "next", null, null, null, null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("next answer", reply);
+    try testing.expectEqual(@as(usize, 2), mock.chat_calls);
 }
 
 test "clearTurnInterruptIfIdle drops a stale stop flag but keeps a running one" {
