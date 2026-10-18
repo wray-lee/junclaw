@@ -2227,6 +2227,12 @@ pub const SessionManager = struct {
             session.agent.drain_injection_cb = previous_callback;
             session.agent.drain_injection_ctx = previous_ctx;
         }
+        // A /stop that landed during this turn is spent once the turn returns,
+        // even when the turn failed before Agent.turn could consume the flag
+        // (e.g. error.RateLimited). Clear it so a follow-up turn for a steered
+        // message cannot inherit it and answer "Interrupted by /stop" without
+        // ever calling the provider.
+        defer session.agent.clearInterruptRequest();
         const response = session.agent.turn(content) catch |err| {
             finalizeSteerRefs(sink, self.allocator, refs, .failed);
             return err;
@@ -8098,4 +8104,48 @@ test "steered message reaction is finalized after its consuming turn is interrup
     // Interrupted turns return a user-visible terminal response, like the
     // original message's .done handling; empty done clears the reaction.
     try testing.expectEqual(SteerOutcome.done, origin.outcomeFor("1.1").?);
+}
+
+test "steered follow-up does not inherit a stop from the failed primary turn" {
+    // Regression: a /stop that landed on a primary turn failing with
+    // error.RateLimited left agent.interrupt_requested set until the whole
+    // streaming call returned. The steered follow-up (drained by
+    // drainInjectionsAfterFailedTurn) then answered "Interrupted by /stop"
+    // without ever calling the provider.
+    var mock = MockProvider{
+        .response = "unused",
+        .responses = &.{ "unused", "follow-up answer" },
+        .fail_rate_limited_calls = &.{1},
+    };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const key = "steer:interrupt-leak";
+    const session = try sm.getOrCreate(key);
+    session.agent.queue_mode = .steer;
+
+    const SteerAndStop = struct {
+        session: *Session,
+        fired: bool = false,
+        fn hook(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.fired) return;
+            self.fired = true;
+            _ = self.session.appendMidTurnIfRunning(testing.allocator, "steered while busy") catch false;
+            self.session.agent.requestInterrupt();
+        }
+    };
+    var hook_ctx = SteerAndStop{ .session = session };
+    mock.on_chat = SteerAndStop.hook;
+    mock.on_chat_ctx = &hook_ctx;
+
+    const reply = try sm.processMessageStreamingWithSteerSink(key, "primary", null, null, null, null);
+    defer testing.allocator.free(reply);
+
+    try testing.expectEqualStrings("follow-up answer", reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "Interrupted by /stop") == null);
+    // The failed primary turn and the steered follow-up both reached the
+    // provider; the stop must not have skipped the follow-up.
+    try testing.expectEqual(@as(usize, 2), mock.chat_calls);
 }
