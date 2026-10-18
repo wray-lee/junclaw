@@ -4175,14 +4175,16 @@ test "json parse scheduler section" {
     try std.testing.expectEqual(@as(u64, 600), cfg.scheduler.agent_timeout_secs);
 }
 
-test "json parse messages section reads inbound debounce config" {
+test "json parse messages section reads inbound debounce and error reply config" {
     const allocator = std.testing.allocator;
     const json =
-        \\{"messages": {"inbound": {"debounce_ms": 1500}}}
+        \\{"messages": {"inbound": {"debounce_ms": 1500}, "error_reply": {"policy": "silent", "cooldown_mins": 30}}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(u32, 1500), cfg.messages.inbound.debounce_ms);
+    try std.testing.expectEqual(config_types.ErrorReplyPolicy.silent, cfg.messages.error_reply.policy);
+    try std.testing.expectEqual(@as(u32, 30), cfg.messages.error_reply.cooldown_mins);
 }
 
 test "json parse agent section" {
