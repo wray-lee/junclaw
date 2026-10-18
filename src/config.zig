@@ -4187,6 +4187,17 @@ test "json parse messages section reads inbound debounce and error reply config"
     try std.testing.expectEqual(@as(u32, 30), cfg.messages.error_reply.cooldown_mins);
 }
 
+test "json parse messages section defaults error reply policy to always" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"messages": {"inbound": {"debounce_ms": 1500}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.ErrorReplyPolicy.always, cfg.messages.error_reply.policy);
+    try std.testing.expectEqual(@as(u32, 240), cfg.messages.error_reply.cooldown_mins);
+}
+
 test "json parse agent section" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

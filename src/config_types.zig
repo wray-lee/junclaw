@@ -346,9 +346,9 @@ pub const InboundMessagesConfig = struct {
 };
 
 /// How the daemon answers a failed inbound turn.
-///   - always: send the error copy on every failure.
-///   - once:   send the first error per chat and failure class, then stay quiet
-///             for `cooldown_mins` (default: shows the first error, no spam).
+///   - always: send the error copy on every failure (default).
+///   - once:   opt-in; send the first error per chat and failure class, then
+///             stay quiet for `cooldown_mins`.
 ///   - silent: never send; the failure is only logged.
 pub const ErrorReplyPolicy = enum {
     always,
@@ -357,7 +357,7 @@ pub const ErrorReplyPolicy = enum {
 };
 
 pub const ErrorReplyConfig = struct {
-    policy: ErrorReplyPolicy = .once,
+    policy: ErrorReplyPolicy = .always,
     cooldown_mins: u32 = 240,
 };
 

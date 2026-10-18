@@ -497,10 +497,10 @@ Example:
 ### `messages.error_reply`
 
 - `policy` controls the user-visible error reply when a daemon-routed inbound turn fails:
-  - `once` (default): send the first error per chat and failure class, then suppress repeats for `cooldown_mins`. The first failure is still visible, but a repeating one cannot flood the chat.
-  - `always`: send every failure.
+  - `always` (default): send every failure.
+  - `once` (opt-in): send the first error per chat and failure class, then suppress repeats for `cooldown_mins`.
   - `silent`: never send; failures are only logged.
-- `cooldown_mins`: how long a suppressed `once` error stays quiet (default: `240`, i.e. 4 hours).
+- `cooldown_mins`: how long a suppressed `once` error stays quiet (default: `240`, i.e. 4 hours). Only applies to `once`.
 - The key is the outbound chat scope plus the classified failure kind, so the same kind of error is deduped even when provider details differ.
 - Applies to daemon-routed inbound turns. Polling channel loops and the HTTP gateway keep their existing behavior.
 
@@ -510,7 +510,7 @@ Example:
 {
   "messages": {
     "error_reply": {
-      "policy": "once",
+      "policy": "always",
       "cooldown_mins": 240
     }
   }
