@@ -28,6 +28,19 @@ const invalid_socket: SocketFd = switch (builtin.os.tag) {
 const CALLBACK_VALUE_PREFIX = "ncslack:";
 const DEFAULT_INTERACTION_TTL_SECS: u64 = 900;
 
+/// Parse a Block Kit button value (`ncslack:<token>:<index>`), as emitted by
+/// `appendInteractivePostMessageBody`. Shared by the HTTP webhook and Socket
+/// Mode handlers.
+pub fn parseCallbackValue(value: []const u8) ?struct { token: []const u8, option_index: usize } {
+    if (!std.mem.startsWith(u8, value, CALLBACK_VALUE_PREFIX)) return null;
+    const rest = value[CALLBACK_VALUE_PREFIX.len..];
+    const sep = std.mem.lastIndexOfScalar(u8, rest, ':') orelse return null;
+    const token = rest[0..sep];
+    if (token.len == 0) return null;
+    const option_index = std.fmt.parseUnsigned(usize, rest[sep + 1 ..], 10) catch return null;
+    return .{ .token = token, .option_index = option_index };
+}
+
 const PendingInteractionOption = struct {
     id: []const u8,
     label: []const u8,
@@ -1477,6 +1490,57 @@ pub const SlackChannel = struct {
         return true;
     }
 
+    /// Handle a Slack `interactive` Socket Mode envelope (Block Kit button
+    /// click). The envelope is already acked by the caller.
+    pub fn handleInteractivePayload(self: *SlackChannel, payload_obj: std.json.ObjectMap) void {
+        const payload_type = jsonStringValue(payload_obj, "type") orelse return;
+        if (!std.mem.eql(u8, payload_type, "block_actions")) return;
+
+        const user_val = payload_obj.get("user") orelse return;
+        const channel_val = payload_obj.get("channel") orelse return;
+        const actions_val = payload_obj.get("actions") orelse return;
+        if (user_val != .object or channel_val != .object or actions_val != .array or actions_val.array.items.len == 0) return;
+
+        const sender_id = jsonStringValue(user_val.object, "id") orelse return;
+        const first_action = actions_val.array.items[0];
+        if (first_action != .object) return;
+        const value = jsonStringValue(first_action.object, "value") orelse return;
+        const parsed_callback = parseCallbackValue(value) orelse return;
+
+        switch (self.consumeInteractionSelection(parsed_callback.token, parsed_callback.option_index, sender_id)) {
+            .ok => |selection| {
+                defer self.allocator.free(selection.submit_text);
+                defer self.allocator.free(selection.target);
+                const callback_channel_id = jsonStringValue(channel_val.object, "id") orelse "";
+                self.publishInteractionSelection(sender_id, selection.target, callback_channel_id, selection.submit_text);
+            },
+            else => {},
+        }
+    }
+
+    /// Publish a consumed button selection back to the target the question was
+    /// posted to, on the same bus path as a typed message. Runs on the socket
+    /// reader, so the bus write is bounded.
+    fn publishInteractionSelection(
+        self: *SlackChannel,
+        sender_id: []const u8,
+        target: []const u8,
+        fallback_channel_id: []const u8,
+        text: []const u8,
+    ) void {
+        const effective_target = if (target.len > 0) target else fallback_channel_id;
+        const idx = std.mem.indexOfScalar(u8, effective_target, ':');
+        const channel_id = if (idx) |i| effective_target[0..i] else effective_target;
+        const thread_ts: ?[]const u8 = if (idx) |i|
+            if (i + 1 < effective_target.len) effective_target[i + 1 ..] else null
+        else
+            null;
+        if (channel_id.len == 0) return;
+        self.publishInboundMessageTimeout(sender_id, channel_id, text, null, thread_ts, STOP_PUBLISH_TIMEOUT_MS) catch |err| {
+            log.warn("Slack interactive selection publish failed: {}", .{err});
+        };
+    }
+
     /// Handle a Slack `slash_commands` Socket Mode envelope for the single
     /// configured command. The envelope is already acked by the caller.
     pub fn handleSlashCommand(self: *SlackChannel, payload_obj: std.json.ObjectMap) void {
@@ -1832,6 +1896,17 @@ pub const SlackChannel = struct {
             const slash_payload = parsed.value.object.get("payload") orelse return;
             if (slash_payload != .object) return;
             self.handleSlashCommand(slash_payload.object);
+            return;
+        }
+
+        if (std.mem.eql(u8, msg_type, "interactive")) {
+            // Block Kit button click on a reply this app posted. The envelope
+            // is already acked above; a redelivery already ran the selection,
+            // so ignore it like the slash-command path.
+            if (socketRetryAttempt(parsed.value.object) > 0) return;
+            const interactive_payload = parsed.value.object.get("payload") orelse return;
+            if (interactive_payload != .object) return;
+            self.handleInteractivePayload(interactive_payload.object);
             return;
         }
 
@@ -4900,6 +4975,105 @@ test "slack pending interactions survive across channel instances" {
     }
 
     try std.testing.expect(receiver.consumeInteractionSelection("tok1", 0, "U123") == .not_found);
+}
+
+test "slack socket interactive block action publishes the selected option" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const alloc = std.testing.allocator;
+        var eb = bus_mod.Bus.init();
+        defer eb.close();
+
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        const allowed = [_][]const u8{"*"};
+        var ch = SlackChannel.init(alloc, "tok", null, "C123", &allowed);
+        ch.account_id = "sl-interactive";
+        ch.setBus(&eb);
+        defer ch.deinitPendingInteractions();
+
+        const choices = [_]root.Channel.OutboundChoice{
+            .{ .id = "yes", .label = "Yes", .submit_text = "Confirm action" },
+        };
+        try ch.registerPendingInteraction("tok-int-1", "C123:1700.1", null, &choices);
+
+        var ws = websocket.WsClient{
+            .allocator = alloc,
+            .stream = .{ .handle = sockets[0] },
+            .tls = null,
+            .write_mu = .{},
+        };
+        const envelope =
+            \\{"type":"interactive","envelope_id":"EnvInt1","payload":{"type":"block_actions","user":{"id":"U123"},"channel":{"id":"C123"},"actions":[{"value":"ncslack:tok-int-1:0"}]}}
+        ;
+        try ch.handleSocketPayload(&ws, envelope);
+
+        // The envelope is acked before the button is dispatched.
+        var pollfds = [_]std.posix.pollfd{.{ .fd = sockets[1], .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = try std.posix.poll(&pollfds, 1000);
+        try std.testing.expect(ready > 0);
+        var ack_buf: [64]u8 = undefined;
+        const ack_len = try std.posix.read(sockets[1], &ack_buf);
+        try std.testing.expect(ack_len > 0);
+        try std.testing.expectEqual(@as(u8, 0x81), ack_buf[0]);
+
+        var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+        defer msg.deinit(alloc);
+        try std.testing.expectEqualStrings("Confirm action", msg.content);
+        try std.testing.expectEqualStrings("U123", msg.sender_id);
+        // The selection goes back to the target the question was posted to, so
+        // a threaded question is answered in the same thread.
+        try std.testing.expectEqualStrings("C123:1700.1", msg.chat_id);
+    }
+}
+
+test "slack socket interactive unknown token is acked and publishes nothing" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    } else {
+        const alloc = std.testing.allocator;
+        var eb = bus_mod.Bus.init();
+        defer eb.close();
+
+        const sockets = try websocket.createTestSocketPair();
+        defer std.Io.Threaded.closeFd(sockets[0]);
+        defer std.Io.Threaded.closeFd(sockets[1]);
+
+        const allowed = [_][]const u8{"*"};
+        var ch = SlackChannel.init(alloc, "tok", null, "C123", &allowed);
+        ch.account_id = "sl-interactive";
+        ch.setBus(&eb);
+        defer ch.deinitPendingInteractions();
+
+        var ws = websocket.WsClient{
+            .allocator = alloc,
+            .stream = .{ .handle = sockets[0] },
+            .tls = null,
+            .write_mu = .{},
+        };
+        const envelope =
+            \\{"type":"interactive","envelope_id":"EnvInt2","payload":{"type":"block_actions","user":{"id":"U123"},"channel":{"id":"C123"},"actions":[{"value":"ncslack:missing-token:0"}]}}
+        ;
+        try ch.handleSocketPayload(&ws, envelope);
+
+        var pollfds = [_]std.posix.pollfd{.{ .fd = sockets[1], .events = std.posix.POLL.IN, .revents = 0 }};
+        const ready = try std.posix.poll(&pollfds, 1000);
+        try std.testing.expect(ready > 0);
+        var ack_buf: [64]u8 = undefined;
+        const ack_len = try std.posix.read(sockets[1], &ack_buf);
+        try std.testing.expect(ack_len > 0);
+        try std.testing.expectEqual(@as(u8, 0x81), ack_buf[0]);
+
+        // An expired/unknown token still acks, but nothing reaches the agent.
+        try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+    }
 }
 
 test "slack channel interface returns slack name" {
