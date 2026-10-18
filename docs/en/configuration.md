@@ -916,7 +916,7 @@ About `rich_messages`:
 - It is off by default because some Desktop/Web/Android and third-party clients render rich messages as an unsupported placeholder.
 - Any rich send or edit that fails falls back to the normal HTML/plain-text path, so replies are never lost.
 - Tables wider than 20 columns are sent as a code block instead of a rich table.
-- Plain-text line breaks in rich replies are emitted as GFM hard breaks so multi-line output such as `/status` stays multi-line; fenced and indented code blocks and tables retain their existing structure.
+- Plain-text line breaks in rich replies are emitted as GFM hard breaks so multi-line output such as `/status` stays multi-line; fenced and indented code blocks, multiline inline code spans, and tables retain their existing structure. Code contents (including heredoc delimiters) receive no added trailing spaces.
 - Escaping caveat: the Bot API documents one rich-Markdown escape (`\#hashtag`) and states Rich Markdown can contain arbitrary HTML. `\<` escaping of raw `<` in model output (so it is not parsed as an HTML tag) follows GFM/CommonMark, where any ASCII punctuation may be backslash-escaped. If a client does not honour that escape, a stray raw HTML tag in a reply renders as a literal tag instead of showing the tag text (cosmetic, and only reachable when the model emits raw HTML despite the prompt telling it not to). `==`, `||` and `$math$` are passed through verbatim by design.
 
 About `account_id`:

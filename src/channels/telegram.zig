@@ -3805,17 +3805,23 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
     var line_it = std.mem.splitScalar(u8, md, '\n');
     while (line_it.next()) |line| try lines.append(allocator, line);
 
-    var fence: ?u8 = null;
+    var fence: ?RichFence = null;
+    var inline_code_end: usize = 0;
     var i: usize = 0;
     while (i < lines.items.len) : (i += 1) {
         const line = lines.items[i];
         const trimmed = std.mem.trim(u8, line, " \t\r");
+        const line_start = @intFromPtr(line.ptr) - @intFromPtr(md.ptr);
+        const was_fenced = fence != null;
+        const in_inline_code = inline_code_end > line_start;
 
-        if (fence) |open_ch| {
+        if (fence) |open| {
             try out.appendSlice(allocator, line);
-            if (closesRichFence(trimmed, open_ch)) fence = null;
-        } else if (richFenceChar(trimmed)) |open_ch| {
-            fence = open_ch;
+            if (closesRichFence(trimmed, open)) fence = null;
+        } else if (in_inline_code) {
+            try appendRichParagraphLine(&out, allocator, md, line, line_start, &inline_code_end);
+        } else if (richFenceChar(trimmed)) |open| {
+            fence = open;
             try out.appendSlice(allocator, line);
         } else if (richTableBlockEnd(lines.items, i)) |end| {
             var max_cols: usize = 0;
@@ -3843,7 +3849,7 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
             // show a literal `\<`.
             try out.appendSlice(allocator, line);
         } else {
-            try appendRichLine(&out, allocator, line);
+            try appendRichParagraphLine(&out, allocator, md, line, line_start, &inline_code_end);
         }
 
         if (i + 1 < lines.items.len) {
@@ -3854,7 +3860,9 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
             // GFM treats a bare newline inside a paragraph as a soft break.
             // Rich Telegram clients render that as a space, so preserve visual
             // line breaks for ordinary multi-line text with a GFM hard break.
-            if (!current_is_block and !next_is_block and lineHasNoHardBreak(line)) {
+            const code_newline = was_fenced or fence != null or
+                inline_code_end > line_start + line.len;
+            if (!code_newline and !current_is_block and !next_is_block and lineHasNoHardBreak(line)) {
                 try out.appendSlice(allocator, "  ");
             }
             try out.append(allocator, '\n');
@@ -3884,21 +3892,26 @@ fn lineHasNoHardBreak(line: []const u8) bool {
     return count % 2 == 0;
 }
 
-/// Fence character for a line that opens a fenced code block, else null.
-fn richFenceChar(trimmed: []const u8) ?u8 {
+const RichFence = struct {
+    char: u8,
+    len: usize,
+};
+
+/// Opening fence, including the run length needed to recognize its closer.
+fn richFenceChar(trimmed: []const u8) ?RichFence {
     if (trimmed.len < 3) return null;
     const ch = trimmed[0];
     if (ch != '`' and ch != '~') return null;
     var run: usize = 0;
     while (run < trimmed.len and trimmed[run] == ch) run += 1;
-    return if (run >= 3) ch else null;
+    return if (run >= 3) .{ .char = ch, .len = run } else null;
 }
 
-/// True when `trimmed` closes a fence opened with `ch` (run of >= 3 fence chars, nothing else).
-fn closesRichFence(trimmed: []const u8, ch: u8) bool {
+/// A shorter inner fence is literal code, not the outer fence's closer.
+fn closesRichFence(trimmed: []const u8, open: RichFence) bool {
     var run: usize = 0;
-    while (run < trimmed.len and trimmed[run] == ch) run += 1;
-    if (run < 3) return false;
+    while (run < trimmed.len and trimmed[run] == open.char) run += 1;
+    if (run < open.len) return false;
     return std.mem.trim(u8, trimmed[run..], " \t\r").len == 0;
 }
 
@@ -3973,48 +3986,57 @@ fn richTableColumns(line: []const u8) usize {
     return pipes;
 }
 
-/// Escape a single non-fenced line: `<` -> `\<`, leaving inline code spans alone.
-fn appendRichLine(
+/// Escape paragraph text while retaining a matched code span across newlines.
+/// The end offset includes the closing run, so no hard break or HTML escape is
+/// inserted inside the span. Unmatched runs remain ordinary paragraph text.
+fn appendRichParagraphLine(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
+    md: []const u8,
     line: []const u8,
+    line_start: usize,
+    inline_code_end: *usize,
 ) !void {
     var i: usize = 0;
     while (i < line.len) {
-        const c = line[i];
-
-        // Inline code span: copy verbatim, never escape inside.
-        if (c == '`') {
-            var run: usize = 0;
+        const absolute = line_start + i;
+        if (inline_code_end.* > absolute) {
+            const end = @min(line.len, inline_code_end.* - line_start);
+            try out.appendSlice(allocator, line[i..end]);
+            i = end;
+            continue;
+        }
+        var backslashes: usize = 0;
+        var k = i;
+        while (k > 0 and line[k - 1] == '\\') : (k -= 1) backslashes += 1;
+        if (line[i] == '`' and backslashes % 2 == 0) {
+            var run: usize = 1;
             while (i + run < line.len and line[i + run] == '`') run += 1;
-            if (findBacktickRun(line, i + run, run)) |close| {
-                try out.appendSlice(allocator, line[i .. close + run]);
-                i = close + run;
+            // Code spans belong to one paragraph. Do not match a closing run
+            // after a blank line, where a new block has already begun.
+            const paragraph_end = std.mem.indexOfPos(u8, md, absolute + run, "\n\n") orelse md.len;
+            if (findBacktickRun(md[0..paragraph_end], absolute + run, run)) |close| {
+                inline_code_end.* = close + run;
                 continue;
             }
             try out.appendSlice(allocator, line[i .. i + run]);
             i += run;
             continue;
         }
-
-        if (c == '<') {
-            // Leave an already-escaped `\<` alone so we never emit `\\<`: an odd
-            // run of backslashes before the `<` means it is already escaped.
-            var backslashes: usize = 0;
-            var k = i;
-            while (k > 0 and line[k - 1] == '\\') : (k -= 1) backslashes += 1;
-            if (backslashes % 2 == 1) {
-                try out.append(allocator, c);
-            } else {
-                try out.appendSlice(allocator, "\\<");
-            }
-            i += 1;
-            continue;
-        }
-
-        try out.append(allocator, c);
+        if (line[i] == '<' and backslashes % 2 == 0) try out.append(allocator, '\\');
+        try out.append(allocator, line[i]);
         i += 1;
     }
+}
+
+/// Escape a single non-fenced line: `<` -> `\<`, leaving inline code spans alone.
+fn appendRichLine(
+    out: *std.ArrayListUnmanaged(u8),
+    allocator: std.mem.Allocator,
+    line: []const u8,
+) !void {
+    var inline_code_end: usize = 0;
+    try appendRichParagraphLine(out, allocator, line, line, 0, &inline_code_end);
 }
 
 /// Start of the next backtick run of exactly `run_len` at or after `from`.
@@ -7134,4 +7156,26 @@ test "telegram countCodepoints counts UTF-8 codepoints correctly" {
     try std.testing.expectEqual(@as(usize, 2), countCodepoints("你好")); // 6 bytes, 2 codepoints
     try std.testing.expectEqual(@as(usize, 32768), countCodepoints("a" ** 32768));
     try std.testing.expectEqual(@as(usize, 32769), countCodepoints("a" ** 32769));
+}
+
+test "telegram rich markdown preserves heredocs and nested fences verbatim" {
+    // Regression: hard breaks added two spaces to fenced code lines, including
+    // heredoc delimiters; shorter inner fences must not end an outer fence.
+    const input = "````sh\ncat <<EOF\nhello\nEOF\n```\nstill code\nlast code line\n````\n\nafter\nstatus";
+    const expected = "````sh\ncat <<EOF\nhello\nEOF\n```\nstill code\nlast code line\n````\n\nafter  \nstatus";
+    try expectRichEscaped(expected, input);
+    const tilde = "~~~sh\ncat <<EOF\nhello\nEOF\n~~~";
+    try expectRichEscaped(tilde, tilde);
+    const indented = "    cat <<EOF\n    hello\n    EOF\n\tcode\n\tlast";
+    try expectRichEscaped(indented, indented);
+}
+
+test "telegram rich markdown leaves multiline inline code newlines untouched" {
+    // Regression: paragraph hard breaks inserted spaces inside multiline code
+    // spans, and raw HTML escaping also changed their literal code contents.
+    try expectRichEscaped("before `first\nsecond <x>\nthird` end  \nnext", "before `first\nsecond <x>\nthird` end\nnext");
+    try expectRichEscaped("before ``first `\nsecond <x>\nthird`` end  \nnext", "before ``first `\nsecond <x>\nthird`` end\nnext");
+    // An unmatched or escaped backtick remains paragraph text.
+    try expectRichEscaped("before `literal  \nnext", "before `literal\nnext");
+    try expectRichEscaped("before \\`literal  \nnext \\`end", "before \\`literal\nnext \\`end");
 }
