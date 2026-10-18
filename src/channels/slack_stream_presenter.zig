@@ -65,8 +65,6 @@ pub const STREAM_UPDATE_MAX_BYTES: usize = 4_000;
 /// Prefix shown when a live preview had to drop its oldest text to fit the
 /// chat.update cap.
 pub const PREVIEW_TRUNCATED_MARKER = "\u{2026} (earlier text truncated)\n\n";
-/// Upper bound on follow-up messages posted when the final reply overflows.
-pub const STREAM_MAX_FOLLOWUPS: usize = 8;
 /// How long a finalized target keeps ignoring `.chunk` events. The daemon
 /// publishes the final reply on the durable outbox worker while the outbound
 /// dispatcher may still be draining deltas of the same turn; without this the
@@ -508,11 +506,12 @@ pub fn splitForSlackLimit(
         }
         if (cut == 0) return error.TextCannotFitSlackLimit;
         if (std.mem.lastIndexOfScalar(u8, rest[0..cut], '\n')) |nl| {
-            if (nl > 0) cut = nl;
+            // Keep the boundary newline: native append and final delivery must
+            // preserve code lines as well as every byte of the answer.
+            cut = nl + 1;
         }
         try chunks.append(allocator, try allocator.dupe(u8, rest[0..cut]));
         rest = rest[cut..];
-        if (rest.len > 0 and rest[0] == '\n') rest = rest[1..];
     }
     if (rest.len > 0 or chunks.items.len == 0) try chunks.append(allocator, try allocator.dupe(u8, rest));
     return chunks.toOwnedSlice(allocator);

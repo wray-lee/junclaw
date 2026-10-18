@@ -1326,7 +1326,12 @@ Deltas are coalesced (at most one API call per second per turn) to stay inside S
 per-method rate limits. Tool-call markup is always stripped before anything is sent. If a
 native streaming call fails with a permanent error (`channel_type_not_supported`,
 `missing_scope`, `invalid_thread_ts`, ...), nullclaw stops trying the native methods for
-that account and uses edited messages from then on.
+that account and uses edited messages from then on. If an append returns
+`msg_too_long`, live updates continue through the edited-message transport with a
+bounded preview. The preview retains the newest text within Slack's escaped-text
+budget; the final reply delivers every chunk in order, including replies needing
+more than eight follow-ups. A failed follow-up is reported as a delivery failure
+so the durable outbox can retry it.
 
 About `tool_progress` on Slack: accepted for parity with Telegram, but currently inert -
 Slack renders no tool-progress block in any mode. The native transport

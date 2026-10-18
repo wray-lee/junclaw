@@ -2918,7 +2918,8 @@ pub const SlackChannel = struct {
                         };
                     }
                     state.mode = .fallback;
-                    state.send_failed = true;
+                    // Keep this flush and future deltas live: the fallback can
+                    // still publish a bounded snapshot of the whole turn.
                 };
             }
             if (state.mode == .native) return;
@@ -3131,8 +3132,15 @@ pub const SlackChannel = struct {
         self.clearStreamCancelLocked(target);
         const state = self.stream_states.getPtr(target) orelse
             return vtableSend(@ptrCast(self), target, message, media);
-        // Keep the entry: late deltas of this turn are dropped by isLateChunk.
-        defer state.finishTurn(self.allocator, now_ms);
+        // Only retire a successfully delivered final. A partial failure must
+        // retain the message ts so an outbox retry uses the chunked path again.
+        var delivery_failed = false;
+        defer if (!delivery_failed) state.finishTurn(self.allocator, now_ms);
+        errdefer {
+            delivery_failed = true;
+            state.mode = .fallback;
+            state.send_failed = true;
+        }
 
         if (state.message_ts.len == 0) {
             // Nothing was ever flushed (short reply inside the throttle window),
@@ -3228,17 +3236,11 @@ pub const SlackChannel = struct {
             }
         };
 
-        // Anything past the first chat.update-able slice goes out as follow-up
-        // messages in the same thread.
-        const followups = @min(final_chunks.len - 1, stream_presenter.STREAM_MAX_FOLLOWUPS);
-        if (final_chunks.len - 1 > followups) {
-            log.warn("Slack streaming reply truncated: {} overflow chunks dropped", .{final_chunks.len - 1 - followups});
-        }
-        for (final_chunks[1 .. 1 + followups]) |chunk| {
-            self.postStreamFollowup(parsed, chunk) catch |err| {
-                log.warn("Slack streaming follow-up post failed ({s})", .{@errorName(err)});
-                break;
-            };
+        // The authoritative reply must survive in full, regardless of how many
+        // chunks entity escaping or the smaller retry budget requires. Surface
+        // failures so the durable outbox can retry an incomplete delivery.
+        for (final_chunks[1..]) |chunk| {
+            try self.postStreamFollowup(parsed, chunk);
         }
     }
 
@@ -3252,7 +3254,8 @@ pub const SlackChannel = struct {
         try self.appendPostMessageMrkdwnBody(&body_list, parsed.channel_id, parsed.thread_ts, mrkdwn_text);
 
         var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
-        result.deinit(self.allocator);
+        defer result.deinit(self.allocator);
+        if (result.error_code != null) return error.SlackStreamRejected;
     }
 
     fn stopNativeStream(
@@ -6625,4 +6628,173 @@ test "slack steered reaction clears on success and failure without a running tra
         try std.testing.expectEqual(@as(usize, 1), probe.additions);
         try std.testing.expectEqual(@as(usize, 1), probe.removals);
     }
+}
+
+const SlackFinalDeliveryProbe = struct {
+    delivered: std.ArrayListUnmanaged(u8) = .empty,
+    updates: usize = 0,
+    posts: usize = 0,
+    reject_update: bool = false,
+    fail_post: bool = false,
+    fail_post_at: ?usize = null,
+    api_error: bool = false,
+
+    fn call(ctx: *anyopaque, allocator: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("C_TEST", parsed.value.object.get("channel").?.string);
+        const text = parsed.value.object.get("text").?.string;
+        if (std.mem.eql(u8, endpoint, "chat.update")) {
+            self.updates += 1;
+            if (self.reject_update and self.updates == 1) return .{ .error_code = try allocator.dupe(u8, "msg_too_long") };
+        } else if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+            self.posts += 1;
+            try std.testing.expectEqualStrings("1700.1", parsed.value.object.get("thread_ts").?.string);
+            if (self.fail_post or (self.fail_post_at != null and self.posts == self.fail_post_at.?)) {
+                if (self.api_error) return .{ .error_code = try allocator.dupe(u8, "ratelimited") };
+                return error.SlackApiError;
+            }
+        } else return error.UnexpectedEndpoint;
+        try std.testing.expect(stream_presenter.slackEscapedLen(text) <= stream_presenter.STREAM_UPDATE_MAX_BYTES);
+        try self.delivered.appendSlice(allocator, text);
+        return .{ .ts = try allocator.dupe(u8, "1700.2") };
+    }
+};
+
+test "slack fallback final delivers every entity heavy chunk including a rebound tail" {
+    // Regression: entity-cost splitting (and a smaller retry budget) produced
+    // more than eight follow-ups, and final delivery silently dropped the tail.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |rebound| {
+        var ch = initStreamingChannel(true);
+        defer ch.channel().stop();
+        var probe = SlackFinalDeliveryProbe{ .reject_update = rebound };
+        defer probe.delivered.deinit(allocator);
+        ch.test_api_ctx = &probe;
+        ch.test_api_call = SlackFinalDeliveryProbe.call;
+        var message: std.ArrayListUnmanaged(u8) = .empty;
+        defer message.deinit(allocator);
+        try message.appendSlice(allocator, "```c\n");
+        for (0..1000) |_| try message.appendSlice(allocator, "if (a < b && c > d) {}\n");
+        try message.appendSlice(allocator, "```\nFinal answer: all lines survived.");
+        const expected = try markdownToSlackMrkdwn(allocator, message.items);
+        defer allocator.free(expected);
+        try ch.deliverFallbackFinal(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "1700.2", message.items, &.{}, "C_TEST:1700.1");
+        try std.testing.expect(probe.posts > 8);
+        try std.testing.expectEqualStrings(expected, probe.delivered.items);
+        try std.testing.expectEqual(@as(usize, if (rebound) 2 else 1), probe.updates);
+    }
+}
+
+test "slack fallback final propagates transport and API follow up failures" {
+    // Regression: a failed follow-up was logged then returned success, so the
+    // durable outbox acknowledged a reply whose remaining chunks were never sent.
+    const allocator = std.testing.allocator;
+    for ([_]bool{ false, true }) |api_error| {
+        var ch = initStreamingChannel(true);
+        defer ch.channel().stop();
+        var probe = SlackFinalDeliveryProbe{ .fail_post = true, .api_error = api_error };
+        defer probe.delivered.deinit(allocator);
+        ch.test_api_ctx = &probe;
+        ch.test_api_call = SlackFinalDeliveryProbe.call;
+        const expected_error = if (api_error) error.SlackStreamRejected else error.SlackApiError;
+        try std.testing.expectError(expected_error, ch.deliverFallbackFinal(
+            .{ .channel_id = "C_TEST", .thread_ts = "1700.1" },
+            "1700.2",
+            "x" ** (stream_presenter.STREAM_UPDATE_MAX_BYTES * 3),
+            &.{},
+            "C_TEST:1700.1",
+        ));
+        try std.testing.expectEqual(@as(usize, 1), probe.posts);
+    }
+}
+
+const SlackNativeRecoveryProbe = struct {
+    appends: usize = 0,
+    stops: usize = 0,
+    updates: usize = 0,
+    preview: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn call(ctx: *anyopaque, allocator: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, endpoint, "chat.startStream")) return .{ .ts = try allocator.dupe(u8, "1700.2") };
+        if (std.mem.eql(u8, endpoint, "chat.appendStream")) {
+            self.appends += 1;
+            return .{ .error_code = try allocator.dupe(u8, "msg_too_long") };
+        }
+        if (std.mem.eql(u8, endpoint, "chat.stopStream")) {
+            self.stops += 1;
+            return .{};
+        }
+        if (!std.mem.eql(u8, endpoint, "chat.update")) return error.UnexpectedEndpoint;
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const text = parsed.value.object.get("text").?.string;
+        self.updates += 1;
+        // Force the fallback's shrink-and-retry path as well as native recovery.
+        if (self.updates == 1) return .{ .error_code = try allocator.dupe(u8, "msg_too_long") };
+        try std.testing.expect(stream_presenter.slackEscapedLen(text) <= stream_presenter.STREAM_UPDATE_MAX_BYTES / 2);
+        self.preview.clearRetainingCapacity();
+        try self.preview.appendSlice(allocator, text);
+        return .{};
+    }
+};
+
+test "slack native append rejection recovers live previews on this and later chunks" {
+    // Regression: appendStream msg_too_long selected fallback but send_failed
+    // skipped that flush and discarded all subsequent deltas, freezing preview.
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackNativeRecoveryProbe{};
+    defer probe.preview.deinit(allocator);
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackNativeRecoveryProbe.call;
+    const target = "C_TEST:1700.1";
+    try ch.channel().sendEvent(target, "x" ** 200, &.{}, .chunk);
+    const state = ch.stream_states.getPtr(target).?;
+    state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+    try ch.channel().sendEvent(target, "&" ** 1000 ++ " first tail", &.{}, .chunk);
+    try std.testing.expectEqual(@as(usize, 1), probe.appends);
+    try std.testing.expectEqual(@as(usize, 1), probe.stops);
+    try std.testing.expectEqual(stream_presenter.StreamMode.fallback, state.mode);
+    try std.testing.expect(!state.send_failed);
+    try std.testing.expectEqual(@as(usize, 2), probe.updates);
+    try std.testing.expect(std.mem.endsWith(u8, probe.preview.items, " first tail"));
+    state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+    try ch.channel().sendEvent(target, " next tail", &.{}, .chunk);
+    try std.testing.expectEqual(@as(usize, 3), probe.updates);
+    try std.testing.expect(std.mem.endsWith(u8, probe.preview.items, " first tail next tail"));
+    try std.testing.expect(!state.send_failed);
+}
+
+test "slack final retry retains the chunked delivery path after a partial failure" {
+    // Regression: retiring the stream state on a failed follow-up lost its ts;
+    // an outbox retry then posted the long reply as one oversized plain message.
+    const allocator = std.testing.allocator;
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackFinalDeliveryProbe{ .fail_post_at = 2, .api_error = true };
+    defer probe.delivered.deinit(allocator);
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackFinalDeliveryProbe.call;
+    const target = "C_TEST:1700.1";
+    const state = try ch.ensureStreamStateLocked(target, 1);
+    state.mode = .fallback;
+    try state.setMessageTs(allocator, "1700.2");
+    const message = "if (a < b && c > d) {}\n" ** 1000 ++ "Final answer.";
+    try std.testing.expectError(error.SlackStreamRejected, ch.channel().sendEvent(target, message, &.{}, .final));
+    try std.testing.expectEqualStrings("1700.2", state.message_ts);
+    try std.testing.expectEqual(@as(i64, 0), state.finished_at_ms);
+    probe.fail_post_at = null;
+    probe.delivered.clearRetainingCapacity();
+    probe.posts = 0;
+    try ch.channel().sendEvent(target, message, &.{}, .final);
+    const expected = try markdownToSlackMrkdwn(allocator, message);
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, probe.delivered.items);
+    try std.testing.expect(probe.posts > 8);
+    try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
+    try std.testing.expect(state.finished_at_ms != 0);
 }
