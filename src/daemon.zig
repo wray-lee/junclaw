@@ -26,6 +26,7 @@ const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const inbound_debounce = @import("inbound_debounce.zig");
+const error_reply_policy = @import("error_reply_policy.zig");
 const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
 const outbound = @import("outbound.zig");
@@ -60,6 +61,8 @@ const HEARTBEAT_THREAD_STACK_SIZE: usize = thread_stacks.SESSION_TURN_STACK_SIZE
 /// Maximum number of supervised components.
 const MAX_COMPONENTS: usize = 8;
 var outbound_draft_id_counter: Atomic(u64) = Atomic(u64).init(1);
+/// Shared across inbound dispatch workers; `Store.decide` serializes access.
+var error_reply_store: error_reply_policy.Store = .{};
 
 /// Component status for state file serialization.
 pub const ComponentStatus = struct {
@@ -1623,9 +1626,38 @@ fn processInboundMessage(
         log.warn("inbound dispatch process failed: {}", .{err});
         setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
 
-        // Send user-visible error reply back to the originating channel
+        // Send user-visible error reply back to the originating channel,
+        // subject to messages.error_reply (silent/once/always).
+        var detail_buf: [256]u8 = undefined;
+        const err_detail = providers.api_error_details.snapshotInto(&detail_buf);
+        const err_kind = providers.error_classify.classifyUserError(err, err_detail);
+        const err_policy = runtime.config.messages.error_reply;
+        const err_key = error_reply_policy.makeKey(
+            routing_plan.outbound_channel,
+            routing_plan.outbound_account_id,
+            routing_plan.outbound_chat_id,
+            err_kind,
+        );
+        const cooldown_ms: i64 = @as(i64, err_policy.cooldown_mins) * 60_000;
+        switch (error_reply_policy.decide(&error_reply_store, err_policy.policy, err_key, inbound_debounce.nowMs(), cooldown_ms)) {
+            .suppress => {
+                log.info("error reply suppressed by policy ({s}) for {s}:{s}", .{
+                    @tagName(err_policy.policy),
+                    routing_plan.outbound_channel,
+                    routing_plan.outbound_chat_id,
+                });
+                return;
+            },
+            .send => {},
+        }
+
         var err_buf: [256]u8 = undefined;
-        const err_msg = providers.userErrorMessage(&err_buf, err, false);
+        const err_msg = providers.error_classify.formatUserError(
+            &err_buf,
+            err_kind,
+            providers.reliable.lastRetryStats().used,
+            false,
+        );
         var err_out = if (routing_plan.outbound_account_id) |aid|
             bus_mod.makeOutboundWithAccount(allocator, routing_plan.outbound_channel, aid, routing_plan.outbound_chat_id, err_msg) catch return
         else

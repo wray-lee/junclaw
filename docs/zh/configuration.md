@@ -430,6 +430,29 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 }
 ```
 
+### `messages.error_reply`
+
+- `policy` 控制 daemon 路由的入站 turn 失败时是否向用户发送错误回复：
+  - `once`（默认）：每个聊天和每种失败类别只发送第一次错误，在 `cooldown_mins` 内抑制重复。第一条错误仍然可见，但反复出现的同一错误不会刷屏。
+  - `always`：每次失败都发送。
+  - `silent`：从不发送，只记录日志。
+- `cooldown_mins`：`once` 策略下抑制重复错误的时长（默认值：`240`，即 4 小时）。
+- 去重键由出站聊天范围和分类后的失败类别组成，因此即使 provider 细节不同，同一种错误也会被去重。
+- 仅作用于 daemon 路由的入站 turn；轮询式 channel loop 和 HTTP gateway 保持原有行为。
+
+示例：
+
+```json
+{
+  "messages": {
+    "error_reply": {
+      "policy": "once",
+      "cooldown_mins": 240
+    }
+  }
+}
+```
+
 ### `reliability`
 
 - 配置 LLM 提供者的全局重试和故障转移行为。

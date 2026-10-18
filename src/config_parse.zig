@@ -2915,6 +2915,26 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
             }
+            if (messages.object.get("error_reply")) |error_reply| {
+                if (error_reply == .object) {
+                    if (error_reply.object.get("policy")) |v| {
+                        if (v == .string) {
+                            if (std.mem.eql(u8, v.string, "always")) {
+                                self.messages.error_reply.policy = .always;
+                            } else if (std.mem.eql(u8, v.string, "once")) {
+                                self.messages.error_reply.policy = .once;
+                            } else if (std.mem.eql(u8, v.string, "silent")) {
+                                self.messages.error_reply.policy = .silent;
+                            }
+                        }
+                    }
+                    if (error_reply.object.get("cooldown_mins")) |v| {
+                        if (v == .integer and v.integer >= 0 and v.integer <= std.math.maxInt(u32)) {
+                            self.messages.error_reply.cooldown_mins = @intCast(v.integer);
+                        }
+                    }
+                }
+            }
         }
     }
 

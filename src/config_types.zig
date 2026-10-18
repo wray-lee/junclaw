@@ -345,8 +345,25 @@ pub const InboundMessagesConfig = struct {
     debounce_ms: u32 = 300,
 };
 
+/// How the daemon answers a failed inbound turn.
+///   - always: send the error copy on every failure.
+///   - once:   send the first error per chat and failure class, then stay quiet
+///             for `cooldown_mins` (default: shows the first error, no spam).
+///   - silent: never send; the failure is only logged.
+pub const ErrorReplyPolicy = enum {
+    always,
+    once,
+    silent,
+};
+
+pub const ErrorReplyConfig = struct {
+    policy: ErrorReplyPolicy = .once,
+    cooldown_mins: u32 = 240,
+};
+
 pub const MessagesConfig = struct {
     inbound: InboundMessagesConfig = .{},
+    error_reply: ErrorReplyConfig = .{},
 };
 
 pub const SchedulerConfig = struct {
