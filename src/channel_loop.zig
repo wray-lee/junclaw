@@ -1573,10 +1573,9 @@ fn stopSessionWorker(
     if (!interrupt.requested and registry.requestInterruptInFlight(session_key, session_mgr)) {
         interrupt.requested = true;
     }
-    const discarded_queued: usize = if (!interrupt.requested)
-        registry.discardQueued(session_key)
-    else
-        0;
+    // A /stop ends the session's whole queue: drop the queued follow-ups even
+    // when a turn is running, since that turn is being interrupted too.
+    const discarded_queued = registry.discardQueued(session_key);
     // The worker may have passed its epoch check and marked the task in flight
     // while discardQueued was acquiring the lock. Any shouldRun after the epoch
     // bump is cancelled, so this re-check closes the remaining window instead
@@ -2344,22 +2343,36 @@ pub fn runTelegramLoop(
                         defer if (dynamic_notice) |msg_alloc| allocator.free(msg_alloc);
                         const immediate_notice: []const u8 = blk_notice: {
                             if (interrupt.requested and interrupt.active_tool != null) {
-                                dynamic_notice = std.fmt.allocPrint(
-                                    allocator,
-                                    "Stop requested. Sent hard-stop signal to running tool: {s}.",
-                                    .{interrupt.active_tool.?},
-                                ) catch null;
+                                dynamic_notice = if (discarded_queued > 0)
+                                    std.fmt.allocPrint(
+                                        allocator,
+                                        "Stop requested. Sent hard-stop signal to running tool: {s}. Discarded {d} queued message(s) for this chat.",
+                                        .{ interrupt.active_tool.?, discarded_queued },
+                                    ) catch null
+                                else
+                                    std.fmt.allocPrint(
+                                        allocator,
+                                        "Stop requested. Sent hard-stop signal to running tool: {s}.",
+                                        .{interrupt.active_tool.?},
+                                    ) catch null;
                                 break :blk_notice dynamic_notice orelse "Stop requested. Sent hard-stop signal.";
                             }
-                            if (interrupt.requested) break :blk_notice "Stop requested. Sent hard-stop signal to in-flight execution.";
                             if (discarded_queued > 0) {
-                                dynamic_notice = std.fmt.allocPrint(
-                                    allocator,
-                                    "Stop requested. Discarded {d} queued message(s) for this chat.",
-                                    .{discarded_queued},
-                                ) catch null;
+                                dynamic_notice = if (interrupt.requested)
+                                    std.fmt.allocPrint(
+                                        allocator,
+                                        "Stop requested. Sent hard-stop signal to in-flight execution. Discarded {d} queued message(s) for this chat.",
+                                        .{discarded_queued},
+                                    ) catch null
+                                else
+                                    std.fmt.allocPrint(
+                                        allocator,
+                                        "Stop requested. Discarded {d} queued message(s) for this chat.",
+                                        .{discarded_queued},
+                                    ) catch null;
                                 break :blk_notice dynamic_notice orelse "Stop requested. Queued messages for this chat were discarded.";
                             }
+                            if (interrupt.requested) break :blk_notice "Stop requested. Sent hard-stop signal to in-flight execution.";
                             break :blk_notice "Stop requested, but no in-flight turn or queued message was found.";
                         };
                         tg_ptr.sendMessageWithReply(

@@ -50,6 +50,9 @@ const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
 /// re-queued: a later turn would see it after newer messages, and an idle
 /// eviction or restart would drop it anyway, so the sender is asked to resend.
 const FOLLOW_UP_FAILED_NOTICE: []const u8 = "It could not be processed; please resend it.";
+/// Appended once when a /stop ends the turn and pending steered messages are
+/// dropped instead of being run as follow-up turns.
+const STOP_DISCARDED_NOTICE: []const u8 = "[Pending message(s) discarded by /stop. Please resend.]";
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
 const RUNTIME_COMMAND_ROLE = memory_mod.RUNTIME_COMMAND_ROLE;
@@ -537,6 +540,22 @@ pub const Session = struct {
         self.injection_refs.clearRetainingCapacity();
         self.injection_pending.clearRetainingCapacity();
         return duped;
+    }
+
+    /// Drop pending mid-turn messages after a /stop: the turn that would have
+    /// consumed them is over, so their refs move to `discarded_refs` for the
+    /// turn-end `.failed` finalizer instead of running as follow-up turns.
+    /// Returns the number of pending messages discarded (the buffer is
+    /// coalesced, so this is 0 or 1).
+    pub fn discardPendingInjections(self: *Session, allocator: Allocator) !usize {
+        self.injection_mu.lock();
+        defer self.injection_mu.unlock();
+        if (self.injection_pending.items.len == 0) return 0;
+        try self.discarded_refs.ensureUnusedCapacity(allocator, self.injection_refs.items.len);
+        for (self.injection_refs.items) |ref| self.discarded_refs.appendAssumeCapacity(ref);
+        self.injection_refs.clearRetainingCapacity();
+        self.injection_pending.clearRetainingCapacity();
+        return 1;
     }
 
     /// Take the refs displaced by `latest` replacements so the running turn can
@@ -2288,6 +2307,22 @@ pub const SessionManager = struct {
         self.allocator.free(follow_up_response);
         response.* = combined;
         completed_turns.* += 1;
+        if (session.agent.last_turn_interrupted) {
+            // The follow-up was stopped: drop newer steered messages instead
+            // of running them as yet another turn.
+            session.closeInjectionWindow();
+            if ((session.discardPendingInjections(self.allocator) catch 0) > 0) {
+                const with_notice = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}\n\n{s}",
+                    .{ response.*, STOP_DISCARDED_NOTICE },
+                ) catch null;
+                if (with_notice) |text| {
+                    self.allocator.free(response.*);
+                    response.* = text;
+                }
+            }
+        }
         return true;
     }
 
@@ -2365,6 +2400,26 @@ pub const SessionManager = struct {
             }
             reply = combined;
             completed_turns.* += 1;
+            if (session.agent.last_turn_interrupted) {
+                // A stop during a follow-up ends the drain: drop newer steered
+                // messages instead of running them as further turns.
+                session.closeInjectionWindow();
+                const discarded = session.discardPendingInjections(self.allocator) catch 0;
+                if (discarded > 0) {
+                    if (reply) |previous| {
+                        const with_notice = std.fmt.allocPrint(
+                            self.allocator,
+                            "{s}\n\n{s}",
+                            .{ previous, STOP_DISCARDED_NOTICE },
+                        ) catch null;
+                        if (with_notice) |text| {
+                            self.allocator.free(previous);
+                            reply = text;
+                        }
+                    }
+                }
+                break;
+            }
         }
         if (drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
             log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
@@ -2606,29 +2661,46 @@ pub const SessionManager = struct {
             self.persistTurnResult(session, session_key, content, response);
         }
 
-        // Drain messages that arrived while the primary turn was running. A
-        // failed follow-up contributes a resend notice but does not stop the
-        // loop: messages that arrived after it were already acknowledged and
-        // must not be left pending (a slash-command turn never drains them).
-        var late_drain_count: u32 = 0;
-        while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-            if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
-        }
+        if (session.agent.last_turn_interrupted) {
+            // One /stop ends the turn: messages steered into it must not run as
+            // fresh follow-up turns with their own model and tool calls.
+            session.closeInjectionWindow();
+            if ((session.discardPendingInjections(self.allocator) catch 0) > 0) {
+                const combined = std.fmt.allocPrint(
+                    self.allocator,
+                    "{s}\n\n{s}",
+                    .{ response, STOP_DISCARDED_NOTICE },
+                ) catch null;
+                if (combined) |text| {
+                    self.allocator.free(response);
+                    response = text;
+                }
+            }
+        } else {
+            // Drain messages that arrived while the primary turn was running. A
+            // failed follow-up contributes a resend notice but does not stop the
+            // loop: messages that arrived after it were already acknowledged and
+            // must not be left pending (a slash-command turn never drains them).
+            var late_drain_count: u32 = 0;
+            while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
+                if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
+            }
 
-        // Regression: a message that arrived after the last drain but before the
-        // deferred turn_running reset was appended and acknowledged, yet nothing
-        // drained it until some later inbound message (or never). Close the
-        // injection window before persistence: a message arriving from now on
-        // falls back to a fresh turn, and anything appended earlier is drained
-        // below with turn_running still set so /stop can interrupt these
-        // follow-up turns.
-        session.closeInjectionWindow();
-        late_drain_count = 0;
-        while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-            if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
-        }
-        if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
-            log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
+            // Regression: a message that arrived after the last drain but before the
+            // deferred turn_running reset was appended and acknowledged, yet nothing
+            // drained it until some later inbound message (or never). Close the
+            // injection window before persistence: a message arriving from now on
+            // falls back to a fresh turn, and anything appended earlier is drained
+            // below with turn_running still set so /stop can interrupt these
+            // follow-up turns.
+            session.closeInjectionWindow();
+            late_drain_count = 0;
+            while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
+                if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
+            }
+            if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
+                log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
+            }
         }
 
         session.turn_count += completed_turns;

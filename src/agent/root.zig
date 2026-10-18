@@ -419,6 +419,10 @@ pub const Agent = struct {
     usage_record_ctx: ?*anyopaque = null,
     /// Cross-thread interrupt flag used to stop in-flight tool loops.
     interrupt_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Whether the last `turn()` returned through `interruptedReply`. The
+    /// interrupt flag itself is consumed by that reply, so callers that run
+    /// post-turn work need this latch to tell that the turn ended on a /stop.
+    last_turn_interrupted: bool = false,
     /// Tracks currently running tool and effective interruptions for user-facing reporting.
     tool_state_mu: std_compat.sync.Mutex = .{},
     active_tool_name: ?[]u8 = null,
@@ -813,6 +817,7 @@ pub const Agent = struct {
         });
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
+        self.last_turn_interrupted = true;
         return msg;
     }
 
@@ -2054,6 +2059,7 @@ pub const Agent = struct {
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
+        self.last_turn_interrupted = false;
         // Provider retries run synchronously on this thread; route their
         // notices to this turn's live-draft sink and restore any outer observer.
         const prev_retry_observer = providers.reliable.retryObserver();
