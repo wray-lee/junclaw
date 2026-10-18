@@ -144,6 +144,10 @@ fn buildSlashResponseBody(allocator: std.mem.Allocator, text: []const u8) ![]u8 
 /// Recently seen inbound event hashes, used to drop Slack redeliveries.
 const SEEN_INBOUND_EVENTS = 256;
 
+/// Channel threads the bot has posted into. A fixed ring of wyhash tags keeps
+/// implicit-mention tracking flat: no per-thread allocation, oldest evicted.
+const THREAD_PARTICIPATION_SLOTS = 64;
+
 /// One unit of inbound work for the worker pool. Message events carry the
 /// serialized Slack event; slash commands carry the command text and sender.
 const InboundEvent = struct {
@@ -364,6 +368,15 @@ pub const SlackChannel = struct {
     inbound_seen: [SEEN_INBOUND_EVENTS]u64 = [_]u64{0} ** SEEN_INBOUND_EVENTS,
     inbound_seen_count: usize = 0,
     inbound_seen_next: usize = 0,
+    /// Bounded ring of hashes of `channel_id:thread_ts` the bot has posted
+    /// into (see THREAD_PARTICIPATION_SLOTS). Guarded by the mutex because
+    /// outbound delivery and inbound workers run on different threads.
+    thread_participation: [THREAD_PARTICIPATION_SLOTS]u64 = [_]u64{0} ** THREAD_PARTICIPATION_SLOTS,
+    thread_participation_count: usize = 0,
+    thread_participation_next: usize = 0,
+    thread_participation_mu: std_compat.sync.Mutex = .{},
+    /// See config_types.SlackConfig.implicit_thread_mention.
+    implicit_thread_mention: bool = true,
     /// Test seam: counts native chat.stopStream calls (the API is stubbed).
     test_native_stop_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     test_api_ctx: if (builtin.is_test) ?*anyopaque else void = if (builtin.is_test) null else {},
@@ -459,6 +472,7 @@ pub const SlackChannel = struct {
         ch.signing_secret = cfg.signing_secret;
         ch.webhook_path = normalizeWebhookPath(cfg.webhook_path);
         ch.reply_to_mode = cfg.reply_to_mode;
+        ch.implicit_thread_mention = cfg.implicit_thread_mention;
         ch.slash_command_enabled = cfg.slash_command.enabled;
         ch.slash_command_name = if (cfg.slash_command.name.len == 0) "nullclaw" else cfg.slash_command.name;
         ch.streaming_enabled = cfg.streaming;
@@ -927,7 +941,13 @@ pub const SlackChannel = struct {
         // mention. Publishing strips a leading bot mention so a "<@BOT> /stop"
         // that had to queue behind earlier work is still a command for the
         // daemon (the stop fast path already strips it).
-        if (!self.shouldHandle(sender_id, is_dm, text, self.bot_user_id)) return;
+        //
+        // Regression: a follow-up in a channel thread the bot had answered was
+        // ignored without re-mentioning the bot. A reply in a thread the bot
+        // posted into counts as an implicit mention so the exchange continues.
+        const is_mention = self.isImplicitThreadMention(channel_id, message_ts, thread_ts) or
+            if (self.bot_user_id) |bot_uid| containsMention(text, bot_uid) else false;
+        if (!root.checkPolicyScoped("slack channel", self.policy, sender_id, is_dm, is_mention)) return;
         const publish_text = if (self.bot_user_id) |bot_uid|
             stripLeadingMention(text, bot_uid) orelse text
         else
@@ -979,6 +999,57 @@ pub const SlackChannel = struct {
         self.inbound_seen_next = (self.inbound_seen_next + 1) % SEEN_INBOUND_EVENTS;
         if (self.inbound_seen_count < SEEN_INBOUND_EVENTS) self.inbound_seen_count += 1;
         return false;
+    }
+
+    fn threadParticipationTag(channel_id: []const u8, thread_ts: []const u8) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(channel_id);
+        hasher.update(":");
+        hasher.update(thread_ts);
+        // Never store 0 so the zero-filled ring reads as empty.
+        return hasher.final() | 1;
+    }
+
+    /// Record that the bot posted into a channel thread. Top-level sends and
+    /// DMs are ignored: only thread follow-ups can be implicitly mentioned.
+    fn markBotThreadParticipation(self: *SlackChannel, channel_id: []const u8, thread_ts: ?[]const u8) void {
+        const tts = thread_ts orelse return;
+        if (channel_id.len == 0 or tts.len == 0) return;
+        if (isDirectConversationId(channel_id)) return;
+        const tag = threadParticipationTag(channel_id, tts);
+        self.thread_participation_mu.lock();
+        defer self.thread_participation_mu.unlock();
+        self.thread_participation[self.thread_participation_next] = tag;
+        self.thread_participation_next = (self.thread_participation_next + 1) % THREAD_PARTICIPATION_SLOTS;
+        if (self.thread_participation_count < THREAD_PARTICIPATION_SLOTS) self.thread_participation_count += 1;
+    }
+
+    fn botParticipatedInThread(self: *SlackChannel, channel_id: []const u8, thread_ts: []const u8) bool {
+        const tag = threadParticipationTag(channel_id, thread_ts);
+        self.thread_participation_mu.lock();
+        defer self.thread_participation_mu.unlock();
+        for (self.thread_participation[0..self.thread_participation_count]) |seen| {
+            if (seen == tag) return true;
+        }
+        return false;
+    }
+
+    /// A reply in a channel thread the bot already posted into counts as an
+    /// implicit mention: the user is continuing that exchange.
+    fn isImplicitThreadMention(
+        self: *SlackChannel,
+        channel_id: []const u8,
+        message_ts: ?[]const u8,
+        thread_ts: ?[]const u8,
+    ) bool {
+        if (!self.implicit_thread_mention) return false;
+        if (isDirectConversationId(channel_id)) return false;
+        const tts = thread_ts orelse return false;
+        // thread_ts == ts is a top-level post that merely started a thread.
+        if (message_ts) |mts| {
+            if (std.mem.eql(u8, tts, mts)) return false;
+        }
+        return self.botParticipatedInThread(channel_id, tts);
     }
 
     /// Hand an owned event to the worker pool. Takes ownership of the event,
@@ -2067,6 +2138,7 @@ pub const SlackChannel = struct {
         thread_ts: ?[]const u8,
         mrkdwn_text: []const u8,
     ) !void {
+        self.markBotThreadParticipation(actual_channel, thread_ts);
         try body_list.appendSlice(self.allocator, "{\"channel\":\"");
         try body_list.appendSlice(self.allocator, actual_channel);
         try body_list.appendSlice(self.allocator, "\",\"mrkdwn\":true,\"text\":");
@@ -2241,6 +2313,7 @@ pub const SlackChannel = struct {
         token: []const u8,
         choices: []const root.Channel.OutboundChoice,
     ) !void {
+        self.markBotThreadParticipation(actual_channel, self.thread_ts);
         const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
         defer self.allocator.free(mrkdwn_text);
 
@@ -2391,6 +2464,7 @@ pub const SlackChannel = struct {
         content_type: []const u8,
         data: []const u8,
     ) !void {
+        self.markBotThreadParticipation(channel_id, thread_ts);
         const ticket_body = try buildGetUploadUrlBody(self.allocator, file_name, data.len);
         defer self.allocator.free(ticket_body);
 
@@ -3057,6 +3131,7 @@ pub const SlackChannel = struct {
             state.mode = .fallback;
             return error.SlackStreamNotThreaded;
         };
+        self.markBotThreadParticipation(parsed.channel_id, thread_ts);
 
         const chunks = try stream_presenter.splitForSlackLimit(
             self.allocator,
@@ -5074,6 +5149,156 @@ test "slack socket interactive unknown token is acked and publishes nothing" {
         // An expired/unknown token still acks, but nothing reaches the agent.
         try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
     }
+}
+
+test "slack implicit thread mention handles a follow-up without a re-mention" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C123", &allowed);
+    ch.account_id = "sl-thread";
+    ch.policy = .{ .dm = .allow, .group = .mention_only };
+    ch.setBus(&eb);
+
+    // The bot answered in this thread; outbound chat.postMessage bodies record
+    // participation for the thread target.
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(alloc);
+    try ch.appendPostMessageBody(&body, "C123", "1700.1", "answer");
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"type":"message","user":"U123","text":"follow up","ts":"1700.2","thread_ts":"1700.1"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    try ch.processHistoryMessage(parsed.value.object, "C123");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("follow up", msg.content);
+    try std.testing.expectEqualStrings("C123:1700.1", msg.chat_id);
+}
+
+test "slack implicit thread mention keeps top-level channel messages mention-only" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C123", &allowed);
+    ch.account_id = "sl-thread";
+    ch.policy = .{ .dm = .allow, .group = .mention_only };
+    ch.setBus(&eb);
+
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(alloc);
+    try ch.appendPostMessageBody(&body, "C123", "1700.1", "answer");
+
+    // No thread_ts: a top-level post in the same channel is not a follow-up.
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"type":"message","user":"U123","text":"top level","ts":"1700.3"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    try ch.processHistoryMessage(parsed.value.object, "C123");
+
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+}
+
+test "slack implicit thread mention still requires a mention without bot participation" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "C123", &allowed);
+    ch.account_id = "sl-thread";
+    ch.policy = .{ .dm = .allow, .group = .mention_only };
+    ch.bot_user_id = try alloc.dupe(u8, "UBOT");
+    defer alloc.free(ch.bot_user_id.?);
+    ch.setBus(&eb);
+
+    const silent = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"type":"message","user":"U123","text":"no mention","ts":"1700.2","thread_ts":"1700.1"}
+    ,
+        .{},
+    );
+    defer silent.deinit();
+    try ch.processHistoryMessage(silent.value.object, "C123");
+    try std.testing.expectError(error.Timeout, eb.consumeInboundTimeout(0));
+
+    const mentioned = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"type":"message","user":"U123","text":"<@UBOT> hello","ts":"1700.4","thread_ts":"1700.1"}
+    ,
+        .{},
+    );
+    defer mentioned.deinit();
+    try ch.processHistoryMessage(mentioned.value.object, "C123");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("hello", msg.content);
+}
+
+test "slack implicit thread mention leaves DMs unchanged" {
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(alloc, "tok", null, "D123", &allowed);
+    ch.account_id = "sl-thread";
+    ch.policy = .{ .dm = .allow, .group = .mention_only };
+    ch.setBus(&eb);
+
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        alloc,
+        \\{"type":"message","user":"U123","text":"dm reply","ts":"1700.2","thread_ts":"1700.1"}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+    try ch.processHistoryMessage(parsed.value.object, "D123");
+
+    var msg = eb.consumeInbound() orelse return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("dm reply", msg.content);
+}
+
+test "slack implicit thread participation ring stays bounded" {
+    const allowed = [_][]const u8{"*"};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, "C123", &allowed);
+
+    var ts_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        const ts = try std.fmt.bufPrint(&ts_buf, "{d}.0", .{i});
+        ch.markBotThreadParticipation("C123", ts);
+    }
+
+    try std.testing.expectEqual(THREAD_PARTICIPATION_SLOTS, ch.thread_participation_count);
+    try std.testing.expectEqual(@as(usize, 100 % THREAD_PARTICIPATION_SLOTS), ch.thread_participation_next);
+    // The oldest 36 entries were evicted; the newest are still tracked.
+    try std.testing.expect(!ch.botParticipatedInThread("C123", "0.0"));
+    try std.testing.expect(ch.botParticipatedInThread("C123", "99.0"));
+
+    // DMs and top-level sends never consume ring slots.
+    ch.markBotThreadParticipation("D123", "1.0");
+    ch.markBotThreadParticipation("C123", null);
+    try std.testing.expectEqual(@as(usize, 100 % THREAD_PARTICIPATION_SLOTS), ch.thread_participation_next);
 }
 
 test "slack channel interface returns slack name" {

@@ -7374,6 +7374,36 @@ test "parse slack status reactions from config" {
     allocator.free(cfg.channels.slack);
 }
 
+test "parse slack implicit thread mention defaults on" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(cfg.channels.slack[0].implicit_thread_mention);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
+test "parse slack implicit thread mention can be disabled" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "implicit_thread_mention": false}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(!cfg.channels.slack[0].implicit_thread_mention);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+}
+
 test "parse slack long reply file threshold defaults to 9" {
     const allocator = std.testing.allocator;
     const json =
