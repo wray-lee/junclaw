@@ -1329,15 +1329,9 @@ native streaming call fails with a permanent error (`channel_type_not_supported`
 that account and uses edited messages from then on. If an append returns
 `msg_too_long`, live updates continue through the edited-message transport with a
 bounded preview. The preview retains the newest text within Slack's escaped-text
-budget; the final reply delivers every chunk in order, including replies needing
-more than eight follow-ups, with follow-ups threaded under the first message when
-answering in a top-level channel. A failed follow-up is reported as a delivery failure
-so the durable outbox can retry it. Final follow-ups and edited preview creation
-share a one-message-per-second budget per channel, including across threads. Partial
-final delivery keeps its own outbox job ID, preview message, and next unsent chunk;
-a retry resumes there without repeating accepted chunks or altering a later turn's
-preview. Chunk progress is held in memory: a process restart can repeat already
-accepted chunks, while the durable outbox retains the full reply for redelivery.
+budget; each final chunk is entity-budgeted to fit Slack's limits, delivering the
+initial message and up to eight follow-ups (overflow beyond the follow-up cap is
+logged and marked with a truncation notice on the final chunk).
 
 About `tool_progress` on Slack: accepted for parity with Telegram, but currently inert -
 Slack renders no tool-progress block in any mode. The native transport

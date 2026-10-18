@@ -65,6 +65,41 @@ pub const STREAM_UPDATE_MAX_BYTES: usize = 4_000;
 /// Prefix shown when a live preview had to drop its oldest text to fit the
 /// chat.update cap.
 pub const PREVIEW_TRUNCATED_MARKER = "\u{2026} (earlier text truncated)\n\n";
+/// Upper bound on follow-up messages posted when the final reply overflows.
+pub const STREAM_MAX_FOLLOWUPS: usize = 8;
+/// Short marker appended when follow-up messages hit STREAM_MAX_FOLLOWUPS.
+pub const FINAL_TRUNCATED_MARKER = "\n\n(reply truncated)";
+
+/// Append the truncation marker to `chunk`, trimming chunk if necessary so that
+/// the escaped mrkdwn length fits within `limit`.
+pub fn appendTruncationMarker(allocator: std.mem.Allocator, chunk: []const u8, limit: usize) ![]u8 {
+    const marker = FINAL_TRUNCATED_MARKER;
+    const marker_cost = slackEscapedLen(marker);
+    if (limit <= marker_cost) {
+        return allocator.dupe(u8, marker);
+    }
+    const max_chunk_budget = limit - marker_cost;
+    var cost: usize = 0;
+    var cut: usize = 0;
+    var i: usize = 0;
+    while (i < chunk.len) {
+        const cp_len = std.unicode.utf8ByteSequenceLength(chunk[i]) catch 1;
+        const next = @min(chunk.len, i + cp_len);
+        const cp_cost = switch (chunk[i]) {
+            '&' => 5,
+            '<', '>' => 4,
+            else => next - i,
+        };
+        if (cost + cp_cost > max_chunk_budget) break;
+        cost += cp_cost;
+        cut = next;
+        i = next;
+    }
+    var result = try allocator.alloc(u8, cut + marker.len);
+    @memcpy(result[0..cut], chunk[0..cut]);
+    @memcpy(result[cut..], marker);
+    return result;
+}
 /// How long a finalized target keeps ignoring `.chunk` events. The daemon
 /// publishes the final reply on the durable outbox worker while the outbound
 /// dispatcher may still be draining deltas of the same turn; without this the
@@ -1114,4 +1149,19 @@ test "clearStreamState frees the target entry" {
 
     clearStreamState(std.testing.allocator, &states, "C123");
     try std.testing.expect(states.count() == 0);
+}
+
+test "appendTruncationMarker appends marker within limit" {
+    const alloc = std.testing.allocator;
+    const short_chunk = "Hello world";
+    const marked = try appendTruncationMarker(alloc, short_chunk, 100);
+    defer alloc.free(marked);
+    try std.testing.expect(std.mem.endsWith(u8, marked, FINAL_TRUNCATED_MARKER));
+    try std.testing.expect(slackEscapedLen(marked) <= 100);
+
+    const long_chunk = "<&>" ** 500;
+    const marked_long = try appendTruncationMarker(alloc, long_chunk, 200);
+    defer alloc.free(marked_long);
+    try std.testing.expect(std.mem.endsWith(u8, marked_long, FINAL_TRUNCATED_MARKER));
+    try std.testing.expect(slackEscapedLen(marked_long) <= 200);
 }
