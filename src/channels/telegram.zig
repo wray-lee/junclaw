@@ -3807,23 +3807,29 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
 
     var fence: ?RichFence = null;
     var inline_code_end: usize = 0;
+    var paragraph_end: usize = 0;
     var i: usize = 0;
     while (i < lines.items.len) : (i += 1) {
         const line = lines.items[i];
         const trimmed = std.mem.trim(u8, line, " \t\r");
         const line_start = @intFromPtr(line.ptr) - @intFromPtr(md.ptr);
         const was_fenced = fence != null;
+        // Resolve block boundaries before matching inline syntax: a fence can
+        // interrupt a paragraph even without a blank line before it.
+        if (line_start >= paragraph_end) paragraph_end = richParagraphEnd(md, lines.items, i);
         const in_inline_code = inline_code_end > line_start;
+        var table_block = false;
 
         if (fence) |open| {
             try out.appendSlice(allocator, line);
             if (closesRichFence(trimmed, open)) fence = null;
         } else if (in_inline_code) {
-            try appendRichParagraphLine(&out, allocator, md, line, line_start, &inline_code_end);
+            try appendRichParagraphLine(&out, allocator, md[0..paragraph_end], line, line_start, &inline_code_end);
         } else if (richFenceChar(trimmed)) |open| {
             fence = open;
             try out.appendSlice(allocator, line);
         } else if (richTableBlockEnd(lines.items, i)) |end| {
+            table_block = true;
             var max_cols: usize = 0;
             for (lines.items[i..end]) |row| max_cols = @max(max_cols, richTableColumns(row));
             if (max_cols > TelegramChannel.RICH_MAX_TABLE_COLUMNS) {
@@ -3849,14 +3855,15 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
             // show a literal `\<`.
             try out.appendSlice(allocator, line);
         } else {
-            try appendRichParagraphLine(&out, allocator, md, line, line_start, &inline_code_end);
+            try appendRichParagraphLine(&out, allocator, md[0..paragraph_end], line, line_start, &inline_code_end);
         }
 
         if (i + 1 < lines.items.len) {
             const next_line = lines.items[i + 1];
-            const current_is_block = richLineStartsBlock(trimmed) or isIndentedCodeLine(line);
+            const current_is_block = table_block or richLineStartsBlock(trimmed) or isIndentedCodeLine(line);
             const next_trimmed = std.mem.trim(u8, next_line, " \t\r");
-            const next_is_block = richLineStartsBlock(next_trimmed) or isIndentedCodeLine(next_line);
+            const next_is_block = richLineStartsBlock(next_trimmed) or isIndentedCodeLine(next_line) or
+                richTableBlockEnd(lines.items, i + 1) != null;
             // GFM treats a bare newline inside a paragraph as a soft break.
             // Rich Telegram clients render that as a space, so preserve visual
             // line breaks for ordinary multi-line text with a GFM hard break.
@@ -3876,12 +3883,59 @@ pub fn escapeRichMarkdown(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
 /// rather than become a paragraph hard break.
 fn richLineStartsBlock(trimmed: []const u8) bool {
     if (trimmed.len == 0) return true;
-    const first = trimmed[0];
-    if (first == '#' or first == '>' or first == '-' or first == '*' or
-        first == '+' or first == '_' or first == '=' or first == '`' or
-        first == '~' or first == '|' or first == '<') return true;
-    if (first >= '0' and first <= '9') return true;
+    if (richFenceChar(trimmed) != null or trimmed[0] == '>') return true;
+    if (trimmed[0] == '#') {
+        var count: usize = 0;
+        while (count < trimmed.len and trimmed[count] == '#') : (count += 1) {}
+        if (count <= 6 and (count == trimmed.len or isRichMarkerSpace(trimmed[count]))) return true;
+    }
+    if (trimmed[0] == '-' or trimmed[0] == '*' or trimmed[0] == '+') {
+        if (trimmed.len == 1 or isRichMarkerSpace(trimmed[1])) return true;
+    }
+    // Thematic breaks and setext underlines are block syntax; emphasis and
+    // ordinary lines beginning with these characters are still paragraphs.
+    if (trimmed[0] == '-' or trimmed[0] == '*' or trimmed[0] == '_' or trimmed[0] == '=') {
+        var count: usize = 0;
+        for (trimmed) |c| {
+            if (c == trimmed[0]) {
+                count += 1;
+            } else if (!isRichMarkerSpace(c)) break;
+        } else {
+            if (count >= 3 or trimmed[0] == '=') return true;
+        }
+    }
+    var digits: usize = 0;
+    while (digits < trimmed.len and std.ascii.isDigit(trimmed[digits])) : (digits += 1) {}
+    if (digits > 0 and digits <= 9 and digits < trimmed.len and
+        (trimmed[digits] == '.' or trimmed[digits] == ')'))
+    {
+        const after = digits + 1;
+        if (after == trimmed.len or isRichMarkerSpace(trimmed[after])) return true;
+    }
     return false;
+}
+
+fn isRichMarkerSpace(c: u8) bool {
+    return c == ' ' or c == '\t' or c == '\r';
+}
+
+/// Exclusive byte offset of this paragraph. Inline code can span soft line
+/// breaks, but never whitespace-only lines or another Markdown block.
+fn richParagraphEnd(md: []const u8, lines: []const []const u8, start: usize) usize {
+    const first = lines[start];
+    if (!richLineStartsBlock(std.mem.trim(u8, first, " \t\r")) and !isIndentedCodeLine(first)) {
+        var i = start + 1;
+        while (i < lines.len) : (i += 1) {
+            const line = lines[i];
+            if (richLineStartsBlock(std.mem.trim(u8, line, " \t\r")) or
+                isIndentedCodeLine(line) or richTableBlockEnd(lines, i) != null)
+            {
+                return @intFromPtr(line.ptr) - @intFromPtr(md.ptr);
+            }
+        }
+        return md.len;
+    }
+    return @intFromPtr(first.ptr) - @intFromPtr(md.ptr) + first.len;
 }
 
 /// A trailing odd backslash already requests a GFM hard break.
@@ -3904,7 +3958,10 @@ fn richFenceChar(trimmed: []const u8) ?RichFence {
     if (ch != '`' and ch != '~') return null;
     var run: usize = 0;
     while (run < trimmed.len and trimmed[run] == ch) run += 1;
-    return if (run >= 3) .{ .char = ch, .len = run } else null;
+    if (run < 3) return null;
+    // Backticks in an info string make this an inline run, not a fence.
+    if (ch == '`' and std.mem.indexOfScalar(u8, trimmed[run..], '`') != null) return null;
+    return .{ .char = ch, .len = run };
 }
 
 /// A shorter inner fence is literal code, not the outer fence's closer.
@@ -4012,10 +4069,8 @@ fn appendRichParagraphLine(
         if (line[i] == '`' and backslashes % 2 == 0) {
             var run: usize = 1;
             while (i + run < line.len and line[i + run] == '`') run += 1;
-            // Code spans belong to one paragraph. Do not match a closing run
-            // after a blank line, where a new block has already begun.
-            const paragraph_end = std.mem.indexOfPos(u8, md, absolute + run, "\n\n") orelse md.len;
-            if (findBacktickRun(md[0..paragraph_end], absolute + run, run)) |close| {
+            // The caller has already bounded md to this Markdown paragraph.
+            if (findBacktickRun(md, absolute + run, run)) |close| {
                 inline_code_end.* = close + run;
                 continue;
             }
@@ -7178,4 +7233,23 @@ test "telegram rich markdown leaves multiline inline code newlines untouched" {
     // An unmatched or escaped backtick remains paragraph text.
     try expectRichEscaped("before `literal  \nnext", "before `literal\nnext");
     try expectRichEscaped("before \\`literal  \nnext \\`end", "before \\`literal\nnext \\`end");
+}
+
+test "p0c rich markdown unmatched backticks cannot cross fenced blocks" {
+    // Regression: an unmatched paragraph backtick consumed a backtick inside
+    // the following fence, escaping heredoc syntax and adding spaces to EOF.
+    const code = "```sh\nprintf `date`\ncat <<EOF\nhello\nEOF\n```";
+    try expectRichEscaped("before `literal\n" ++ code, "before `literal\n" ++ code);
+    const tilde = "~~~sh\nprintf `date`\ncat <<EOF\nhello\nEOF\n~~~";
+    try expectRichEscaped("before `literal\n" ++ tilde, "before `literal\n" ++ tilde);
+    try expectRichEscaped("before `literal\n \t\nnext `code`", "before `literal\n \t\nnext `code`");
+}
+
+test "p0c rich markdown recognizes syntax instead of paragraph first characters" {
+    // Regression: emphasis, inline code, and numbers were classified as blocks,
+    // so normal status lines still collapsed into one rich-message paragraph.
+    try expectRichEscaped("**Current status**  \nReady  \n42 tokens  \nNext", "**Current status**\nReady\n42 tokens\nNext");
+    try expectRichEscaped("`model`  \n_ready_  \n#tag  \n-final  \n+ready  \n~done~  \n|plain|  \n\\<text>", "`model`\n_ready_\n#tag\n-final\n+ready\n~done~\n|plain|\n<text>");
+    const blocks = "# Heading\n> quote\n- item\n* item\n+ item\n1. item\n2) item\n---\n___\n***\nTitle\n===";
+    try expectRichEscaped(blocks, blocks);
 }
