@@ -191,8 +191,8 @@ fn slackChannelIdOf(target: []const u8) ?[]const u8 {
 
 /// The API calls one lifecycle transition needs. Slack adds reactions instead
 /// of replacing them, so the state being left behind has to be removed
-/// explicitly; a state that reuses the emoji already on the message needs no
-/// call at all.
+/// explicitly. Running can retain the accepted emoji. Terminal transitions
+/// ensure their emoji exists, since steered messages can skip running entirely.
 pub const ReactionPlan = struct {
     removals: [2]?[]const u8 = .{ null, null },
     removals_len: u8 = 0,
@@ -231,12 +231,12 @@ pub fn planTaskReaction(
 ) ReactionPlan {
     var plan = ReactionPlan{};
     const add = reactionEmoji(emojis, reaction);
-    var add_already_present = false;
+    const running_keeps_accepted = reaction == .running and add != null and
+        std.mem.eql(u8, add.?, emojis.accepted);
     for (supersededReactions(reaction)) |previous| {
         const emoji = reactionEmoji(emojis, previous) orelse continue;
         if (add) |next| {
             if (std.mem.eql(u8, next, emoji)) {
-                add_already_present = true;
                 continue;
             }
         }
@@ -250,7 +250,9 @@ pub fn planTaskReaction(
         plan.removals[plan.removals_len] = emoji;
         plan.removals_len += 1;
     }
-    plan.add = if (add_already_present) null else add;
+    // A terminal emoji matching accepted may have been removed by running;
+    // one matching running may never have been added on a steered message.
+    plan.add = if (running_keeps_accepted) null else add;
     return plan;
 }
 
@@ -349,6 +351,8 @@ pub const SlackChannel = struct {
     inbound_seen_next: usize = 0,
     /// Test seam: counts native chat.stopStream calls (the API is stubbed).
     test_native_stop_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
+    test_api_ctx: if (builtin.is_test) ?*anyopaque else void = if (builtin.is_test) null else {},
+    test_api_call: if (builtin.is_test) ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!SlackApiResult else void = if (builtin.is_test) null else {},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
     bot_team_id: ?[]u8 = null,
@@ -3277,6 +3281,7 @@ pub const SlackChannel = struct {
         // Streaming outbound must never touch the network under `zig build test`;
         // the throttling/fallback state machine is covered through this stub.
         if (builtin.is_test) {
+            if (self.test_api_call) |call| return call(self.test_api_ctx.?, self.allocator, endpoint, body);
             return .{ .ts = try self.allocator.dupe(u8, "1700000000.000000") };
         }
 
@@ -3288,7 +3293,7 @@ pub const SlackChannel = struct {
         try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxyTimeout(self.allocator, url, body, &.{auth_header}, null, "15") catch |err| {
             log.err("Slack {s} POST failed: {}", .{ endpoint, err });
             return error.SlackApiError;
         };
@@ -6536,4 +6541,88 @@ test "slack marker-only final stops and discards the stream preview" {
     const state = ch.stream_states.getPtr("C1:1700.1") orelse return error.TestUnexpectedResult;
     try std.testing.expect(state.finished_at_ms != 0);
     try std.testing.expectEqual(@as(usize, 0), state.message_ts.len);
+}
+
+test "p0f reaction regression final emoji can reuse accepted after running removed it" {
+    // Regression: matching any historical emoji suppressed the terminal add,
+    // even though running had already removed that accepted emoji.
+    const emojis = config_types.SlackReactionEmojisConfig{
+        .accepted = "eyes",
+        .running = "hourglass_flowing_sand",
+        .done = "eyes",
+        .failed = "eyes",
+    };
+    for ([_]root.Channel.TaskReaction{ .done, .failed }) |terminal| {
+        const plan = planTaskReaction(emojis, terminal);
+        try std.testing.expectEqualStrings("eyes", plan.add orelse "");
+        try std.testing.expectEqual(@as(u8, 1), plan.removals_len);
+        try std.testing.expectEqualStrings("hourglass_flowing_sand", plan.removals[0].?);
+    }
+}
+
+const SlackReactionRegressionProbe = struct {
+    eyes: bool = false,
+    hourglass: bool = false,
+    additions: usize = 0,
+    removals: usize = 0,
+
+    fn call(ctx: *anyopaque, allocator: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+        defer parsed.deinit();
+        const emoji = parsed.value.object.get("name").?.string;
+        const present = if (std.mem.eql(u8, emoji, "eyes")) &self.eyes else &self.hourglass;
+        if (std.mem.eql(u8, endpoint, "reactions.add")) {
+            self.additions += 1;
+            if (present.*) return .{ .error_code = try allocator.dupe(u8, "already_reacted") };
+            present.* = true;
+        } else if (std.mem.eql(u8, endpoint, "reactions.remove")) {
+            self.removals += 1;
+            present.* = false;
+        } else return error.UnexpectedEndpoint;
+        return .{};
+    }
+};
+
+test "slack terminal reaction restores an emoji removed by running" {
+    // Regression: accepted=eyes, running=hourglass, done=eyes suppressed the
+    // final add based on accepted's history, so completion showed no reaction.
+    for ([_]root.Channel.TaskReaction{ .done, .failed }) |terminal| {
+        var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+            .bot_token = "test-token",
+            .status_reactions = true,
+            .reaction_emojis = .{ .accepted = "eyes", .running = "hourglass_flowing_sand", .done = "eyes", .failed = "eyes" },
+        });
+        defer ch.channel().stop();
+        var probe = SlackReactionRegressionProbe{};
+        ch.test_api_ctx = &probe;
+        ch.test_api_call = SlackReactionRegressionProbe.call;
+        ch.setTaskReaction("D_TEST", "1.1", .accepted);
+        try std.testing.expect(probe.eyes);
+        ch.setTaskReaction("D_TEST", "1.1", .running);
+        try std.testing.expect(!probe.eyes and probe.hourglass);
+        ch.setTaskReaction("D_TEST", "1.1", terminal);
+        try std.testing.expect(probe.eyes and !probe.hourglass);
+    }
+}
+
+test "slack steered reaction clears on success and failure without a running transition" {
+    // Regression: steered messages only receive accepted; finishing their
+    // consuming turn must remove that reaction on either terminal outcome.
+    for ([_]root.Channel.TaskReaction{ .done, .failed }) |terminal| {
+        var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+            .bot_token = "test-token",
+            .status_reactions = true,
+            .reaction_emojis = .{ .accepted = "eyes", .running = "eyes", .done = "", .failed = "" },
+        });
+        defer ch.channel().stop();
+        var probe = SlackReactionRegressionProbe{};
+        ch.test_api_ctx = &probe;
+        ch.test_api_call = SlackReactionRegressionProbe.call;
+        ch.setTaskReaction("D_TEST", "1.1", .accepted);
+        ch.setTaskReaction("D_TEST", "1.1", terminal);
+        try std.testing.expect(!probe.eyes and !probe.hourglass);
+        try std.testing.expectEqual(@as(usize, 1), probe.additions);
+        try std.testing.expectEqual(@as(usize, 1), probe.removals);
+    }
 }

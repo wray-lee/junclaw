@@ -1288,6 +1288,11 @@ With `status_reactions = true`, nullclaw reacts to the triggering message with
 on the final state when that state's emoji is empty. Slack adds reactions instead
 of replacing them, so the previous state is removed explicitly.
 
+Messages steered into an active turn also receive that turn's final reaction,
+including when the turn is interrupted or a follow-up fails. Each inserted
+message is finalized on its original channel and account, even when accounts or
+channels share a session. An empty `done` or `failed` removes its acknowledgement.
+
 Give `accepted` and `running` the same name to keep the traffic to one reaction
 per turn:
 

@@ -1051,6 +1051,8 @@ webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答�
 
 `status_reactions = true` 时，nullclaw 用 `reactions.add` 在触发消息上加 reaction，随任务推进在 `accepted`、`running`、`done`/`failed` 之间切换，并在该状态的短名为空时用 `reactions.remove` 移除。Slack 的 reaction 是累加而非替换，因此会显式移除上一个状态。
 
+插入正在运行轮次的消息也会收到该轮次的终态 reaction，包括轮次被中断或后续轮次失败的情况。即使不同账号或通道共用一个 session，每条插入消息也会通过其原始通道和账号收尾。`done` 或 `failed` 为空时会移除该消息的确认 reaction。
+
 把 `accepted` 和 `running` 设为同一个短名，可以让每轮只产生一次 reaction 请求：
 
 ```json

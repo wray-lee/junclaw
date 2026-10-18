@@ -805,14 +805,13 @@ fn handleTelegramInteractiveCallback(
         }
 
         const progress_sink: ?agent_mod.ProgressSink = if (heartbeat) |h| progressHeartbeatSink(h) else null;
-        var steer_reaction_ctx = TelegramSteerReactionCtx{ .tg_ptr = tg_ptr };
         const turn_result = runtime.session_mgr.processMessageStreamingWithSteerSink(
             session_key,
             content,
             conversation_context,
             null,
             progress_sink,
-            .{ .ctx = @ptrCast(&steer_reaction_ctx), .finalize = finalizeTelegramSteerReaction },
+            .{ .ctx = @ptrCast(tg_ptr), .finalize = finalizeTelegramSteerReaction },
         );
         // Clear the worker's pre-turn marker before the in-place edit is sent.
         if (turn_end) |hook| hook.run(hook.ctx);
@@ -1001,10 +1000,6 @@ fn telegramSteerRef(
     };
 }
 
-const TelegramSteerReactionCtx = struct {
-    tg_ptr: *telegram.TelegramChannel,
-};
-
 /// Apply the consuming turn's outcome to a steered Telegram message's
 /// reaction, the same way the turn's own message is finalized.
 fn finalizeTelegramSteerReaction(
@@ -1012,9 +1007,15 @@ fn finalizeTelegramSteerReaction(
     ref: session_mod.ConsumedRef,
     outcome: session_mod.SteerOutcome,
 ) void {
-    const steer_ctx: *TelegramSteerReactionCtx = @ptrCast(@alignCast(ctx));
+    const tg_ptr: *telegram.TelegramChannel = @ptrCast(@alignCast(ctx));
+    // A ref with an origin sink always returns to its own transport/account.
+    // Legacy callers without one must never clear a different bot's message.
+    if (!std.mem.eql(u8, ref.channel, "telegram")) return;
+    if (ref.account_id) |aid| {
+        if (!std.mem.eql(u8, aid, tg_ptr.account_id)) return;
+    }
     const message_id = std.fmt.parseInt(i64, ref.message_id, 10) catch return;
-    steer_ctx.tg_ptr.setTaskReaction(ref.target, message_id, if (outcome == .done) .done else .failed);
+    tg_ptr.setTaskReaction(ref.target, message_id, if (outcome == .done) .done else .failed);
 }
 
 fn processTelegramMessage(
@@ -1045,7 +1046,7 @@ fn processTelegramMessage(
         session_key,
         content,
         telegramSteerRef(tg_ptr, sender, message_id, &steer_id_buf),
-        null,
+        .{ .ctx = @ptrCast(tg_ptr), .finalize = finalizeTelegramSteerReaction },
     );
     if (route_action.skipsTurn()) {
         if (route_action == .steered) {
@@ -1115,14 +1116,13 @@ fn processTelegramMessage(
         .callback = telegramToolProgressCallback,
         .ctx = @ptrCast(&tool_progress_ctx),
     };
-    var steer_reaction_ctx = TelegramSteerReactionCtx{ .tg_ptr = tg_ptr };
     const turn_result = runtime.session_mgr.processMessageStreamingWithSteerSink(
         session_key,
         content,
         conversation_context,
         sink,
         progress_sink,
-        .{ .ctx = @ptrCast(&steer_reaction_ctx), .finalize = finalizeTelegramSteerReaction },
+        .{ .ctx = @ptrCast(tg_ptr), .finalize = finalizeTelegramSteerReaction },
     );
     // The turn is over even when it failed. Clear the worker's pre-turn
     // marker before the reply send: a media upload can take up to the HTTP
@@ -2370,7 +2370,7 @@ pub fn runTelegramLoop(
                             session_key,
                             msg.content,
                             telegramSteerRef(tg_ptr, msg.sender, msg.message_id, &steer_id_buf),
-                            null,
+                            .{ .ctx = @ptrCast(tg_ptr), .finalize = finalizeTelegramSteerReaction },
                         );
                         if (route_action.skipsTurn()) {
                             if (route_action == .steered) {
@@ -4918,14 +4918,13 @@ test "telegram steered message reaction is finalized when the consuming turn end
     // Run the turn that consumes it. The provider is replaced so the turn does
     // not touch the network; the sink is the one the worker installs.
     session.agent.provider = steerTelegramProvider();
-    var sink_ctx = TelegramSteerReactionCtx{ .tg_ptr = &tg };
     const reply = try runtime.session_mgr.processMessageStreamingWithSteerSink(
         session_key,
         "hello",
         null,
         null,
         null,
-        .{ .ctx = @ptrCast(&sink_ctx), .finalize = finalizeTelegramSteerReaction },
+        .{ .ctx = @ptrCast(&tg), .finalize = finalizeTelegramSteerReaction },
     );
     defer allocator.free(reply);
 
@@ -4949,13 +4948,121 @@ test "telegram steer finalizer clears the reaction on done and failed" {
     telegram.TelegramChannel.test_reaction_log = &calls;
     defer telegram.TelegramChannel.test_reaction_log = null;
 
-    var ctx = TelegramSteerReactionCtx{ .tg_ptr = &tg };
-    finalizeTelegramSteerReaction(@ptrCast(&ctx), .{ .channel = "telegram", .target = "12345", .message_id = "7" }, .done);
-    finalizeTelegramSteerReaction(@ptrCast(&ctx), .{ .channel = "telegram", .target = "12345", .message_id = "8" }, .failed);
+    finalizeTelegramSteerReaction(@ptrCast(&tg), .{ .channel = "telegram", .target = "12345", .message_id = "7" }, .done);
+    finalizeTelegramSteerReaction(@ptrCast(&tg), .{ .channel = "telegram", .target = "12345", .message_id = "8" }, .failed);
 
     try std.testing.expectEqual(@as(usize, 2), calls.items.len);
     try std.testing.expectEqual(@as(i64, 7), calls.items[0].message_id);
     try std.testing.expect(calls.items[0].cleared);
     try std.testing.expectEqual(@as(i64, 8), calls.items[1].message_id);
     try std.testing.expect(calls.items[1].cleared);
+}
+
+test "telegram shared session finalizes a steered message through its original bot" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+    tg.account_id = "bot-b";
+    var consuming_bot = telegram.TelegramChannel.init(allocator, "other-test-token", &.{}, &.{}, "allowlist");
+    defer consuming_bot.channel().stop();
+    consuming_bot.account_id = "bot-a";
+    consuming_bot.status_reactions_enabled = true;
+    consuming_bot.reaction_emojis.done = "";
+    tg.status_reactions_enabled = true;
+    // Production clears the reaction on completion (done/failed are empty).
+    tg.reaction_emojis.done = "";
+    tg.reaction_emojis.failed = "";
+
+    var calls: std.ArrayListUnmanaged(telegram.TelegramChannel.TestReactionCall) = .empty;
+    defer calls.deinit(allocator);
+    telegram.TelegramChannel.test_reaction_log = &calls;
+    defer telegram.TelegramChannel.test_reaction_log = null;
+
+    const session_key = "telegram:default:direct:12345";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.agent.queue_mode = .steer;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    // The poller acknowledges every non-callback message before routing it.
+    tg.setTaskReaction("12345", 222, .accepted);
+
+    processTelegramMessage(
+        allocator,
+        runtime,
+        &tg,
+        session_key,
+        "follow-up",
+        "12345",
+        222,
+        false,
+        null,
+        "user_a",
+        false,
+        null,
+        null,
+    );
+
+    // Regression: bot B shares a per-channel-peer session with bot A. Its
+    // inserted message must be finalized with B's token even when A owns the turn.
+    try std.testing.expect(session.hasInjection());
+    {
+        session.injection_mu.lock();
+        defer session.injection_mu.unlock();
+        try std.testing.expectEqual(@as(usize, 1), session.injection_refs.items.len);
+        try std.testing.expectEqualStrings("222", session.injection_refs.items[0].message_id);
+    }
+
+    // Run the turn that consumes it. The provider is replaced so the turn does
+    // not touch the network; the sink is the one the worker installs.
+    session.agent.provider = steerTelegramProvider();
+    const reply = try runtime.session_mgr.processMessageStreamingWithSteerSink(
+        session_key,
+        "hello",
+        null,
+        null,
+        null,
+        .{ .ctx = @ptrCast(&consuming_bot), .finalize = finalizeTelegramSteerReaction },
+    );
+    defer allocator.free(reply);
+
+    var steered_cleared = false;
+    for (calls.items) |call| {
+        if (call.message_id == 222 and call.cleared and std.mem.eql(u8, call.account_id, "bot-b")) steered_cleared = true;
+    }
+    try std.testing.expect(steered_cleared);
 }

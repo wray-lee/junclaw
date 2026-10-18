@@ -963,14 +963,10 @@ fn buildSteerRef(
     };
 }
 
-const SteerReactionCtx = struct {
-    registry: *const dispatch.ChannelRegistry,
-};
-
-/// Acknowledge before the injection becomes visible to the running turn.
+/// Acknowledge outside routing locks; the ref defers a racing terminal reaction.
 fn acceptSteerReaction(ctx: *anyopaque, ref: session_mod.ConsumedRef) void {
-    const steer_ctx: *SteerReactionCtx = @ptrCast(@alignCast(ctx));
-    const channel = resolveOutboundChannel(steer_ctx.registry, ref.channel, ref.account_id);
+    const registry: *const dispatch.ChannelRegistry = @ptrCast(@alignCast(ctx));
+    const channel = resolveOutboundChannel(registry, ref.channel, ref.account_id);
     setInboundTaskReaction(channel, ref.target, ref.message_id, .accepted);
 }
 
@@ -980,8 +976,8 @@ fn finalizeSteerReaction(
     ref: session_mod.ConsumedRef,
     outcome: session_mod.SteerOutcome,
 ) void {
-    const steer_ctx: *SteerReactionCtx = @ptrCast(@alignCast(ctx));
-    const channel = resolveOutboundChannel(steer_ctx.registry, ref.channel, ref.account_id);
+    const registry: *const dispatch.ChannelRegistry = @ptrCast(@alignCast(ctx));
+    const channel = resolveOutboundChannel(registry, ref.channel, ref.account_id);
     setInboundTaskReaction(channel, ref.target, ref.message_id, if (outcome == .done) .done else .failed);
 }
 
@@ -1441,12 +1437,11 @@ fn tryHandleRoutedInboundBeforeEnqueue(
     var routing_plan = buildInboundRoutingPlan(allocator, config, msg, parsed_meta.fields);
     defer routing_plan.deinit(allocator);
 
-    var steer_ctx = SteerReactionCtx{ .registry = registry };
     const action = session_mgr.routeInboundWithRef(
         routing_plan.session_key,
         msg.content,
         buildSteerRef(parsed_meta.fields, routing_plan),
-        .{ .ctx = @ptrCast(&steer_ctx), .finalize = finalizeSteerReaction, .accepted = acceptSteerReaction },
+        .{ .ctx = @ptrCast(@constCast(registry)), .finalize = finalizeSteerReaction, .accepted = acceptSteerReaction },
     );
     if (!action.skipsTurn()) return false;
 
@@ -1523,12 +1518,11 @@ fn processInboundMessage(
         markInboundMessageRead(channel, buildInboundMessageRef(msg, parsed_meta.fields));
     }
 
-    var steer_ctx = SteerReactionCtx{ .registry = registry };
     const route_action = runtime.session_mgr.routeInboundWithRef(
         routing_plan.session_key,
         msg.content,
         buildSteerRef(parsed_meta.fields, routing_plan),
-        .{ .ctx = @ptrCast(&steer_ctx), .finalize = finalizeSteerReaction, .accepted = acceptSteerReaction },
+        .{ .ctx = @ptrCast(@constCast(registry)), .finalize = finalizeSteerReaction, .accepted = acceptSteerReaction },
     );
     if (route_action.skipsTurn()) {
         if (route_action == .dropped) {
@@ -1618,14 +1612,13 @@ fn processInboundMessage(
         break :blk .{ .callback = daemonToolProgressCallback, .ctx = @ptrCast(&tool_progress_ctx) };
     };
 
-    var steer_reaction_ctx = SteerReactionCtx{ .registry = registry };
     const reply = runtime.session_mgr.processMessageStreamingWithSteerSink(
         routing_plan.session_key,
         msg.content,
         routing_plan.conversation_context,
         stream_sink,
         tool_progress_sink,
-        .{ .ctx = @ptrCast(&steer_reaction_ctx), .finalize = finalizeSteerReaction },
+        .{ .ctx = @ptrCast(@constCast(registry)), .finalize = finalizeSteerReaction },
     ) catch |err| {
         log.warn("inbound dispatch process failed: {}", .{err});
         setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .failed);
@@ -4492,14 +4485,13 @@ test "a steered daemon message is finalized when the consuming turn ends" {
 
     // The turn that consumed it finishes; the sink must finalize the steered
     // message, not just the turn-owning one.
-    var steer_ctx = SteerReactionCtx{ .registry = &registry };
     const reply = try sm.processMessageStreamingWithSteerSink(
         session_key,
         "hello",
         null,
         null,
         null,
-        .{ .ctx = @ptrCast(&steer_ctx), .finalize = finalizeSteerReaction },
+        .{ .ctx = @ptrCast(&registry), .finalize = finalizeSteerReaction },
     );
     defer allocator.free(reply);
 

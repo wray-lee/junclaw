@@ -1171,6 +1171,7 @@ pub const TelegramChannel = struct {
     /// message ids get an accepted/running/done/failed reaction (the API is
     /// stubbed under `zig build test`).
     pub const TestReactionCall = struct {
+        account_id: []const u8,
         message_id: i64,
         cleared: bool,
     };
@@ -1182,6 +1183,7 @@ pub const TelegramChannel = struct {
         if (builtin.is_test) {
             if (test_reaction_log) |calls| {
                 calls.append(std.testing.allocator, .{
+                    .account_id = self.account_id,
                     .message_id = msg_id,
                     .cleared = self.taskReactionEmoji(reaction) == null,
                 }) catch {};
