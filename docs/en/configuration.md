@@ -1238,7 +1238,7 @@ Parameters:
 - `implicit_thread_mention` (default: `true`) - A reply in a channel thread the bot has already posted into counts as a mention under `group_policy = mention_only`, so the conversation can continue without re-mentioning the bot. Top-level messages and DMs are unaffected
 - `streaming` (default: `false`) - Show the reply while it is still being generated. See below
 - `long_reply_file_threshold_chunks` (default: `9`) - When a final reply needs more chunks than this, send only the readable first chunk and upload the complete reply as `reply.md` to the same thread/DM. `0` disables the upload. See below
-- `status_reactions` (default: `false`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
+- `status_reactions` (default: `true`) - Show the task lifecycle as a reaction on the message that triggered it: `accepted`, `running`, then `done` or `failed`. Needs the `reactions:write` scope. See below
 - `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
 - `slash_command` (default: disabled) - Single-command Slack integration: register one slash command and handle its text like a normal message. See below
 

@@ -793,8 +793,9 @@ pub const SlackConfig = struct {
     /// message is out of scope. Reserved for a future pre-text preview.
     tool_progress: bool = true,
     /// Show task lifecycle on the triggering user message via Slack reactions.
-    /// Needs the `reactions:write` scope.
-    status_reactions: bool = false,
+    /// Needs the `reactions:write` scope. Defaults on: a top-level DM has no
+    /// other progress indicator (`assistant.threads.setStatus` is thread-only).
+    status_reactions: bool = true,
     /// Per-state reaction overrides. Empty string clears the reaction for that
     /// state; two states that share a name cost no extra API call.
     reaction_emojis: SlackReactionEmojisConfig = .{},

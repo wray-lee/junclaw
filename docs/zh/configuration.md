@@ -1039,7 +1039,7 @@ Slack 示例：
 - `group_policy`（默认 `mention_only`）——`open`、`allowlist`、`mention_only`
 - `reply_to_mode`（默认 `off`）——`off` 仅在触发消息本身已是 thread 回复时才用 thread；`all` 始终在 thread 中回复
 - `implicit_thread_mention`（默认 `true`）——在 bot 已发言过的频道 thread 中，后续回复在 `group_policy = mention_only` 下视为已 mention，无需再次 @ bot 即可继续对话。顶层消息与 DM 不受影响
-- `status_reactions`（默认 `false`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
+- `status_reactions`（默认 `true`）——在触发消息上用 reaction 显示任务状态：`accepted`、`running`，最后是 `done` 或 `failed`。需要 `reactions:write` 权限
 - `reaction_emojis`（默认 `eyes`、`hourglass_flowing_sand`、`white_check_mark`、`x`）——按状态覆盖 `accepted`、`running`、`done`、`failed`。Slack 用短名而非 emoji 本身；空字符串表示该状态不加 reaction（并移除已有的）
 - `slash_command`（默认关闭）——单命令 Slack 集成：注册一个斜杠命令，并把其后的文本当作普通消息处理。见下文
 - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
