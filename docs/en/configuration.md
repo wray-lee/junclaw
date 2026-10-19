@@ -1486,7 +1486,7 @@ Common issues:
 Automatic transcript reset, evaluated lazily on the next inbound message (there is no timer). Defaults keep resets disabled.
 
 - `session.reset.mode`: `none` (default), `daily`, or `idle`.
-- `session.reset.at_hour` (default: `4`): hour of the daily boundary, clamped to `0`-`23`. **Evaluated in UTC**; OpenClaw uses the host's local timezone.
+- `session.reset.at_hour` (default: `4`): hour of the daily boundary, clamped to `0`-`23`. The boundary is computed in `agent.timezone`, which supports `UTC` or a fixed offset such as `UTC+08:00` / `UTC-05:00` (default `UTC`); IANA names and DST are not supported. OpenClaw reads the host's local timezone instead.
 - `session.reset.idle_minutes`: inactivity minutes for `idle` mode. Must be positive; `null` means idle never expires.
 - `session.reset_by_type`: optional overrides for `direct`, `group`, and `thread` session keys. A present entry replaces the base `reset` policy for that kind; thread keys win over group keys.
 - Keys are snake_case. OpenClaw camelCase aliases (`atHour`, `idleMinutes`, `resetByType`) are also accepted. A reset block without `mode` means `daily` (OpenClaw behavior).

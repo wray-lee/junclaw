@@ -4,8 +4,9 @@
 //! session is next used, not by a timer. Defaults keep the old behavior: with
 //! `mode: none` nothing is ever reset automatically.
 //!
-//! Divergence from OpenClaw: junclaw has no local-time helper, so `at_hour` is
-//! evaluated in UTC. OpenClaw resolves it in the host's local timezone.
+//! Divergence from OpenClaw: there is no host-local-timezone resolution, so the
+//! daily `at_hour` boundary is computed from `agent.timezone` (a fixed offset
+//! such as "UTC+08:00", default "UTC"). IANA/DST names are not supported.
 
 const std = @import("std");
 const config_types = @import("config_types.zig");
@@ -35,25 +36,33 @@ pub fn resolvePolicy(
     };
 }
 
-/// Most recent `at_hour` boundary, in UTC epoch seconds.
+/// Most recent `at_hour` boundary in UTC epoch seconds.
 pub fn dailyBoundary(now: i64, at_hour: u8) i64 {
     const hour: i64 = @min(at_hour, 23);
     const today = @divFloor(now, 86400) * 86400 + hour * 3600;
     return if (now < today) today - 86400 else today;
 }
 
+/// Most recent `at_hour` boundary in the given fixed UTC offset, returned as
+/// UTC epoch seconds: `dailyBoundary(now + offset, at_hour) - offset`.
+pub fn dailyBoundaryAtOffset(now: i64, at_hour: u8, offset_secs: i64) i64 {
+    return dailyBoundary(now + offset_secs, at_hour) - offset_secs;
+}
+
 /// Whether a session must be reset before serving the next message.
 /// `created_at` is the session start (daily), `last_active` the last
-/// interaction (idle).
+/// interaction (idle). `tz_offset_secs` is the configured `agent.timezone`
+/// fixed offset applied to the daily boundary.
 pub fn isStale(
     policy: config_types.SessionResetConfig,
     now: i64,
     created_at: i64,
     last_active: i64,
+    tz_offset_secs: i64,
 ) bool {
     return switch (policy.mode) {
         .none => false,
-        .daily => created_at < dailyBoundary(now, policy.at_hour),
+        .daily => created_at < dailyBoundaryAtOffset(now, policy.at_hour, tz_offset_secs),
         .idle => if (policy.idle_minutes) |minutes|
             minutes > 0 and now > last_active + @as(i64, minutes) * 60
         else
@@ -93,7 +102,7 @@ test "resolvePolicy: resetByType overrides base per kind" {
 
 test "isStale: none never resets, even with old timestamps" {
     const policy = config_types.SessionResetConfig{};
-    try std.testing.expect(!isStale(policy, 1_000_000_000, 0, 0));
+    try std.testing.expect(!isStale(policy, 1_000_000_000, 0, 0, 0));
 }
 
 test "isStale: daily boundary before and after at_hour" {
@@ -101,9 +110,9 @@ test "isStale: daily boundary before and after at_hour" {
     const now: i64 = 20_000 * day + 10 * 3600; // 10:00 UTC
     const policy = config_types.SessionResetConfig{ .mode = .daily, .at_hour = 4 };
     // Started 03:00 UTC today: before the boundary -> stale.
-    try std.testing.expect(isStale(policy, now, 20_000 * day + 3 * 3600, now));
+    try std.testing.expect(isStale(policy, now, 20_000 * day + 3 * 3600, now, 0));
     // Started 05:00 UTC today: after the boundary -> fresh.
-    try std.testing.expect(!isStale(policy, now, 20_000 * day + 5 * 3600, now));
+    try std.testing.expect(!isStale(policy, now, 20_000 * day + 5 * 3600, now, 0));
     // Boundary is today 04:00 UTC.
     try std.testing.expectEqual(20_000 * day + 4 * 3600, dailyBoundary(now, 4));
     // Before at_hour the boundary is yesterday's.
@@ -114,9 +123,37 @@ test "isStale: daily boundary before and after at_hour" {
 test "isStale: idle expiry uses last_active" {
     const policy = config_types.SessionResetConfig{ .mode = .idle, .idle_minutes = 60 };
     const now: i64 = 1_000_000;
-    try std.testing.expect(!isStale(policy, now, 0, now - 59 * 60));
-    try std.testing.expect(isStale(policy, now, 0, now - 61 * 60));
+    try std.testing.expect(!isStale(policy, now, 0, now - 59 * 60, 0));
+    try std.testing.expect(isStale(policy, now, 0, now - 61 * 60, 0));
     // Idle mode without idle_minutes never expires.
     const no_minutes = config_types.SessionResetConfig{ .mode = .idle };
-    try std.testing.expect(!isStale(no_minutes, now, 0, 0));
+    try std.testing.expect(!isStale(no_minutes, now, 0, 0, 0));
+}
+
+test "isStale: daily boundary honors agent.timezone fixed offset" {
+    const day: i64 = 86_400;
+    // 2026-05-01T00:00:00Z is day 24661; pick 2026-05-01T12:00:00Z as "now".
+    const now: i64 = 24_661 * day + 12 * 3600;
+    const policy = config_types.SessionResetConfig{ .mode = .daily, .at_hour = 4 };
+
+    // UTC (default): boundary is today 04:00 UTC -> started at 12:00 today is fresh.
+    try std.testing.expectEqual(24_661 * day + 4 * 3600, dailyBoundaryAtOffset(now, 4, 0));
+    try std.testing.expect(!isStale(policy, now, 24_661 * day + 5 * 3600, now, 0));
+    try std.testing.expect(isStale(policy, now, 24_661 * day + 3 * 3600, now, 0));
+
+    // UTC+08:00 (east of UTC): the day runs ahead, so local 04:00 falls at
+    // 20:00 UTC on the previous day. A session created at 21:00 UTC yesterday
+    // is fresh in that zone but would be reset by UTC reasoning.
+    const plus8: i64 = 8 * 3600;
+    try std.testing.expectEqual(24_660 * day + 20 * 3600, dailyBoundaryAtOffset(now, 4, plus8));
+    try std.testing.expect(!isStale(policy, now, 24_660 * day + 21 * 3600, now, plus8));
+    try std.testing.expect(isStale(policy, now, 24_660 * day + 19 * 3600, now, plus8));
+
+    // UTC-05:00 (west of UTC): the day lags, so local 04:00 is 09:00 UTC today.
+    // A session created at 08:00 UTC today is already stale in that zone but
+    // fresh under UTC reasoning.
+    const minus5: i64 = -5 * 3600;
+    try std.testing.expectEqual(24_661 * day + 9 * 3600, dailyBoundaryAtOffset(now, 4, minus5));
+    try std.testing.expect(!isStale(policy, now, 24_661 * day + 10 * 3600, now, minus5));
+    try std.testing.expect(isStale(policy, now, 24_661 * day + 8 * 3600, now, minus5));
 }
