@@ -128,8 +128,25 @@ fn setScheduleToolContext(
 // ════════════════════════════════════════════════════════════════════════════
 
 /// A silent token must never reach any channel as visible text, in groups or DMs.
+/// Only token-only replies are suppressed; prose mentioning the token is delivered.
 pub fn shouldSuppressReply(reply: []const u8) bool {
-    return std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+    var saw_token = false;
+    var words = std.mem.tokenizeAny(u8, reply, " \t\r\n");
+    while (words.next()) |word| {
+        const bare = stripEdgePunctuation(word);
+        if (bare.len == 0) continue; // Punctuation alone is neither content nor a token.
+        if (!std.ascii.eqlIgnoreCase(bare, "NO_REPLY")) return false;
+        saw_token = true;
+    }
+    return saw_token;
+}
+
+fn stripEdgePunctuation(word: []const u8) []const u8 {
+    var start: usize = 0;
+    var end: usize = word.len;
+    while (start < end and std.ascii.isPunctuation(word[start])) start += 1;
+    while (end > start and std.ascii.isPunctuation(word[end - 1])) end -= 1;
+    return word[start..end];
 }
 
 fn logAgentProcessingError(
@@ -3551,10 +3568,20 @@ test "polling subagent drain delivers only matching origin account" {
     try std.testing.expectEqual(@as(usize, 0), signal_notices.len);
 }
 
-test "shouldSuppressReply suppresses marked replies in groups and DMs" {
-    try std.testing.expect(shouldSuppressReply("ok [NO_REPLY]"));
+test "shouldSuppressReply suppresses token-only replies in groups and DMs" {
+    try std.testing.expect(!shouldSuppressReply("ok [NO_REPLY]"));
     try std.testing.expect(shouldSuppressReply("[NO_REPLY]"));
     try std.testing.expect(!shouldSuppressReply("regular reply"));
+}
+
+// Regression: substantive replies mentioning [NO_REPLY] were silently dropped.
+test "shouldSuppressReply delivers replies that mention the silent token" {
+    try std.testing.expect(!shouldSuppressReply("Use the `[NO_REPLY]` marker to stay silent."));
+    try std.testing.expect(!shouldSuppressReply("Done, shipping now [NO_REPLY]"));
+    try std.testing.expect(shouldSuppressReply("[NO_REPLY]"));
+    try std.testing.expect(shouldSuppressReply("  NO_REPLY  "));
+    try std.testing.expect(shouldSuppressReply("NO_REPLY."));
+    try std.testing.expect(shouldSuppressReply("[NO_REPLY] [NO_REPLY]"));
 }
 
 test "isStopLikeCommand matches stop and abort variants" {

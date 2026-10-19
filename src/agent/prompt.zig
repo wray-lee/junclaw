@@ -385,7 +385,7 @@ pub fn buildSystemPrompt(
             try w.writeAll("- The message is not directed at you (no question, no @mention)\n");
             try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
             try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
-            try w.writeAll("When you choose NOT to reply, include `[NO_REPLY]` anywhere in your response. The system will suppress the message.\n\n");
+            try w.writeAll("When you choose NOT to reply, respond with exactly `[NO_REPLY]` and no other text; the system suppresses only token-only replies.\n\n");
             try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
             try w.writeAll("- \"Anyone online?\" -> `[NO_REPLY]` (unless you're specifically needed)\n");
             try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");

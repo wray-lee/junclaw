@@ -1670,8 +1670,8 @@ fn processInboundMessage(
     };
     defer allocator.free(reply);
 
-    // Regression: [NO_REPLY] sent literally in DMs and on Slack. The marker
-    // suppresses the reply on every channel, not just Telegram groups.
+    // Regression: [NO_REPLY] sent literally in DMs and on Slack. A token-only
+    // marker reply is suppressed on every channel, not just Telegram groups.
     if (channel_loop.shouldSuppressReply(reply)) {
         log.info("inbound dispatch: suppressing [NO_REPLY] reply", .{});
         // Streaming may already have published a preview. An empty final closes
