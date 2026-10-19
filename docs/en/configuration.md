@@ -1398,13 +1398,23 @@ works with `streaming` off. The status reaction (default hourglass) still marks 
 message's progress, and nullclaw does not post an extra progress message.
 Set `tool_progress=false` to keep only the plain `is typing...` status.
 
-About `session_status` on Slack: off by default (`session_status = false`). When enabled, nullclaw drives Slack's Agents session status via `agents.sessions.setStatus` (`processing` while a turn runs, `active` when it completes; `suspended` is reserved for approval-wait hooks). Like `tool_progress`, it is thread-only (top-level messages without a thread are skipped).
+About `session_status` on Slack: off by default (`session_status = false`). When enabled, nullclaw drives Slack's Agents session status via `agents.sessions.setStatus` (`processing` while a turn runs, `active` when it completes; `suspended` is reserved for approval-wait hooks). Like `tool_progress`, the status follows the turn's thread target: a top-level message or DM uses its own message ts as the thread root - the same `channel:message_ts` target the typing indicator uses - so those conversations get a session status instead of being skipped.
 
-Native **Stop** button: when `session_status = true` and the Slack app subscribes to the `agent_session_stopped` bot event, clicking Slack's native Stop button in the Agents view delivers `/stop` with the same policy and sender authorization checks as a typed `/stop`, interrupting the active turn immediately. Denied or malformed events are dropped.
+Native **Stop** button: when `session_status = true` and the Slack app subscribes to the `agent_session_stopped` bot event, clicking Slack's native Stop button in the Agents view delivers `/stop`, interrupting the active turn immediately. A native Stop is an explicit bot-directed action, so - like the Block Kit button and slash-command paths - it does not need a text mention: `group_policy = mention_only` does not block it, while the allowlist, DM policy and block checks still apply (a non-bot sender only). Denied or malformed events are dropped. The stale-status recovery is best-effort: it is queued to the inbound workers so no status POST runs on the Socket Mode reader, and it is dropped when the queue is full.
 
 Scopes and manifest delta:
 - Uses the existing `chat:write` bot scope; no new OAuth scope is required.
-- Requires Slack's Agents & AI Apps / Agent View feature (`features.agent_view` or legacy `features.assistant_view`).
+- Requires Slack's Agents & AI Apps / Agent View feature - `features.agent_view` (the migration from the legacy `features.assistant_view` is irreversible) or `features.assistant_view`:
+  ```json
+  {
+    "features": {
+      "agent_view": {
+        "agent_description": "Describe what your agent does."
+      }
+    }
+  }
+  ```
+  `features.agent_view` replaces `features.assistant_view`, and its nested `assistant_description` becomes `agent_description`. Slack documents that once an app is switched from `assistant_view` to `agent_view` the change cannot be reverted, so try it on a separate app or workspace first.
 - Manifest change (Socket Mode): add `agent_session_stopped` to `settings.event_subscriptions.bot_events`:
   ```json
   {

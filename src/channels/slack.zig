@@ -264,8 +264,11 @@ const InboundEvent = struct {
     /// Set by the worker that picked the event; keeps later events of the same
     /// conversation from overtaking it.
     claimed: bool = false,
+    /// `.session_status` only: the status to publish. A `.session_status` event
+    /// also carries the owned `thread_ts` in `payload`; `deinit` frees both.
+    session_status: SessionStatus = .active,
 
-    const Kind = enum { message, slash };
+    const Kind = enum { message, slash, session_status };
 
     fn deinit(self: *InboundEvent, allocator: std.mem.Allocator) void {
         allocator.free(self.payload);
@@ -284,6 +287,11 @@ const MAX_INBOUND_QUEUE = 256;
 /// The Socket Mode reader may wait at most this long for space on the inbound
 /// bus before it hands the event to the FIFO instead.
 const STOP_PUBLISH_TIMEOUT_MS: u32 = 100;
+/// Default Slack Web API ceiling (seconds) for the streaming/outbound paths.
+const SLACK_API_TIMEOUT: []const u8 = "15";
+/// `agents.sessions.setStatus` runs on turn-boundary threads, so a hung Slack
+/// must not stall every turn start/end.
+const SESSION_STATUS_TIMEOUT: []const u8 = "5";
 
 /// Slack re-delivers an envelope (after a failed ack) with `retry_attempt`
 /// set. Return it, or 0 when absent, so a first delivery is always processed.
@@ -648,7 +656,7 @@ pub const SlackChannel = struct {
         const body = buildReactionRequestBody(self.allocator, channel_id, ts, emoji) catch return;
         defer self.allocator.free(body);
 
-        var result = self.callSlackApi(endpoint, body, channel_id) catch |err| {
+        var result = self.callSlackApi(endpoint, body, channel_id, SLACK_API_TIMEOUT) catch |err| {
             log.debug("Slack {s} failed: {}", .{ endpoint, err });
             return;
         };
@@ -1320,6 +1328,7 @@ pub const SlackChannel = struct {
                         log.warn("Slack slash command publish failed: {}", .{err});
                     };
                 },
+                .session_status => self.setSessionStatus(event.channel_id, event.payload, event.session_status, null),
             }
         }
     }
@@ -1708,9 +1717,11 @@ pub const SlackChannel = struct {
     }
 
     /// Native Slack Stop: `agent_session_stopped` delivered over Socket Mode.
-    /// Authorizes the sender with the same policy gate as a typed `/stop`, then
-    /// publishes `/stop` immediately through the bounded stop path. Denied or
-    /// malformed events publish nothing.
+    /// Authorizes the sender with the same allowlist/DM/group gates as a typed
+    /// `/stop` (as an explicit bot-directed action it counts as a mention, like
+    /// the Block Kit button and slash-command paths), then publishes `/stop`
+    /// immediately through the bounded stop path. Denied or malformed events
+    /// publish nothing.
     fn handleAgentSessionStopped(
         self: *SlackChannel,
         payload_obj: std.json.ObjectMap,
@@ -1746,9 +1757,27 @@ pub const SlackChannel = struct {
         };
 
         // Recover stale processing only when no turn remains for this thread.
+        // The recovery POST must never run on the socket reader (its timeout
+        // would stall acks and pings, so Slack would redeliver), so hand the
+        // update to the inbound pool like any other event. Best-effort: a full
+        // queue or a stopped channel drops it and only leaves a stale status.
         if (thread_ts) |ts| {
             if (self.activeTurnCount(channel_id, ts) == 0) {
-                self.setSessionStatus(channel_id, ts, .active, null);
+                const status_channel = self.allocator.dupe(u8, channel_id) catch return;
+                const status_thread = self.allocator.dupe(u8, ts) catch {
+                    self.allocator.free(status_channel);
+                    return;
+                };
+                self.enqueueInboundEvent(.{
+                    .kind = .session_status,
+                    .payload = status_thread,
+                    .channel_id = status_channel,
+                    .conversation_hash = self.inboundConversationHash(user, channel_id, thread_ts),
+                    .session_status = .active,
+                }) catch |err| {
+                    // enqueueInboundEvent already freed the owned copies.
+                    log.debug("Slack session status recovery dropped: {}", .{err});
+                };
             }
         }
     }
@@ -2641,7 +2670,7 @@ pub const SlackChannel = struct {
         };
         defer self.allocator.free(body);
 
-        var result = self.callSlackApi("chat.delete", body, parsed.channel_id) catch |err| {
+        var result = self.callSlackApi("chat.delete", body, parsed.channel_id, SLACK_API_TIMEOUT) catch |err| {
             log.warn("Slack chat.delete preview failed ({s})", .{@errorName(err)});
             return;
         };
@@ -2690,7 +2719,7 @@ pub const SlackChannel = struct {
         const ticket_body = try buildGetUploadUrlBody(self.allocator, file_name, data.len);
         defer self.allocator.free(ticket_body);
 
-        var ticket = try self.callSlackApi("files.getUploadURLExternal", ticket_body, channel_id);
+        var ticket = try self.callSlackApi("files.getUploadURLExternal", ticket_body, channel_id, SLACK_API_TIMEOUT);
         defer ticket.deinit(self.allocator);
         if (ticket.error_code != null) return error.SlackApiError;
         const upload_url = ticket.upload_url orelse return error.SlackApiError;
@@ -2713,7 +2742,7 @@ pub const SlackChannel = struct {
         const complete_body = try buildCompleteUploadBody(self.allocator, file_id, file_name, channel_id, thread_ts);
         defer self.allocator.free(complete_body);
 
-        var completed = try self.callSlackApi("files.completeUploadExternal", complete_body, channel_id);
+        var completed = try self.callSlackApi("files.completeUploadExternal", complete_body, channel_id, SLACK_API_TIMEOUT);
         defer completed.deinit(self.allocator);
         if (completed.error_code != null) return error.SlackApiError;
     }
@@ -2867,7 +2896,7 @@ pub const SlackChannel = struct {
         const body = buildSessionStatusRequestBody(self.allocator, channel_id, thread_ts, status, title) catch return;
         defer self.allocator.free(body);
 
-        var result = self.callSlackApi("agents.sessions.setStatus", body, channel_id) catch return;
+        var result = self.callSlackApi("agents.sessions.setStatus", body, channel_id, SESSION_STATUS_TIMEOUT) catch return;
         defer result.deinit(self.allocator);
 
         if (result.warning) |warning| {
@@ -3692,7 +3721,7 @@ pub const SlackChannel = struct {
         );
         defer self.allocator.free(body);
 
-        var result = try self.callSlackApi("chat.startStream", body, parsed.channel_id);
+        var result = try self.callSlackApi("chat.startStream", body, parsed.channel_id, SLACK_API_TIMEOUT);
         defer result.deinit(self.allocator);
 
         if (result.error_code) |code| {
@@ -3731,7 +3760,7 @@ pub const SlackChannel = struct {
             );
             defer self.allocator.free(body);
 
-            var result = try self.callSlackApi("chat.appendStream", body, parsed.channel_id);
+            var result = try self.callSlackApi("chat.appendStream", body, parsed.channel_id, SLACK_API_TIMEOUT);
             defer result.deinit(self.allocator);
             if (result.error_code) |code| try self.recordNativeStreamFailure(code);
         }
@@ -3759,7 +3788,7 @@ pub const SlackChannel = struct {
         defer body_list.deinit(self.allocator);
         try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, text);
 
-        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
+        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id, SLACK_API_TIMEOUT);
         defer result.deinit(self.allocator);
         return result.takeTs() orelse error.SlackStreamRejected;
     }
@@ -3799,7 +3828,7 @@ pub const SlackChannel = struct {
         const body = try stream_presenter.buildUpdateBody(self.allocator, parsed.channel_id, ts, mrkdwn_text);
         defer self.allocator.free(body);
 
-        var result = try self.callSlackApi("chat.update", body, parsed.channel_id);
+        var result = try self.callSlackApi("chat.update", body, parsed.channel_id, SLACK_API_TIMEOUT);
         defer result.deinit(self.allocator);
         if (result.error_code) |code| {
             if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
@@ -3819,7 +3848,7 @@ pub const SlackChannel = struct {
         const body = try stream_presenter.buildUpdateMarkdownBody(self.allocator, parsed.channel_id, ts, markdown_text);
         defer self.allocator.free(body);
 
-        var result = try self.callSlackApi("chat.update", body, parsed.channel_id);
+        var result = try self.callSlackApi("chat.update", body, parsed.channel_id, SLACK_API_TIMEOUT);
         defer result.deinit(self.allocator);
         if (result.error_code) |code| {
             if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
@@ -4012,7 +4041,7 @@ pub const SlackChannel = struct {
         defer body_list.deinit(self.allocator);
         try self.appendPostMessageMrkdwnBody(&body_list, parsed.channel_id, parsed.thread_ts, mrkdwn_text);
 
-        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
+        var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id, SLACK_API_TIMEOUT);
         result.deinit(self.allocator);
     }
 
@@ -4024,7 +4053,7 @@ pub const SlackChannel = struct {
         const body = try stream_presenter.buildStopStreamBody(self.allocator, parsed.channel_id, ts);
         defer self.allocator.free(body);
 
-        var result = try self.callSlackApi("chat.stopStream", body, parsed.channel_id);
+        var result = try self.callSlackApi("chat.stopStream", body, parsed.channel_id, SLACK_API_TIMEOUT);
         defer result.deinit(self.allocator);
         if (builtin.is_test) self.test_native_stop_calls += 1;
         if (result.error_code) |code| try self.recordNativeStreamFailure(code);
@@ -4038,6 +4067,7 @@ pub const SlackChannel = struct {
         endpoint: []const u8,
         body: []const u8,
         context: ?[]const u8,
+        timeout_secs: []const u8,
     ) !SlackApiResult {
         // Streaming outbound must never touch the network under `zig build test`;
         // the throttling/fallback state machine is covered through this stub.
@@ -4054,7 +4084,7 @@ pub const SlackChannel = struct {
         try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.httpPostJsonWithProxyTimeout(self.allocator, url, body, &.{auth_header}, null, "15") catch |err| {
+        const resp = root.http_util.httpPostJsonWithProxyTimeout(self.allocator, url, body, &.{auth_header}, null, timeout_secs) catch |err| {
             log.err("Slack {s} POST failed: {}", .{ endpoint, err });
             return error.SlackApiError;
         };
@@ -5193,6 +5223,85 @@ test "slack agent_session_stopped authorized sender publishes one /stop" {
         owned.deinit(alloc);
     }
     try std.testing.expect(extra == null);
+}
+
+test "slack agent_session_stopped in a mention_only channel needs no text mention" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[0]);
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    const allowed = [_][]const u8{"U_ALLOWED"};
+    var ch = SlackChannel.initFromConfig(alloc, .{
+        .bot_token = "tok",
+        .allow_from = &allowed,
+        .dm_policy = "allow",
+        .group_policy = "mention_only",
+        .session_status = true,
+    });
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    // No "<@BOT>" anywhere: an explicit, bot-directed native Stop must not be
+    // blocked by mention_only (a typed /stop would need the mention).
+    const envelope =
+        \\{"type":"events_api","envelope_id":"e_stop_mention_only","payload":{"event":{"type":"agent_session_stopped","user":"U_ALLOWED","channel":"C1","thread_ts":"1700.1","event_ts":"1700.2"}}}
+    ;
+    try ch.handleSocketPayload(&ws, envelope);
+
+    var msg = (eb.consumeInboundTimeout(0) catch return error.TestExpectedEqual) orelse
+        return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("/stop", msg.content);
+    try std.testing.expectEqualStrings("C1:1700.1", msg.chat_id);
+
+    // The stale-recovery status is enqueued for the inbound workers, never
+    // POSTed on the socket reader; the pool drains it below.
+    ch.waitForInboundIdle();
+    try std.testing.expectEqual(@as(u32, 1), ch.test_session_status_calls);
+
+    const extra = (eb.consumeInboundTimeout(0) catch null);
+    if (extra) |m| {
+        var owned = m;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect(extra == null);
+
+    // session_status off: the same event publishes nothing at all.
+    var off = SlackChannel.initFromConfig(alloc, .{
+        .bot_token = "tok",
+        .allow_from = &allowed,
+        .dm_policy = "allow",
+        .group_policy = "mention_only",
+        .session_status = false,
+    });
+    off.account_id = "sl-off";
+    off.setBus(&eb);
+    defer off.channel().stop();
+    try off.handleSocketPayload(&ws, envelope);
+
+    const none = (eb.consumeInboundTimeout(0) catch null);
+    if (none) |m| {
+        var owned = m;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect(none == null);
 }
 
 test "slack agent_session_stopped denied sender publishes nothing" {
