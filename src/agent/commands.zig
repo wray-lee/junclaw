@@ -3353,6 +3353,9 @@ fn clearSessionState(self: anytype) void {
 
     if (self.session_store) |store| {
         store.clearAutoSaved(self.memory_session_id) catch {};
+        if (self.memory_session_id) |session_id| {
+            store.saveCompactionCount(session_id, 0) catch {};
+        }
     }
 }
 

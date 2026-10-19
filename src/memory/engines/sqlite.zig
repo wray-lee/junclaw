@@ -909,6 +909,41 @@ pub const SqliteMemory = struct {
         return @intCast(total);
     }
 
+    pub fn saveCompactionCount(self: *Self, session_id: []const u8, count: u64) !void {
+        const key = try std.fmt.allocPrint(self.allocator, "compaction_count:{s}", .{session_id});
+        defer self.allocator.free(key);
+        const value = try std.fmt.allocPrint(self.allocator, "{d}", .{count});
+        defer self.allocator.free(value);
+
+        const sql = "INSERT INTO kv (key, value) VALUES (?1, ?2) " ++
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, value.ptr, @intCast(value.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
+    pub fn loadCompactionCount(self: *Self, session_id: []const u8) !?u64 {
+        const key = try std.fmt.allocPrint(self.allocator, "compaction_count:{s}", .{session_id});
+        defer self.allocator.free(key);
+
+        const sql = "SELECT value FROM kv WHERE key = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        const raw = c.sqlite3_column_text(stmt, 0) orelse return null;
+        const len: usize = @intCast(c.sqlite3_column_bytes(stmt, 0));
+        return std.fmt.parseInt(u64, raw[0..len], 10) catch null;
+    }
+
     fn clearUsage(self: *Self, session_id: []const u8) !void {
         const sql = "DELETE FROM session_usage WHERE session_id = ?1";
         var stmt: ?*c.sqlite3_stmt = null;
@@ -1089,6 +1124,16 @@ pub const SqliteMemory = struct {
         return self_.loadUsage(session_id);
     }
 
+    fn implSessionSaveCompactionCount(ptr: *anyopaque, session_id: []const u8, count: u64) anyerror!void {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.saveCompactionCount(session_id, count);
+    }
+
+    fn implSessionLoadCompactionCount(ptr: *anyopaque, session_id: []const u8) anyerror!?u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadCompactionCount(session_id);
+    }
+
     fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
         const self_: *Self = @ptrCast(@alignCast(ptr));
         return self_.countSessions();
@@ -1116,6 +1161,8 @@ pub const SqliteMemory = struct {
         .clearAutoSaved = &implSessionClearAutoSaved,
         .saveUsage = &implSessionSaveUsage,
         .loadUsage = &implSessionLoadUsage,
+        .saveCompactionCount = &implSessionSaveCompactionCount,
+        .loadCompactionCount = &implSessionLoadCompactionCount,
         .countSessions = &implSessionCountSessions,
         .listSessions = &implSessionListSessions,
         .countDetailedMessages = &implSessionCountDetailedMessages,
@@ -2440,6 +2487,18 @@ test "sqlite sessionStore saveUsage + loadUsage roundtrip" {
     const store = mem.sessionStore();
     try store.saveUsage("s1", 123);
     try std.testing.expectEqual(@as(?u64, 123), try store.loadUsage("s1"));
+}
+
+test "sqlite sessionStore saveCompactionCount + loadCompactionCount roundtrip" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    const store = mem.sessionStore();
+    try std.testing.expectEqual(@as(?u64, null), try store.loadCompactionCount("s1"));
+    try store.saveCompactionCount("s1", 2);
+    try store.saveCompactionCount("s1", 3);
+    try std.testing.expectEqual(@as(?u64, 3), try store.loadCompactionCount("s1"));
+    try std.testing.expectEqual(@as(?u64, null), try store.loadCompactionCount("s2"));
 }
 
 test "sqlite sessionStore clearAutoSaved" {
