@@ -558,6 +558,11 @@ pub const LucidMemory = struct {
         return self.local.loadMessagesDetailed(allocator, session_id, limit, offset);
     }
 
+    fn implSessionLoadMessageTimeRange(ptr: *anyopaque, session_id: []const u8) anyerror!?root.MessageTimeRange {
+        const self = castSelf(ptr);
+        return self.local.loadMessageTimeRange(session_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -569,6 +574,7 @@ pub const LucidMemory = struct {
         .listSessions = &implSessionListSessions,
         .countDetailedMessages = &implSessionCountDetailedMessages,
         .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
+        .loadMessageTimeRange = &implSessionLoadMessageTimeRange,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

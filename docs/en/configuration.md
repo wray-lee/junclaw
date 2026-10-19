@@ -1454,7 +1454,7 @@ Automatic transcript reset, evaluated lazily on the next inbound message (there 
 - `session.reset_by_type`: optional overrides for `direct`, `group`, and `thread` session keys. A present entry replaces the base `reset` policy for that kind; thread keys win over group keys.
 - Keys are snake_case. OpenClaw camelCase aliases (`atHour`, `idleMinutes`, `resetByType`) are also accepted. A reset block without `mode` means `daily` (OpenClaw behavior).
 - The reset reuses the `/new` path: live history, the pending exec command, the active skill, token and compaction counters, session-scoped memory rows, and the persisted transcript are cleared. It is silent (log only), runs before the next turn refreshes activity, and never runs while a turn is active.
-- `created_at` (session start) drives `daily`; `last_active` drives `idle`. Daily state is not persisted, so a restart after idle eviction starts a fresh daily window.
+- `created_at` (session start) drives `daily`; `last_active` drives `idle`. For a session recreated from the store (idle eviction or restart), the decision uses persisted transcript timestamps: the first message for `daily` (OpenClaw's `sessionStartedAt`) and the latest message for `idle` (its `lastInteractionAt`) when the backend stores them (SQLite, Lucid). Other backends skip that check and start a fresh window.
 - Legacy: an explicit `session.idle_minutes` with no `session.reset` block is migrated to `{ "mode": "idle", "idle_minutes": <value> }`. The old implicit default of 60 minutes does **not** enable resets.
 
 ```json

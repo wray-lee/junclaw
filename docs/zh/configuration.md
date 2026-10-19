@@ -1169,7 +1169,7 @@ nullclaw channel status
 - `session.reset_by_type`：可选的 `direct`、`group`、`thread` 覆盖。存在的条目会整体替换该类型的 `reset` 策略；thread key 优先于 group key。
 - 配置键使用 snake_case，同时接受 OpenClaw 的 camelCase 别名（`atHour`、`idleMinutes`、`resetByType`）。未写 `mode` 的 reset 块按 `daily` 处理（与 OpenClaw 一致）。
 - 重置复用 `/new` 路径：清理实时历史、待执行的 exec 命令、当前 skill、token 与 compaction 计数、会话级 memory 行以及持久化会话记录。重置是静默的（仅写日志），在下一轮刷新活跃时间之前执行，且不会在轮次进行中触发。
-- `created_at`（会话开始时间）用于 `daily`；`last_active` 用于 `idle`。每日状态不持久化，因此空闲回收后的重启会重新开始一个每日窗口。
+- `created_at`（会话开始时间）用于 `daily`；`last_active` 用于 `idle`。对于从存储中重建的会话（空闲回收或重启），判断使用持久化记录的时间戳：`daily` 取首条消息（对应 OpenClaw 的 `sessionStartedAt`），`idle` 取最新消息（对应其 `lastInteractionAt`），前提是后端会存储这些时间戳（SQLite、Lucid）；其他后端跳过该检查，直接开始新的窗口。
 - 兼容旧配置：显式写了 `session.idle_minutes` 且没有 `session.reset` 时，会映射为 `{ "mode": "idle", "idle_minutes": <值> }`。旧结构默认的 60 分钟**不会**开启自动重置。
 
 ```json
