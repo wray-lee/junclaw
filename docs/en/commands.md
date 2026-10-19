@@ -67,6 +67,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 
 - `/status` shows `📚 Context: used/window (pct%)` and `🧹 Compactions: N`, so you can see how full the session context window is and how many times history has been compacted.
 - `/context` shows the same numbers plus message, tool, and per-role counts; `/context json` exposes `context_window` and `compactions` for scripts.
+- `/compact [focus instructions]` runs a summarizing compaction immediately instead of deleting old messages: older history is replaced by a `[Compaction summary]` message, durable facts are flushed to memory first, and optional focus instructions steer what the summary keeps. Explicit `/compact` works even when `agent.compact_context` is false. The reply reports token estimates before and after plus the compaction number, for example `Compacted (~1,234 → ~567 tokens, compaction #2).`
 
 ## Runtime and operations
 

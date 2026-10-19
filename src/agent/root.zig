@@ -951,9 +951,8 @@ pub const Agent = struct {
         return self.autoCompactHistory() catch false;
     }
 
-    /// Auto-compact history when it exceeds thresholds.
-    pub fn autoCompactHistory(self: *Agent) !bool {
-        const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, self.provider, self.model_name, .{
+    fn compactionConfig(self: *const Agent) compaction.CompactionConfig {
+        return .{
             .keep_recent = self.compaction_keep_recent,
             .max_summary_chars = self.compaction_max_summary_chars,
             .max_source_chars = self.compaction_max_source_chars,
@@ -964,13 +963,45 @@ pub const Agent = struct {
             .memory_flush = self.compaction_memory_flush,
             .mem = self.mem,
             .memory_session_id = self.memory_session_id,
-        }, self.redactor);
+        };
+    }
+
+    fn runCompaction(self: *Agent, config: compaction.CompactionConfig) !bool {
+        const compacted = try compaction.autoCompactHistory(self.allocator, &self.history, self.provider, self.model_name, config, self.redactor);
         if (compacted) {
             self.compaction_count += 1;
             self.persistCompactionSummary();
             self.persistCompactionCount();
         }
         return compacted;
+    }
+
+    /// Auto-compact history when it exceeds thresholds.
+    pub fn autoCompactHistory(self: *Agent) !bool {
+        return self.runCompaction(self.compactionConfig());
+    }
+
+    pub const CompactResult = struct {
+        compacted: bool,
+        tokens_before: u64,
+        tokens_after: u64,
+        count: u64,
+    };
+
+    /// Explicit /compact: summarize regardless of the auto thresholds and of
+    /// the agent.compact_context flag. Honors optional user focus instructions.
+    pub fn compactNow(self: *Agent, focus: ?[]const u8) !CompactResult {
+        const tokens_before = self.tokenEstimate();
+        var config = self.compactionConfig();
+        config.force = true;
+        config.focus = focus;
+        const compacted = try self.runCompaction(config);
+        return .{
+            .compacted = compacted,
+            .tokens_before = tokens_before,
+            .tokens_after = self.tokenEstimate(),
+            .count = self.compaction_count,
+        };
     }
 
     /// Persist the newest compaction summary so a restarted session can replay
@@ -4477,6 +4508,153 @@ test "maybeAutoCompactHistory compacts when compact_context is true" {
     try std.testing.expect(agent.history.items.len < len_before);
     try std.testing.expect(provider_state.calls > 0);
     try std.testing.expectEqual(@as(u64, 1), agent.compaction_count);
+}
+
+const CompactPersistStore = struct {
+    const Self = @This();
+
+    allocator: std.mem.Allocator,
+    save_message_calls: usize = 0,
+    save_count_calls: usize = 0,
+    saved_role: ?[]u8 = null,
+    saved_content: ?[]u8 = null,
+    saved_count: u64 = 0,
+
+    fn saveMessage(ptr: *anyopaque, _: []const u8, role: []const u8, content: []const u8) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.save_message_calls += 1;
+        if (self.saved_role) |old| self.allocator.free(old);
+        if (self.saved_content) |old| self.allocator.free(old);
+        self.saved_role = try self.allocator.dupe(u8, role);
+        self.saved_content = try self.allocator.dupe(u8, content);
+    }
+
+    fn loadMessages(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]memory_mod.MessageEntry {
+        return allocator.alloc(memory_mod.MessageEntry, 0);
+    }
+
+    fn clearMessages(_: *anyopaque, _: []const u8) anyerror!void {}
+    fn clearAutoSaved(_: *anyopaque, _: ?[]const u8) anyerror!void {}
+
+    fn saveCompactionCount(ptr: *anyopaque, _: []const u8, count: u64) anyerror!void {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.save_count_calls += 1;
+        self.saved_count = count;
+    }
+
+    const vtable = memory_mod.SessionStore.VTable{
+        .saveMessage = saveMessage,
+        .loadMessages = loadMessages,
+        .clearMessages = clearMessages,
+        .clearAutoSaved = clearAutoSaved,
+        .saveCompactionCount = saveCompactionCount,
+    };
+};
+
+fn appendCompactNowHistory(allocator: std.mem.Allocator, history: *std.ArrayListUnmanaged(Agent.OwnedMessage)) !void {
+    try history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..4) |i| {
+        try history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "detailed user conversation message {d} with extensive context about the project", .{i}),
+        });
+    }
+}
+
+test "compactNow increments compaction count and persists summary and count" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var store_state = CompactPersistStore{ .allocator = allocator };
+    defer {
+        if (store_state.saved_role) |r| allocator.free(r);
+        if (store_state.saved_content) |c| allocator.free(c);
+    }
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, true);
+    defer agent.deinit();
+    agent.compaction_keep_recent = 2;
+    agent.memory_session_id = "test-session";
+    agent.session_store = .{ .ptr = @ptrCast(&store_state), .vtable = &CompactPersistStore.vtable };
+    try appendCompactNowHistory(allocator, &agent.history);
+
+    const tokens_before = agent.tokenEstimate();
+    const result = try agent.compactNow("keep the setup steps");
+
+    try std.testing.expect(result.compacted);
+    try std.testing.expectEqual(tokens_before, result.tokens_before);
+    try std.testing.expect(result.tokens_after < result.tokens_before);
+    try std.testing.expectEqual(@as(u64, 1), result.count);
+    try std.testing.expectEqual(@as(u64, 1), agent.compaction_count);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.calls);
+    try std.testing.expectEqual(@as(usize, 1), store_state.save_message_calls);
+    try std.testing.expectEqual(@as(usize, 1), store_state.save_count_calls);
+    try std.testing.expectEqual(@as(u64, 1), store_state.saved_count);
+    try std.testing.expectEqualStrings("assistant", store_state.saved_role.?);
+    try std.testing.expect(std.mem.startsWith(u8, store_state.saved_content.?, compaction.COMPACTION_SUMMARY_PREFIX));
+}
+
+test "slash /compact summarizes even when compact_context is false" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, false);
+    defer agent.deinit();
+    agent.compaction_keep_recent = 2;
+    try appendCompactNowHistory(allocator, &agent.history);
+
+    const tokens_before = agent.tokenEstimate();
+    const response = (try agent.handleSlashCommand("/compact")).?;
+    defer allocator.free(response);
+    const tokens_after = agent.tokenEstimate();
+
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "Compacted (~{d} → ~{d} tokens, compaction #1).",
+        .{ tokens_before, tokens_after },
+    );
+    defer allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expectEqual(@as(u64, 1), agent.compaction_count);
+    try std.testing.expect(provider_state.calls > 0);
+}
+
+test "slash /compact reports nothing to compact and keeps history" {
+    const allocator = std.testing.allocator;
+    var noop = observability.NoopObserver{};
+    var provider_state = CompactionTestProvider{};
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &CompactionTestProvider.vtable };
+
+    var agent = makeCompactionTestAgent(allocator, noop.observer(), provider, true);
+    defer agent.deinit();
+    agent.compaction_keep_recent = 2;
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "one"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "two"),
+    });
+
+    const response = (try agent.handleSlashCommand("/compact")).?;
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Nothing to compact.", response);
+    try std.testing.expectEqual(@as(usize, 3), agent.history.items.len);
+    try std.testing.expectEqual(@as(u64, 0), agent.compaction_count);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
 
 test "compaction count increments on forced context recovery" {
