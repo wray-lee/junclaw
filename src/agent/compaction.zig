@@ -190,6 +190,23 @@ pub fn autoCompactHistory(
     return true;
 }
 
+fn stripLeadingListNumber(line: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < line.len and std.ascii.isDigit(line[i])) : (i += 1) {}
+    if (i > 0 and i < line.len and line[i] == '.') {
+        return std.mem.trim(u8, line[i + 1 ..], " \t\r\n");
+    }
+    return line;
+}
+
+fn isPlaceholderFact(line: []const u8) bool {
+    const prefixes = [_][]const u8{ "none", "nothing", "n/a", "no durable facts" };
+    for (prefixes) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(line, prefix)) return true;
+    }
+    return false;
+}
+
 /// One-shot extraction of durable user facts from the messages about to be
 /// compacted. Uses the provider directly (no Agent turn), so it cannot
 /// re-enter compaction. Every failure is swallowed: compaction must proceed.
@@ -227,8 +244,12 @@ fn flushMemoriesBeforeCompaction(
     var lines = std.mem.splitScalar(u8, response, '\n');
     while (lines.next()) |raw_line| {
         if (line_no >= COMPACTION_FLUSH_MAX_LINES) break;
-        const line = std.mem.trim(u8, raw_line, " \t\r\n-*");
+        var line = std.mem.trim(u8, raw_line, " \t\r\n-*");
         if (line.len == 0) continue;
+        line = stripLeadingListNumber(line);
+        if (line.len == 0) continue;
+        // Skip common model placeholder responses to avoid storing non-facts in memory.
+        if (isPlaceholderFact(line)) continue;
         const key = std.fmt.allocPrint(allocator, "flush_compact_{d}_{d}", .{ ts, line_no }) catch continue;
         defer allocator.free(key);
         mem.store(key, line, .conversation, session_id) catch {};
@@ -1390,6 +1411,82 @@ test "autoCompactHistory flushes durable facts before dropping messages" {
     }
     try std.testing.expect(found_tea);
     try std.testing.expect(found_dark);
+}
+
+test "autoCompactHistory ignores placeholder flush responses" {
+    // Regression: placeholder flush responses were stored as memory facts
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider_state = FlushTestProvider{ .flush_response = "None." };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FlushTestProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try appendFlushTestHistory(allocator, &agent.history);
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .token_limit = 0,
+        .memory_flush = true,
+        .mem = mem,
+        .memory_session_id = "flush-session",
+    }, null);
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.flush_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+
+    const entries = try mem.list(allocator, null, "flush-session");
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "autoCompactHistory strips bullets and ignores placeholder lines" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider_state = FlushTestProvider{
+        .flush_response = "- likes green tea\n* prefers dark mode\n1. works from home\nN/A\nNothing worth remembering.",
+    };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FlushTestProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try appendFlushTestHistory(allocator, &agent.history);
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .token_limit = 0,
+        .memory_flush = true,
+        .mem = mem,
+        .memory_session_id = "flush-session",
+    }, null);
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.flush_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+
+    const entries = try mem.list(allocator, null, "flush-session");
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 3), entries.len);
+
+    var found_tea = false;
+    var found_dark = false;
+    var found_home = false;
+    for (entries) |entry| {
+        try std.testing.expect(std.mem.startsWith(u8, entry.key, "flush_compact_"));
+        if (std.mem.eql(u8, entry.content, "likes green tea")) found_tea = true;
+        if (std.mem.eql(u8, entry.content, "prefers dark mode")) found_dark = true;
+        if (std.mem.eql(u8, entry.content, "works from home")) found_home = true;
+    }
+    try std.testing.expect(found_tea);
+    try std.testing.expect(found_dark);
+    try std.testing.expect(found_home);
 }
 
 test "autoCompactHistory still compacts when the memory flush fails" {
