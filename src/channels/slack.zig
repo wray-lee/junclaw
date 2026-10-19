@@ -744,6 +744,14 @@ pub const SlackChannel = struct {
         }
     }
 
+    /// True when a parsed Slack API response succeeded (`ok: true`). A missing or
+    /// non-bool `ok` is treated as not-ok without logging or classifying auth
+    /// state, so callers can branch (e.g. retry) before committing to an error.
+    fn isSlackApiOk(obj: std.json.ObjectMap) bool {
+        const ok_val = obj.get("ok") orelse return false;
+        return ok_val == .bool and ok_val.bool;
+    }
+
     fn ensureSlackApiOk(obj: std.json.ObjectMap, endpoint: []const u8, context: ?[]const u8) !void {
         const ok_val = obj.get("ok") orelse return error.SlackApiError;
         if (ok_val == .bool and ok_val.bool) return;
@@ -2125,15 +2133,18 @@ pub const SlackChannel = struct {
     /// `thread_ts` is passed explicitly rather than read from `self.thread_ts`
     /// so callers on the streaming path do not depend on the mutable field that
     /// `parseTarget` rewrites.
+    ///
+    /// Replies small enough for Slack's `markdown_text` cap are sent as native
+    /// Markdown so they render like the streamed preview; larger replies fall
+    /// back to mrkdwn.
     fn appendPostMessageBody(
         self: *SlackChannel,
         body_list: *std.ArrayListUnmanaged(u8),
         actual_channel: []const u8,
         thread_ts: ?[]const u8,
         text: []const u8,
-        allow_native_markdown: bool,
     ) !void {
-        if (allow_native_markdown and md_tables.hasMarkdownTable(text) and text.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
+        if (text.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
             self.markBotThreadParticipation(actual_channel, thread_ts);
             try body_list.appendSlice(self.allocator, "{\"channel\":\"");
             try body_list.appendSlice(self.allocator, actual_channel);
@@ -2530,16 +2541,43 @@ pub const SlackChannel = struct {
         // Parse target for thread_ts (channel_id:thread_ts)
         const actual_channel = self.parseTarget(target_channel);
 
-        // Build JSON body
-        var body_list: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_list.deinit(self.allocator);
-        try self.appendPostMessageBody(&body_list, actual_channel, self.thread_ts, text, true);
-
-        // Build auth header: "Authorization: Bearer xoxb-..."
         var auth_buf: [512]u8 = undefined;
         var auth_writer: std.Io.Writer = .fixed(&auth_buf);
         try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
         const auth_header = auth_writer.buffered();
+
+        // First attempt: native markdown_text when the reply fits Slack's cap.
+        const first_used_markdown = text.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES;
+        {
+            var body_list: std.ArrayListUnmanaged(u8) = .empty;
+            defer body_list.deinit(self.allocator);
+            try self.appendPostMessageBody(&body_list, actual_channel, self.thread_ts, text);
+
+            const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+                log.err("Slack API POST failed: {}", .{err});
+                return error.SlackApiError;
+            };
+            defer self.allocator.free(resp);
+
+            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.SlackApiError;
+            if (isSlackApiOk(parsed.value.object)) return;
+            if (!first_used_markdown) {
+                try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
+                return;
+            }
+            log.warn("Slack chat.postMessage rejected markdown_text; retrying as mrkdwn", .{});
+        }
+
+        // Retry once as mrkdwn: Slack returned an API error for the first
+        // markdown_text body. Transport/network errors return already above so
+        // this can never double-post on a network failure.
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+        try self.appendPostMessageMrkdwnBody(&body_list, actual_channel, self.thread_ts, mrkdwn_text);
 
         const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
             log.err("Slack API POST failed: {}", .{err});
@@ -3235,7 +3273,7 @@ pub const SlackChannel = struct {
     ) ![]u8 {
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
-        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, text, false);
+        try self.appendPostMessageBody(&body_list, parsed.channel_id, parsed.thread_ts, text);
 
         var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id);
         defer result.deinit(self.allocator);
@@ -3249,21 +3287,20 @@ pub const SlackChannel = struct {
         markdown_text: []const u8,
         preview_limit: usize,
     ) !void {
-        const mrkdwn = try markdownToSlackMrkdwn(self.allocator, markdown_text);
-        defer self.allocator.free(mrkdwn);
-
-        // chat.update rejects text above 4,000 chars with `msg_too_long`. Bound
-        // the in-place preview to that cap, keeping the newest text so a growing
-        // turn keeps moving instead of freezing on its first chunk; the final
-        // reply is still delivered complete by deliverFallbackFinal.
+        // Bound the RAW markdown preview (not the mrkdwn-converted text) so the
+        // live preview renders identically to the final markdown_text body.
+        // chat.update rejects text above 4,000 chars with `msg_too_long`;
+        // keeping the newest text lets a growing turn keep moving instead of
+        // freezing on its first chunk. The final reply is still delivered
+        // complete by deliverFallbackFinal.
         const preview = try stream_presenter.boundUpdatePreview(
             self.allocator,
-            mrkdwn,
+            markdown_text,
             preview_limit,
         );
         defer self.allocator.free(preview);
 
-        try self.updateStreamMessageMrkdwn(parsed, ts, preview);
+        try self.updateStreamMessageMarkdown(parsed, ts, preview);
     }
 
     /// `chat.update` with text already converted to mrkdwn and known to fit the
@@ -3304,6 +3341,7 @@ pub const SlackChannel = struct {
             if (stream_presenter.classifyStreamFailure(code) == .disable_native) {
                 self.native_stream_disabled.store(true, .release);
             }
+            if (std.mem.eql(u8, code, "msg_too_long")) return error.SlackMessageTooLong;
             return error.SlackStreamRejected;
         }
     }
@@ -3413,7 +3451,7 @@ pub const SlackChannel = struct {
         media: []const []const u8,
         target: []const u8,
     ) !void {
-        if (md_tables.hasMarkdownTable(message) and message.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
+        if (message.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
             if (self.updateStreamMessageMarkdown(parsed, ts, message)) |_| {
                 return;
             } else |err| {
@@ -5056,25 +5094,75 @@ test "slack stop releases streaming buffers" {
     try std.testing.expectEqual(@as(usize, 0), ch.stream_states.count());
 }
 
-test "sendMessage payload converts markdown to mrkdwn" {
+// Regression: native markdown_text was only sent for table replies, so plain
+// markdown final replies rendered differently from the streamed preview.
+test "appendPostMessageBody size gating" {
     const allowed = [_][]const u8{};
     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
 
-    var body_list: std.ArrayListUnmanaged(u8) = .empty;
-    defer body_list.deinit(std.testing.allocator);
+    // A small non-table plain-markdown reply (<= 12k) -> native markdown_text,
+    // raw markdown preserved, no mrkdwn:true / text.
+    {
+        const plain_text = "**hello** world";
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(std.testing.allocator);
+        try ch.appendPostMessageBody(&body, "C123", "1700.1", plain_text);
 
-    try ch.appendPostMessageBody(&body_list, "C123", null, "**hello** world", true);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"text\":") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "**hello** world") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thread_ts\":\"1700.1\"") != null);
+    }
 
-    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body_list.items, .{});
-    defer parsed.deinit();
-    try std.testing.expect(parsed.value == .object);
+    // A small table reply (<= 12k) is also sent as native markdown_text.
+    {
+        const table_text = "| A | B |\n| --- | --- |\n| 1 | 2 |";
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(std.testing.allocator);
+        try ch.appendPostMessageBody(&body, "C123", null, table_text);
 
-    const text_value = parsed.value.object.get("text") orelse return error.TestExpectedEqual;
-    try std.testing.expect(text_value == .string);
-    try std.testing.expectEqualStrings("*hello* world", text_value.string);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "| A | B |") != null);
+    }
 
-    const mrkdwn_value = parsed.value.object.get("mrkdwn") orelse return error.TestExpectedEqual;
-    try std.testing.expect(mrkdwn_value == .bool and mrkdwn_value.bool);
+    // A non-table reply over 12k -> mrkdwn body (markdown converted + tables
+    // fenced), with mrkdwn:true.
+    {
+        var large: std.ArrayListUnmanaged(u8) = .empty;
+        defer large.deinit(std.testing.allocator);
+        try large.appendSlice(std.testing.allocator, "# Heading\n\n");
+        while (large.items.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
+            try large.appendSlice(std.testing.allocator, "row of content that is plain prose\n");
+        }
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(std.testing.allocator);
+        try ch.appendPostMessageBody(&body, "C123", null, large.items);
+
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"text\":") != null);
+    }
+
+    // A table reply over 12k -> mrkdwn body with the table fenced as a code block.
+    {
+        var large_table: std.ArrayListUnmanaged(u8) = .empty;
+        defer large_table.deinit(std.testing.allocator);
+        try large_table.appendSlice(std.testing.allocator, "| Col1 | Col2 |\n| --- | --- |\n");
+        while (large_table.items.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
+            try large_table.appendSlice(std.testing.allocator, "| val1 | val2 |\n");
+        }
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(std.testing.allocator);
+        try ch.appendPostMessageBody(&body, "C123", null, large_table.items);
+
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") == null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") != null);
+        try std.testing.expect(std.mem.indexOf(u8, body.items, "```") != null);
+    }
 }
 
 test "slack pending interactions survive across channel instances" {
@@ -5283,7 +5371,7 @@ test "slack implicit thread mention handles a follow-up without a re-mention" {
     // participation for the thread target.
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(alloc);
-    try ch.appendPostMessageBody(&body, "C123", "1700.1", "answer", true);
+    try ch.appendPostMessageBody(&body, "C123", "1700.1", "answer");
 
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -5314,7 +5402,7 @@ test "slack implicit thread mention keeps top-level channel messages mention-onl
 
     var body: std.ArrayListUnmanaged(u8) = .empty;
     defer body.deinit(alloc);
-    try ch.appendPostMessageBody(&body, "C123", "1700.1", "answer", true);
+    try ch.appendPostMessageBody(&body, "C123", "1700.1", "answer");
 
     // No thread_ts: a top-level post in the same channel is not a follow-up.
     const parsed = try std.json.parseFromSlice(
@@ -7223,7 +7311,9 @@ test "slack fallback final entity budgeted chunks fit slack limit" {
 
     var message: std.ArrayListUnmanaged(u8) = .empty;
     defer message.deinit(allocator);
-    for (0..250) |_| try message.appendSlice(allocator, "if (a < b && c > d) { ret = 1; }\n");
+    // Over 12k so deliverFallbackFinal routes past the markdown_text path onto
+    // the chunked mrkdwn transport where entity expansion bites.
+    for (0..700) |_| try message.appendSlice(allocator, "if (a < b && c > d) { ret = 1; }\n");
     const expected = try markdownToSlackMrkdwn(allocator, message.items);
     defer allocator.free(expected);
 
@@ -7365,7 +7455,9 @@ test "slack long reply within threshold posts chunks without uploading" {
 
     var message: std.ArrayListUnmanaged(u8) = .empty;
     defer message.deinit(allocator);
-    for (0..250) |_| try message.appendSlice(allocator, "if (a < b && c > d) { ret = 1; }\n");
+    // Over 12k so deliverFallbackFinal routes onto the chunked mrkdwn transport
+    // (a smaller reply now goes out as a single markdown_text update instead).
+    for (0..700) |_| try message.appendSlice(allocator, "if (a < b && c > d) { ret = 1; }\n");
     const chunks = try chunkFinalFallbackReply(allocator, message.items);
     defer stream_presenter.freeChunks(allocator, chunks);
     try std.testing.expect(chunks.len > 1);
@@ -7449,7 +7541,7 @@ const SlackNativeRecoveryProbe = struct {
         if (!std.mem.eql(u8, endpoint, "chat.update")) return error.UnexpectedEndpoint;
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
         defer parsed.deinit();
-        const text = parsed.value.object.get("text").?.string;
+        const text = parsed.value.object.get("markdown_text").?.string;
         self.updates += 1;
         // Force the fallback's shrink-and-retry path as well as native recovery.
         if (self.updates == 1) return .{ .error_code = try allocator.dupe(u8, "msg_too_long") };
@@ -7524,7 +7616,10 @@ test "slack final delivery releases stream_mu during chunk delivery" {
     const state = try ch.ensureStreamStateLocked(target, 1);
     state.mode = .fallback;
     try state.setMessageTs(std.testing.allocator, "1700.2");
-    const message = "if (a < b && c > d) {}\n" ** 300 ++ "Done.";
+    // Over 12k so the fallback final routes onto the chunked transport, which
+    // posts follow-ups (chat.postMessage) -- the path this test exercises for
+    // stream_mu non-holding during postMessage I/O.
+    const message = "if (a < b && c > d) {}\n" ** 600 ++ "Done.";
     try ch.channel().sendEvent(target, message, &.{}, .final);
 
     try std.testing.expect(probe.posts > 0);
@@ -7545,74 +7640,145 @@ test "slack markdownToSlackMrkdwn renders tables as aligned fenced blocks" {
     );
 }
 
-// Regression: slack final reply stopped rendering markdown tables after the stream finished
-test "appendPostMessageBody table gating" {
-    const allowed = [_][]const u8{};
-    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+// Regression: fallback preview initial post sent mrkdwn instead of native markdown_text.
+test "slack fallback preview initial post sends markdown_text" {
+    const allocator = std.testing.allocator;
+    const Probe = struct {
+        last_post: ?[]u8 = null,
 
-    const table_text = "| A | B |\n| --- | --- |\n| 1 | 2 |";
-
-    // 1. Table short text + allow_native_markdown=true -> body has markdown_text and raw pipes, no mrkdwn:true
-    {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(std.testing.allocator);
-        try ch.appendPostMessageBody(&body, "C123", "1700.1", table_text, true);
-
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") != null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") == null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "| A | B |") != null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"thread_ts\":\"1700.1\"") != null);
-    }
-
-    // 2. Without table -> byte-for-byte identical between allow_native_markdown=true and allow_native_markdown=false
-    {
-        const plain_text = "**hello** world";
-        var body_true: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_true.deinit(std.testing.allocator);
-        try ch.appendPostMessageBody(&body_true, "C123", null, plain_text, true);
-
-        var body_false: std.ArrayListUnmanaged(u8) = .empty;
-        defer body_false.deinit(std.testing.allocator);
-        try ch.appendPostMessageBody(&body_false, "C123", null, plain_text, false);
-
-        try std.testing.expectEqualStrings(body_false.items, body_true.items);
-        try std.testing.expect(std.mem.indexOf(u8, body_true.items, "\"mrkdwn\":true") != null);
-    }
-
-    // 3. With table but > 12k -> mrkdwn body (table converted to fenced code block)
-    {
-        var large_table: std.ArrayListUnmanaged(u8) = .empty;
-        defer large_table.deinit(std.testing.allocator);
-        try large_table.appendSlice(std.testing.allocator, "| Col1 | Col2 |\n| --- | --- |\n");
-        while (large_table.items.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
-            try large_table.appendSlice(std.testing.allocator, "| val1 | val2 val2 val2 val2 val2 |\n");
+        fn call(ctx: *anyopaque, a: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+                if (self.last_post) |prev| a.free(prev);
+                self.last_post = try a.dupe(u8, body);
+                return .{ .ts = try a.dupe(u8, "1700.2") };
+            }
+            return error.UnexpectedEndpoint;
         }
 
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(std.testing.allocator);
-        try ch.appendPostMessageBody(&body, "C123", null, large_table.items, true);
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            if (self.last_post) |b| a.free(b);
+        }
+    };
 
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") == null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "```") != null);
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = Probe{};
+    defer probe.deinit(allocator);
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = Probe.call;
+    // A non-threaded target forces the fallback transport, which posts the
+    // initial preview with postMessageForStream (chat.postMessage).
+    try ch.channel().sendEvent("C1", "x" ** 200, &.{}, .chunk);
+
+    try std.testing.expect(probe.last_post != null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, probe.last_post.?, .{});
+    defer parsed.deinit();
+    // Native markdown_text, no mrkdwn:text.
+    try std.testing.expect(parsed.value.object.get("markdown_text") != null);
+    try std.testing.expect(parsed.value.object.get("text") == null);
+    try std.testing.expect(parsed.value.object.get("mrkdwn") == null);
+}
+
+// Regression: streaming preview converted markdown to mrkdwn and truncated the
+// wrong text, so the live preview diverged from the final markdown_text render.
+test "slack updateStreamMessage sends raw markdown bounded as markdown_text" {
+    const allocator = std.testing.allocator;
+    // (a) bounded raw markdown_text update under the 4k preview cap.
+    const BoundProbe = struct {
+        updates: usize = 0,
+        last_md: ?[]u8 = null,
+
+        fn call(ctx: *anyopaque, a: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+                return .{ .ts = try a.dupe(u8, "1700.2") };
+            }
+            if (std.mem.eql(u8, endpoint, "chat.update")) {
+                self.updates += 1;
+                if (self.last_md) |prev| a.free(prev);
+                const p = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+                defer p.deinit();
+                const md = p.value.object.get("markdown_text").?.string;
+                self.last_md = try a.dupe(u8, md);
+                return .{};
+            }
+            return error.UnexpectedEndpoint;
+        }
+
+        fn deinit(self: *@This(), a: std.mem.Allocator) void {
+            if (self.last_md) |b| a.free(b);
+        }
+    };
+
+    // (a) bounded raw markdown_text update under the 4k preview cap.
+    {
+        var ch = initStreamingChannel(true);
+        defer ch.channel().stop();
+        ch.native_stream_disabled.store(true, .release);
+        var probe = BoundProbe{};
+        defer probe.deinit(allocator);
+        ch.test_api_ctx = &probe;
+        ch.test_api_call = BoundProbe.call;
+        const target = "C_TEST:1700.1";
+        // First delta opens the fallback preview (postMessage -> ts).
+        try ch.channel().sendEvent(target, "x" ** 200, &.{}, .chunk);
+        // Force a second flush now that a ts is held, exercising updateStreamMessage.
+        const state = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+        try ch.channel().sendEvent(target, "y" ** 200, &.{}, .chunk);
+
+        try std.testing.expectEqual(@as(usize, 1), probe.updates);
+        try std.testing.expect(probe.last_md != null);
+        const md = probe.last_md.?;
+        // Bound to the preview cap; raw markdown preserved (no mrkdwn escaping).
+        try std.testing.expect(md.len <= stream_presenter.STREAM_UPDATE_MAX_BYTES);
+        try std.testing.expect(std.mem.indexOf(u8, md, "x") != null);
     }
 
-    // 4. allow_native_markdown=false with table -> always mrkdwn (table converted to code block)
-    {
-        var body: std.ArrayListUnmanaged(u8) = .empty;
-        defer body.deinit(std.testing.allocator);
-        try ch.appendPostMessageBody(&body, "C123", null, table_text, false);
+    // (b) msg_too_long from chat.update maps to SlackMessageTooLong so the
+    // halving retry in publishStreamFlushLocked keeps working.
+    const TooLongProbe = struct {
+        updates: usize = 0,
+        first_call: bool = true,
 
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"markdown_text\":") == null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "\"mrkdwn\":true") != null);
-        try std.testing.expect(std.mem.indexOf(u8, body.items, "```") != null);
+        fn call(ctx: *anyopaque, a: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+            _ = body;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (std.mem.eql(u8, endpoint, "chat.update")) {
+                self.updates += 1;
+                if (self.first_call) {
+                    self.first_call = false;
+                    return .{ .error_code = try a.dupe(u8, "msg_too_long") };
+                }
+                return .{};
+            } else if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+                return .{ .ts = try a.dupe(u8, "1700.2") };
+            }
+            return error.UnexpectedEndpoint;
+        }
+    };
+    {
+        var ch = initStreamingChannel(true);
+        defer ch.channel().stop();
+        ch.native_stream_disabled.store(true, .release);
+        var probe = TooLongProbe{};
+        ch.test_api_ctx = &probe;
+        ch.test_api_call = TooLongProbe.call;
+        const target = "C_TEST:1700.1";
+        try ch.channel().sendEvent(target, "x" ** 200, &.{}, .chunk);
+        const state = ch.stream_states.getPtr(target) orelse return error.TestUnexpectedResult;
+        state.last_flush_time -= stream_presenter.STREAM_FLUSH_MIN_INTERVAL_MS + 1;
+        try ch.channel().sendEvent(target, "y" ** 200, &.{}, .chunk);
+        // Retry with a halved preview_limit succeeded.
+        try std.testing.expectEqual(@as(usize, 2), probe.updates);
     }
 }
 
 // Regression: slack final reply stopped rendering markdown tables after the stream finished
-test "slack fallback final delivers native markdown_text when table fits limit" {
+test "slack fallback final delivers native markdown_text when reply fits limit" {
     const allocator = std.testing.allocator;
-    const TableDeliveryProbe = struct {
+    const NativeProbe = struct {
         updates: usize = 0,
         posts: usize = 0,
         last_body: ?[]u8 = null,
@@ -7638,13 +7804,14 @@ test "slack fallback final delivers native markdown_text when table fits limit" 
 
     var ch = initStreamingChannel(true);
     defer ch.channel().stop();
-    var probe = TableDeliveryProbe{};
+    var probe = NativeProbe{};
     defer probe.deinit(allocator);
     ch.test_api_ctx = &probe;
-    ch.test_api_call = TableDeliveryProbe.call;
+    ch.test_api_call = NativeProbe.call;
 
-    const table_message = "Here is the summary:\n\n| Item | Status |\n| --- | --- |\n| Task | Done |\n\nAll clear!";
-    try ch.deliverFallbackFinal(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "1700.2", table_message, &.{}, "C_TEST:1700.1");
+    // Regression: final reply renders identically to the streamed preview.
+    const message = "# Summary\n\nAll clear! [docs](https://x.test/help)";
+    try ch.deliverFallbackFinal(.{ .channel_id = "C_TEST", .thread_ts = "1700.1" }, "1700.2", message, &.{}, "C_TEST:1700.1");
 
     try std.testing.expectEqual(@as(usize, 1), probe.updates);
     try std.testing.expectEqual(@as(usize, 0), probe.posts);
@@ -7653,7 +7820,7 @@ test "slack fallback final delivers native markdown_text when table fits limit" 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, probe.last_body.?, .{});
     defer parsed.deinit();
     const md_text = parsed.value.object.get("markdown_text") orelse return error.TestExpectedEqual;
-    try std.testing.expectEqualStrings(table_message, md_text.string);
+    try std.testing.expectEqualStrings(message, md_text.string);
     try std.testing.expect(parsed.value.object.get("text") == null);
 }
 
