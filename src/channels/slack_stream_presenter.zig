@@ -428,6 +428,25 @@ pub fn buildUpdateBody(
     return body.toOwnedSlice(allocator);
 }
 
+pub fn buildUpdateMarkdownBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    ts: []const u8,
+    markdown_text: []const u8,
+) ![]u8 {
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body.deinit(allocator);
+
+    try body.appendSlice(allocator, "{\"channel\":");
+    try json_util.appendJsonString(&body, allocator, channel_id);
+    try body.appendSlice(allocator, ",\"ts\":");
+    try json_util.appendJsonString(&body, allocator, ts);
+    try body.appendSlice(allocator, ",\"markdown_text\":");
+    try json_util.appendJsonString(&body, allocator, markdown_text);
+    try body.append(allocator, '}');
+    return body.toOwnedSlice(allocator);
+}
+
 // ---------------------------------------------------------------------------
 // Failure classification
 // ---------------------------------------------------------------------------

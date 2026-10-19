@@ -46,6 +46,31 @@ pub fn markdownTablesToCodeBlocks(allocator: std.mem.Allocator, md: []const u8) 
     return out.toOwnedSlice(allocator);
 }
 
+/// True when `md` contains at least one GFM table outside of fenced code blocks.
+/// Scans line by line without allocating.
+pub fn hasMarkdownTable(md: []const u8) bool {
+    var in_fence = false;
+    var prev_was_table_row = false;
+    var line_iter = std.mem.splitScalar(u8, md, '\n');
+    while (line_iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (std.mem.startsWith(u8, trimmed, "```")) {
+            in_fence = !in_fence;
+            prev_was_table_row = false;
+            continue;
+        }
+        if (in_fence) {
+            prev_was_table_row = false;
+            continue;
+        }
+        if (prev_was_table_row and isDelimiterRow(trimmed)) {
+            return true;
+        }
+        prev_was_table_row = isTableRow(trimmed);
+    }
+    return false;
+}
+
 fn appendLine(
     out: *std.ArrayListUnmanaged(u8),
     allocator: std.mem.Allocator,
@@ -347,4 +372,24 @@ test "markdownTablesToCodeBlocks aligns wide CJK characters" {
         "```\n| 名称 | 值  |\n| ---- | --- |\n| a    | b   |\n```",
         out,
     );
+}
+
+// Regression: slack final reply stopped rendering markdown tables after the stream finished
+test "hasMarkdownTable detects valid GFM table" {
+    try std.testing.expect(hasMarkdownTable("| Name | Age |\n| --- | --- |\n| Alice | 30 |"));
+    try std.testing.expect(hasMarkdownTable("Header\nName | Age\n---|---\nAlice | 30"));
+}
+
+// Regression: slack final reply stopped rendering markdown tables after the stream finished
+test "hasMarkdownTable ignores tables inside fenced code" {
+    const fenced = "```markdown\n| Name | Age |\n| --- | --- |\n| Alice | 30 |\n```";
+    try std.testing.expect(!hasMarkdownTable(fenced));
+}
+
+// Regression: slack final reply stopped rendering markdown tables after the stream finished
+test "hasMarkdownTable returns false for stray pipes or delimiter-less text" {
+    try std.testing.expect(!hasMarkdownTable("Use a | b as separator"));
+    try std.testing.expect(!hasMarkdownTable("| only | one | row |"));
+    try std.testing.expect(!hasMarkdownTable("plain text without tables"));
+    try std.testing.expect(!hasMarkdownTable(""));
 }
