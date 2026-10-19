@@ -7243,6 +7243,7 @@ test "restored session token reconstruction stays aligned across response cache 
 }
 
 fn expectResetTurnPersistsFreshSession(command: []const u8) !void {
+    // Regression: bare /new and /reset ran a full LLM turn instead of a local ack.
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
 
@@ -7275,6 +7276,7 @@ fn expectResetTurnPersistsFreshSession(command: []const u8) !void {
     const token_cost = @as(u64, agent_mod.estimate_text_tokens("ok"));
     const session = try sm.getOrCreate(session_key);
     try testing.expectEqual(token_cost, session.agent.total_tokens);
+    const calls_before_reset = mock.chat_calls;
 
     const reset_reply = try sm.processMessage(session_key, command, .{
         .channel = "telegram",
@@ -7282,32 +7284,29 @@ fn expectResetTurnPersistsFreshSession(command: []const u8) !void {
         .group_id = null,
     });
     defer testing.allocator.free(reset_reply);
-    try testing.expectEqual(token_cost, session.agent.total_tokens);
+    try testing.expectEqualStrings("Session cleared.", reset_reply);
+    try testing.expectEqual(calls_before_reset, mock.chat_calls);
+    try testing.expectEqual(@as(u64, 0), session.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 0), session.agent.historyLen());
 
     const entries = try store.loadMessages(testing.allocator, session_key);
     defer memory_mod.freeMessages(testing.allocator, entries);
-    try testing.expectEqual(@as(usize, 2), entries.len);
-    try testing.expectEqualStrings("user", entries[0].role);
-    try testing.expectEqualStrings(agent_mod.commands.bareSessionResetPrompt(command).?, entries[0].content);
-    try testing.expectEqualStrings("assistant", entries[1].role);
-    try testing.expectEqualStrings("ok", entries[1].content);
-    try testing.expectEqual(@as(?u64, token_cost), try store.loadUsage(session_key));
+    try testing.expectEqual(@as(usize, 0), entries.len);
+    try testing.expectEqual(@as(?u64, null), try store.loadUsage(session_key));
 
     session.last_active = 0;
     try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
 
     const restored = try sm.getOrCreate(session_key);
-    try testing.expectEqual(token_cost, restored.agent.total_tokens);
-    try testing.expectEqual(@as(usize, 2), restored.agent.historyLen());
-    try testing.expectEqualStrings(entries[0].content, restored.agent.history.items[0].content);
-    try testing.expectEqualStrings("ok", restored.agent.history.items[1].content);
+    try testing.expectEqual(@as(u64, 0), restored.agent.total_tokens);
+    try testing.expectEqual(@as(usize, 0), restored.agent.historyLen());
 }
 
-test "processMessage bare /new persists fresh-session turn across reload" {
+test "processMessage bare /new is a local ack and clears stored session" {
     try expectResetTurnPersistsFreshSession("/new");
 }
 
-test "processMessage bare /reset with mention persists fresh-session turn across reload" {
+test "processMessage bare /reset with mention is a local ack and clears stored session" {
     try expectResetTurnPersistsFreshSession("/reset@nullclaw_bot:");
 }
 
