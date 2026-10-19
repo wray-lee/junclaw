@@ -30,17 +30,7 @@ const SlashCommand = control_plane.SlashCommand;
 const parseSlashCommand = control_plane.parseSlashCommand;
 const isSlashName = control_plane.isSlashName;
 
-pub const BARE_SESSION_RESET_PROMPT =
-    "A new session was started via /new or /reset. Execute your Session Startup sequence now - read the required files before responding to the user. Then greet the user in your configured persona, if one is provided. Be yourself - use your defined voice, mannerisms, and mood. Keep it to 1-3 sentences and ask what they want to do. If the runtime model differs from default_model in the system prompt, mention the default model. Do not mention internal steps, files, tools, or reasoning.";
-
 const MODEL_MENU_PAGE_SIZE: usize = 10;
-
-pub fn bareSessionResetPrompt(message: []const u8) ?[]const u8 {
-    const cmd = parseSlashCommand(message) orelse return null;
-    if (!(isSlashName(cmd, "new") or isSlashName(cmd, "reset"))) return null;
-    if (cmd.arg.len != 0) return null;
-    return BARE_SESSION_RESET_PROMPT;
-}
 
 pub const TurnInputPlan = struct {
     clear_session: bool = false,
@@ -157,14 +147,6 @@ pub fn planTurnInput(message: []const u8) TurnInputPlan {
     const cmd = parseSlashCommand(message) orelse return .{ .llm_user_message = message };
     const kind = classifySlashCommand(cmd);
     const clear_session = slashCommandClearsSession(kind);
-
-    if (bareSessionResetPrompt(message)) |fresh_prompt| {
-        return .{
-            .clear_session = clear_session,
-            .invoke_local_handler = true,
-            .llm_user_message = fresh_prompt,
-        };
-    }
 
     if (kind != .unknown) {
         return .{
@@ -1024,25 +1006,14 @@ test "configPrimaryModelForSelection keeps configured versionless custom url nam
     try std.testing.expectEqualStrings("custom:https://gateway.example.com/qianfan/custom-model", primary);
 }
 
-test "bareSessionResetPrompt returns prompt for bare /new" {
-    const prompt = bareSessionResetPrompt("/new") orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "Execute your Session Startup sequence now") != null);
-}
-
-test "bareSessionResetPrompt returns prompt for bare /reset with mention" {
-    const prompt = bareSessionResetPrompt("/reset@nullclaw_bot:") orelse return error.TestExpectedEqual;
-    try std.testing.expect(std.mem.indexOf(u8, prompt, "A new session was started via /new or /reset") != null);
-}
-
-test "bareSessionResetPrompt ignores /reset with argument" {
-    try std.testing.expect(bareSessionResetPrompt("/reset gpt-4o-mini") == null);
-}
-
-test "planTurnInput routes bare reset through local clear and llm prompt" {
-    const plan = planTurnInput("/reset@nullclaw_bot:");
-    try std.testing.expect(plan.clear_session);
-    try std.testing.expect(plan.invoke_local_handler);
-    try std.testing.expectEqualStrings(BARE_SESSION_RESET_PROMPT, plan.llm_user_message.?);
+test "planTurnInput keeps bare /new and /reset local-only" {
+    // Regression: bare /new and /reset ran a full LLM turn instead of a local ack.
+    for ([_][]const u8{ "/new", "/reset", "/reset@nullclaw_bot:", "/reset gpt-4o-mini" }) |message| {
+        const plan = planTurnInput(message);
+        try std.testing.expect(plan.clear_session);
+        try std.testing.expect(plan.invoke_local_handler);
+        try std.testing.expect(plan.llm_user_message == null);
+    }
 }
 
 test "planTurnInput keeps unknown slash-prefixed text on llm path" {

@@ -2115,13 +2115,7 @@ pub const Agent = struct {
         }
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
-                const slash_response = (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
-                if (turn_input.llm_user_message) |llm_user_message| {
-                    // Bare /new and /reset clear session state first, then continue as a fresh LLM turn.
-                    self.allocator.free(slash_response);
-                    break :blk llm_user_message;
-                }
-                return slash_response;
+                return (try self.handleSlashCommand(user_message)) orelse return error.SlashCommandDispatchMismatch;
             }
             break :blk turn_input.llm_user_message orelse user_message;
         };
@@ -5909,7 +5903,8 @@ test "slash /reset clears history and switches model" {
     try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
 }
 
-test "turn bare /new routes through fresh-session prompt" {
+test "turn bare /new and /reset are local acks with no model call" {
+    // Regression: bare /new and /reset ran a full LLM turn instead of a local ack.
     const EchoProvider = struct {
         const Self = @This();
         call_count: usize = 0,
@@ -5985,19 +5980,18 @@ test "turn bare /new routes through fresh-session prompt" {
     };
     defer agent.deinit();
 
-    try agent.history.append(allocator, .{
-        .role = .user,
-        .content = try allocator.dupe(u8, "old-before-reset"),
-    });
+    for ([_][]const u8{ "/new", "/reset" }) |command| {
+        try agent.history.append(allocator, .{
+            .role = .user,
+            .content = try allocator.dupe(u8, "old-before-reset"),
+        });
 
-    const response = try agent.turn("/new");
-    defer allocator.free(response);
+        const response = try agent.turn(command);
+        defer allocator.free(response);
 
-    try std.testing.expect(std.mem.indexOf(u8, response, "Execute your Session Startup sequence now") != null);
-    try std.testing.expectEqual(@as(usize, 1), provider_state.call_count);
-
-    for (agent.history.items) |msg| {
-        try std.testing.expect(std.mem.indexOf(u8, msg.content, "old-before-reset") == null);
+        try std.testing.expectEqualStrings("Session cleared.", response);
+        try std.testing.expectEqual(@as(usize, 0), provider_state.call_count);
+        try std.testing.expectEqual(@as(usize, 0), agent.historyLen());
     }
 }
 
