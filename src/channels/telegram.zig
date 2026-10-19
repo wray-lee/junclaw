@@ -16,6 +16,7 @@ const telegram_update_ingress = @import("telegram_update_ingress.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 const Atomic = @import("../portable_atomic.zig").Atomic;
 const util = @import("../util.zig");
+const md_tables = @import("md_tables.zig");
 
 const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
@@ -4142,7 +4143,10 @@ fn findBacktickRun(line: []const u8, from: usize, run_len: usize) ?usize {
 /// Convert Markdown to Telegram-compatible HTML.
 /// Handles: code blocks, inline code, bold, italic, strikethrough,
 /// links, headers, bullet lists. Escapes HTML entities.
-pub fn markdownToTelegramHtml(allocator: std.mem.Allocator, md: []const u8) ![]u8 {
+pub fn markdownToTelegramHtml(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    const md = try md_tables.markdownTablesToCodeBlocks(allocator, input);
+    defer allocator.free(md);
+
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer buf.deinit(allocator);
 
@@ -7349,4 +7353,17 @@ test "p0c rich markdown recognizes syntax instead of paragraph first characters"
     try expectRichEscaped("`model`  \n_ready_  \n#tag  \n-final  \n+ready  \n~done~  \n|plain|  \n\\<text>", "`model`\n_ready_\n#tag\n-final\n+ready\n~done~\n|plain|\n<text>");
     const blocks = "# Heading\n> quote\n- item\n* item\n+ item\n1. item\n2) item\n---\n___\n***\nTitle\n===";
     try expectRichEscaped(blocks, blocks);
+}
+
+// Regression: Markdown tables rendered as raw pipes on the default Telegram path
+test "telegram markdownToTelegramHtml renders tables as aligned pre blocks" {
+    const html = try markdownToTelegramHtml(
+        std.testing.allocator,
+        "| Name | Value |\n| --- | --- |\n| a | 1 |",
+    );
+    defer std.testing.allocator.free(html);
+    try std.testing.expectEqualStrings(
+        "<pre>| Name | Value |\n| ---- | ----- |\n| a    | 1     |\n</pre>",
+        html,
+    );
 }
