@@ -3007,9 +3007,8 @@ pub const SlackChannel = struct {
         if (!self.running.load(.acquire)) return;
         const status_target = parseStatusTarget(target) orelse return;
 
-        self.beginSessionTurn(status_target);
-
         if (!self.tool_progress_enabled) {
+            self.beginSessionTurn(status_target);
             self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "is typing...", null);
             return;
         }
@@ -3044,6 +3043,9 @@ pub const SlackChannel = struct {
             };
         }
 
+        // Count the turn only after every fallible step: on error, stopTyping
+        // is skipped, so an early increment would never be undone.
+        self.beginSessionTurn(status_target);
         self.setThreadStatus(status_target.channel_id, status_target.thread_ts, PROGRESS_STATUS_TITLE, null);
     }
 
@@ -5539,6 +5541,48 @@ test "slack keepalive thread lifecycle starts and joins cleanly" {
     std_compat.thread.sleep(20 * std.time.ns_per_ms);
     try ch.stopTyping(target);
     try std.testing.expectEqual(@as(usize, 0), ch.progress_targets.count());
+}
+
+test "slack startTyping error paths leave no active session turn" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .account_id = "test",
+        .bot_token = "tok",
+        .session_status = true,
+        .tool_progress = true,
+    });
+    defer ch.clearActiveTurns();
+    defer ch.stopAllProgress();
+    ch.running.store(true, .release);
+    const target = "C12345:1700.1";
+
+    // Baseline: a clean start counts one turn and stopTyping clears it.
+    try ch.startTyping(target);
+    try std.testing.expectEqual(@as(u32, 1), ch.activeTurnCount("C12345", "1700.1"));
+    try ch.stopTyping(target);
+    try std.testing.expectEqual(@as(u32, 0), ch.activeTurnCount("C12345", "1700.1"));
+
+    // Every fallible step in startTyping must leave no increment behind.
+    var saw_error = false;
+    var saw_counted_success = false;
+    var fail_index: usize = 0;
+    while (fail_index < 8) : (fail_index += 1) {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        ch.allocator = failing.allocator();
+        const result = ch.startTyping(target);
+        ch.allocator = std.testing.allocator;
+
+        if (result) |_| {
+            if (ch.activeTurnCount("C12345", "1700.1") == 1) saw_counted_success = true;
+            try ch.stopTyping(target);
+        } else |_| {
+            saw_error = true;
+            try std.testing.expectEqual(@as(u32, 0), ch.activeTurnCount("C12345", "1700.1"));
+            try ch.stopTyping(target);
+        }
+        try std.testing.expectEqual(@as(u32, 0), ch.activeTurnCount("C12345", "1700.1"));
+    }
+    try std.testing.expect(saw_error);
+    try std.testing.expect(saw_counted_success);
 }
 
 test "slack processHistoryMessage publishes inbound message to bus" {
