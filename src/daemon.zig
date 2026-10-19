@@ -1670,6 +1670,33 @@ fn processInboundMessage(
     };
     defer allocator.free(reply);
 
+    // Regression: [NO_REPLY] sent literally in DMs and on Slack. The marker
+    // suppresses the reply on every channel, not just Telegram groups.
+    if (channel_loop.shouldSuppressReply(reply)) {
+        log.info("inbound dispatch: suppressing [NO_REPLY] reply", .{});
+        // Streaming may already have published a preview. An empty final closes
+        // the draft/stream (Telegram, Slack and Max discard it and send
+        // nothing), so the preview never becomes the visible reply; without a
+        // published chunk there is nothing to clean up, so stay silent.
+        if (streaming_ctx.emitted_chunk) {
+            if (makeAssistantReplyOutbound(
+                allocator,
+                routing_plan.outbound_channel,
+                routing_plan.outbound_account_id,
+                routing_plan.outbound_chat_id,
+                "",
+                outbound_draft_id,
+            ) catch null) |out| {
+                event_bus.publishOutbound(out) catch {
+                    out.deinit(allocator);
+                };
+            }
+        }
+        setInboundTaskReaction(outbound_channel, msg.chat_id, parsed_meta.fields.message_id, .done);
+        health.markComponentOk("inbound_dispatcher");
+        return;
+    }
+
     if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
         if (outbound_channel) |channel| {
             var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
@@ -2533,6 +2560,274 @@ test "publishStreamingChunk drops a preview instead of blocking on a full outbou
         var m = msg;
         m.deinit(allocator);
     }
+}
+
+const NoReplyDaemonMockProvider = struct {
+    fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return a.dupe(u8, "[NO_REPLY]");
+    }
+    fn chat(_: *anyopaque, a: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return .{ .content = try a.dupe(u8, "[NO_REPLY]") };
+    }
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "no-reply-daemon-mock";
+    }
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+const noReplyDaemonProviderVTable = providers.Provider.VTable{
+    .chatWithSystem = NoReplyDaemonMockProvider.chatWithSystem,
+    .chat = NoReplyDaemonMockProvider.chat,
+    .supportsNativeTools = NoReplyDaemonMockProvider.supportsNativeTools,
+    .getName = NoReplyDaemonMockProvider.getName,
+    .deinit = NoReplyDaemonMockProvider.deinitFn,
+};
+
+var noReplyDaemonProviderState: u8 = 0;
+
+fn noReplyDaemonProvider() providers.Provider {
+    return .{ .ptr = @ptrCast(&noReplyDaemonProviderState), .vtable = &noReplyDaemonProviderVTable };
+}
+
+const NoReplyStreamingDaemonMockProvider = struct {
+    fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return a.dupe(u8, "[NO_REPLY]");
+    }
+    fn chat(_: *anyopaque, a: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return .{ .content = try a.dupe(u8, "[NO_REPLY]") };
+    }
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "no-reply-stream-daemon-mock";
+    }
+    fn deinitFn(_: *anyopaque) void {}
+    fn supportsStreaming(_: *anyopaque) bool {
+        return true;
+    }
+    fn streamChat(
+        _: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const text = "[NO_REPLY]";
+        callback(callback_ctx, providers.StreamChunk.textDelta(text[0..5]));
+        callback(callback_ctx, providers.StreamChunk.textDelta(text[5..]));
+        callback(callback_ctx, providers.StreamChunk.finalChunk());
+        return .{
+            .content = try allocator.dupe(u8, text),
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+};
+
+const noReplyStreamingDaemonProviderVTable = providers.Provider.VTable{
+    .chatWithSystem = NoReplyStreamingDaemonMockProvider.chatWithSystem,
+    .chat = NoReplyStreamingDaemonMockProvider.chat,
+    .supportsNativeTools = NoReplyStreamingDaemonMockProvider.supportsNativeTools,
+    .getName = NoReplyStreamingDaemonMockProvider.getName,
+    .deinit = NoReplyStreamingDaemonMockProvider.deinitFn,
+    .supports_streaming = NoReplyStreamingDaemonMockProvider.supportsStreaming,
+    .stream_chat = NoReplyStreamingDaemonMockProvider.streamChat,
+};
+
+var noReplyStreamingDaemonProviderState: u8 = 0;
+
+fn noReplyStreamingDaemonProvider() providers.Provider {
+    return .{ .ptr = @ptrCast(&noReplyStreamingDaemonProviderState), .vtable = &noReplyStreamingDaemonProviderVTable };
+}
+
+test "daemon inbound dispatch suppresses [NO_REPLY] instead of publishing it" {
+    // Regression: Slack and every other bus-routed channel published the
+    // literal marker; only the Telegram loop suppressed it.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try channel_loop.ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    const RecordingChannel = struct {
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "test-channel";
+        }
+        fn healthCheck(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var ch_state: u8 = 0;
+    const ch_vtable = channels_mod.Channel.VTable{
+        .start = RecordingChannel.start,
+        .stop = RecordingChannel.stop,
+        .send = RecordingChannel.send,
+        .name = RecordingChannel.name,
+        .healthCheck = RecordingChannel.healthCheck,
+    };
+    var registry = dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.register(.{ .ptr = @ptrCast(&ch_state), .vtable = &ch_vtable });
+
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    const session_key = "test-channel:default:direct:C1";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.agent.provider = noReplyDaemonProvider();
+
+    var inbound = bus_mod.InboundMessage{
+        .channel = "test-channel",
+        .sender_id = "user-1",
+        .chat_id = "C1",
+        .content = "hello",
+        .session_key = session_key,
+    };
+    var evict_counter = Atomic(u32).init(0);
+    processInboundMessage(allocator, &event_bus, &registry, runtime, &evict_counter, &inbound);
+
+    event_bus.close();
+    var published: usize = 0;
+    while (event_bus.consumeOutbound()) |msg| {
+        var m = msg;
+        m.deinit(allocator);
+        published += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), published);
+}
+
+test "daemon inbound dispatch closes a streamed preview instead of publishing the marker" {
+    // The stream chunks may already be visible as a preview, so suppression
+    // publishes one empty final: channels discard the preview and send nothing.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try channel_loop.ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    const RecordingChannel = struct {
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "test-stream-channel";
+        }
+        fn healthCheck(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreamingOutbound(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var ch_state: u8 = 0;
+    const ch_vtable = channels_mod.Channel.VTable{
+        .start = RecordingChannel.start,
+        .stop = RecordingChannel.stop,
+        .send = RecordingChannel.send,
+        .name = RecordingChannel.name,
+        .healthCheck = RecordingChannel.healthCheck,
+        .supportsStreamingOutbound = RecordingChannel.supportsStreamingOutbound,
+    };
+    var registry = dispatch.ChannelRegistry.init(allocator);
+    defer registry.deinit();
+    try registry.register(.{ .ptr = @ptrCast(&ch_state), .vtable = &ch_vtable });
+
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    const session_key = "test-stream-channel:default:direct:C1";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.agent.provider = noReplyStreamingDaemonProvider();
+
+    var inbound = bus_mod.InboundMessage{
+        .channel = "test-stream-channel",
+        .sender_id = "user-1",
+        .chat_id = "C1",
+        .content = "hello",
+        .session_key = session_key,
+    };
+    var evict_counter = Atomic(u32).init(0);
+    processInboundMessage(allocator, &event_bus, &registry, runtime, &evict_counter, &inbound);
+
+    event_bus.close();
+    var chunks: usize = 0;
+    var finals: usize = 0;
+    while (event_bus.consumeOutbound()) |msg| {
+        var m = msg;
+        defer m.deinit(allocator);
+        switch (m.stage) {
+            .chunk => chunks += 1,
+            .final => {
+                finals += 1;
+                // The only final is the empty cleanup marker, never the reply.
+                try std.testing.expectEqual(@as(usize, 0), m.content.len);
+            },
+        }
+    }
+    try std.testing.expect(chunks > 0);
+    try std.testing.expectEqual(@as(usize, 1), finals);
 }
 
 test "dispatcher cancels the stopped turn's queued stream chunks before enqueue" {

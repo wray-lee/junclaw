@@ -127,8 +127,9 @@ fn setScheduleToolContext(
 // Parallel Message Processing
 // ════════════════════════════════════════════════════════════════════════════
 
-fn shouldSuppressGroupReply(is_group: bool, reply: []const u8) bool {
-    return is_group and std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
+/// A silent token must never reach any channel as visible text, in groups or DMs.
+pub fn shouldSuppressReply(reply: []const u8) bool {
+    return std.mem.indexOf(u8, reply, "[NO_REPLY]") != null;
 }
 
 fn logAgentProcessingError(
@@ -836,7 +837,7 @@ fn handleTelegramInteractiveCallback(
     if (turn_end) |hook| hook.run(hook.ctx);
     defer if (response_owned) allocator.free(response);
 
-    if (shouldSuppressGroupReply(is_group, response)) return true;
+    if (shouldSuppressReply(response)) return true;
 
     tg_ptr.editAssistantMessage(sender, message_sender_id, is_group, message_id, response) catch |err| {
         log.warn("failed to edit telegram callback response in place: {}", .{err});
@@ -1151,7 +1152,7 @@ fn processTelegramMessage(
     };
     defer allocator.free(reply);
 
-    if (shouldSuppressGroupReply(is_group, reply)) {
+    if (shouldSuppressReply(reply)) {
         log.info("Smart reply: skipping non-essential message", .{});
         tg_ptr.setTaskReaction(sender, message_id, .done);
         return;
@@ -3399,7 +3400,7 @@ pub fn runMaxLoop(
             };
             defer allocator.free(reply);
 
-            if (shouldSuppressGroupReply(msg.is_group, reply)) {
+            if (shouldSuppressReply(reply)) {
                 log.info("Smart reply: skipping non-essential message", .{});
                 continue;
             }
@@ -3550,10 +3551,10 @@ test "polling subagent drain delivers only matching origin account" {
     try std.testing.expectEqual(@as(usize, 0), signal_notices.len);
 }
 
-test "shouldSuppressGroupReply suppresses only group replies with marker" {
-    try std.testing.expect(shouldSuppressGroupReply(true, "ok [NO_REPLY]"));
-    try std.testing.expect(!shouldSuppressGroupReply(false, "ok [NO_REPLY]"));
-    try std.testing.expect(!shouldSuppressGroupReply(true, "regular reply"));
+test "shouldSuppressReply suppresses marked replies in groups and DMs" {
+    try std.testing.expect(shouldSuppressReply("ok [NO_REPLY]"));
+    try std.testing.expect(shouldSuppressReply("[NO_REPLY]"));
+    try std.testing.expect(!shouldSuppressReply("regular reply"));
 }
 
 test "isStopLikeCommand matches stop and abort variants" {
@@ -5024,6 +5025,71 @@ test "telegram polling releases the progress draft before the final reply" {
     );
 
     try std.testing.expect(probe.released);
+}
+
+test "telegram DM [NO_REPLY] is suppressed instead of sent literally" {
+    // Regression: the marker was suppressed only for groups, so a DM sent the
+    // literal "[NO_REPLY]" as the reply.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+
+    const session_key = "telegram:default:direct:99999";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.agent.provider = noReplyTelegramProvider();
+
+    const sends_before = telegram.TelegramChannel.test_send_calls;
+    processTelegramMessage(
+        allocator,
+        runtime,
+        &tg,
+        session_key,
+        "hello",
+        "99999",
+        333,
+        false, // DM: the reply must still be suppressed.
+        null,
+        "user_a",
+        false,
+        null,
+        null,
+    );
+
+    try std.testing.expectEqual(sends_before, telegram.TelegramChannel.test_send_calls);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
