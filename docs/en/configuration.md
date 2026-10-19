@@ -1381,17 +1381,21 @@ as `reply.md` to the same thread/DM instead of posting follow-ups. If the upload
 fails it falls back to the chunked delivery above. The upload reuses the
 existing `files:write` scope; no new scope is required.
 
-About `tool_progress` on Slack: on by default. While a turn runs in a thread, nullclaw sets
-the assistant thread status to `is working…` and passes the newest tool operation as a
+About `tool_progress` on Slack: on by default. While a turn runs, nullclaw sets the
+assistant status to `is working…` and passes the newest tool operation as a
 `loading_messages` entry (for example `🔧 web_fetch example.com`), so a long tool-heavy turn
 shows what the agent is doing. The status is refreshed every ~6 seconds to stay ahead of
 Slack's two-minute status timeout, and updates coalesce to at most one API call per second
 per thread. Hints are conservative: file paths are reduced to basenames, URLs to hosts,
 search queries are truncated, and shell/unknown tools show only the tool name - raw
-arguments are never rendered. This uses `assistant.threads.setStatus` with the existing
-`chat:write` scope; no new OAuth scope is required, and it works with `streaming` off. The
-API is thread-only: top-level messages (no `thread_ts`) keep the status reaction (default
-hourglass) as their progress signal, and nullclaw does not post an extra progress message.
+arguments are never rendered. The status goes to the same target as the typing indicator:
+the thread for a thread reply, and the message's own thread root for a top-level message
+or DM, so those conversations get the operation line too. It renders in Slack's
+Assistant/Agent View experience and is best-effort elsewhere. `assistant.threads.setStatus`
+accepts `assistant:write` or `chat:write` today (Slack plans to require `chat:write` only);
+nullclaw uses the existing `chat:write` scope, so no new OAuth scope is required, and it
+works with `streaming` off. The status reaction (default hourglass) still marks each
+message's progress, and nullclaw does not post an extra progress message.
 Set `tool_progress=false` to keep only the plain `is typing...` status.
 
 #### Live reasoning in drafts

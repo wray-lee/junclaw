@@ -2730,7 +2730,9 @@ pub const SlackChannel = struct {
         auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()}) catch return;
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, url, body, &.{auth_header}) catch return;
+        // Bounded: the keepalive thread is joined on stop, so a hung curl must
+        // not block channel shutdown.
+        const resp = root.http_util.curlPostWithProxy(self.allocator, url, body, &.{auth_header}, null, "5") catch return;
         self.allocator.free(resp);
     }
 
@@ -2793,9 +2795,10 @@ pub const SlackChannel = struct {
         self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "", null);
     }
 
-    /// Record one tool event for an existing turn target. Events for targets
-    /// that never called startTyping (top-level messages have no thread_ts) are
-    /// dropped: `assistant.threads.setStatus` is thread-only.
+    /// Record one tool event for an existing turn target. The target is the one
+    /// startTyping registered: `channel:thread_ts`, where a top-level message
+    /// uses its own ts as the thread root. Targets that never called
+    /// startTyping have no state and are dropped.
     pub fn recordToolProgress(self: *SlackChannel, target: []const u8, update: tool_progress.Update) void {
         if (!self.tool_progress_enabled) return;
         const status_target = parseStatusTarget(target) orelse return;

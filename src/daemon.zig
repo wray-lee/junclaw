@@ -1120,9 +1120,19 @@ const StreamingOutboundCtx = struct {
     emitted_chunk: bool = false,
 };
 
+/// Tool progress uses the same target as the typing indicator: Slack's
+/// synthesized `channel:message_ts` is the only address that reaches a
+/// top-level message or DM, where the outbound chat id is the bare channel.
+fn resolveProgressTarget(typing_recipient: ?[]const u8, outbound_chat_id: []const u8) []const u8 {
+    if (typing_recipient) |recipient| {
+        if (recipient.len != 0) return recipient;
+    }
+    return outbound_chat_id;
+}
+
 /// Per-turn context for the daemon-path tool-progress sink. Lives on the
 /// dispatching thread's stack for the duration of the synchronous
-/// `processMessageStreaming` call, so the borrowed chat id stays valid.
+/// `processMessageStreaming` call, so the borrowed target stays valid.
 const DaemonToolProgressCtx = struct {
     channel: channels_mod.Channel,
     chat_id: []const u8,
@@ -1613,7 +1623,10 @@ fn processInboundMessage(
     const tool_progress_sink: ?agent_mod.ProgressSink = blk: {
         const ch = outbound_channel orelse break :blk null;
         if (!use_streaming_outbound and !ch.supportsToolProgress()) break :blk null;
-        tool_progress_ctx = .{ .channel = ch, .chat_id = routing_plan.outbound_chat_id };
+        tool_progress_ctx = .{
+            .channel = ch,
+            .chat_id = resolveProgressTarget(typing_recipient, routing_plan.outbound_chat_id),
+        };
         break :blk .{ .callback = daemonToolProgressCallback, .ctx = @ptrCast(&tool_progress_ctx) };
     };
 
@@ -4693,6 +4706,19 @@ test "daemonToolProgressUpdate maps retry hints" {
     try std.testing.expectEqual(channels_mod.Channel.ToolProgressKind.retry, update.kind);
     try std.testing.expectEqual(@as(u32, 1), update.retry.attempt);
     try std.testing.expectEqual(@as(u32, 2), update.retry.max);
+}
+
+test "daemon tool progress target prefers the typing recipient" {
+    try std.testing.expectEqualStrings(
+        "C12345:1700000000.100",
+        resolveProgressTarget("C12345:1700000000.100", "C12345"),
+    );
+    try std.testing.expectEqualStrings("12345", resolveProgressTarget("12345", "12345"));
+}
+
+test "daemon tool progress target falls back to the outbound chat id" {
+    try std.testing.expectEqualStrings("C12345", resolveProgressTarget(null, "C12345"));
+    try std.testing.expectEqualStrings("C12345", resolveProgressTarget("", "C12345"));
 }
 
 test "a steered daemon message is finalized when the consuming turn ends" {
