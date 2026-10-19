@@ -2834,6 +2834,8 @@ test "save roundtrip preserves extended config sections" {
 
     cfg.session.dm_scope = .per_peer;
     cfg.session.idle_minutes = 45;
+    cfg.session.reset = .{ .mode = .daily, .at_hour = 6 };
+    cfg.session.reset_by_type = .{ .group = .{ .mode = .idle, .idle_minutes = 30 } };
     cfg.session.typing_interval_secs = 2;
     cfg.session.identity_links = &.{
         .{
@@ -2920,6 +2922,10 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(loaded.peripherals.enabled);
     try std.testing.expectEqualStrings("/dev/tty.usbmodem1", loaded.hardware.serial_port.?);
     try std.testing.expectEqual(config_types.DmScope.per_peer, loaded.session.dm_scope);
+    try std.testing.expectEqual(config_types.SessionResetMode.daily, loaded.session.reset.mode);
+    try std.testing.expectEqual(@as(u8, 6), loaded.session.reset.at_hour);
+    try std.testing.expectEqual(config_types.SessionResetMode.idle, loaded.session.reset_by_type.group.?.mode);
+    try std.testing.expectEqual(@as(?u32, 30), loaded.session.reset_by_type.group.?.idle_minutes);
     try std.testing.expectEqual(@as(usize, 1), loaded.session.identity_links.len);
     try std.testing.expectEqual(@as(usize, 2), loaded.gateway.paired_tokens.len);
     try std.testing.expect(pairing.isTokenHash(loaded.gateway.paired_tokens[0]));
@@ -8252,7 +8258,7 @@ test "session config: default dm_scope is per_channel_peer" {
     try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
 }
 
-test "session config: parse idle_minutes" {
+test "session config: explicit legacy idle_minutes maps to idle reset" {
     const allocator = std.testing.allocator;
     const json =
         \\{"session": {"idle_minutes": 30}}
@@ -8260,9 +8266,11 @@ test "session config: parse idle_minutes" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(u32, 30), cfg.session.idle_minutes);
+    try std.testing.expectEqual(config_types.SessionResetMode.idle, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(?u32, 30), cfg.session.reset.idle_minutes);
 }
 
-test "session config: ignores idleMinutes camelCase alias" {
+test "session config: session-level idleMinutes alone does not enable resets" {
     const allocator = std.testing.allocator;
     const json =
         \\{"session": {"idleMinutes": 45}}
@@ -8270,6 +8278,77 @@ test "session config: ignores idleMinutes camelCase alias" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
+    try std.testing.expectEqual(config_types.SessionResetMode.none, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(?u32, null), cfg.session.reset.idle_minutes);
+}
+
+test "session config: parse session.reset snake_case" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"reset": {"mode": "daily", "at_hour": 7, "idle_minutes": 15}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.SessionResetMode.daily, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(u8, 7), cfg.session.reset.at_hour);
+    try std.testing.expectEqual(@as(?u32, 15), cfg.session.reset.idle_minutes);
+}
+
+test "session config: parse session.reset camelCase aliases" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"reset": {"mode": "idle", "atHour": 21, "idleMinutes": 45}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.SessionResetMode.idle, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(u8, 21), cfg.session.reset.at_hour);
+    try std.testing.expectEqual(@as(?u32, 45), cfg.session.reset.idle_minutes);
+}
+
+test "session config: reset block without mode defaults to daily" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"reset": {"at_hour": 5}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.SessionResetMode.daily, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(u8, 5), cfg.session.reset.at_hour);
+}
+
+test "session config: explicit reset wins over legacy idle_minutes" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {"idle_minutes": 30, "reset": {"mode": "none"}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(config_types.SessionResetMode.none, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(?u32, null), cfg.session.reset.idle_minutes);
+}
+
+test "session config: parse reset_by_type and clamp values" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"session": {
+        \\  "reset": {"mode": "daily", "at_hour": 99},
+        \\  "reset_by_type": {
+        \\    "direct": {"mode": "idle", "idle_minutes": 10},
+        \\    "group": {"atHour": 23, "idleMinutes": 0},
+        \\    "thread": {"mode": "none"}
+        \\  }
+        \\}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(@as(u8, 23), cfg.session.reset.at_hour);
+    try std.testing.expectEqual(config_types.SessionResetMode.idle, cfg.session.reset_by_type.direct.?.mode);
+    try std.testing.expectEqual(@as(?u32, 10), cfg.session.reset_by_type.direct.?.idle_minutes);
+    try std.testing.expectEqual(config_types.SessionResetMode.daily, cfg.session.reset_by_type.group.?.mode);
+    try std.testing.expectEqual(@as(u8, 23), cfg.session.reset_by_type.group.?.at_hour);
+    try std.testing.expectEqual(@as(?u32, null), cfg.session.reset_by_type.group.?.idle_minutes);
+    try std.testing.expectEqual(config_types.SessionResetMode.none, cfg.session.reset_by_type.thread.?.mode);
 }
 
 test "session config: parse auto_provision_direct_agents" {
@@ -8341,6 +8420,9 @@ test "session config: empty session block uses defaults" {
     try cfg.parseJson(json);
     try std.testing.expectEqual(config_types.DmScope.per_channel_peer, cfg.session.dm_scope);
     try std.testing.expectEqual(@as(u32, 60), cfg.session.idle_minutes);
+    try std.testing.expectEqual(config_types.SessionResetMode.none, cfg.session.reset.mode);
+    try std.testing.expectEqual(@as(?u32, null), cfg.session.reset.idle_minutes);
+    try std.testing.expect(cfg.session.reset_by_type.direct == null);
     try std.testing.expectEqual(@as(usize, 0), cfg.session.identity_links.len);
     try std.testing.expect(!cfg.session.auto_provision_direct_agents);
 }

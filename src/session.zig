@@ -16,6 +16,7 @@ const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
 const turn_persistence = @import("agent/turn_persistence.zig");
+const session_reset = @import("session_reset.zig");
 const Agent = agent_mod.Agent;
 const NamedAgentConfig = @import("config_types.zig").NamedAgentConfig;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
@@ -1805,7 +1806,15 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
 
         if (self.sessions.get(session_key)) |session| {
-            session.last_active = std_compat.time.timestamp();
+            const now = std_compat.time.timestamp();
+            // Lazy automatic reset, evaluated before last_active is refreshed
+            // so an idle policy can still see the previous interaction.
+            // Lock order: SessionManager.mutex -> (agent/memory/store); no
+            // reset path acquires session.mutex or re-enters the manager.
+            if (!session.turn_running.load(.acquire)) {
+                self.maybeResetLocked(session, now);
+            }
+            session.last_active = now;
             return session;
         }
 
@@ -1932,6 +1941,22 @@ pub const SessionManager = struct {
 
         try self.sessions.put(self.allocator, owned_key, session);
         return session;
+    }
+
+    /// Reset a stale session through the shared /new path. Caller holds
+    /// self.mutex and has verified that no turn is running.
+    fn maybeResetLocked(self: *SessionManager, session: *Session, now: i64) void {
+        const policy = session_reset.resolvePolicy(self.config.session, session.session_key);
+        if (!session_reset.isStale(policy, now, session.created_at, session.last_active)) return;
+
+        agent_mod.commands.clearSessionState(&session.agent);
+        if (session.agent.session_store) |store| {
+            store.clearMessages(session.session_key) catch {};
+            store.clearAutoSaved(session.session_key) catch {};
+        }
+        session.created_at = now;
+        session.last_active = now;
+        log.info("session auto-reset key={s} mode={s}", .{ session.session_key, @tagName(policy.mode) });
     }
 
     fn resolveProviderForSession(
@@ -8590,4 +8615,125 @@ test "steered follow-up does not inherit a stop from the failed primary turn" {
     // The failed primary turn and the steered follow-up both reached the
     // provider; the stop must not have skipped the follow-up.
     try testing.expectEqual(@as(usize, 2), mock.chat_calls);
+}
+
+test "auto reset clears stale session state on next getOrCreate" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .idle, .idle_minutes = 1 };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    const session_key = "agent:main:telegram:direct:auto-reset";
+    const store = sqlite_mem.sessionStore();
+    const mem = sqlite_mem.memory();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        mem,
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    {
+        const session = try sm.getOrCreate(session_key);
+        const reply = try session.agent.turn("old conversation user turn");
+        testing.allocator.free(reply);
+        const scoped_id = session.agent.memory_session_id.?;
+        try mem.store("autosave_user_1", "old-session autosave row", .conversation, scoped_id);
+        try store.saveMessage(session_key, "assistant", "old persisted reply");
+        try store.saveCompactionCount(session_key, 3);
+        try testing.expect(session.agent.history.items.len > 0);
+        session.created_at = std_compat.time.timestamp() - 600;
+        session.last_active = std_compat.time.timestamp() - 600;
+    }
+
+    const before = std_compat.time.timestamp();
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 0), session.agent.history.items.len);
+    try testing.expectEqual(@as(u64, 0), session.agent.total_tokens);
+    try testing.expectEqual(@as(u64, 0), session.agent.compaction_count);
+    try testing.expect(session.created_at >= before);
+    try testing.expect(session.last_active >= before);
+
+    const persisted = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, persisted);
+    try testing.expectEqual(@as(usize, 0), persisted.len);
+    try testing.expectEqual(@as(?u64, 0), try store.loadCompactionCount(session_key));
+
+    const scoped = try mem.list(testing.allocator, null, session_key);
+    defer memory_mod.freeEntries(testing.allocator, scoped);
+    try testing.expectEqual(@as(usize, 0), scoped.len);
+
+    // The next turn runs with empty history (system prompt + user + assistant).
+    const reply = try session.agent.turn("fresh turn");
+    testing.allocator.free(reply);
+    try testing.expectEqual(@as(usize, 3), session.agent.history.items.len);
+    try testing.expectEqualStrings("fresh turn", session.agent.history.items[1].content);
+}
+
+test "auto reset daily boundary uses created_at" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .daily, .at_hour = 0 };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:group:daily-reset";
+    const session = try sm.getOrCreate(session_key);
+    const reply = try session.agent.turn("old conversation user turn");
+    testing.allocator.free(reply);
+    try testing.expect(session.agent.history.items.len > 0);
+    // Started before today's boundary; the last interaction is current.
+    session.created_at = std_compat.time.timestamp() - 2 * 86400;
+    session.last_active = std_compat.time.timestamp();
+
+    const again = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 0), again.agent.history.items.len);
+}
+
+test "auto reset stays off by default even for old sessions" {
+    var mock = MockProvider{ .response = "reply" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:direct:no-reset";
+    const session = try sm.getOrCreate(session_key);
+    const reply = try session.agent.turn("keep me");
+    testing.allocator.free(reply);
+    const history_len = session.agent.history.items.len;
+    session.created_at = 0;
+    session.last_active = 0;
+
+    const again = try sm.getOrCreate(session_key);
+    try testing.expectEqual(history_len, again.agent.history.items.len);
+}
+
+test "auto reset is skipped while a turn is running" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .idle, .idle_minutes = 1 };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:direct:busy-reset";
+    const session = try sm.getOrCreate(session_key);
+    const reply = try session.agent.turn("keep me");
+    testing.allocator.free(reply);
+    const history_len = session.agent.history.items.len;
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+    session.created_at = std_compat.time.timestamp() - 600;
+    session.last_active = std_compat.time.timestamp() - 600;
+
+    const again = try sm.getOrCreate(session_key);
+    try testing.expectEqual(history_len, again.agent.history.items.len);
 }

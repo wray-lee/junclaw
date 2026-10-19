@@ -2098,9 +2098,29 @@ pub const IdentityLink = struct {
     peers: []const []const u8 = &.{},
 };
 
+pub const SessionResetMode = enum {
+    none,
+    daily,
+    idle,
+};
+
+pub const SessionResetConfig = struct {
+    mode: SessionResetMode = .none,
+    at_hour: u8 = 4,
+    idle_minutes: ?u32 = null,
+};
+
+pub const SessionResetByType = struct {
+    direct: ?SessionResetConfig = null,
+    group: ?SessionResetConfig = null,
+    thread: ?SessionResetConfig = null,
+};
+
 pub const SessionConfig = struct {
     dm_scope: DmScope = .per_channel_peer,
     idle_minutes: u32 = 60,
+    reset: SessionResetConfig = .{},
+    reset_by_type: SessionResetByType = .{},
     identity_links: []const IdentityLink = &.{},
     /// Automatically route direct messages from unknown peers into deterministic
     /// per-peer agent IDs (agent runtime/workspace/memory isolation).
