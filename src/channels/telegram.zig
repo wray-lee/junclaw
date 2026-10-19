@@ -1184,6 +1184,10 @@ pub const TelegramChannel = struct {
     };
     pub var test_reaction_log: ?*std.ArrayListUnmanaged(TestReactionCall) = null;
 
+    /// Test seam: counts outbound sends so tests can prove a suppressed reply
+    /// never reached the wire.
+    pub var test_send_calls: usize = 0;
+
     pub fn setTaskReaction(self: *TelegramChannel, target: []const u8, message_id: ?i64, reaction: TaskReaction) void {
         if (!self.status_reactions_enabled or target.len == 0) return;
         const msg_id = message_id orelse return;
@@ -2195,6 +2199,7 @@ pub const TelegramChannel = struct {
         payload: root.Channel.OutboundPayload,
         reply_to: ?i64,
     ) !void {
+        if (builtin.is_test) test_send_calls += 1;
         // Send typing indicator (best-effort)
         self.sendTypingIndicator(target);
 

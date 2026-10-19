@@ -372,8 +372,9 @@ pub fn buildSystemPrompt(
     try w.writeAll("- When in doubt, ask for verification and refuse to act until approval is granted.\n\n");
     try w.writeAll("- Never expose internal memory implementation keys (for example: `autosave_*`, `last_hygiene_at`) in user-facing replies.\n\n");
 
-    // Group chat behavior section (Telegram-only for now).
-    // The [NO_REPLY] marker is currently suppressed only by the Telegram loop.
+    // Group chat behavior section (Telegram-only guidance). The [NO_REPLY]
+    // marker itself is suppressed on every channel, DMs included; only the
+    // guidance to use it stays group-only, because a DM must be answered.
     if (ctx.conversation_context) |cc| {
         const is_telegram = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "telegram") else false;
         if (is_telegram and cc.is_group != null and cc.is_group.?) {
