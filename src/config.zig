@@ -7345,7 +7345,8 @@ test "parse slack streaming from config" {
     allocator.free(cfg.channels.slack);
 }
 
-test "parse slack status reactions default to off" {
+// Regression: top-level Slack DM showed no sign of life during long tool turns.
+test "parse slack status reactions default to on" {
     const allocator = std.testing.allocator;
     const json =
         \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
@@ -7353,7 +7354,7 @@ test "parse slack status reactions default to off" {
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
     try std.testing.expect(cfg.channels.slack.len > 0);
-    try std.testing.expect(!cfg.channels.slack[0].status_reactions);
+    try std.testing.expect(cfg.channels.slack[0].status_reactions);
     try std.testing.expectEqualStrings("eyes", cfg.channels.slack[0].reaction_emojis.accepted);
     try std.testing.expectEqualStrings("hourglass_flowing_sand", cfg.channels.slack[0].reaction_emojis.running);
     try std.testing.expectEqualStrings("white_check_mark", cfg.channels.slack[0].reaction_emojis.done);

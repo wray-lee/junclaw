@@ -5450,7 +5450,11 @@ test "slackChannelIdOf drops the thread suffix" {
 }
 
 test "slack setTaskReaction is inert until status_reactions is on" {
-    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{ .bot_token = "tok" });
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "tok",
+        .status_reactions = false,
+    });
+    try std.testing.expect(!ch.status_reactions_enabled);
     ch.setTaskReaction("C123:1700000000.000000", "1700000000.000001", .accepted);
 
     ch.status_reactions_enabled = true;
