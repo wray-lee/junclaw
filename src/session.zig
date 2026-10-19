@@ -1920,6 +1920,7 @@ pub const SessionManager = struct {
             agent.usage_record_ctx = @ptrCast(self);
         }
 
+        const now = std_compat.time.timestamp();
         const session_provider_holder = session.provider_holder;
         const session_owned_provider_api_key = session.owned_provider_api_key;
         session.* = .{
@@ -1927,8 +1928,8 @@ pub const SessionManager = struct {
             .provider_holder = session_provider_holder,
             .owned_provider_api_key = session_owned_provider_api_key,
             .owned_memory_session_id = owned_memory_session_id,
-            .created_at = std_compat.time.timestamp(),
-            .last_active = std_compat.time.timestamp(),
+            .created_at = now,
+            .last_active = now,
             .last_consolidated = 0,
             .session_key = owned_key,
             .turn_count = 0,
@@ -1939,6 +1940,10 @@ pub const SessionManager = struct {
         };
         key_owned_by_session = true;
         session_initialized = true;
+
+        if (selected_session_store) |store| {
+            self.resetStaleRestoredSessionLocked(session, store, now);
+        }
 
         // Restore persisted conversation history from session store.
         // Bound the restored window so a long-lived session cannot re-inflate the
@@ -1980,14 +1985,50 @@ pub const SessionManager = struct {
         const tz_offset_secs = config_types.AgentConfig.parseTimezoneOffsetSeconds(self.config.agent.timezone) orelse 0;
         if (!session_reset.isStale(policy, now, session.created_at, session.last_active, tz_offset_secs)) return;
 
-        agent_mod.commands.clearSessionState(&session.agent);
-        if (session.agent.session_store) |store| {
-            store.clearMessages(session.session_key) catch {};
-            store.clearAutoSaved(session.session_key) catch {};
-        }
+        clearSessionForReset(session);
         session.created_at = now;
         session.last_active = now;
         log.info("session auto-reset key={s} mode={s}", .{ session.session_key, @tagName(policy.mode) });
+    }
+
+    /// Wipe the state a reset must clear. Shared by maybeResetLocked and the
+    /// restore-time check so both paths clear exactly the same things.
+    fn clearSessionForReset(session: *Session) void {
+        agent_mod.commands.clearSessionState(&session.agent);
+        const store = session.agent.session_store orelse return;
+        store.clearMessages(session.session_key) catch {};
+        store.clearAutoSaved(session.session_key) catch {};
+        // Explicit save under session_key also clears dedicated-runtime keys,
+        // whose memory_session_id is `agent:{id}`.
+        store.saveCompactionCount(session.session_key, 0) catch {};
+    }
+
+    /// Reset a session recreated from the store when its persisted transcript
+    /// is stale. Caller holds self.mutex and calls this before restoring
+    /// history. Lock order matches maybeResetLocked: manager mutex ->
+    /// agent/memory/store; no session.mutex and no re-entry.
+    fn resetStaleRestoredSessionLocked(
+        self: *SessionManager,
+        session: *Session,
+        store: memory_mod.SessionStore,
+        now: i64,
+    ) void {
+        const policy = session_reset.resolvePolicy(self.config.session, session.session_key);
+        // Default path: no store query at all.
+        if (policy.mode == .none) return;
+
+        // OpenClaw src/config/sessions/reset-policy.ts:90-105 maps daily to the
+        // first interaction (sessionStartedAt) and idle to the latest
+        // (lastInteractionAt); the persisted transcript supplies both.
+        const range = (store.loadMessageTimeRange(session.session_key) catch null) orelse return;
+        // Clamp future timestamps from clock skew (OpenClaw resolveTimestamp).
+        const first = @min(range.first, now);
+        const last = @min(range.last, now);
+        const tz = config_types.AgentConfig.parseTimezoneOffsetSeconds(self.config.agent.timezone) orelse 0;
+        if (!session_reset.isStale(policy, now, first, last, tz)) return;
+
+        clearSessionForReset(session);
+        log.info("session auto-reset on restore key={s} mode={s}", .{ session.session_key, @tagName(policy.mode) });
     }
 
     fn resolveProviderForSession(
@@ -8854,6 +8895,184 @@ test "auto reset does not fire for a session claimed for a turn (TOCTOU)" {
     try testing.expect(!after.turn_pending.load(.acquire));
     try testing.expectEqual(@as(usize, 0), after.agent.history.items.len);
     try testing.expect(after.created_at > stale_at);
+}
+
+// Regression: a session evicted from memory must be reset on restore from
+// the persisted transcript, not from the fresh in-memory timestamps.
+test "auto reset fires for an evicted idle session on restore" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .idle, .idle_minutes = 1 };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+    const mem = sqlite_mem.memory();
+
+    const session_key = "agent:main:telegram:direct:restore-idle-stale";
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        mem,
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    const now = std_compat.time.timestamp();
+    {
+        const session = try sm.getOrCreate(session_key);
+        try sqlite_mem.saveMessageAt(session_key, "user", "old question", now - 600);
+        try sqlite_mem.saveMessageAt(session_key, "assistant", "old answer", now - 600);
+        try store.saveUsage(session_key, 123);
+        try store.saveCompactionCount(session_key, 3);
+        try mem.store("autosave_user_1", "old scoped row", .conversation, session.agent.memory_session_id.?);
+        session.last_active = now - 600;
+    }
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const before = std_compat.time.timestamp();
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 0), session.agent.history.items.len);
+    try testing.expectEqual(@as(u64, 0), session.agent.total_tokens);
+    try testing.expectEqual(@as(u64, 0), session.agent.compaction_count);
+    try testing.expect(session.created_at >= before);
+    try testing.expect(session.last_active >= before);
+
+    const persisted = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, persisted);
+    try testing.expectEqual(@as(usize, 0), persisted.len);
+    try testing.expectEqual(@as(?u64, null), try store.loadUsage(session_key));
+    try testing.expectEqual(@as(?u64, 0), try store.loadCompactionCount(session_key));
+
+    const scoped = try mem.list(testing.allocator, null, session_key);
+    defer memory_mod.freeEntries(testing.allocator, scoped);
+    try testing.expectEqual(@as(usize, 0), scoped.len);
+}
+
+// Regression: fresh persisted activity must keep an evicted session's history.
+test "evicted session with fresh persisted activity restores history" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .idle, .idle_minutes = 1 };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const session_key = "agent:main:telegram:direct:restore-idle-fresh";
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    const now = std_compat.time.timestamp();
+    {
+        const session = try sm.getOrCreate(session_key);
+        try sqlite_mem.saveMessageAt(session_key, "user", "recent question", now - 5);
+        try sqlite_mem.saveMessageAt(session_key, "assistant", "recent answer", now - 5);
+        session.last_active = now - 600;
+    }
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 2), session.agent.history.items.len);
+    try testing.expectEqualStrings("recent question", session.agent.history.items[0].content);
+    try testing.expectEqualStrings("recent answer", session.agent.history.items[1].content);
+
+    const persisted = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, persisted);
+    try testing.expectEqual(@as(usize, 2), persisted.len);
+}
+
+// Regression: daily reset must use the first persisted message after eviction.
+test "auto reset daily fires across a boundary after eviction" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .daily, .at_hour = 0 };
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const session_key = "agent:main:telegram:group:restore-daily-stale";
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    const now = std_compat.time.timestamp();
+    {
+        const session = try sm.getOrCreate(session_key);
+        try sqlite_mem.saveMessageAt(session_key, "user", "old question", now - 2 * 86400);
+        try sqlite_mem.saveMessageAt(session_key, "assistant", "current answer", now);
+        session.last_active = now - 600;
+    }
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 0), session.agent.history.items.len);
+
+    const persisted = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, persisted);
+    try testing.expectEqual(@as(usize, 0), persisted.len);
+}
+
+// Regression: with the default policy (none) the restore check is skipped and
+// persisted history still loads.
+test "default reset mode restores persisted history after eviction" {
+    var mock = MockProvider{ .response = "reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const session_key = "agent:main:telegram:direct:restore-default";
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    const now = std_compat.time.timestamp();
+    {
+        const session = try sm.getOrCreate(session_key);
+        try sqlite_mem.saveMessageAt(session_key, "user", "kept question", now - 2 * 86400);
+        try sqlite_mem.saveMessageAt(session_key, "assistant", "kept answer", now - 2 * 86400);
+        session.last_active = now - 600;
+    }
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 2), session.agent.history.items.len);
 }
 
 test "abandonTurn releases a claim so a stale session can still reset" {

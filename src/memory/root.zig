@@ -160,6 +160,13 @@ pub const MessageEntry = struct {
     content: []const u8,
 };
 
+/// First and last persisted message timestamps (UTC epoch seconds) for a
+/// session, used to decide whether a session restored from the store is stale.
+pub const MessageTimeRange = struct {
+    first: i64,
+    last: i64,
+};
+
 pub fn freeMessages(allocator: std.mem.Allocator, messages: []MessageEntry) void {
     for (messages) |entry| {
         allocator.free(entry.role);
@@ -222,6 +229,9 @@ pub const SessionStore = struct {
         listSessions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]SessionInfo = null,
         countDetailedMessages: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!u64 = null,
         loadMessagesDetailed: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]DetailedMessageEntry = null,
+        /// Null when the backend stores no message timestamps: callers skip
+        /// the restore-time staleness check.
+        loadMessageTimeRange: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?MessageTimeRange = null,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
@@ -278,6 +288,12 @@ pub const SessionStore = struct {
     pub fn loadMessagesDetailed(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]DetailedMessageEntry {
         const func = self.vtable.loadMessagesDetailed orelse return error.NotSupported;
         return func(self.ptr, allocator, session_id, limit, offset);
+    }
+
+    /// Null when the backend has no persisted timestamps (or no messages).
+    pub fn loadMessageTimeRange(self: SessionStore, session_id: []const u8) !?MessageTimeRange {
+        const func = self.vtable.loadMessageTimeRange orelse return null;
+        return func(self.ptr, session_id);
     }
 };
 

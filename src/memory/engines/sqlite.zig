@@ -827,6 +827,23 @@ pub const SqliteMemory = struct {
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
     }
 
+    /// Test seam: insert a message with an explicit UTC timestamp so reset
+    /// boundary tests do not depend on the wall clock.
+    pub fn saveMessageAt(self: *Self, session_id: []const u8, role_str: []const u8, content: []const u8, unix_secs: i64) !void {
+        const sql = "INSERT INTO messages (session_id, role, content, created_at) VALUES (?1, ?2, ?3, datetime(?4, 'unixepoch'))";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 2, role_str.ptr, @intCast(role_str.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_text(stmt, 3, content.ptr, @intCast(content.len), SQLITE_STATIC);
+        _ = c.sqlite3_bind_int64(stmt, 4, unix_secs);
+
+        if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+    }
+
     /// A single persisted message entry (role + content).
     pub const MessageEntry = root.MessageEntry;
 
@@ -865,6 +882,25 @@ pub const SqliteMemory = struct {
         }
 
         return list.toOwnedSlice(allocator);
+    }
+
+    /// First and last message time (UTC epoch seconds) for a session.
+    /// `created_at` is UTC text from `datetime('now')`, and strftime reads it
+    /// back as UTC. Returns null when the session has no messages.
+    pub fn loadMessageTimeRange(self: *Self, session_id: []const u8) !?root.MessageTimeRange {
+        const sql = "SELECT MIN(CAST(strftime('%s', created_at) AS INTEGER)), MAX(CAST(strftime('%s', created_at) AS INTEGER)) FROM messages WHERE session_id = ?1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        const rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+
+        _ = c.sqlite3_bind_text(stmt, 1, session_id.ptr, @intCast(session_id.len), SQLITE_STATIC);
+        if (c.sqlite3_step(stmt) != c.SQLITE_ROW) return null;
+        if (c.sqlite3_column_type(stmt, 0) == c.SQLITE_NULL or c.sqlite3_column_type(stmt, 1) == c.SQLITE_NULL) return null;
+        return .{
+            .first = c.sqlite3_column_int64(stmt, 0),
+            .last = c.sqlite3_column_int64(stmt, 1),
+        };
     }
 
     /// Delete all messages for a session.
@@ -1154,6 +1190,11 @@ pub const SqliteMemory = struct {
         return self_.loadMessagesDetailed(allocator, session_id, limit, offset);
     }
 
+    fn implSessionLoadMessageTimeRange(ptr: *anyopaque, session_id: []const u8) anyerror!?root.MessageTimeRange {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+        return self_.loadMessageTimeRange(session_id);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -1167,6 +1208,7 @@ pub const SqliteMemory = struct {
         .listSessions = &implSessionListSessions,
         .countDetailedMessages = &implSessionCountDetailedMessages,
         .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
+        .loadMessageTimeRange = &implSessionLoadMessageTimeRange,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {
@@ -2499,6 +2541,27 @@ test "sqlite sessionStore saveCompactionCount + loadCompactionCount roundtrip" {
     try store.saveCompactionCount("s1", 3);
     try std.testing.expectEqual(@as(?u64, 3), try store.loadCompactionCount("s1"));
     try std.testing.expectEqual(@as(?u64, null), try store.loadCompactionCount("s2"));
+}
+
+// Regression: reset decisions on restore need persisted message timestamps.
+test "sqlite loadMessageTimeRange returns first and last explicit timestamps" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try mem.saveMessageAt("s1", "user", "first", 1_700_000_000);
+    try mem.saveMessageAt("s1", "assistant", "second", 1_700_000_060);
+
+    const range = (try mem.loadMessageTimeRange("s1")).?;
+    try std.testing.expectEqual(@as(i64, 1_700_000_000), range.first);
+    try std.testing.expectEqual(@as(i64, 1_700_000_060), range.last);
+}
+
+// Regression: unknown sessions must not produce a fake time range.
+test "sqlite loadMessageTimeRange returns null for unknown session" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+
+    try std.testing.expectEqual(@as(?root.MessageTimeRange, null), try mem.loadMessageTimeRange("nope"));
 }
 
 test "sqlite sessionStore clearAutoSaved" {
