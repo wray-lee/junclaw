@@ -14,6 +14,7 @@ const agent_routing = @import("../agent_routing.zig");
 const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 const stream_presenter = @import("slack_stream_presenter.zig");
+const md_tables = @import("md_tables.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -3896,7 +3897,10 @@ fn chunkFinalFallbackReply(allocator: std.mem.Allocator, message: []const u8) ![
 ///   [text](url)      -> <url|text>
 ///   # Header         -> *Header*
 ///   - bullet         -> bullet (with bullet char)
-pub fn markdownToSlackMrkdwn(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+pub fn markdownToSlackMrkdwn(allocator: std.mem.Allocator, source: []const u8) ![]const u8 {
+    const input = try md_tables.markdownTablesToCodeBlocks(allocator, source);
+    defer allocator.free(input);
+
     var result: std.ArrayListUnmanaged(u8) = .empty;
     errdefer result.deinit(allocator);
 
@@ -7480,4 +7484,17 @@ test "slack final delivery releases stream_mu during chunk delivery" {
     try std.testing.expect(probe.posts > 0);
     try std.testing.expect(probe.stream_mu_unlocked);
     try std.testing.expect(probe.cancel_succeeded);
+}
+
+// Regression: Markdown tables rendered as raw pipes on the default Telegram path
+test "slack markdownToSlackMrkdwn renders tables as aligned fenced blocks" {
+    const out = try markdownToSlackMrkdwn(
+        std.testing.allocator,
+        "| Name | Value |\n| --- | --- |\n| a | 1 |",
+    );
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(
+        "```\n| Name | Value |\n| ---- | ----- |\n| a    | 1     |\n```",
+        out,
+    );
 }
