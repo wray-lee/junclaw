@@ -53,6 +53,7 @@
 
 - `/status` 会显示 `📚 Context: 已用/窗口 (百分比%)` 和 `🧹 Compactions: N`，可以直接看出当前会话窗口占用了多少、历史已被压缩几次。
 - `/context` 会显示同样的数字，并附带消息数、工具数和按角色统计；`/context json` 会输出 `context_window` 与 `compactions` 供脚本读取。
+- `/compact [关注点说明]` 会立即执行一次摘要式压缩，而不是直接删除旧消息：较早的历史会被替换为一条 `[Compaction summary]` 消息，压缩前会先把持久事实写入记忆，可选的关注点说明会引导摘要保留哪些内容。即使 `agent.compact_context` 为 false，显式执行 `/compact` 也仍然有效。回复会给出压缩前后的 token 估算和压缩次数，例如 `Compacted (~1,234 → ~567 tokens, compaction #2).`
 
 ## 运行与运维
 

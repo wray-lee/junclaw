@@ -5691,10 +5691,19 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
         .tts => return try handleTtsCommand(self, cmd.arg),
         .stop => return try handleStopCommand(self),
         .compact => {
-            if (self.forceCompressHistory()) {
-                return try self.allocator.dupe(u8, "Context compacted.");
+            // parseSlashCommand already trims the argument and strips a leading :.
+            const focus: ?[]const u8 = if (cmd.arg.len > 0) cmd.arg else null;
+            const result = self.compactNow(focus) catch |err| {
+                return try std.fmt.allocPrint(self.allocator, "Compaction failed: {s}", .{@errorName(err)});
+            };
+            if (!result.compacted) {
+                return try self.allocator.dupe(u8, "Nothing to compact.");
             }
-            return try self.allocator.dupe(u8, "Nothing to compact.");
+            return try std.fmt.allocPrint(
+                self.allocator,
+                "Compacted (~{d} → ~{d} tokens, compaction #{d}).",
+                .{ result.tokens_before, result.tokens_after, result.count },
+            );
         },
         .allowlist => return try handleAllowlistCommand(self, cmd.arg),
         .approve => return try handleApproveCommand(self, cmd.arg),

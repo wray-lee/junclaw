@@ -38,6 +38,8 @@ pub const DEFAULT_COMPACTION_KEEP_RECENT: u32 = 20;
 pub const DEFAULT_COMPACTION_MAX_SUMMARY_CHARS: u32 = 2_000;
 /// Maximum characters appended from workspace critical rules.
 const MAX_WORKSPACE_CONTEXT_CHARS: usize = 2_000;
+/// Maximum characters of user focus instructions sent to the summarizer.
+pub const MAX_COMPACTION_FOCUS_CHARS: usize = 2_000;
 /// Maximum AGENTS.md bytes read for critical rules extraction.
 const MAX_AGENTS_FILE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -68,6 +70,10 @@ pub const CompactionConfig = struct {
     max_source_chars: u32 = DEFAULT_COMPACTION_MAX_SOURCE_CHARS,
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
     max_history_messages: u32 = 50,
+    /// Manual /compact: bypass the automatic count/token thresholds.
+    force: bool = false,
+    /// Optional user focus instructions appended to the summarizer prompt.
+    focus: ?[]const u8 = null,
     workspace_dir: ?[]const u8 = null,
     bootstrap_provider: ?BootstrapProvider = null,
     /// Extract durable user facts into memory before compaction drops them.
@@ -113,7 +119,7 @@ pub fn autoCompactHistory(
     const token_threshold = (config.token_limit * 3) / 4;
     const token_trigger = config.token_limit > 0 and tokenEstimate(history.items) > token_threshold;
 
-    if (!count_trigger and !token_trigger) return false;
+    if (!config.force and !count_trigger and !token_trigger) return false;
 
     const keep_recent = @min(config.keep_recent, @as(u32, @intCast(non_system_count)));
     var compact_count = non_system_count - keep_recent;
@@ -406,7 +412,12 @@ fn summarizeSlice(
     defer allocator.free(transcript);
 
     const summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
-    const summarizer_user = try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
+    const focus = if (config.focus) |f| std.mem.trim(u8, f, " \t\r\n") else "";
+    const capped_focus = util.truncateUtf8(focus, MAX_COMPACTION_FOCUS_CHARS);
+    const summarizer_user = if (capped_focus.len > 0)
+        try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\nUser instructions: {s}\n\n{s}", .{ capped_focus, transcript })
+    else
+        try std.fmt.allocPrint(allocator, "Summarize the following conversation history for context preservation. Keep it short (max 12 bullet points).\n\n{s}", .{transcript});
     defer allocator.free(summarizer_user);
 
     var summary_messages: [2]ChatMessage = .{
@@ -1547,4 +1558,175 @@ test "autoCompactHistory skips the memory flush when disabled" {
     const entries = try mem.list(allocator, null, "flush-session");
     defer memory_mod.freeEntries(allocator, entries);
     try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+// ── Manual (/compact) forced compaction ─────────────────────────
+
+const FocusCaptureProvider = struct {
+    const Self = @This();
+
+    captured_user: ?[]u8 = null,
+    capture_alloc: std.mem.Allocator,
+    calls: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        for (request.messages) |msg| {
+            if (msg.role == .user) {
+                if (self.captured_user) |old| self.capture_alloc.free(old);
+                self.captured_user = try self.capture_alloc.dupe(u8, msg.content);
+            }
+        }
+        return .{ .content = try allocator.dupe(u8, "forced summary") };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "focus-capture-provider";
+    }
+
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+};
+
+fn appendForceTestHistory(allocator: std.mem.Allocator, history: *std.ArrayListUnmanaged(OwnedMessage)) !void {
+    try history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    for (0..4) |i| {
+        try history.append(allocator, .{
+            .role = .user,
+            .content = try std.fmt.allocPrint(allocator, "message-{d}", .{i}),
+        });
+    }
+}
+
+test "forced compaction below thresholds replaces history with a summary" {
+    const allocator = std.testing.allocator;
+    var provider_state = FocusCaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FocusCaptureProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+    try appendForceTestHistory(allocator, &agent.history);
+
+    // Well below both automatic thresholds; only  triggers compaction.
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .force = true,
+        .keep_recent = 2,
+        .max_history_messages = 50,
+        .token_limit = DEFAULT_TOKEN_LIMIT,
+        .workspace_dir = null,
+    }, null);
+
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 4), agent.history.items.len);
+    try std.testing.expect(agent.history.items[0].role == .system);
+    try std.testing.expect(agent.history.items[1].role == .assistant);
+    try std.testing.expect(std.mem.startsWith(u8, agent.history.items[1].content, COMPACTION_SUMMARY_PREFIX));
+    try std.testing.expect(std.mem.indexOf(u8, agent.history.items[1].content, "forced summary") != null);
+    try std.testing.expectEqualStrings("message-2", agent.history.items[2].content);
+    try std.testing.expectEqualStrings("message-3", agent.history.items[3].content);
+}
+
+test "forced compaction passes trimmed focus instructions to the summarizer" {
+    const allocator = std.testing.allocator;
+    var provider_state = FocusCaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FocusCaptureProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+    try appendForceTestHistory(allocator, &agent.history);
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .force = true,
+        .keep_recent = 2,
+        .focus = "  keep the deployment steps  ",
+        .workspace_dir = null,
+    }, null);
+
+    try std.testing.expect(compacted);
+    const captured = provider_state.captured_user.?;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "User instructions: keep the deployment steps\n\n") != null);
+}
+
+test "forced compaction caps focus instructions" {
+    const allocator = std.testing.allocator;
+    var provider_state = FocusCaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FocusCaptureProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+    try appendForceTestHistory(allocator, &agent.history);
+
+    const long_focus = try allocator.alloc(u8, MAX_COMPACTION_FOCUS_CHARS + 500);
+    defer allocator.free(long_focus);
+    @memset(long_focus, 'z');
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .force = true,
+        .keep_recent = 2,
+        .focus = long_focus,
+        .workspace_dir = null,
+    }, null);
+
+    try std.testing.expect(compacted);
+    const captured = provider_state.captured_user.?;
+    try std.testing.expect(std.mem.indexOf(u8, captured, "z" ** MAX_COMPACTION_FOCUS_CHARS) != null);
+    try std.testing.expect(std.mem.indexOf(u8, captured, "z" ** (MAX_COMPACTION_FOCUS_CHARS + 1)) == null);
+}
+
+test "forced compaction leaves history untouched when nothing is compactable" {
+    const allocator = std.testing.allocator;
+    var provider_state = FocusCaptureProvider{ .capture_alloc = allocator };
+    defer if (provider_state.captured_user) |c| allocator.free(c);
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FocusCaptureProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    agent.provider = provider;
+    defer agent.deinit();
+    try agent.history.append(allocator, .{
+        .role = .system,
+        .content = try allocator.dupe(u8, "system prompt"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .user,
+        .content = try allocator.dupe(u8, "one"),
+    });
+    try agent.history.append(allocator, .{
+        .role = .assistant,
+        .content = try allocator.dupe(u8, "two"),
+    });
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .force = true,
+        .keep_recent = 2,
+        .workspace_dir = null,
+    }, null);
+
+    try std.testing.expect(!compacted);
+    try std.testing.expectEqual(@as(usize, 3), agent.history.items.len);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.calls);
 }
