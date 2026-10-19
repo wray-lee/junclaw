@@ -340,6 +340,8 @@ pub const Agent = struct {
     recall_limit: usize = 5,
     max_context_bytes: usize = 4_000,
     compact_context: bool = true,
+    /// Extract durable user facts into memory before compaction drops them.
+    compaction_memory_flush: bool = true,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -668,6 +670,7 @@ pub const Agent = struct {
             .recall_limit = @intCast(cfg.memory.recall_limit),
             .max_context_bytes = @intCast(cfg.memory.max_context_bytes),
             .compact_context = cfg.agent.compact_context,
+            .compaction_memory_flush = cfg.agent.compaction_memory_flush,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
@@ -958,6 +961,9 @@ pub const Agent = struct {
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
             .bootstrap_provider = self.bootstrap,
+            .memory_flush = self.compaction_memory_flush,
+            .mem = self.mem,
+            .memory_session_id = self.memory_session_id,
         }, self.redactor);
         if (compacted) {
             self.compaction_count += 1;

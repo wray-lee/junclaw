@@ -1360,6 +1360,7 @@ pub const Config = struct {
         try writePrettyField(self.allocator, w, "  ", "messages", self.messages, ",\n");
         try writePrettyField(self.allocator, w, "  ", "agent", .{
             .compact_context = self.agent.compact_context,
+            .compaction_memory_flush = self.agent.compaction_memory_flush,
             .max_tool_iterations = self.agent.max_tool_iterations,
             .max_history_messages = self.agent.max_history_messages,
             .parallel_tools = self.agent.parallel_tools,

@@ -7061,6 +7061,7 @@ test "session restore keeps compaction summary and drops pre-compaction history"
     var cfg = testConfig();
     cfg.agent.max_history_messages = 4;
     cfg.agent.compaction_keep_recent = 4;
+    cfg.agent.compaction_memory_flush = false;
 
     var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
     defer sqlite_mem.deinit();

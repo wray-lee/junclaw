@@ -13,6 +13,7 @@ const config_types = @import("../config_types.zig");
 const path_prefix = @import("../path_prefix.zig");
 const util = @import("../util.zig");
 const redaction = @import("../redaction.zig");
+const memory_mod = @import("../memory/root.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
 const bootstrap_mod = @import("../bootstrap/root.zig");
@@ -52,6 +53,11 @@ pub const CONTEXT_RECOVERY_MIN_HISTORY: usize = 6;
 /// Number of recent messages to keep during force compression.
 pub const CONTEXT_RECOVERY_KEEP: usize = 4;
 
+/// Bound on the transcript handed to the pre-compaction memory flush.
+const COMPACTION_FLUSH_MAX_SOURCE_CHARS: usize = 8_000;
+/// Bound on facts stored by one pre-compaction memory flush.
+const COMPACTION_FLUSH_MAX_LINES: usize = 10;
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Config
 // ═══════════════════════════════════════════════════════════════════════════
@@ -64,6 +70,10 @@ pub const CompactionConfig = struct {
     max_history_messages: u32 = 50,
     workspace_dir: ?[]const u8 = null,
     bootstrap_provider: ?BootstrapProvider = null,
+    /// Extract durable user facts into memory before compaction drops them.
+    memory_flush: bool = true,
+    mem: ?memory_mod.Memory = null,
+    memory_session_id: ?[]const u8 = null,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -112,6 +122,10 @@ pub fn autoCompactHistory(
     const compact_end = adjustKeepStartForToolResultPair(history.items, start, start + compact_count);
     compact_count = compact_end - start;
     if (compact_count == 0) return false;
+
+    // Extract durable facts before the messages are dropped. Failures here
+    // never block compaction.
+    flushMemoriesBeforeCompaction(allocator, provider, model_name, history.items, start, compact_end, config, redactor);
 
     // Multi-part strategy: if >10 messages to summarize, split into halves
     const summary = if (compact_count > 10) blk: {
@@ -174,6 +188,52 @@ pub fn autoCompactHistory(
     }
 
     return true;
+}
+
+/// One-shot extraction of durable user facts from the messages about to be
+/// compacted. Uses the provider directly (no Agent turn), so it cannot
+/// re-enter compaction. Every failure is swallowed: compaction must proceed.
+fn flushMemoriesBeforeCompaction(
+    allocator: std.mem.Allocator,
+    provider: Provider,
+    model_name: []const u8,
+    history_items: []const OwnedMessage,
+    start: usize,
+    end: usize,
+    config: CompactionConfig,
+    redactor: ?*redaction.Redactor,
+) void {
+    if (!config.memory_flush) return;
+    const mem = config.mem orelse return;
+    const session_id = config.memory_session_id orelse return;
+
+    const transcript = buildCompactionTranscript(
+        allocator,
+        history_items,
+        start,
+        end,
+        @intCast(COMPACTION_FLUSH_MAX_SOURCE_CHARS),
+        redactor,
+    ) catch return;
+    defer allocator.free(transcript);
+    if (transcript.len == 0) return;
+
+    const system_prompt = "Extract durable facts and preferences about the user from this conversation excerpt. Output one fact per line, at most 10 lines. Output nothing if there is nothing worth remembering.";
+    const response = provider.chatWithSystem(allocator, system_prompt, transcript, model_name, 0.2) catch return;
+    defer allocator.free(response);
+
+    const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
+    var line_no: usize = 0;
+    var lines = std.mem.splitScalar(u8, response, '\n');
+    while (lines.next()) |raw_line| {
+        if (line_no >= COMPACTION_FLUSH_MAX_LINES) break;
+        const line = std.mem.trim(u8, raw_line, " \t\r\n-*");
+        if (line.len == 0) continue;
+        const key = std.fmt.allocPrint(allocator, "flush_compact_{d}_{d}", .{ ts, line_no }) catch continue;
+        defer allocator.free(key);
+        mem.store(key, line, .conversation, session_id) catch {};
+        line_no += 1;
+    }
 }
 
 fn adjustKeepStartForToolResultPair(
@@ -1224,4 +1284,170 @@ test "summarizeSlice fallback uses redacted transcript" {
 
     try std.testing.expect(std.mem.indexOf(u8, summary, "user@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, summary, "[EMAIL_1]") != null);
+}
+
+// ── Pre-compaction memory flush ───────────────────────────────────
+
+const FlushTestProvider = struct {
+    flush_response: []const u8 = "",
+    fail_flush: bool = false,
+    flush_calls: usize = 0,
+    chat_calls: usize = 0,
+
+    fn chatWithSystem(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        const self: *FlushTestProvider = @ptrCast(@alignCast(ptr));
+        self.flush_calls += 1;
+        if (self.fail_flush) return error.ProviderError;
+        return allocator.dupe(u8, self.flush_response);
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *FlushTestProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        return .{ .content = try allocator.dupe(u8, "summary") };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "flush-test-provider";
+    }
+
+    fn deinit(_: *anyopaque) void {}
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinit,
+    };
+};
+
+fn appendFlushTestHistory(allocator: std.mem.Allocator, history: *std.ArrayListUnmanaged(OwnedMessage)) !void {
+    try history.append(allocator, .{ .role = .system, .content = try allocator.dupe(u8, "system") });
+    for (0..10) |i| {
+        try history.append(allocator, .{
+            .role = if (i % 2 == 0) .user else .assistant,
+            .content = try std.fmt.allocPrint(allocator, "message {d}", .{i}),
+        });
+    }
+}
+
+test "autoCompactHistory flushes durable facts before dropping messages" {
+    // Regression: no memory flush before compaction dropped durable facts
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider_state = FlushTestProvider{ .flush_response = "likes green tea\nprefers dark mode" };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FlushTestProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try appendFlushTestHistory(allocator, &agent.history);
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .token_limit = 0,
+        .memory_flush = true,
+        .mem = mem,
+        .memory_session_id = "flush-session",
+    }, null);
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.flush_calls);
+    // Flush uses chatWithSystem only; chat() is the summarizer. A single chat
+    // call proves the flush path did not re-enter compaction.
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+
+    const entries = try mem.list(allocator, null, "flush-session");
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+
+    var found_tea = false;
+    var found_dark = false;
+    for (entries) |entry| {
+        try std.testing.expect(std.mem.startsWith(u8, entry.key, "flush_compact_"));
+        if (std.mem.eql(u8, entry.content, "likes green tea")) found_tea = true;
+        if (std.mem.eql(u8, entry.content, "prefers dark mode")) found_dark = true;
+    }
+    try std.testing.expect(found_tea);
+    try std.testing.expect(found_dark);
+}
+
+test "autoCompactHistory still compacts when the memory flush fails" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider_state = FlushTestProvider{ .fail_flush = true };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FlushTestProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try appendFlushTestHistory(allocator, &agent.history);
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .token_limit = 0,
+        .memory_flush = true,
+        .mem = mem,
+        .memory_session_id = "flush-session",
+    }, null);
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.flush_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+
+    const entries = try mem.list(allocator, null, "flush-session");
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "autoCompactHistory skips the memory flush when disabled" {
+    const allocator = std.testing.allocator;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider_state = FlushTestProvider{ .flush_response = "should not be stored" };
+    const provider = Provider{ .ptr = @ptrCast(&provider_state), .vtable = &FlushTestProvider.vtable };
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    try appendFlushTestHistory(allocator, &agent.history);
+
+    const compacted = try autoCompactHistory(allocator, &agent.history, provider, agent.model_name, .{
+        .keep_recent = 4,
+        .max_history_messages = 4,
+        .token_limit = 0,
+        .memory_flush = false,
+        .mem = mem,
+        .memory_session_id = "flush-session",
+    }, null);
+    try std.testing.expect(compacted);
+    try std.testing.expectEqual(@as(usize, 0), provider_state.flush_calls);
+    try std.testing.expectEqual(@as(usize, 1), provider_state.chat_calls);
+
+    const entries = try mem.list(allocator, null, "flush-session");
+    defer memory_mod.freeEntries(allocator, entries);
+    try std.testing.expectEqual(@as(usize, 0), entries.len);
 }
