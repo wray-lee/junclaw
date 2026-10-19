@@ -151,6 +151,55 @@ fn mergedToolCustomizationCount(
     return count;
 }
 
+fn parseSessionResetConfig(obj: std.json.ObjectMap) types.SessionResetConfig {
+    var out: types.SessionResetConfig = .{};
+    var mode_set = false;
+    if (obj.get("mode")) |v| {
+        if (v == .string) {
+            if (std.mem.eql(u8, v.string, "none")) {
+                out.mode = .none;
+                mode_set = true;
+            } else if (std.mem.eql(u8, v.string, "daily")) {
+                out.mode = .daily;
+                mode_set = true;
+            } else if (std.mem.eql(u8, v.string, "idle")) {
+                out.mode = .idle;
+                mode_set = true;
+            }
+        }
+    }
+    // OpenClaw: a configured reset block without an explicit mode means daily.
+    if (!mode_set) out.mode = .daily;
+    const at_hour = obj.get("at_hour") orelse obj.get("atHour");
+    if (at_hour) |v| {
+        if (v == .integer) {
+            const clamped = @max(@as(i64, 0), @min(@as(i64, 23), v.integer));
+            out.at_hour = @intCast(clamped);
+        }
+    }
+    const idle_minutes = obj.get("idle_minutes") orelse obj.get("idleMinutes");
+    if (idle_minutes) |v| {
+        if (v == .integer and v.integer > 0) {
+            out.idle_minutes = @intCast(@min(v.integer, @as(i64, std.math.maxInt(u32))));
+        }
+    }
+    return out;
+}
+
+fn parseSessionResetByType(obj: std.json.ObjectMap) types.SessionResetByType {
+    var out: types.SessionResetByType = .{};
+    if (obj.get("direct")) |v| {
+        if (v == .object) out.direct = parseSessionResetConfig(v.object);
+    }
+    if (obj.get("group")) |v| {
+        if (v == .object) out.group = parseSessionResetConfig(v.object);
+    }
+    if (obj.get("thread")) |v| {
+        if (v == .object) out.thread = parseSessionResetConfig(v.object);
+    }
+    return out;
+}
+
 pub fn mergeToolCustomizations(self: *Config, content: []const u8) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, content, .{});
     defer parsed.deinit();
@@ -2944,6 +2993,8 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
     // Session config
     if (root.get("session")) |sess| {
         if (sess == .object) {
+            var legacy_idle_minutes: ?u32 = null;
+            var reset_configured = false;
             const dm_val = sess.object.get("dm_scope");
             if (dm_val) |v| {
                 if (v == .string) {
@@ -2963,6 +3014,20 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             const idle_val = sess.object.get("idle_minutes");
             if (idle_val) |v| {
                 if (v == .integer) self.session.idle_minutes = @intCast(v.integer);
+                // Explicit legacy values become the idle reset policy below;
+                // the struct default of 60 must not enable resets on its own.
+                if (v == .integer and v.integer > 0) {
+                    legacy_idle_minutes = @intCast(@min(v.integer, @as(i64, std.math.maxInt(u32))));
+                }
+            }
+            if (sess.object.get("reset")) |v| {
+                if (v == .object) {
+                    self.session.reset = parseSessionResetConfig(v.object);
+                    reset_configured = true;
+                }
+            }
+            if (sess.object.get("reset_by_type") orelse sess.object.get("resetByType")) |v| {
+                if (v == .object) self.session.reset_by_type = parseSessionResetByType(v.object);
             }
             const typing_val = sess.object.get("typing_interval_secs");
             if (typing_val) |v| {
@@ -3024,6 +3089,14 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
             if (sess.object.get("claim_lockout_secs")) |v| {
                 if (v == .integer and v.integer > 0) self.session.claim_lockout_secs = @intCast(v.integer);
+            }
+            // Migration: an explicit legacy `session.idle_minutes` (OpenClaw
+            // camelCase is normalized on migration) becomes an idle reset only
+            // when no `session.reset` block was authored.
+            if (!reset_configured) {
+                if (legacy_idle_minutes) |minutes| {
+                    self.session.reset = .{ .mode = .idle, .idle_minutes = minutes };
+                }
             }
         }
     }

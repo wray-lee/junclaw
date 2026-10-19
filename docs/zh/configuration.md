@@ -1189,6 +1189,30 @@ nullclaw channel status
 - 频道里没有流式输出：Slack 只支持在 thread 内流式输出，请把 `reply_to_mode` 设为 `all`
 - 完全没有回复：检查 `allow_from`；在群里还需确认 bot 被 @ 提及
 
+### `session`
+
+自动重置会话记录，在下一条入站消息到达时惰性判断（没有定时器）。默认不启用。
+
+- `session.reset.mode`：`none`（默认）、`daily` 或 `idle`。
+- `session.reset.at_hour`（默认 `4`）：每日重置边界的小时，自动夹到 `0`-`23`。**按 UTC 计算**；OpenClaw 使用宿主机本地时区。
+- `session.reset.idle_minutes`：`idle` 模式下的空闲分钟数，必须为正数；`null` 表示永不过期。
+- `session.reset_by_type`：可选的 `direct`、`group`、`thread` 覆盖。存在的条目会整体替换该类型的 `reset` 策略；thread key 优先于 group key。
+- 配置键使用 snake_case，同时接受 OpenClaw 的 camelCase 别名（`atHour`、`idleMinutes`、`resetByType`）。未写 `mode` 的 reset 块按 `daily` 处理（与 OpenClaw 一致）。
+- 重置复用 `/new` 路径：清理实时历史、待执行的 exec 命令、当前 skill、token 与 compaction 计数、会话级 memory 行以及持久化会话记录。重置是静默的（仅写日志），在下一轮刷新活跃时间之前执行，且不会在轮次进行中触发。
+- `created_at`（会话开始时间）用于 `daily`；`last_active` 用于 `idle`。每日状态不持久化，因此空闲回收后的重启会重新开始一个每日窗口。
+- 兼容旧配置：显式写了 `session.idle_minutes` 且没有 `session.reset` 时，会映射为 `{ "mode": "idle", "idle_minutes": <值> }`。旧结构默认的 60 分钟**不会**开启自动重置。
+
+```json
+{
+  "session": {
+    "reset": { "mode": "daily", "at_hour": 4 },
+    "reset_by_type": {
+      "group": { "mode": "idle", "idle_minutes": 120 }
+    }
+  }
+}
+```
+
 ### `memory`
 
 - `backend`: 建议从 `sqlite` 开始。可选引擎：`sqlite`、`markdown`、`clickhouse`、`postgres`、`redis`、`lancedb`、`lucid`、`memory`（LRU）、`api`、`none`。

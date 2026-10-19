@@ -55,6 +55,7 @@ pub const error_reply_policy = @import("error_reply_policy.zig");
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
+pub const session_reset = @import("session_reset.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
 pub const bootstrap = @import("bootstrap/root.zig");

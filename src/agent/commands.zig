@@ -3343,7 +3343,7 @@ fn clearSessionMemory(self: anytype) void {
     }
 }
 
-fn clearSessionState(self: anytype) void {
+pub fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
     clearActiveSkillSession(self);
