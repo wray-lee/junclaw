@@ -340,6 +340,8 @@ pub const Agent = struct {
     recall_limit: usize = 5,
     max_context_bytes: usize = 4_000,
     compact_context: bool = true,
+    /// Extract durable user facts into memory before compaction drops them.
+    compaction_memory_flush: bool = true,
     token_limit: u64 = 0,
     token_limit_override: ?u64 = null,
     max_tokens: u32 = max_tokens_resolver.DEFAULT_MODEL_MAX_TOKENS,
@@ -668,6 +670,7 @@ pub const Agent = struct {
             .recall_limit = @intCast(cfg.memory.recall_limit),
             .max_context_bytes = @intCast(cfg.memory.max_context_bytes),
             .compact_context = cfg.agent.compact_context,
+            .compaction_memory_flush = cfg.agent.compaction_memory_flush,
             .token_limit = resolved_token_limit,
             .token_limit_override = token_limit_override,
             .max_tokens = resolved_max_tokens,
@@ -958,15 +961,48 @@ pub const Agent = struct {
             .max_history_messages = self.max_history_messages,
             .workspace_dir = self.workspace_dir,
             .bootstrap_provider = self.bootstrap,
+            .memory_flush = self.compaction_memory_flush,
+            .mem = self.mem,
+            .memory_session_id = self.memory_session_id,
         }, self.redactor);
-        if (compacted) self.compaction_count += 1;
+        if (compacted) {
+            self.compaction_count += 1;
+            self.persistCompactionSummary();
+            self.persistCompactionCount();
+        }
         return compacted;
+    }
+
+    /// Persist the newest compaction summary so a restarted session can replay
+    /// from it instead of re-injecting the messages compaction already dropped.
+    fn persistCompactionSummary(self: *Agent) void {
+        const store = self.session_store orelse return;
+        const session_id = self.memory_session_id orelse return;
+        var i = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const msg = self.history.items[i];
+            if (msg.role == .assistant and std.mem.startsWith(u8, msg.content, compaction.COMPACTION_SUMMARY_PREFIX)) {
+                store.saveMessage(session_id, "assistant", msg.content) catch {};
+                return;
+            }
+        }
+    }
+
+    /// Persist the compaction counter so it survives a restart.
+    fn persistCompactionCount(self: *Agent) void {
+        const store = self.session_store orelse return;
+        const session_id = self.memory_session_id orelse return;
+        store.saveCompactionCount(session_id, self.compaction_count) catch {};
     }
 
     /// Force-compress history for context exhaustion recovery.
     pub fn forceCompressHistory(self: *Agent) bool {
         const compressed = compaction.forceCompressHistory(self.allocator, &self.history);
-        if (compressed) self.compaction_count += 1;
+        if (compressed) {
+            self.compaction_count += 1;
+            self.persistCompactionCount();
+        }
         return compressed;
     }
 

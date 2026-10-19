@@ -231,6 +231,24 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 }
 ```
 
+### `agent.compaction_memory_flush`
+
+- 默认 `true`。压缩丢弃旧消息之前会发起一次有界的一次性 LLM 调用，提取值得长期记住的用户事实和偏好，每行存为一条记忆（键名以 `flush_compact_*` 开头）。
+- flush 输入上限为 8,000 字符（UTF-8 安全截断），每次压缩最多存储 10 行。
+- provider 报错或输出为空不会阻塞压缩，摘要和历史裁剪照常进行。
+- flush 直接调用 provider，不经过 agent turn，因此不会递归触发再次压缩。
+- 设为 `false` 可跳过这次额外调用。主动压缩本身仍需 `agent.compact_context` 开启。
+
+示例：
+
+```json
+{
+  "agent": {
+    "compaction_memory_flush": false
+  }
+}
+```
+
 ### `workspace_audit.llm_triage`
 
 - 选择 `nullclaw workspace audit --llm-triage external` 使用的 provider/model。

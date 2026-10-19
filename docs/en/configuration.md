@@ -251,6 +251,24 @@ Example:
 }
 ```
 
+### `agent.compaction_memory_flush`
+
+- When `true` (default), one bounded one-shot LLM call runs before compaction discards older messages. It extracts durable user facts and preferences and stores each line as a memory entry (`flush_compact_*`).
+- Flush input is capped at 8,000 characters (UTF-8 safe truncation) and at most 10 lines are stored per compaction.
+- A provider error or empty output never blocks compaction; the summary and history trimming still happen.
+- The flush calls the provider directly instead of running an agent turn, so it cannot recursively trigger another compaction.
+- Set to `false` to skip the extra call. `agent.compact_context` must still be enabled for proactive compaction to run.
+
+Example:
+
+```json
+{
+  "agent": {
+    "compaction_memory_flush": false
+  }
+}
+```
+
 ### `workspace_audit.llm_triage`
 
 - Selects the provider/model used by `nullclaw workspace audit --llm-triage external`.

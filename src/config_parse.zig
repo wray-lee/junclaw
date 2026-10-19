@@ -1795,6 +1795,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("compact_context")) |v| {
                 if (v == .bool) self.agent.compact_context = v.bool;
             }
+            if (ag.object.get("compaction_memory_flush")) |v| {
+                if (v == .bool) self.agent.compaction_memory_flush = v.bool;
+            }
             if (ag.object.get("max_tool_iterations")) |v| {
                 if (v == .integer) self.agent.max_tool_iterations = @intCast(v.integer);
             }

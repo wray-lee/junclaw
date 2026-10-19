@@ -216,6 +216,8 @@ pub const SessionStore = struct {
         clearAutoSaved: *const fn (ptr: *anyopaque, session_id: ?[]const u8) anyerror!void,
         saveUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void = null,
         loadUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?u64 = null,
+        saveCompactionCount: ?*const fn (ptr: *anyopaque, session_id: []const u8, count: u64) anyerror!void = null,
+        loadCompactionCount: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?u64 = null,
         countSessions: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
         listSessions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]SessionInfo = null,
         countDetailedMessages: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!u64 = null,
@@ -245,6 +247,16 @@ pub const SessionStore = struct {
 
     pub fn loadUsage(self: SessionStore, session_id: []const u8) !?u64 {
         const func = self.vtable.loadUsage orelse return null;
+        return func(self.ptr, session_id);
+    }
+
+    pub fn saveCompactionCount(self: SessionStore, session_id: []const u8, count: u64) !void {
+        const func = self.vtable.saveCompactionCount orelse return error.NotSupported;
+        return func(self.ptr, session_id, count);
+    }
+
+    pub fn loadCompactionCount(self: SessionStore, session_id: []const u8) !?u64 {
+        const func = self.vtable.loadCompactionCount orelse return null;
         return func(self.ptr, session_id);
     }
 
