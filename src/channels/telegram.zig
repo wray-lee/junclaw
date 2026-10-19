@@ -1282,6 +1282,15 @@ pub const TelegramChannel = struct {
     fn startTypingLoop(self: *TelegramChannel, chat_id: []const u8) !void {
         if (chat_id.len == 0) return;
 
+        // Create the chat's draft slot up front so the typing heartbeat has
+        // something to refresh (the daemon path never calls beginDraftTurn).
+        // This does not claim it: no active flag, no draft-id rotation.
+        if (self.streaming_enabled and self.draft_previews_enabled and supportsDraftPreviewTarget(chat_id)) {
+            self.draft_mu.lock();
+            defer self.draft_mu.unlock();
+            _ = self.ensureDraftStateLocked(chat_id, std_compat.time.milliTimestamp()) catch {};
+        }
+
         try self.stopTyping(chat_id);
 
         const key_copy = try self.allocator.dupe(u8, chat_id);
@@ -3382,25 +3391,31 @@ pub const TelegramChannel = struct {
         return state.draft_id != draft_id;
     }
 
-    fn sendDraftHeartbeat(self: *TelegramChannel, chat_id: []const u8) void {
-        if (builtin.is_test or !self.streaming_enabled or !self.draft_previews_enabled or chat_id.len == 0 or !supportsDraftPreviewTarget(chat_id)) return;
+    /// One typing-heartbeat tick. Returns the flush to send (caller owns it),
+    /// or null. The state management stays test-observable; only the network
+    /// send is skipped under test.
+    fn draftHeartbeatTick(self: *TelegramChannel, chat_id: []const u8, now_ms: i64) ?telegram_draft_presenter.DraftFlush {
+        if (!self.streaming_enabled or !self.draft_previews_enabled or chat_id.len == 0 or !supportsDraftPreviewTarget(chat_id)) return null;
 
-        const now_ms = std_compat.time.milliTimestamp();
-        var pending_flush: ?telegram_draft_presenter.DraftFlush = null;
+        self.draft_mu.lock();
+        defer self.draft_mu.unlock();
+
+        // Refresh only a draft the chat already owns. The turn-final delivery
+        // clears it; recreating it here would re-send a ghost tool-progress
+        // draft after the answer is visible.
+        const state = self.draft_buffers.getPtr(chat_id) orelse return null;
+        return telegram_draft_presenter.heartbeatDraft(
+            self.allocator,
+            state,
+            now_ms,
+        ) catch null;
+    }
+
+    fn sendDraftHeartbeat(self: *TelegramChannel, chat_id: []const u8) void {
+        var pending_flush = self.draftHeartbeatTick(chat_id, std_compat.time.milliTimestamp());
         defer if (pending_flush) |*flush| flush.deinit(self.allocator);
 
-        {
-            self.draft_mu.lock();
-            defer self.draft_mu.unlock();
-
-            const state = self.ensureDraftStateLocked(chat_id, now_ms) catch return;
-            pending_flush = telegram_draft_presenter.heartbeatDraft(
-                self.allocator,
-                state,
-                now_ms,
-            ) catch return;
-        }
-
+        if (builtin.is_test) return;
         if (pending_flush) |flush| {
             self.sendDraft(chat_id, flush.draft_id, flush.text, flush.started_at_ms, flush.html);
         }
@@ -6812,10 +6827,51 @@ test "startTyping (daemon indicator) does not claim the live draft" {
     var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
     defer ch.channel().stop();
 
+    // The typing heartbeat needs a draft slot to refresh, so startTyping may
+    // create one; it must not claim it for a turn: no active flag, no rotation.
+    try ch.channel().sendEvent("12345", "reasoning", &.{}, .chunk);
+    ch.draft_mu.lock();
+    const draft_id = ch.draft_buffers.get("12345").?.draft_id;
+    ch.draft_mu.unlock();
+
     try ch.startTyping("12345");
 
     ch.draft_mu.lock();
     defer ch.draft_mu.unlock();
+    const draft = ch.draft_buffers.get("12345") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(draft_id, draft.draft_id);
+    try std.testing.expect(!draft.active);
+}
+
+test "heartbeat does not resurrect a finished draft" {
+    // Regression: 模型回复已送达后，工具进度草稿仍被心跳重发并滞留。
+    // A heartbeat tick after the turn-final release must neither recreate the
+    // draft slot nor produce a flush to send.
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer ch.deinitDraftBuffers();
+
+    // Polling path: finishDraftTurn on turn end.
+    const draft_id = try ch.beginDraftTurn("12345");
+    ch.recordToolProgress("12345", draft_id, .{ .tool = "shell" });
+    try ch.finishDraftTurn("12345", draft_id);
+
+    try std.testing.expect(ch.draftHeartbeatTick("12345", 1_000) == null);
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+    try std.testing.expect(
+        ch.draftHeartbeatTick("12345", 1_000 + telegram_draft_presenter.DRAFT_HEARTBEAT_INTERVAL_MS + 1) == null,
+    );
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+
+    // Daemon path: clearLiveDraft on the final outbound stage.
+    try ch.channel().sendEvent("12345", "reasoning", &.{}, .chunk);
+    try ch.channel().sendEvent("12345", "", &.{}, .final);
+
+    try std.testing.expect(ch.draftHeartbeatTick("12345", 2_000) == null);
+    try std.testing.expect(ch.draft_buffers.get("12345") == null);
+    try std.testing.expect(
+        ch.draftHeartbeatTick("12345", 2_000 + telegram_draft_presenter.DRAFT_HEARTBEAT_INTERVAL_MS + 1) == null,
+    );
     try std.testing.expect(ch.draft_buffers.get("12345") == null);
 }
 

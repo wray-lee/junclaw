@@ -824,6 +824,11 @@ fn handleTelegramInteractiveCallback(
         response_owned = true;
         break :blk model_reply;
     };
+    // Release the typing indicator and draft before the in-place edit for the
+    // same reason as processTelegramMessage: a callback answer can take a while
+    // to deliver, and a heartbeat re-sent afterwards would linger.
+    if (typing_turn.started) tg_ptr.stopTyping(typing_target) catch {};
+    if (typing_turn.draft_id != 0) tg_ptr.finishDraftTurn(typing_target, typing_turn.draft_id) catch {};
     // The local slash path has no turn of its own: release the worker's
     // pre-turn marker before the edit is sent. The model path above already
     // ran the hook (a second run is a no-op); a local miss returns false
@@ -1124,6 +1129,13 @@ fn processTelegramMessage(
         progress_sink,
         .{ .ctx = @ptrCast(tg_ptr), .finalize = finalizeTelegramSteerReaction },
     );
+    // Release the typing indicator and the progress draft before the reply is
+    // delivered: a slow send (split messages, media upload) must not keep the
+    // heartbeat re-sending the tool-progress draft, which would reset its TTL
+    // and leave it on screen after the answer. Both calls are idempotent; the
+    // defer above still covers early returns and errors.
+    if (typing_turn.started) tg_ptr.stopTyping(typing_target) catch {};
+    if (typing_turn.draft_id != 0) tg_ptr.finishDraftTurn(typing_target, typing_turn.draft_id) catch {};
     // The turn is over even when it failed. Clear the worker's pre-turn
     // marker before the reply send: a media upload can take up to the HTTP
     // timeout, and a /stop during that window must not cancel the next
@@ -4898,6 +4910,120 @@ test "gateway tool-progress wiring renders the first tool call immediately" {
     const block = try state.tool_progress.renderBlockHtml(allocator, std_compat.time.milliTimestamp());
     defer allocator.free(block);
     try std.testing.expect(std.mem.indexOf(u8, block, "shell") != null);
+}
+
+const NoReplyTelegramMockProvider = struct {
+    fn chatWithSystem(_: *anyopaque, a: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return a.dupe(u8, "[NO_REPLY]");
+    }
+    fn chat(_: *anyopaque, a: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return .{ .content = try a.dupe(u8, "[NO_REPLY]") };
+    }
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+    fn getName(_: *anyopaque) []const u8 {
+        return "no-reply-mock";
+    }
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+const noReplyTelegramProviderVTable = providers.Provider.VTable{
+    .chatWithSystem = NoReplyTelegramMockProvider.chatWithSystem,
+    .chat = NoReplyTelegramMockProvider.chat,
+    .supportsNativeTools = NoReplyTelegramMockProvider.supportsNativeTools,
+    .getName = NoReplyTelegramMockProvider.getName,
+    .deinit = NoReplyTelegramMockProvider.deinitFn,
+};
+
+var noReplyTelegramProviderState: u8 = 0;
+
+fn noReplyTelegramProvider() providers.Provider {
+    return .{ .ptr = @ptrCast(&noReplyTelegramProviderState), .vtable = &noReplyTelegramProviderVTable };
+}
+
+test "telegram polling releases the progress draft before the final reply" {
+    // Regression: 轮询路径最终回复投递期间 typing 心跳仍重发进度草稿.
+    // The turn-end hook fires immediately before the reply delivery, so it
+    // observes whether the draft (and its typing thread) is already gone.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ workspace, "config.json" });
+    defer allocator.free(config_path);
+
+    var allowed_paths = [_][]const u8{workspace};
+    const cfg = Config{
+        .workspace_dir = workspace,
+        .config_path = config_path,
+        .allocator = allocator,
+        .default_model = "test/mock-model",
+        .memory = .{
+            .profile = "minimal_none",
+            .backend = "none",
+            .auto_save = false,
+        },
+        .security = .{
+            .sandbox = .{
+                .enabled = false,
+                .backend = .none,
+            },
+        },
+        .autonomy = .{
+            .allowed_paths = &allowed_paths,
+        },
+    };
+
+    var runtime = try ChannelRuntime.init(allocator, &cfg);
+    defer runtime.deinit();
+
+    var tg = telegram.TelegramChannel.init(allocator, "test-token", &.{}, &.{}, "allowlist");
+    defer tg.channel().stop();
+
+    const session_key = "telegram:default:direct:12345";
+    const session = try runtime.session_mgr.getOrCreate(session_key);
+    session.agent.provider = noReplyTelegramProvider();
+
+    const Probe = struct {
+        tg: *telegram.TelegramChannel,
+        observed: bool = false,
+        released: bool = false,
+
+        fn run(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            // The hook also runs from the function's early-return defer, after
+            // the turn cleanup; only the first (pre-delivery) call matters.
+            if (self.observed) return;
+            self.observed = true;
+            self.released = self.tg.draft_buffers.get("12345") == null and
+                self.tg.typing_handles.get("12345") == null;
+        }
+    };
+    var probe = Probe{ .tg = &tg };
+
+    processTelegramMessage(
+        allocator,
+        runtime,
+        &tg,
+        session_key,
+        "hello",
+        "12345",
+        222,
+        // Group + [NO_REPLY] suppresses the reply send, so the test never
+        // reaches the network; the turn-end hook still runs before it.
+        true,
+        null,
+        "user_a",
+        false,
+        null,
+        .{ .ctx = @ptrCast(&probe), .run = Probe.run },
+    );
+
+    try std.testing.expect(probe.released);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
