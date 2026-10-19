@@ -53,6 +53,10 @@ const FOLLOW_UP_FAILED_NOTICE: []const u8 = "It could not be processed; please r
 /// Appended once when a /stop ends the turn and pending steered messages are
 /// dropped instead of being run as follow-up turns.
 const STOP_DISCARDED_NOTICE: []const u8 = "[Pending message(s) discarded by /stop. Please resend.]";
+/// Appended once when this turn cleared the session (/new, /reset, /clear) and
+/// pending steered messages are dropped instead of leaking into the fresh
+/// session as follow-up turns.
+const RESET_DISCARDED_NOTICE: []const u8 = "[Pending message(s) discarded by the session reset. Please resend.]";
 const TOKEN_USAGE_LEDGER_FILENAME = "llm_token_usage.jsonl";
 const NS_PER_SEC: i128 = std.time.ns_per_s;
 const RUNTIME_COMMAND_ROLE = memory_mod.RUNTIME_COMMAND_ROLE;
@@ -2682,15 +2686,24 @@ pub const SessionManager = struct {
             self.persistTurnResult(session, session_key, content, response);
         }
 
-        if (session.agent.last_turn_interrupted) {
+        // A reset turn opens a fresh session: a message steered into it belongs
+        // to the conversation that just ended, so it must not run as a follow-up
+        // turn inside the new session. OpenClaw does the same by refusing steer
+        // and follow-up admission for a reset-triggered turn.
+        // src/auto-reply/reply/agent-runner-run.ts:244-245
+        const reset_turn = !session.agent.last_turn_interrupted and
+            agent_mod.commands.planTurnInput(content).clear_session;
+
+        if (session.agent.last_turn_interrupted or reset_turn) {
             // One /stop ends the turn: messages steered into it must not run as
             // fresh follow-up turns with their own model and tool calls.
             session.closeInjectionWindow();
             if ((session.discardPendingInjections(self.allocator) catch 0) > 0) {
+                const notice = if (reset_turn) RESET_DISCARDED_NOTICE else STOP_DISCARDED_NOTICE;
                 const combined = std.fmt.allocPrint(
                     self.allocator,
                     "{s}\n\n{s}",
-                    .{ response, STOP_DISCARDED_NOTICE },
+                    .{ response, notice },
                 ) catch null;
                 if (combined) |text| {
                     self.allocator.free(response);
@@ -7052,6 +7065,154 @@ test "restored session history is bounded to max_history_messages" {
     const restored = try sm.getOrCreate(session_key);
     try testing.expect(restored.agent.history.items.len > 0);
     try testing.expect(restored.agent.history.items.len <= max);
+}
+
+test "/new drops every piece of session-scoped state" {
+    // Regression: after /new, /reset or /clear the session still carried heavy
+    // context residue. The next turn's request was rebuilt from sqlite history,
+    // the persisted compaction summary, pending injections, and session-scoped
+    // memory (autosave rows plus the facts the pre-compaction memory flush wrote
+    // from the old conversation), which autorecall then re-injected.
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    const session_key = "telegram:main:chat-new-reset";
+    const store = sqlite_mem.sessionStore();
+    const mem = sqlite_mem.memory();
+
+    var mock = MockProvider{ .response = "reply" };
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        mem,
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    // Phase 1: build old-session state. The raw `*Session` is dropped before
+    // evicting so the manager mutex is free (getOrCreate holds it).
+    {
+        const session = try sm.getOrCreate(session_key);
+        const reply = try session.agent.turn("old conversation user turn");
+        testing.allocator.free(reply);
+        // A pre-compaction memory flush row and a compaction summary, both
+        // scoped to this session, as a real compaction leaves behind.
+        const scoped_id = session.agent.memory_session_id.?;
+        try mem.store("flush_compact_1_0", "old-session durable fact", .conversation, scoped_id);
+        try mem.store("autosave_user_1", "old-session autosave row", .conversation, scoped_id);
+        try store.saveMessage(session_key, "assistant", agent_mod.compaction.COMPACTION_SUMMARY_PREFIX ++ "\nold summary");
+        session.last_active = 0;
+    }
+
+    // Phase 2: a restart replays everything the reset path missed.
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+
+    const session = try sm.getOrCreate(session_key);
+    try testing.expect(session.agent.history.items.len > 0);
+    try testing.expect(session.agent.total_tokens > 0);
+    // A pending injection that outlived the /new turn is what leaks into the
+    // fresh session: the manager drains it as a post-turn follow-up. Seed it on
+    // the live restored session, then reset through the manager path.
+    session.injectMidTurn(testing.allocator, "mid-turn steered message") catch {};
+    try testing.expect(session.hasInjection());
+    const calls_before_reset = mock.chat_calls;
+
+    const ack = try sm.processMessageStreaming(session_key, "/new", null, null, null);
+    defer testing.allocator.free(ack);
+    try testing.expect(std.mem.startsWith(u8, ack, "Session cleared."));
+    // The steered message is reported dropped, never answered: the drain loop
+    // that would have run it as a follow-up turn must not have called the
+    // provider for it.
+    try testing.expect(std.mem.indexOf(u8, ack, "discarded by the session reset") != null);
+    try testing.expect(std.mem.indexOf(u8, ack, "mid-turn steered message") == null);
+    try testing.expectEqual(calls_before_reset, mock.chat_calls);
+
+    try testing.expectEqual(@as(usize, 0), session.agent.history.items.len);
+    try testing.expectEqual(@as(u64, 0), session.agent.total_tokens);
+    try testing.expectEqual(@as(u64, 0), session.agent.compaction_count);
+    try testing.expect(!session.hasInjection());
+
+    // Nothing persisted under the session key survives either.
+    const persisted = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, persisted);
+    try testing.expectEqual(@as(usize, 0), persisted.len);
+    try testing.expectEqual(@as(?u64, 0), try store.loadCompactionCount(session_key));
+
+    // Session-scoped memory is gone.
+    const scoped = try mem.list(testing.allocator, null, session_key);
+    defer memory_mod.freeEntries(testing.allocator, scoped);
+    for (scoped) |entry| {
+        try testing.expect(std.mem.indexOf(u8, entry.content, "old-session") == null);
+    }
+    try testing.expectEqual(@as(usize, 0), scoped.len);
+
+    // A restart after /new must not bring the old conversation back: evict the
+    // now-idle session so the next getOrCreate replays only what is persisted.
+    // The live `session` pointer is no longer used past this point.
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+    const revived = try sm.getOrCreate(session_key);
+    try testing.expectEqual(@as(usize, 0), revived.agent.history.items.len);
+    try testing.expectEqual(@as(u64, 0), revived.agent.total_tokens);
+}
+
+test "/new keeps global long-term memory but drops session-scoped memory" {
+    // Regression: long-term memory is global by design (OpenClaw keeps it across
+    // /new), but rows scoped to the resetting session are old conversation and
+    // autorecall re-injected them into the fresh session.
+    var mock = MockProvider{ .response = "reply" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    try mem.store("global_fact", "user prefers Zig", .core, null);
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session_key = "telegram:main:chat-scoped-memory";
+    const session = try sm.getOrCreate(session_key);
+    const scoped_session_id = session.agent.memory_session_id.?;
+    // Store under the session id the agent actually uses, not the channel key.
+    try mem.store("flush_compact_1_0", "old-session durable fact", .conversation, scoped_session_id);
+    try mem.store("autosave_user_1", "old-session autosave row", .conversation, scoped_session_id);
+
+    const ack = try sm.handleLocalSlashCommand(session_key, "/reset", null) orelse
+        return error.TestExpectedEqual;
+    defer testing.allocator.free(ack);
+
+    // A global fact survives: memory is not session-scoped by design.
+    const global = (try mem.get(testing.allocator, "global_fact")) orelse
+        return error.TestExpectedEqual;
+    defer global.deinit(testing.allocator);
+
+    for ([_][]const u8{ "flush_compact_1_0", "autosave_user_1" }) |key| {
+        const scoped = try mem.getScoped(testing.allocator, key, scoped_session_id);
+        if (scoped) |entry| {
+            entry.deinit(testing.allocator);
+            try testing.expect(false);
+        }
+    }
 }
 
 test "session restore keeps compaction summary and drops pre-compaction history" {

@@ -85,7 +85,7 @@ const SlashCommandKind = enum {
 };
 
 fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
-    if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) return .new_reset;
+    if (isSlashName(cmd, "new") or isSlashName(cmd, "reset") or isSlashName(cmd, "clear")) return .new_reset;
     if (isSlashName(cmd, "restart")) return .restart;
     if (isSlashName(cmd, "help") or isSlashName(cmd, "commands") or isSlashName(cmd, "menu")) return .help;
     if (isSlashName(cmd, "status")) return .status;
@@ -1009,6 +1009,17 @@ test "configPrimaryModelForSelection keeps configured versionless custom url nam
 test "planTurnInput keeps bare /new and /reset local-only" {
     // Regression: bare /new and /reset ran a full LLM turn instead of a local ack.
     for ([_][]const u8{ "/new", "/reset", "/reset@nullclaw_bot:", "/reset gpt-4o-mini" }) |message| {
+        const plan = planTurnInput(message);
+        try std.testing.expect(plan.clear_session);
+        try std.testing.expect(plan.invoke_local_handler);
+        try std.testing.expect(plan.llm_user_message == null);
+    }
+}
+
+test "planTurnInput treats /clear as a session reset" {
+    // Regression: /new, /reset and /clear kept heavy context residue, and
+    // OpenClaw's /clear resets the same session in place.
+    for ([_][]const u8{ "/clear", "/clear@nullclaw_bot:", "/CLEAR" }) |message| {
         const plan = planTurnInput(message);
         try std.testing.expect(plan.clear_session);
         try std.testing.expect(plan.invoke_local_handler);
@@ -3308,6 +3319,30 @@ fn findShellTool(self: anytype) ?Tool {
     return null;
 }
 
+/// Drop this session's memory rows so nothing session-scoped survives /new.
+///
+/// Long-term memory facts are global by design (OpenClaw keeps memory across
+/// `/new` too), but rows scoped to this session are old conversation: the
+/// autosave_rows, the facts `flushMemoriesBeforeCompaction` wrote from the
+/// pre-compaction transcript (`flush_compact_*`), and the persisted compaction
+/// summary. Without the last two, autorecall re-injected the old conversation
+/// into the fresh session, which is exactly what OpenClaw's reset drops.
+fn clearSessionMemory(self: anytype) void {
+    const session_id = self.memory_session_id orelse return;
+    const mem = self.mem orelse return;
+
+    const entries = mem.list(self.allocator, null, session_id) catch return;
+    defer memory_mod.freeEntries(self.allocator, entries);
+
+    for (entries) |entry| {
+        // A global row must never be reachable through a session scope; skip
+        // it rather than deleting shared long-term memory.
+        if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, session_id)) continue;
+        _ = mem.forgetScoped(self.allocator, entry.key, session_id) catch {};
+        if (self.mem_rt) |rt| rt.deleteFromVectorStore(entry.key, session_id);
+    }
+}
+
 fn clearSessionState(self: anytype) void {
     self.clearHistory();
     clearPendingExecCommand(self);
@@ -3321,9 +3356,9 @@ fn clearSessionState(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "compaction_count")) {
         self.compaction_count = 0;
     }
+    clearSessionMemory(self);
 
     if (self.session_store) |store| {
-        store.clearAutoSaved(self.memory_session_id) catch {};
         if (self.memory_session_id) |session_id| {
             store.saveCompactionCount(session_id, 0) catch {};
         }
