@@ -2762,18 +2762,22 @@ pub const SlackChannel = struct {
         self.stopProgressTarget(target);
 
         const key = try self.allocator.dupe(u8, target);
-        errdefer self.allocator.free(key);
-        const state = try self.allocator.create(ProgressTarget);
-        errdefer self.allocator.destroy(state);
+        const state = self.allocator.create(ProgressTarget) catch |err| {
+            self.allocator.free(key);
+            return err;
+        };
         state.* = .{};
 
         self.progress_mu.lock();
         self.progress_targets.put(self.allocator, key, state) catch |err| {
             self.progress_mu.unlock();
+            self.allocator.destroy(state);
+            self.allocator.free(key);
             return err;
         };
         self.progress_mu.unlock();
 
+        // Once inserted in progress_targets, stopProgressTarget owns key and state.
         if (!builtin.is_test or self.test_spawn_keepalive) {
             state.thread = std.Thread.spawn(
                 .{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE },
