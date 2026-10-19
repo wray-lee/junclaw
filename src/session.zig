@@ -1921,6 +1921,9 @@ pub const SessionManager = struct {
                     session.agent.total_tokens = estimateRestoredSessionTokens(restored);
                 }
             }
+            if (try store.loadCompactionCount(session_key)) |count| {
+                session.agent.compaction_count = count;
+            }
         }
 
         try self.sessions.put(self.allocator, owned_key, session);
@@ -7092,6 +7095,8 @@ test "session restore keeps compaction summary and drops pre-compaction history"
         try testing.expect(try session.agent.autoCompactHistory());
     }
 
+    try testing.expectEqual(@as(?u64, 1), try store.loadCompactionCount(session_key));
+
     const persisted = try store.loadMessages(testing.allocator, session_key);
     defer memory_mod.freeMessages(testing.allocator, persisted);
     var has_persisted_summary = false;
@@ -7129,6 +7134,7 @@ test "session restore keeps compaction summary and drops pre-compaction history"
     }
     try testing.expect(found_summary);
     try testing.expect(!found_pre_compaction);
+    try testing.expectEqual(@as(u64, 1), restored.agent.compaction_count);
 }
 
 test "persisted session falls back to rendered response when degraded turn has no final assistant history entry" {

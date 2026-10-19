@@ -962,6 +962,7 @@ pub const Agent = struct {
         if (compacted) {
             self.compaction_count += 1;
             self.persistCompactionSummary();
+            self.persistCompactionCount();
         }
         return compacted;
     }
@@ -982,10 +983,20 @@ pub const Agent = struct {
         }
     }
 
+    /// Persist the compaction counter so it survives a restart.
+    fn persistCompactionCount(self: *Agent) void {
+        const store = self.session_store orelse return;
+        const session_id = self.memory_session_id orelse return;
+        store.saveCompactionCount(session_id, self.compaction_count) catch {};
+    }
+
     /// Force-compress history for context exhaustion recovery.
     pub fn forceCompressHistory(self: *Agent) bool {
         const compressed = compaction.forceCompressHistory(self.allocator, &self.history);
-        if (compressed) self.compaction_count += 1;
+        if (compressed) {
+            self.compaction_count += 1;
+            self.persistCompactionCount();
+        }
         return compressed;
     }
 
