@@ -959,8 +959,27 @@ pub const Agent = struct {
             .workspace_dir = self.workspace_dir,
             .bootstrap_provider = self.bootstrap,
         }, self.redactor);
-        if (compacted) self.compaction_count += 1;
+        if (compacted) {
+            self.compaction_count += 1;
+            self.persistCompactionSummary();
+        }
         return compacted;
+    }
+
+    /// Persist the newest compaction summary so a restarted session can replay
+    /// from it instead of re-injecting the messages compaction already dropped.
+    fn persistCompactionSummary(self: *Agent) void {
+        const store = self.session_store orelse return;
+        const session_id = self.memory_session_id orelse return;
+        var i = self.history.items.len;
+        while (i > 0) {
+            i -= 1;
+            const msg = self.history.items[i];
+            if (msg.role == .assistant and std.mem.startsWith(u8, msg.content, compaction.COMPACTION_SUMMARY_PREFIX)) {
+                store.saveMessage(session_id, "assistant", msg.content) catch {};
+                return;
+            }
+        }
     }
 
     /// Force-compress history for context exhaustion recovery.

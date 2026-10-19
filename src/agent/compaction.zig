@@ -26,6 +26,10 @@ const OwnedMessage = Agent.OwnedMessage;
 // Constants
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Marker prefix of the assistant message that carries a compaction summary.
+/// Session restore uses it to discard rows from before the last compaction.
+pub const COMPACTION_SUMMARY_PREFIX = "[Compaction summary]";
+
 /// Default: keep this many most-recent non-system messages after compaction.
 pub const DEFAULT_COMPACTION_KEEP_RECENT: u32 = 20;
 
@@ -149,7 +153,7 @@ pub fn autoCompactHistory(
     defer allocator.free(summary_with_context);
 
     // Create the compaction summary message
-    const summary_content = try std.fmt.allocPrint(allocator, "[Compaction summary]\n{s}", .{summary_with_context});
+    const summary_content = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ COMPACTION_SUMMARY_PREFIX, summary_with_context });
 
     // Free old messages being compacted
     for (history.items[start..compact_end]) |*msg| {

@@ -158,6 +158,22 @@ fn recentHistoryWindow(
     return entries[entries.len - max ..];
 }
 
+/// Replay from the newest compaction summary. Rows before it were already
+/// dropped from the live history by compaction, so replaying them would
+/// resurrect context the summary replaced.
+fn dropRowsBeforeLastCompactionSummary(entries: []const memory_mod.MessageEntry) []const memory_mod.MessageEntry {
+    var i = entries.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, entries[i].role, "assistant") and
+            std.mem.startsWith(u8, entries[i].content, agent_mod.compaction.COMPACTION_SUMMARY_PREFIX))
+        {
+            return entries[i..];
+        }
+    }
+    return entries;
+}
+
 fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
     for (entries) |entry| {
         if (memory_mod.isRuntimeCommandRole(entry.role)) {
@@ -1893,7 +1909,9 @@ pub const SessionManager = struct {
             const maybe_entries = store.loadMessages(self.allocator, session_key) catch null;
             if (maybe_entries) |entries| {
                 defer memory_mod.freeMessages(self.allocator, entries);
-                const restored = recentHistoryWindow(entries, session.agent.max_history_messages);
+                const restored = dropRowsBeforeLastCompactionSummary(
+                    recentHistoryWindow(entries, session.agent.max_history_messages),
+                );
                 if (restored.len > 0) {
                     restorePersistedSessionState(session, restored);
                 }
@@ -7031,6 +7049,86 @@ test "restored session history is bounded to max_history_messages" {
     const restored = try sm.getOrCreate(session_key);
     try testing.expect(restored.agent.history.items.len > 0);
     try testing.expect(restored.agent.history.items.len <= max);
+}
+
+test "session restore keeps compaction summary and drops pre-compaction history" {
+    // Regression: session restore dropped the compaction summary and replayed
+    // every pre-compaction row, resurrecting context compaction had dropped.
+    var mock = MockProvider{ .response = "summary text" };
+    var cfg = testConfig();
+    cfg.agent.max_history_messages = 4;
+    cfg.agent.compaction_keep_recent = 4;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    const session_key = "telegram:main:chat-compaction-restore";
+    const store = sqlite_mem.sessionStore();
+    // Rows persisted before compaction ran.
+    try store.saveMessage(session_key, "user", "pre-compaction-old");
+    try store.saveMessage(session_key, "assistant", "pre-compaction-old-reply");
+
+    {
+        var noop = observability.NoopObserver{};
+        var sm = SessionManager.init(
+            testing.allocator,
+            &cfg,
+            mock.provider(),
+            &.{},
+            sqlite_mem.memory(),
+            noop.observer(),
+            store,
+            null,
+        );
+        defer sm.deinit();
+
+        const session = try sm.getOrCreate(session_key);
+        for (0..12) |i| {
+            try session.agent.history.append(testing.allocator, .{
+                .role = if (i % 2 == 0) .user else .assistant,
+                .content = try std.fmt.allocPrint(testing.allocator, "message {d}", .{i}),
+            });
+        }
+        try testing.expect(try session.agent.autoCompactHistory());
+    }
+
+    const persisted = try store.loadMessages(testing.allocator, session_key);
+    defer memory_mod.freeMessages(testing.allocator, persisted);
+    var has_persisted_summary = false;
+    for (persisted) |entry| {
+        if (std.mem.startsWith(u8, entry.content, agent_mod.compaction.COMPACTION_SUMMARY_PREFIX)) {
+            has_persisted_summary = true;
+        }
+    }
+    try testing.expect(has_persisted_summary);
+
+    var mock2 = MockProvider{ .response = "reply" };
+    var noop2 = observability.NoopObserver{};
+    var sm2 = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock2.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop2.observer(),
+        store,
+        null,
+    );
+    defer sm2.deinit();
+
+    const restored = try sm2.getOrCreate(session_key);
+    var found_summary = false;
+    var found_pre_compaction = false;
+    for (restored.agent.history.items) |msg| {
+        if (std.mem.startsWith(u8, msg.content, agent_mod.compaction.COMPACTION_SUMMARY_PREFIX)) {
+            found_summary = true;
+        }
+        if (std.mem.indexOf(u8, msg.content, "pre-compaction-old") != null) {
+            found_pre_compaction = true;
+        }
+    }
+    try testing.expect(found_summary);
+    try testing.expect(!found_pre_compaction);
 }
 
 test "persisted session falls back to rendered response when degraded turn has no final assistant history entry" {
