@@ -1398,6 +1398,26 @@ works with `streaming` off. The status reaction (default hourglass) still marks 
 message's progress, and nullclaw does not post an extra progress message.
 Set `tool_progress=false` to keep only the plain `is typing...` status.
 
+About `session_status` on Slack: off by default (`session_status = false`). When enabled, nullclaw drives Slack's Agents session status via `agents.sessions.setStatus` (`processing` while a turn runs, `active` when it completes; `suspended` is reserved for approval-wait hooks). Like `tool_progress`, it is thread-only (top-level messages without a thread are skipped).
+
+Native **Stop** button: when `session_status = true` and the Slack app subscribes to the `agent_session_stopped` bot event, clicking Slack's native Stop button in the Agents view delivers `/stop` with the same policy and sender authorization checks as a typed `/stop`, interrupting the active turn immediately. Denied or malformed events are dropped.
+
+Scopes and manifest delta:
+- Uses the existing `chat:write` bot scope; no new OAuth scope is required.
+- Requires Slack's Agents & AI Apps / Agent View feature (`features.agent_view` or legacy `features.assistant_view`).
+- Manifest change (Socket Mode): add `agent_session_stopped` to `settings.event_subscriptions.bot_events`:
+  ```json
+  {
+    "settings": {
+      "event_subscriptions": {
+        "bot_events": [
+          "agent_session_stopped"
+        ]
+      }
+    }
+  }
+  ```
+
 #### Live reasoning in drafts
 
 `/reasoning stream` makes the model's thinking visible while it is produced, in the live

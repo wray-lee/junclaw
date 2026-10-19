@@ -1122,6 +1122,26 @@ webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答�
 
 关于 Slack 的 `tool_progress`：默认开启。当一轮对话运行时，nullclaw 会把 assistant 状态设为 `is working…`，并通过 `loading_messages` 传入最新的工具操作（例如 `🔧 web_fetch example.com`），让长时间、多次工具调用的回合能看到 agent 正在做什么。状态每约 6 秒刷新一次，以免被 Slack 的两分钟状态超时清除；更新会合并，每个 thread 每秒最多一次 API 调用。提示是保守的：文件路径只保留文件名，URL 只保留主机名，搜索查询会截断，shell/未知工具只显示工具名——原始参数永远不会被渲染。状态与 typing 指示器使用同一个目标：thread 回复使用该 thread，顶层消息或 DM 使用消息自身的 thread 根，因此这些会话也能看到操作行。该状态会显示在 Slack 的 Assistant/Agent View 体验中，在其他客户端为尽力而为。`assistant.threads.setStatus` 目前接受 `assistant:write` 或 `chat:write`（Slack 计划之后仅要求 `chat:write`）；nullclaw 沿用现有的 `chat:write` 权限，无需新增 OAuth scope，并且在 `streaming` 关闭时也能工作。状态 reaction（默认沙漏）仍用于标记每条消息的进度，nullclaw 不会额外发送进度消息。将 `tool_progress` 设为 `false` 可只保留简单的 `is typing...` 状态。
 
+关于 `session_status`（Slack 智能助手会话状态）：默认关闭（`session_status = false`）。开启后，nullclaw 通过 `agents.sessions.setStatus` 驱动 Slack 的 Agents 会话状态（Turn 执行期间为 `processing`，完成或失败后置为 `active`；`suspended` 保留给未来的人工审批挂起机制）。与 `tool_progress` 一致，仅在具有 `thread_ts` 的线程会话中生效，无 thread 的顶层消息直接跳过。
+
+原生 **Stop**（停止）按钮支持：当 `session_status = true` 且 Slack 应用订阅了 `agent_session_stopped` 事件时，用户点击 Slack 界面原生 Stop 按钮会通过 Socket Mode 触发该事件，nullclaw 会像收到用户发送的 `/stop` 一样对其进行发送者策略授权校验；鉴权通过后立即以高优先级中断当前 turn。未授权或异常事件直接丢弃。
+
+权限与 Manifest 变更说明：
+- 沿用现有的 `chat:write` bot scope，无需申请任何新的 OAuth scope。
+- 依赖 Slack 的 Agents & AI Apps / Agent View 特性（`features.agent_view` 或旧版 `features.assistant_view`）。
+- Manifest 配置调整（Socket Mode）：在 `settings.event_subscriptions.bot_events` 中添加 `agent_session_stopped`：
+  ```json
+  {
+    "settings": {
+      "event_subscriptions": {
+        "bot_events": [
+          "agent_session_stopped"
+        ]
+      }
+    }
+  }
+  ```
+
 #### 草稿中的实时推理
 
 使用 `/reasoning stream` 时，模型的思考过程会在生成过程中实时显示在 Slack 与 Telegram 的草稿里。思考内容以 `>` 引用形式渲染（Slack 为 blockquote；Telegram 草稿不设置 parse mode，因此是带 `>` 前缀的纯文本），模型开始写正文后答案出现在其下方。过长的思考会按平台上限截断并保留尾部，同时沿用原有的每轮限流。

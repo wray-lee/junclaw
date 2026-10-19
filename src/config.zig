@@ -7389,6 +7389,33 @@ test "parse slack status reactions from config" {
     allocator.free(cfg.channels.slack);
 }
 
+test "parse slack session status defaults off and can be enabled" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123"}}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.channels.slack.len > 0);
+    try std.testing.expect(!cfg.channels.slack[0].session_status);
+    allocator.free(cfg.channels.slack[0].account_id);
+    allocator.free(cfg.channels.slack[0].bot_token);
+    allocator.free(cfg.channels.slack[0].allow_from);
+    allocator.free(cfg.channels.slack);
+
+    const json_on =
+        \\{"channels": {"slack": {"accounts": {"main": {"bot_token": "xoxb-123", "session_status": true}}}}}
+    ;
+    var cfg_on = Config{ .workspace_dir = "/tmp/yc2", .config_path = "/tmp/yc2/config.json", .allocator = allocator };
+    try cfg_on.parseJson(json_on);
+    try std.testing.expect(cfg_on.channels.slack.len > 0);
+    try std.testing.expect(cfg_on.channels.slack[0].session_status);
+    allocator.free(cfg_on.channels.slack[0].account_id);
+    allocator.free(cfg_on.channels.slack[0].bot_token);
+    allocator.free(cfg_on.channels.slack[0].allow_from);
+    allocator.free(cfg_on.channels.slack);
+}
+
 test "parse slack implicit thread mention defaults on" {
     const allocator = std.testing.allocator;
     const json =

@@ -793,6 +793,12 @@ pub const SlackConfig = struct {
     /// top-level messages keep the status reaction as their progress signal.
     /// Uses the existing `chat:write` scope; no new OAuth scope.
     tool_progress: bool = true,
+    /// Drive Slack's Agents session status (`agents.sessions.setStatus`):
+    /// processing while a turn runs, active when it ends. Thread-only, needs
+    /// Slack's Agent View feature and the `agent_session_stopped` event
+    /// subscription (for the native Stop button). Off by default: no new API
+    /// calls and no behavior change. Scope is the existing `chat:write`.
+    session_status: bool = false,
     /// Show task lifecycle on the triggering user message via Slack reactions.
     /// Needs the `reactions:write` scope. Defaults on: a top-level DM has no
     /// other progress indicator (`assistant.threads.setStatus` is thread-only).

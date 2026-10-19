@@ -153,6 +153,53 @@ fn buildThreadStatusRequestBody(
     return try body_list.toOwnedSlice(allocator);
 }
 
+/// Slack Agents session status. `suspended` is only emitted when a native
+/// approval-wait state exists; nullclaw has no such hook yet, so only
+/// `processing`/`active` are wired to the turn lifecycle.
+pub const SessionStatus = enum {
+    processing,
+    active,
+    suspended,
+
+    fn asStr(self: SessionStatus) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// `title` is capped by the Slack API at 200 characters.
+const SESSION_STATUS_TITLE_MAX_CHARS: usize = 200;
+
+fn buildSessionStatusRequestBody(
+    allocator: std.mem.Allocator,
+    channel_id: []const u8,
+    thread_ts: []const u8,
+    status: SessionStatus,
+    title: ?[]const u8,
+) ![]u8 {
+    var body_list: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer body_list.deinit(allocator);
+    var body_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &body_list);
+    errdefer body_writer.deinit();
+    const bw = &body_writer.writer;
+    try bw.writeAll("{\"channel_id\":");
+    try root.appendJsonStringW(bw, channel_id);
+    try bw.writeAll(",\"thread_ts\":");
+    try root.appendJsonStringW(bw, thread_ts);
+    try bw.writeAll(",\"status\":");
+    try root.appendJsonStringW(bw, status.asStr());
+    if (title) |t| {
+        if (t.len > 0) {
+            const clamped = try tool_progress.clampUtf8(allocator, t, SESSION_STATUS_TITLE_MAX_CHARS);
+            defer allocator.free(clamped);
+            try bw.writeAll(",\"title\":");
+            try root.appendJsonStringW(bw, clamped);
+        }
+    }
+    try bw.writeByte('}');
+    body_list = body_writer.toArrayList();
+    return try body_list.toOwnedSlice(allocator);
+}
+
 const StatusTarget = struct {
     channel_id: []const u8,
     thread_ts: []const u8,
@@ -443,6 +490,17 @@ pub const SlackChannel = struct {
     /// Render tool progress in the assistant thread status
     /// (config_types.SlackConfig.tool_progress).
     tool_progress_enabled: bool = true,
+    /// Drive agents.sessions.setStatus (config_types.SlackConfig.session_status).
+    session_status_enabled: bool = false,
+    /// Warn once when Slack reports the Stop subscription / Agent View is missing.
+    session_status_warned: bool = false,
+    /// Guards `active_turns`.
+    turns_mu: std_compat.sync.Mutex = .{},
+    /// Active turn count per "channel_id:thread_ts" target. The key is owned.
+    /// The count keeps an old turn's stop from marking a newer turn active.
+    active_turns: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Test seam: counts setSessionStatus calls that passed the gating checks.
+    test_session_status_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     /// Guards `progress_targets`.
     progress_mu: std_compat.sync.Mutex = .{},
     /// Per-turn progress state keyed by the exact outbound target
@@ -553,6 +611,7 @@ pub const SlackChannel = struct {
         ch.streaming_enabled = cfg.streaming;
         ch.long_reply_file_threshold_chunks = cfg.long_reply_file_threshold_chunks;
         ch.tool_progress_enabled = cfg.tool_progress;
+        ch.session_status_enabled = cfg.session_status;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
         return ch;
@@ -749,6 +808,8 @@ pub const SlackChannel = struct {
     const SlackApiResult = struct {
         ts: ?[]u8 = null,
         error_code: ?[]u8 = null,
+        /// Non-fatal API warning (e.g. missing event subscription).
+        warning: ?[]u8 = null,
         /// files.getUploadURLExternal ticket fields.
         upload_url: ?[]u8 = null,
         file_id: ?[]u8 = null,
@@ -756,6 +817,7 @@ pub const SlackChannel = struct {
         pub fn deinit(self: *SlackApiResult, allocator: std.mem.Allocator) void {
             if (self.ts) |ts| allocator.free(ts);
             if (self.error_code) |code| allocator.free(code);
+            if (self.warning) |warning| allocator.free(warning);
             if (self.upload_url) |url| allocator.free(url);
             if (self.file_id) |id| allocator.free(id);
             self.* = .{};
@@ -1645,6 +1707,52 @@ pub const SlackChannel = struct {
         return true;
     }
 
+    /// Native Slack Stop: `agent_session_stopped` delivered over Socket Mode.
+    /// Authorizes the sender with the same policy gate as a typed `/stop`, then
+    /// publishes `/stop` immediately through the bounded stop path. Denied or
+    /// malformed events publish nothing.
+    fn handleAgentSessionStopped(
+        self: *SlackChannel,
+        payload_obj: std.json.ObjectMap,
+        event_obj: std.json.ObjectMap,
+    ) void {
+        if (!self.session_status_enabled) return;
+        // A lost ack makes Slack redeliver; the event_id dedupe below also
+        // covers that, and an explicit retry_attempt is ignored like the
+        // slash/interactive paths.
+        if (socketRetryAttempt(payload_obj) > 0 or socketRetryAttempt(event_obj) > 0) return;
+        if (self.inboundEventAlreadySeen(payload_obj, event_obj)) return;
+
+        const user = jsonStringValue(event_obj, "user") orelse return;
+        if (user.len == 0) return;
+        if (self.bot_user_id) |bot_uid| {
+            if (std.mem.eql(u8, user, bot_uid)) return;
+        }
+        const channel_id = jsonStringValue(event_obj, "channel") orelse return;
+        if (channel_id.len == 0) return;
+        const thread_ts = jsonStringValue(event_obj, "thread_ts");
+        const event_ts = jsonStringValue(event_obj, "event_ts");
+
+        // A native Stop is an explicit bot-directed action, so it counts as a
+        // mention exactly like a Block Kit button click.
+        if (!root.checkPolicyScoped("slack channel", self.policy, user, isDirectConversationId(channel_id), true)) {
+            log.warn("Slack agent_session_stopped denied by policy for {s}", .{user});
+            return;
+        }
+
+        self.publishInboundMessageTimeout(user, channel_id, "/stop", event_ts, thread_ts, STOP_PUBLISH_TIMEOUT_MS) catch |err| {
+            log.warn("Slack agent_session_stopped publish failed: {}", .{err});
+            return;
+        };
+
+        // Recover stale processing only when no turn remains for this thread.
+        if (thread_ts) |ts| {
+            if (self.activeTurnCount(channel_id, ts) == 0) {
+                self.setSessionStatus(channel_id, ts, .active, null);
+            }
+        }
+    }
+
     /// Handle a Slack `interactive` Socket Mode envelope (Block Kit button
     /// click). The envelope is already acked by the caller.
     pub fn handleInteractivePayload(self: *SlackChannel, payload_obj: std.json.ObjectMap) void {
@@ -2082,6 +2190,12 @@ pub const SlackChannel = struct {
         const event_type_val = event_val.object.get("type") orelse return;
         if (event_type_val != .string) return;
         const event_type = event_type_val.string;
+        if (std.mem.eql(u8, event_type, "agent_session_stopped")) {
+            // A lost ack makes Slack redeliver the whole envelope.
+            if (socketRetryAttempt(parsed.value.object) > 0) return;
+            self.handleAgentSessionStopped(payload_val.object, event_val.object);
+            return;
+        }
         if (!std.mem.eql(u8, event_type, "message") and !std.mem.eql(u8, event_type, "app_mention")) {
             return;
         }
@@ -2736,6 +2850,116 @@ pub const SlackChannel = struct {
         self.allocator.free(resp);
     }
 
+    /// Best-effort Slack Agents session status. Never throws; a missing
+    /// `agent_session_stopped` subscription or an app without Agent View is
+    /// logged once. Thread-only: a target without a thread is skipped.
+    pub fn setSessionStatus(
+        self: *SlackChannel,
+        channel_id: []const u8,
+        thread_ts: []const u8,
+        status: SessionStatus,
+        title: ?[]const u8,
+    ) void {
+        if (!self.session_status_enabled) return;
+        if (channel_id.len == 0 or thread_ts.len == 0) return;
+        if (builtin.is_test) self.test_session_status_calls += 1;
+
+        const body = buildSessionStatusRequestBody(self.allocator, channel_id, thread_ts, status, title) catch return;
+        defer self.allocator.free(body);
+
+        var result = self.callSlackApi("agents.sessions.setStatus", body, channel_id) catch return;
+        defer result.deinit(self.allocator);
+
+        if (result.warning) |warning| {
+            if (!self.session_status_warned and
+                (std.mem.eql(u8, warning, "missing_agent_session_stopped_event_subscription") or
+                    std.mem.eql(u8, warning, "agent_view_required")))
+            {
+                self.session_status_warned = true;
+                log.warn(
+                    "Slack session status needs Slack Agent View and the agent_session_stopped event subscription: {s}",
+                    .{warning},
+                );
+            }
+        }
+    }
+
+    fn turnKey(buf: []u8, channel_id: []const u8, thread_ts: []const u8) ?[]const u8 {
+        return std.fmt.bufPrint(buf, "{s}:{s}", .{ channel_id, thread_ts }) catch null;
+    }
+
+    fn beginSessionTurn(self: *SlackChannel, status_target: StatusTarget) void {
+        if (!self.session_status_enabled) return;
+
+        var key_buf: [512]u8 = undefined;
+        const key = turnKey(&key_buf, status_target.channel_id, status_target.thread_ts) orelse return;
+
+        self.turns_mu.lock();
+        const gop = self.active_turns.getOrPut(self.allocator, key) catch {
+            self.turns_mu.unlock();
+            return;
+        };
+        if (!gop.found_existing) {
+            gop.key_ptr.* = self.allocator.dupe(u8, key) catch {
+                _ = self.active_turns.remove(key);
+                self.turns_mu.unlock();
+                return;
+            };
+            gop.value_ptr.* = 0;
+        }
+        gop.value_ptr.* += 1;
+        self.turns_mu.unlock();
+
+        self.setSessionStatus(status_target.channel_id, status_target.thread_ts, .processing, null);
+    }
+
+    fn endSessionTurn(self: *SlackChannel, status_target: StatusTarget) void {
+        if (!self.session_status_enabled) return;
+
+        var key_buf: [512]u8 = undefined;
+        const key = turnKey(&key_buf, status_target.channel_id, status_target.thread_ts) orelse return;
+
+        var remaining: u32 = 0;
+        var found = false;
+        self.turns_mu.lock();
+        if (self.active_turns.getPtr(key)) |count_ptr| {
+            found = true;
+            if (count_ptr.* > 0) count_ptr.* -= 1;
+            remaining = count_ptr.*;
+            if (remaining == 0) {
+                const entry = self.active_turns.fetchRemove(key).?;
+                self.allocator.free(entry.key);
+            }
+        }
+        self.turns_mu.unlock();
+
+        // A stop with no matching start is stale: never mark active.
+        if (!found) return;
+        if (remaining == 0) {
+            self.setSessionStatus(status_target.channel_id, status_target.thread_ts, .active, null);
+        }
+    }
+
+    fn clearActiveTurns(self: *SlackChannel) void {
+        self.turns_mu.lock();
+        var turns = self.active_turns;
+        self.active_turns = .empty;
+        self.turns_mu.unlock();
+
+        var it = turns.iterator();
+        while (it.next()) |entry| self.allocator.free(entry.key_ptr.*);
+        turns.deinit(self.allocator);
+    }
+
+    fn activeTurnCount(self: *SlackChannel, channel_id: []const u8, thread_ts: []const u8) u32 {
+        if (!self.session_status_enabled) return 0;
+        var key_buf: [512]u8 = undefined;
+        const key = turnKey(&key_buf, channel_id, thread_ts) orelse return 0;
+        self.turns_mu.lock();
+        defer self.turns_mu.unlock();
+        return if (self.active_turns.get(key)) |count| count else 0;
+    }
+
     fn parseStatusTarget(target: []const u8) ?StatusTarget {
         const idx = std.mem.indexOfScalar(u8, target, ':') orelse return null;
         if (idx == 0) return null;
@@ -2753,6 +2977,8 @@ pub const SlackChannel = struct {
     pub fn startTyping(self: *SlackChannel, target: []const u8) !void {
         if (!self.running.load(.acquire)) return;
         const status_target = parseStatusTarget(target) orelse return;
+
+        self.beginSessionTurn(status_target);
 
         if (!self.tool_progress_enabled) {
             self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "is typing...", null);
@@ -2796,6 +3022,7 @@ pub const SlackChannel = struct {
         if (!self.running.load(.acquire)) return;
         const status_target = parseStatusTarget(target) orelse return;
         self.stopProgressTarget(target);
+        self.endSessionTurn(status_target);
         self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "", null);
     }
 
@@ -3045,6 +3272,7 @@ pub const SlackChannel = struct {
         self.deinitPendingInteractions();
         self.clearChannelCursors();
         self.stopAllProgress();
+        self.clearActiveTurns();
         self.deinitStreamStates();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
@@ -3852,6 +4080,25 @@ pub const SlackChannel = struct {
         if (parsed.value.object.get("file_id")) |file_id_val| {
             if (file_id_val == .string and file_id_val.string.len > 0) {
                 result.file_id = try self.allocator.dupe(u8, file_id_val.string);
+            }
+        }
+        if (parsed.value.object.get("warning")) |warning_val| {
+            if (warning_val == .string and warning_val.string.len > 0) {
+                result.warning = try self.allocator.dupe(u8, warning_val.string);
+            }
+        }
+        if (result.warning == null) {
+            if (parsed.value.object.get("response_metadata")) |meta_val| {
+                if (meta_val == .object) {
+                    if (meta_val.object.get("warnings")) |warnings_val| {
+                        if (warnings_val == .array and warnings_val.array.items.len > 0) {
+                            const first = warnings_val.array.items[0];
+                            if (first == .string and first.string.len > 0) {
+                                result.warning = try self.allocator.dupe(u8, first.string);
+                            }
+                        }
+                    }
+                }
             }
         }
         if (slackApiErrorInfo(parsed.value.object)) |info| {
@@ -4807,6 +5054,281 @@ test "slack buildThreadStatusRequestBody includes loading messages" {
         "{\"channel_id\":\"C12345\",\"thread_ts\":\"1700000000.100\",\"status\":\"is working\u{2026}\",\"loading_messages\":[\"\u{1F527} web_search \\\"quoted\\\"\"]}",
         body,
     );
+}
+
+test "slack buildSessionStatusRequestBody serializes status enum and title" {
+    const alloc = std.testing.allocator;
+    const body_proc = try buildSessionStatusRequestBody(alloc, "C123", "1700.1", .processing, null);
+    defer alloc.free(body_proc);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"C123\",\"thread_ts\":\"1700.1\",\"status\":\"processing\"}", body_proc);
+
+    const body_active = try buildSessionStatusRequestBody(alloc, "C123", "1700.1", .active, null);
+    defer alloc.free(body_active);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"C123\",\"thread_ts\":\"1700.1\",\"status\":\"active\"}", body_active);
+
+    const body_susp = try buildSessionStatusRequestBody(alloc, "C123", "1700.1", .suspended, null);
+    defer alloc.free(body_susp);
+    try std.testing.expectEqualStrings("{\"channel_id\":\"C123\",\"thread_ts\":\"1700.1\",\"status\":\"suspended\"}", body_susp);
+}
+
+test "slack buildSessionStatusRequestBody truncates title to 200 utf8 chars" {
+    const alloc = std.testing.allocator;
+    const long_title = "a" ** 250;
+    const body = try buildSessionStatusRequestBody(alloc, "C123", "1700.1", .active, long_title);
+    defer alloc.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    const title_val = parsed.value.object.get("title").?.string;
+    try std.testing.expectEqual(@as(usize, 200), title_val.len);
+}
+
+test "slack session status is no-op when disabled" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "tok",
+        .session_status = false,
+    });
+    defer ch.channel().stop();
+    ch.running.store(true, .release);
+
+    ch.setSessionStatus("C123", "1700.1", .processing, null);
+    try std.testing.expectEqual(@as(u32, 0), ch.test_session_status_calls);
+
+    try ch.startTyping("C123:1700.1");
+    try ch.stopTyping("C123:1700.1");
+    try std.testing.expectEqual(@as(u32, 0), ch.test_session_status_calls);
+}
+
+test "slack session status is no-op for top-level target without thread" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "tok",
+        .session_status = true,
+    });
+    defer ch.channel().stop();
+    ch.running.store(true, .release);
+
+    ch.setSessionStatus("C123", "", .processing, null);
+    try std.testing.expectEqual(@as(u32, 0), ch.test_session_status_calls);
+
+    try ch.startTyping("C123");
+    try ch.stopTyping("C123");
+    try std.testing.expectEqual(@as(u32, 0), ch.test_session_status_calls);
+}
+
+test "slack per-target active turns prevent early active status" {
+    var ch = SlackChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "tok",
+        .session_status = true,
+    });
+    defer ch.channel().stop();
+    ch.running.store(true, .release);
+
+    try ch.startTyping("C123:1700.1");
+    try std.testing.expectEqual(@as(u32, 1), ch.test_session_status_calls);
+    try std.testing.expectEqual(@as(u32, 1), ch.activeTurnCount("C123", "1700.1"));
+
+    try ch.startTyping("C123:1700.1");
+    try std.testing.expectEqual(@as(u32, 2), ch.test_session_status_calls);
+    try std.testing.expectEqual(@as(u32, 2), ch.activeTurnCount("C123", "1700.1"));
+
+    // Turn 1 ends while Turn 2 still runs: no active status.
+    try ch.stopTyping("C123:1700.1");
+    try std.testing.expectEqual(@as(u32, 2), ch.test_session_status_calls);
+    try std.testing.expectEqual(@as(u32, 1), ch.activeTurnCount("C123", "1700.1"));
+
+    // Turn 2 ends: active status now.
+    try ch.stopTyping("C123:1700.1");
+    try std.testing.expectEqual(@as(u32, 3), ch.test_session_status_calls);
+    try std.testing.expectEqual(@as(u32, 0), ch.activeTurnCount("C123", "1700.1"));
+}
+
+test "slack agent_session_stopped authorized sender publishes one /stop" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[0]);
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    const allowed = [_][]const u8{"U_ALLOWED"};
+    var ch = SlackChannel.initFromConfig(alloc, .{
+        .bot_token = "tok",
+        .allow_from = &allowed,
+        .dm_policy = "allowlist",
+        .group_policy = "allowlist",
+        .session_status = true,
+    });
+    ch.account_id = "sl-main";
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    const envelope =
+        \\{"type":"events_api","envelope_id":"e_stop_1","payload":{"event":{"type":"agent_session_stopped","user":"U_ALLOWED","channel":"C1","thread_ts":"1700.1","event_ts":"1700.2"}}}
+    ;
+    try ch.handleSocketPayload(&ws, envelope);
+
+    var msg = (eb.consumeInboundTimeout(0) catch return error.TestExpectedEqual) orelse
+        return error.TestExpectedEqual;
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("/stop", msg.content);
+    try std.testing.expectEqualStrings("U_ALLOWED", msg.sender_id);
+    try std.testing.expectEqualStrings("C1:1700.1", msg.chat_id);
+
+    const extra = (eb.consumeInboundTimeout(0) catch null);
+    if (extra) |m| {
+        var owned = m;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect(extra == null);
+}
+
+test "slack agent_session_stopped denied sender publishes nothing" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[0]);
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    const allowed = [_][]const u8{"U_ALLOWED"};
+    var ch = SlackChannel.initFromConfig(alloc, .{
+        .bot_token = "tok",
+        .allow_from = &allowed,
+        .dm_policy = "allowlist",
+        .group_policy = "allowlist",
+        .session_status = true,
+    });
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    const envelope =
+        \\{"type":"events_api","envelope_id":"e_stop_denied","payload":{"event":{"type":"agent_session_stopped","user":"U_ATTACKER","channel":"C1","thread_ts":"1700.1"}}}
+    ;
+    try ch.handleSocketPayload(&ws, envelope);
+
+    const queued = (eb.consumeInboundTimeout(0) catch null);
+    if (queued) |m| {
+        var owned = m;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect(queued == null);
+}
+
+test "slack agent_session_stopped retry envelope is ignored" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[0]);
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    var ch = SlackChannel.initFromConfig(alloc, .{
+        .bot_token = "tok",
+        .session_status = true,
+    });
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    const envelope =
+        \\{"type":"events_api","envelope_id":"e_retry","retry_attempt":1,"payload":{"event":{"type":"agent_session_stopped","user":"U1","channel":"C1","thread_ts":"1700.1"}}}
+    ;
+    try ch.handleSocketPayload(&ws, envelope);
+
+    const queued = (eb.consumeInboundTimeout(0) catch null);
+    if (queued) |m| {
+        var owned = m;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect(queued == null);
+}
+
+test "slack agent_session_stopped duplicate event id is ignored" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or
+        @TypeOf(std.posix.system.socketpair) == void)
+    {
+        return error.SkipZigTest;
+    }
+    const alloc = std.testing.allocator;
+    var eb = bus_mod.Bus.init();
+    defer eb.close();
+
+    const sockets = try websocket.createTestSocketPair();
+    defer std.Io.Threaded.closeFd(sockets[0]);
+    defer std.Io.Threaded.closeFd(sockets[1]);
+
+    var ch = SlackChannel.initFromConfig(alloc, .{
+        .bot_token = "tok",
+        .session_status = true,
+    });
+    ch.policy = .{ .dm = .allow, .group = .open };
+    ch.setBus(&eb);
+    defer ch.channel().stop();
+
+    var ws = websocket.WsClient{
+        .allocator = alloc,
+        .stream = .{ .handle = sockets[0] },
+        .tls = null,
+        .write_mu = .{},
+    };
+
+    const envelope =
+        \\{"type":"events_api","envelope_id":"e_dup","payload":{"event_id":"Ev_DUP","event":{"type":"agent_session_stopped","user":"U1","channel":"C1","thread_ts":"1700.1"}}}
+    ;
+    try ch.handleSocketPayload(&ws, envelope);
+
+    var first = (eb.consumeInboundTimeout(0) catch return error.TestExpectedEqual) orelse
+        return error.TestExpectedEqual;
+    defer first.deinit(alloc);
+    try std.testing.expectEqualStrings("/stop", first.content);
+
+    // Same event_id delivered again: the dedupe table drops it.
+    try ch.handleSocketPayload(&ws, envelope);
+    const dup = (eb.consumeInboundTimeout(0) catch null);
+    if (dup) |m| {
+        var owned = m;
+        owned.deinit(alloc);
+    }
+    try std.testing.expect(dup == null);
 }
 
 test "slack startTyping and stopTyping are safe in tests" {
