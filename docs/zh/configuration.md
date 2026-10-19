@@ -1164,7 +1164,7 @@ nullclaw channel status
 自动重置会话记录，在下一条入站消息到达时惰性判断（没有定时器）。默认不启用。
 
 - `session.reset.mode`：`none`（默认）、`daily` 或 `idle`。
-- `session.reset.at_hour`（默认 `4`）：每日重置边界的小时，自动夹到 `0`-`23`。**按 UTC 计算**；OpenClaw 使用宿主机本地时区。
+- `session.reset.at_hour`（默认 `4`）：每日重置边界的小时，自动夹到 `0`-`23`。边界按 `agent.timezone` 计算，该字段支持 `UTC` 或固定偏移如 `UTC+08:00` / `UTC-05:00`（默认 `UTC`），不支持 IANA 名称和夏令时。OpenClaw 则读取宿主机本地时区。
 - `session.reset.idle_minutes`：`idle` 模式下的空闲分钟数，必须为正数；`null` 表示永不过期。
 - `session.reset_by_type`：可选的 `direct`、`group`、`thread` 覆盖。存在的条目会整体替换该类型的 `reset` 策略；thread key 优先于 group key。
 - 配置键使用 snake_case，同时接受 OpenClaw 的 camelCase 别名（`atHour`、`idleMinutes`、`resetByType`）。未写 `mode` 的 reset 块按 `daily` 处理（与 OpenClaw 一致）。

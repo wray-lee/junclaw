@@ -380,6 +380,12 @@ pub const Session = struct {
     session_key: []const u8, // owned copy
     turn_count: u64,
     turn_running: std.atomic.Value(bool),
+    /// True from the moment a caller claims the session for a turn (under
+    /// SessionManager.mutex) until the turn actually starts under
+    /// Session.mutex. Closes the reset TOCTOU window: without it, a concurrent
+    /// getOrCreate could reset the session between the reset decision and the
+    /// turn start. Set and cleared only under SessionManager.mutex.
+    turn_pending: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// True while the turn is tearing down: new mid-turn deposits are refused
     /// and fall back to a fresh turn, so nothing is stranded after the last drain.
     turn_closing: std.atomic.Value(bool),
@@ -1802,6 +1808,19 @@ pub const SessionManager = struct {
 
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
+        return self.getOrCreateForTurn(session_key, false);
+    }
+
+    /// Find or create a session for the given key, optionally marking it as
+    /// claimed for an about-to-start turn (`for_turn`).
+    ///
+    /// `for_turn` is what makes the automatic reset race-free: the claim and
+    /// the reset decision happen under the same `SessionManager.mutex` hold,
+    /// so a concurrent getOrCreate for the same key cannot reset the session
+    /// after a caller has already decided to run a turn in it. The claim is
+    /// released by `beginTurn` (which sets `turn_running`) or by
+    /// `abandonTurn` on every failure exit of the caller. Caller holds no lock.
+    pub fn getOrCreateForTurn(self: *SessionManager, session_key: []const u8, for_turn: bool) !*Session {
         self.mutex.lock();
         defer self.mutex.unlock();
 
@@ -1811,9 +1830,14 @@ pub const SessionManager = struct {
             // so an idle policy can still see the previous interaction.
             // Lock order: SessionManager.mutex -> (agent/memory/store); no
             // reset path acquires session.mutex or re-enters the manager.
+            // maybeResetLocked bails out when a turn is running or claimed
+            // (turn_pending is set below under this same mutex hold), so a
+            // session already claimed for a turn is never reset out from under
+            // its caller.
             if (!session.turn_running.load(.acquire)) {
                 self.maybeResetLocked(session, now);
             }
+            if (for_turn) session.turn_pending.store(true, .release);
             session.last_active = now;
             return session;
         }
@@ -1909,6 +1933,7 @@ pub const SessionManager = struct {
             .session_key = owned_key,
             .turn_count = 0,
             .turn_running = std.atomic.Value(bool).init(false),
+            .turn_pending = std.atomic.Value(bool).init(false),
             .turn_closing = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
@@ -1946,8 +1971,14 @@ pub const SessionManager = struct {
     /// Reset a stale session through the shared /new path. Caller holds
     /// self.mutex and has verified that no turn is running.
     fn maybeResetLocked(self: *SessionManager, session: *Session, now: i64) void {
+        // A turn that is running or merely claimed must never be reset: the
+        // claim is set under this same mutex (see getOrCreateForTurn), so this
+        // check is race-free.
+        if (session.turn_pending.load(.acquire) or session.turn_running.load(.acquire)) return;
+
         const policy = session_reset.resolvePolicy(self.config.session, session.session_key);
-        if (!session_reset.isStale(policy, now, session.created_at, session.last_active)) return;
+        const tz_offset_secs = config_types.AgentConfig.parseTimezoneOffsetSeconds(self.config.agent.timezone) orelse 0;
+        if (!session_reset.isStale(policy, now, session.created_at, session.last_active, tz_offset_secs)) return;
 
         agent_mod.commands.clearSessionState(&session.agent);
         if (session.agent.session_store) |store| {
@@ -2164,6 +2195,31 @@ pub const SessionManager = struct {
         session.mutex.lock();
     }
 
+    /// Promote a session claimed by `getOrCreateForTurn` to a running turn.
+    /// The caller owns `session` for the whole turn, so it clears the pending
+    /// claim itself once `turn_running` is visible; no manager lock is needed.
+    ///
+    /// Order matters: `turn_running` must be visible before `turn_pending` is
+    /// dropped, otherwise a concurrent getOrCreate could observe both as false
+    /// and reset a session whose turn is about to start.
+    fn beginTurn(session: *Session) void {
+        session.turn_closing.store(false, .release);
+        session.turn_running.store(true, .release);
+        session.turn_pending.store(false, .release);
+    }
+
+    /// Release a claim left behind by a `getOrCreateForTurn` whose caller is
+    /// unwinding, so a later getOrCreate can still reset a stale session.
+    /// `turn_pending` is owned by `SessionManager.mutex`, so it is cleared
+    /// under that mutex, and only by this path: a live turn clears it itself
+    /// (see beginTurn) before it ever releases the session.
+    fn abandonTurn(self: *SessionManager, session: *Session) void {
+        if (!session.turn_pending.load(.acquire)) return;
+        self.mutex.lock();
+        session.turn_pending.store(false, .release);
+        self.mutex.unlock();
+    }
+
     /// Result of routing and processing an inbound message. `reply` is owned by
     /// the session manager allocator and is null when no turn ran.
     pub const InboundResult = struct {
@@ -2203,13 +2259,17 @@ pub const SessionManager = struct {
         content: []const u8,
         conversation_context: ?ConversationContext,
     ) !?[]const u8 {
-        const session = try self.getOrCreate(session_key);
+        // The claim is registered before the session lock, so Zig's LIFO
+        // unwinding releases it only once the lock is gone: the whole local
+        // command is protected from a concurrent reset, and the session never
+        // reports itself busy (`turn_running` stays false), so a concurrent
+        // message still starts its own turn instead of steering into a buffer
+        // this path never drains.
+        const session = try self.getOrCreateForTurn(session_key, true);
+        defer self.abandonTurn(session);
 
         lockSessionForTurn(session);
         defer session.mutex.unlock();
-        // The command runs locally under the session lock, so the session is
-        // not busy: a concurrent message must start its own turn instead of
-        // steering into a buffer this path never drains.
 
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
@@ -2596,7 +2656,8 @@ pub const SessionManager = struct {
             return gate_reply;
         }
 
-        const session = try self.getOrCreate(session_key);
+        const session = try self.getOrCreateForTurn(session_key, true);
+        errdefer self.abandonTurn(session);
 
         // A /stop that landed before this session existed recorded a pre-turn
         // interrupt in the manager; consume it before the turn lock so the
@@ -2611,8 +2672,8 @@ pub const SessionManager = struct {
 
         lockSessionForTurn(session);
         defer session.mutex.unlock();
-        session.turn_closing.store(false, .release);
-        session.turn_running.store(true, .release);
+        // Promotes the claim from getOrCreateForTurn into a running turn.
+        beginTurn(session);
         defer {
             // Clear the busy flag first: a router that observes it must not
             // deposit into a turn that is already gone.
@@ -8736,4 +8797,96 @@ test "auto reset is skipped while a turn is running" {
 
     const again = try sm.getOrCreate(session_key);
     try testing.expectEqual(history_len, again.agent.history.items.len);
+}
+
+test "auto reset does not fire for a session claimed for a turn (TOCTOU)" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .idle, .idle_minutes = 1 };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:direct:claimed-reset";
+    // The session exists and holds live history from a previous turn.
+    const session = try sm.getOrCreate(session_key);
+    const reply = try session.agent.turn("live conversation");
+    testing.allocator.free(reply);
+    try testing.expect(session.agent.history.items.len > 0);
+
+    // Every getOrCreate refreshes last_active, so staleness is re-applied
+    // before each step that needs a live reset decision.
+    const makeStale = struct {
+        fn apply(s: *Session) void {
+            const stale = std_compat.time.timestamp() - 600;
+            s.created_at = stale;
+            s.last_active = stale;
+        }
+    }.apply;
+
+    // The first claimant owns the reset decision: it resets the stale session
+    // and takes the claim in the same SessionManager.mutex hold (single-threaded
+    // stand-in for the getOrCreateForTurn -> lockSessionForTurn window).
+    makeStale(session);
+    const claimed = try sm.getOrCreateForTurn(session_key, true);
+    try testing.expectEqual(@as(usize, 0), claimed.agent.history.items.len);
+    const reset_at = claimed.created_at;
+    try testing.expect(claimed.turn_pending.load(.acquire));
+    // The claim is visible on the live session.
+    try testing.expect(session.turn_pending.load(.acquire));
+
+    // While the claim is live, nobody else may reset: a fresh-stale session
+    // keeps its timestamps (a reset would push created_at to "now").
+    makeStale(claimed);
+    const stale_at = claimed.created_at;
+    const second = try sm.getOrCreate(session_key);
+    try testing.expectEqual(stale_at, second.created_at);
+    try testing.expect(second.turn_pending.load(.acquire));
+
+    const third = try sm.getOrCreateForTurn(session_key, true);
+    try testing.expectEqual(stale_at, third.created_at);
+    try testing.expect(third.turn_pending.load(.acquire));
+    try testing.expect(reset_at > stale_at);
+
+    // Once the claim is released, the staleness is acted on normally.
+    claimed.turn_pending.store(false, .release);
+    makeStale(session);
+    const after = try sm.getOrCreate(session_key);
+    try testing.expect(!after.turn_pending.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), after.agent.history.items.len);
+    try testing.expect(after.created_at > stale_at);
+}
+
+test "abandonTurn releases a claim so a stale session can still reset" {
+    var mock = MockProvider{ .response = "reply" };
+    var cfg = testConfig();
+    cfg.session.reset = .{ .mode = .idle, .idle_minutes = 1 };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session_key = "agent:main:telegram:direct:failed-claim";
+    const session = try sm.getOrCreate(session_key);
+    const reply = try session.agent.turn("live conversation");
+    testing.allocator.free(reply);
+
+    // Mirrors the errdefer in processMessageStreamingWithSteerSink: a claim is
+    // taken and the caller unwinds without ever reaching beginTurn.
+    _ = failClaimedTurn(&sm, session_key) catch {};
+
+    // The stale session becomes resettable again once the claim is released.
+    const stale = std_compat.time.timestamp() - 600;
+    session.created_at = stale;
+    session.last_active = stale;
+    const after = try sm.getOrCreate(session_key);
+    try testing.expect(!after.turn_pending.load(.acquire));
+    try testing.expectEqual(@as(usize, 0), after.agent.history.items.len);
+    try testing.expect(after.created_at > stale);
+}
+
+/// Takes a turn claim and unwinds before the turn starts, exactly as the
+/// `errdefer self.abandonTurn(session)` in the streaming path does.
+fn failClaimedTurn(sm: *SessionManager, session_key: []const u8) !void {
+    const session = try sm.getOrCreateForTurn(session_key, true);
+    errdefer sm.abandonTurn(session);
+    // Simulated failure exit of the caller.
+    return error.ProviderError;
 }
