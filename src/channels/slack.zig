@@ -15,6 +15,8 @@ const bus_mod = @import("../bus.zig");
 const websocket = @import("../websocket.zig");
 const stream_presenter = @import("slack_stream_presenter.zig");
 const md_tables = @import("md_tables.zig");
+const tool_progress = @import("tool_progress.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
@@ -28,6 +30,19 @@ const invalid_socket: SocketFd = switch (builtin.os.tag) {
 
 const CALLBACK_VALUE_PREFIX = "ncslack:";
 const DEFAULT_INTERACTION_TTL_SECS: u64 = 900;
+
+/// Assistant status title; Slack renders it as "<App Name> is working…".
+const PROGRESS_STATUS_TITLE = "is working…";
+/// One loading line, matching tool_progress's per-line budget.
+const PROGRESS_LINE_MAX_CHARS: usize = tool_progress.LINE_MAX_CHARS;
+/// At most one status POST per target per second; newer tool events coalesce
+/// into the next keepalive tick.
+const PROGRESS_MIN_INTERVAL_MS: i64 = std.time.ms_per_s;
+/// Slack clears an assistant status after two minutes without a message, so
+/// refresh while a turn runs. 6s matches OpenClaw's typing keepalive default
+/// (docs/concepts/typing-indicators.md).
+const PROGRESS_REFRESH_INTERVAL_NS: u64 = 6 * std.time.ns_per_s;
+const PROGRESS_SLEEP_STEP_NS: u64 = 100 * std.time.ns_per_ms;
 
 /// Parse a Block Kit button value (`ncslack:<token>:<index>`), as emitted by
 /// `appendInteractivePostMessageBody`. Shared by the HTTP webhook and Socket
@@ -110,6 +125,7 @@ fn buildThreadStatusRequestBody(
     channel_id: []const u8,
     thread_ts: []const u8,
     status: []const u8,
+    loading_messages: ?[]const []const u8,
 ) ![]u8 {
     var body_list: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_list.deinit(allocator);
@@ -122,9 +138,43 @@ fn buildThreadStatusRequestBody(
     try root.appendJsonStringW(bw, thread_ts);
     try bw.writeAll(",\"status\":");
     try root.appendJsonStringW(bw, status);
+    if (loading_messages) |messages| {
+        if (messages.len > 0) {
+            try bw.writeAll(",\"loading_messages\":[");
+            for (messages, 0..) |message, i| {
+                if (i > 0) try bw.writeByte(',');
+                try root.appendJsonStringW(bw, message);
+            }
+            try bw.writeByte(']');
+        }
+    }
     try bw.writeByte('}');
     body_list = body_writer.toArrayList();
     return try body_list.toOwnedSlice(allocator);
+}
+
+const StatusTarget = struct {
+    channel_id: []const u8,
+    thread_ts: []const u8,
+};
+
+/// Pick the newest safe operation line for the assistant loading indicator.
+/// Lines come from tool_progress, which already strips raw arguments and
+/// control bytes; this only selects and clamps.
+fn buildProgressLoadingMessage(allocator: std.mem.Allocator, progress: *const tool_progress.ToolProgress) !?[]u8 {
+    if (progress.retry) |retry| {
+        return try std.fmt.allocPrint(allocator, "Retrying ({d}/{d})…", .{ retry.attempt, retry.max });
+    }
+    if (progress.lines.items.len == 0) return null;
+    const latest = progress.lines.items[progress.lines.items.len - 1].text;
+    return try tool_progress.clampUtf8(allocator, latest, PROGRESS_LINE_MAX_CHARS);
+}
+
+/// The first render bypasses the throttle so the first tool call is visible
+/// immediately; later updates coalesce to one POST per second.
+fn shouldSendProgress(progress: *const tool_progress.ToolProgress, last_sent_ms: i64, now_ms: i64) bool {
+    if (!progress.rendered) return true;
+    return now_ms - last_sent_ms >= PROGRESS_MIN_INTERVAL_MS;
 }
 
 /// Build the JSON body for an ephemeral slash-command reply. Split out of
@@ -380,6 +430,8 @@ pub const SlackChannel = struct {
     implicit_thread_mention: bool = true,
     /// Test seam: counts native chat.stopStream calls (the API is stubbed).
     test_native_stop_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
+    test_status_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
+    test_spawn_keepalive: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     test_api_ctx: if (builtin.is_test) ?*anyopaque else void = if (builtin.is_test) null else {},
     test_api_call: if (builtin.is_test) ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!SlackApiResult else void = if (builtin.is_test) null else {},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
@@ -388,6 +440,28 @@ pub const SlackChannel = struct {
     bot_api_app_id: ?[]u8 = null,
     slash_command_enabled: bool = false,
     slash_command_name: []const u8 = "nullclaw",
+    /// Render tool progress in the assistant thread status
+    /// (config_types.SlackConfig.tool_progress).
+    tool_progress_enabled: bool = true,
+    /// Guards `progress_targets`.
+    progress_mu: std_compat.sync.Mutex = .{},
+    /// Per-turn progress state keyed by the exact outbound target
+    /// ("channel_id:thread_ts"). Owns the key, state and keepalive thread.
+    progress_targets: std.StringHashMapUnmanaged(*ProgressTarget) = .empty,
+
+    /// Rolling progress for one thread target. Lives from startTyping to
+    /// stopTyping; the keepalive thread is joined before it is freed.
+    const ProgressTarget = struct {
+        progress: tool_progress.ToolProgress = .{},
+        last_sent_ms: i64 = 0,
+        stop_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        thread: ?std.Thread = null,
+    };
+
+    const ProgressEntry = struct {
+        key: []u8,
+        state: *ProgressTarget,
+    };
 
     pub const API_BASE = "https://slack.com/api";
     pub const DEFAULT_WEBHOOK_PATH = "/slack/events";
@@ -478,6 +552,7 @@ pub const SlackChannel = struct {
         ch.slash_command_name = if (cfg.slash_command.name.len == 0) "nullclaw" else cfg.slash_command.name;
         ch.streaming_enabled = cfg.streaming;
         ch.long_reply_file_threshold_chunks = cfg.long_reply_file_threshold_chunks;
+        ch.tool_progress_enabled = cfg.tool_progress;
         ch.status_reactions_enabled = cfg.status_reactions;
         ch.reaction_emojis = cfg.reaction_emojis;
         return ch;
@@ -2632,12 +2707,22 @@ pub const SlackChannel = struct {
     }
 
     /// Set Slack Assistant thread status (best-effort, errors ignored).
-    pub fn setThreadStatus(self: *SlackChannel, channel_id: []const u8, thread_ts: []const u8, status: []const u8) void {
-        if (builtin.is_test) return;
+    /// `loading_messages` rotates under the status as a loading indicator.
+    pub fn setThreadStatus(
+        self: *SlackChannel,
+        channel_id: []const u8,
+        thread_ts: []const u8,
+        status: []const u8,
+        loading_messages: ?[]const []const u8,
+    ) void {
+        if (builtin.is_test) {
+            self.test_status_calls += 1;
+            return;
+        }
         if (channel_id.len == 0 or thread_ts.len == 0) return;
 
         const url = API_BASE ++ "/assistant.threads.setStatus";
-        const body = buildThreadStatusRequestBody(self.allocator, channel_id, thread_ts, status) catch return;
+        const body = buildThreadStatusRequestBody(self.allocator, channel_id, thread_ts, status, loading_messages) catch return;
         defer self.allocator.free(body);
 
         var auth_buf: [512]u8 = undefined;
@@ -2649,7 +2734,7 @@ pub const SlackChannel = struct {
         self.allocator.free(resp);
     }
 
-    fn parseStatusTarget(target: []const u8) ?struct { channel_id: []const u8, thread_ts: []const u8 } {
+    fn parseStatusTarget(target: []const u8) ?StatusTarget {
         const idx = std.mem.indexOfScalar(u8, target, ':') orelse return null;
         if (idx == 0) return null;
         const channel_id = target[0..idx];
@@ -2661,16 +2746,158 @@ pub const SlackChannel = struct {
         };
     }
 
+    /// Start the per-turn progress state and keepalive for a thread target.
+    /// With tool_progress off, keeps the old one-shot "is typing..." status.
     pub fn startTyping(self: *SlackChannel, target: []const u8) !void {
         if (!self.running.load(.acquire)) return;
         const status_target = parseStatusTarget(target) orelse return;
-        self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "is typing...");
+
+        if (!self.tool_progress_enabled) {
+            self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "is typing...", null);
+            return;
+        }
+
+        self.stopProgressTarget(target);
+
+        const key = try self.allocator.dupe(u8, target);
+        errdefer self.allocator.free(key);
+        const state = try self.allocator.create(ProgressTarget);
+        errdefer self.allocator.destroy(state);
+        state.* = .{};
+
+        self.progress_mu.lock();
+        self.progress_targets.put(self.allocator, key, state) catch |err| {
+            self.progress_mu.unlock();
+            return err;
+        };
+        self.progress_mu.unlock();
+
+        if (!builtin.is_test or self.test_spawn_keepalive) {
+            state.thread = std.Thread.spawn(
+                .{ .stack_size = thread_stacks.HEAVY_RUNTIME_STACK_SIZE },
+                progressLoop,
+                .{ self, state, key },
+            ) catch |err| {
+                self.stopProgressTarget(target);
+                return err;
+            };
+        }
+
+        self.setThreadStatus(status_target.channel_id, status_target.thread_ts, PROGRESS_STATUS_TITLE, null);
     }
 
     pub fn stopTyping(self: *SlackChannel, target: []const u8) !void {
         if (!self.running.load(.acquire)) return;
         const status_target = parseStatusTarget(target) orelse return;
-        self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "");
+        self.stopProgressTarget(target);
+        self.setThreadStatus(status_target.channel_id, status_target.thread_ts, "", null);
+    }
+
+    /// Record one tool event for an existing turn target. Events for targets
+    /// that never called startTyping (top-level messages have no thread_ts) are
+    /// dropped: `assistant.threads.setStatus` is thread-only.
+    pub fn recordToolProgress(self: *SlackChannel, target: []const u8, update: tool_progress.Update) void {
+        if (!self.tool_progress_enabled) return;
+        const status_target = parseStatusTarget(target) orelse return;
+
+        var loading: ?[]u8 = null;
+        {
+            self.progress_mu.lock();
+            defer self.progress_mu.unlock();
+
+            const state = (self.progress_targets.getPtr(target) orelse return).*;
+            const now_ms = std_compat.time.milliTimestamp();
+            const changed = state.progress.record(self.allocator, update, now_ms) catch return;
+            if (!changed) return;
+            if (!shouldSendProgress(&state.progress, state.last_sent_ms, now_ms)) return;
+
+            loading = buildProgressLoadingMessage(self.allocator, &state.progress) catch return;
+            state.progress.markRendered();
+            state.last_sent_ms = now_ms;
+        }
+        defer if (loading) |line| self.allocator.free(line);
+
+        if (loading) |line| {
+            self.setThreadStatus(status_target.channel_id, status_target.thread_ts, PROGRESS_STATUS_TITLE, &.{line});
+        } else {
+            self.setThreadStatus(status_target.channel_id, status_target.thread_ts, PROGRESS_STATUS_TITLE, null);
+        }
+    }
+
+    /// Keep the assistant status alive while a turn runs: Slack clears it after
+    /// two minutes without a message, which a long single tool call can exceed.
+    fn progressLoop(self: *SlackChannel, state: *ProgressTarget, target: []const u8) void {
+        const status_target = parseStatusTarget(target) orelse return;
+        while (!state.stop_requested.load(.acquire)) {
+            var elapsed: u64 = 0;
+            while (elapsed < PROGRESS_REFRESH_INTERVAL_NS and !state.stop_requested.load(.acquire)) {
+                std_compat.thread.sleep(PROGRESS_SLEEP_STEP_NS);
+                elapsed += PROGRESS_SLEEP_STEP_NS;
+            }
+            if (state.stop_requested.load(.acquire)) return;
+            self.refreshProgressStatus(status_target, state);
+        }
+    }
+
+    fn refreshProgressStatus(self: *SlackChannel, status_target: StatusTarget, state: *ProgressTarget) void {
+        var loading: ?[]u8 = null;
+        {
+            self.progress_mu.lock();
+            defer self.progress_mu.unlock();
+
+            if (state.stop_requested.load(.acquire)) return;
+            loading = buildProgressLoadingMessage(self.allocator, &state.progress) catch null;
+            state.progress.markRendered();
+            state.last_sent_ms = std_compat.time.milliTimestamp();
+        }
+        defer if (loading) |line| self.allocator.free(line);
+
+        if (loading) |line| {
+            self.setThreadStatus(status_target.channel_id, status_target.thread_ts, PROGRESS_STATUS_TITLE, &.{line});
+        } else {
+            self.setThreadStatus(status_target.channel_id, status_target.thread_ts, PROGRESS_STATUS_TITLE, null);
+        }
+    }
+
+    fn takeProgressTarget(self: *SlackChannel, target: []const u8) ?ProgressEntry {
+        self.progress_mu.lock();
+        defer self.progress_mu.unlock();
+        const entry = self.progress_targets.fetchRemove(target) orelse return null;
+        if (self.progress_targets.count() == 0) {
+            self.progress_targets.deinit(self.allocator);
+            self.progress_targets = .empty;
+        }
+        return .{ .key = @constCast(entry.key), .state = entry.value };
+    }
+
+    fn destroyProgressEntry(self: *SlackChannel, entry: ProgressEntry) void {
+        entry.state.progress.deinit(self.allocator);
+        self.allocator.destroy(entry.state);
+        self.allocator.free(entry.key);
+    }
+
+    fn stopProgressTarget(self: *SlackChannel, target: []const u8) void {
+        const entry = self.takeProgressTarget(target) orelse return;
+        entry.state.stop_requested.store(true, .release);
+        if (entry.state.thread) |thread| thread.join();
+        self.destroyProgressEntry(entry);
+    }
+
+    /// Join every keepalive thread on channel stop.
+    pub fn stopAllProgress(self: *SlackChannel) void {
+        self.progress_mu.lock();
+        var targets = self.progress_targets;
+        self.progress_targets = .empty;
+        self.progress_mu.unlock();
+
+        var it = targets.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            state.stop_requested.store(true, .release);
+            if (state.thread) |thread| thread.join();
+            self.destroyProgressEntry(.{ .key = @constCast(entry.key_ptr.*), .state = state });
+        }
+        targets.deinit(self.allocator);
     }
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -2810,6 +3037,7 @@ pub const SlackChannel = struct {
         }
         self.deinitPendingInteractions();
         self.clearChannelCursors();
+        self.stopAllProgress();
         self.deinitStreamStates();
         if (self.last_ts_owned) {
             self.allocator.free(self.last_ts);
@@ -2857,6 +3085,27 @@ pub const SlackChannel = struct {
     fn vtableStopTyping(ptr: *anyopaque, recipient: []const u8) anyerror!void {
         const self: *SlackChannel = @ptrCast(@alignCast(ptr));
         try self.stopTyping(recipient);
+    }
+
+    fn vtableRecordToolProgress(ptr: *anyopaque, target: []const u8, update: root.Channel.ToolProgressUpdate) void {
+        const self: *SlackChannel = @ptrCast(@alignCast(ptr));
+        self.recordToolProgress(target, .{
+            .kind = switch (update.kind) {
+                .tool => .tool,
+                .retry => .retry,
+            },
+            .tool = update.tool,
+            .arguments_json = update.arguments_json,
+            .phase = switch (update.phase) {
+                .start => .start,
+                .end => .end,
+            },
+            .success = update.success,
+            .retry = .{
+                .attempt = update.retry.attempt,
+                .max = update.retry.max,
+            },
+        });
     }
 
     // ── Streaming outbound ──────────────────────────────────────────
@@ -3618,6 +3867,7 @@ pub const SlackChannel = struct {
         .setTaskReaction = &vtableSetTaskReaction,
         .supportsStreamingOutbound = &vtableSupportsStreamingOutbound,
         .cancelStreams = &vtableCancelStreams,
+        .recordToolProgress = &vtableRecordToolProgress,
     };
 
     pub fn channel(self: *SlackChannel) root.Channel {
@@ -4530,23 +4780,127 @@ test "parseTarget clears stale thread_ts for non-thread target" {
 test "slack setThreadStatus is no-op in tests" {
     const allowed = [_][]const u8{};
     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
-    ch.setThreadStatus("C12345", "1700000000.100", "is typing...");
+    ch.setThreadStatus("C12345", "1700000000.100", "is typing...", null);
 }
 
 test "slack buildThreadStatusRequestBody includes non-empty body" {
     const alloc = std.testing.allocator;
     // Regression: Writer.Allocating must be finalized before Slack status POST reads the body.
-    const body = try buildThreadStatusRequestBody(alloc, "C12345", "1700000000.100", "is typing...");
+    const body = try buildThreadStatusRequestBody(alloc, "C12345", "1700000000.100", "is typing...", null);
     defer alloc.free(body);
     try std.testing.expectEqualStrings("{\"channel_id\":\"C12345\",\"thread_ts\":\"1700000000.100\",\"status\":\"is typing...\"}", body);
+}
+
+test "slack buildThreadStatusRequestBody includes loading messages" {
+    const alloc = std.testing.allocator;
+    const messages = [_][]const u8{"\u{1F527} web_search \"quoted\""};
+    const body = try buildThreadStatusRequestBody(alloc, "C12345", "1700000000.100", "is working\u{2026}", &messages);
+    defer alloc.free(body);
+    try std.testing.expectEqualStrings(
+        "{\"channel_id\":\"C12345\",\"thread_ts\":\"1700000000.100\",\"status\":\"is working\u{2026}\",\"loading_messages\":[\"\u{1F527} web_search \\\"quoted\\\"\"]}",
+        body,
+    );
 }
 
 test "slack startTyping and stopTyping are safe in tests" {
     const allowed = [_][]const u8{};
     var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    defer ch.stopAllProgress();
     ch.running.store(true, .release);
     try ch.startTyping("C12345:1700000000.100");
+    try std.testing.expectEqual(@as(usize, 1), ch.progress_targets.count());
     try ch.stopTyping("C12345:1700000000.100");
+    try std.testing.expectEqual(@as(usize, 0), ch.progress_targets.count());
+}
+
+test "slack recordToolProgress maps the latest safe operation and throttles" {
+    const alloc = std.testing.allocator;
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(alloc, "tok", null, null, &allowed);
+    defer ch.stopAllProgress();
+    ch.running.store(true, .release);
+    const target = "C12345:1700000000.100";
+    try ch.startTyping(target);
+    defer ch.stopTyping(target) catch {};
+
+    ch.recordToolProgress(target, .{ .tool = "web_search", .arguments_json = "{\"query\":\"docs\"}" });
+    const state = ch.progress_targets.getPtr(target).?.*;
+    try std.testing.expectEqual(@as(u32, 1), state.progress.tool_calls);
+    try std.testing.expect(state.progress.rendered);
+
+    const loading = (try buildProgressLoadingMessage(alloc, &state.progress)).?;
+    defer alloc.free(loading);
+    try std.testing.expectEqualStrings("\u{1F527} web_search docs", loading);
+
+    // A second event inside the one-second window is coalesced.
+    const before = state.last_sent_ms;
+    ch.recordToolProgress(target, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com/x\"}" });
+    try std.testing.expectEqual(before, state.last_sent_ms);
+    try std.testing.expect(state.progress.dirty);
+
+    // Once the window has passed the pending change flushes.
+    state.last_sent_ms -= PROGRESS_MIN_INTERVAL_MS;
+    ch.recordToolProgress(target, .{ .tool = "web_fetch", .arguments_json = "{\"url\":\"https://example.com/y\"}" });
+    try std.testing.expect(!state.progress.dirty);
+}
+
+test "slack progress loading message truncates to the line budget" {
+    const alloc = std.testing.allocator;
+    var progress: tool_progress.ToolProgress = .{};
+    defer progress.deinit(alloc);
+    const long = "x" ** (PROGRESS_LINE_MAX_CHARS + 20);
+    try progress.lines.append(alloc, .{ .text = try alloc.dupe(u8, long), .failed = false });
+
+    const loading = (try buildProgressLoadingMessage(alloc, &progress)).?;
+    defer alloc.free(loading);
+    try std.testing.expectEqual(PROGRESS_LINE_MAX_CHARS, loading.len);
+}
+
+test "slack shouldSendProgress bypasses throttle on first render only" {
+    var progress: tool_progress.ToolProgress = .{};
+    defer progress.deinit(std.testing.allocator);
+
+    try std.testing.expect(shouldSendProgress(&progress, 0, 1_000));
+    progress.markRendered();
+    try std.testing.expect(!shouldSendProgress(&progress, 1_000, 1_999));
+    try std.testing.expect(shouldSendProgress(&progress, 1_000, 2_000));
+}
+
+test "slack tool progress is gated by tool_progress and needs a live target" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    ch.running.store(true, .release);
+
+    // Top-level targets have no thread_ts: no state, so events are dropped.
+    ch.recordToolProgress("C12345", .{ .tool = "web_search" });
+    try std.testing.expectEqual(@as(usize, 0), ch.progress_targets.count());
+
+    ch.tool_progress_enabled = false;
+    try ch.startTyping("C12345:1700000000.100");
+    try std.testing.expectEqual(@as(usize, 0), ch.progress_targets.count());
+}
+
+test "slack vtable exposes tool progress" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    try std.testing.expect(SlackChannel.vtable.recordToolProgress != null);
+    try std.testing.expect(ch.channel().supportsToolProgress());
+}
+
+test "slack keepalive thread lifecycle starts and joins cleanly" {
+    const allowed = [_][]const u8{};
+    var ch = SlackChannel.init(std.testing.allocator, "tok", null, null, &allowed);
+    defer ch.stopAllProgress();
+    ch.running.store(true, .release);
+    ch.test_spawn_keepalive = true;
+    const target = "C12345:1700000000.100";
+    try ch.startTyping(target);
+    try std.testing.expectEqual(@as(usize, 1), ch.progress_targets.count());
+    const state = ch.progress_targets.getPtr(target).?.*;
+    try std.testing.expect(state.thread != null);
+    std_compat.thread.sleep(20 * std.time.ns_per_ms);
+    try ch.stopTyping(target);
+    try std.testing.expectEqual(@as(usize, 0), ch.progress_targets.count());
 }
 
 test "slack processHistoryMessage publishes inbound message to bus" {

@@ -787,10 +787,11 @@ pub const SlackConfig = struct {
     /// this. 9 = STREAM_MAX_FOLLOWUPS + 1, the 1 chat.update plus 8 follow-ups
     /// the chunked path can carry; 0 disables the upload.
     long_reply_file_threshold_chunks: usize = 9,
-    /// Accepted for parity with Telegram. Currently inert on Slack: Slack only
-    /// creates its live preview on the first visible answer delta, so there is
-    /// no pre-text preview to render tool activity into, and posting an extra
-    /// message is out of scope. Reserved for a future pre-text preview.
+    /// Show the current tool operation in the assistant thread status while a
+    /// turn runs (status title + one loading line), refreshed every ~6s so
+    /// Slack's two-minute status timeout does not clear it. Thread-only:
+    /// top-level messages keep the status reaction as their progress signal.
+    /// Uses the existing `chat:write` scope; no new OAuth scope.
     tool_progress: bool = true,
     /// Show task lifecycle on the triggering user message via Slack reactions.
     /// Needs the `reactions:write` scope. Defaults on: a top-level DM has no

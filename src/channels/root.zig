@@ -331,6 +331,13 @@ pub const Channel = struct {
         if (self.vtable.cancelStreams) |cancel| cancel(self.ptr, target);
     }
 
+    /// Whether the channel accepts tool-progress events (its vtable slot is
+    /// wired). Slack uses this without outbound streaming; Telegram also
+    /// ignores events while streaming is off.
+    pub fn supportsToolProgress(self: Channel) bool {
+        return self.vtable.recordToolProgress != null;
+    }
+
     /// Forward one tool event to the channel's live preview, if it has one.
     pub fn recordToolProgress(self: Channel, target: []const u8, update: ToolProgressUpdate) void {
         if (self.vtable.recordToolProgress) |record| record(self.ptr, target, update);

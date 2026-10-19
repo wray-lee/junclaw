@@ -1120,7 +1120,7 @@ webhook 模式（`mode = http`）不处理附件：Slack 要求 3 秒内应答�
 增量会被合并（每轮最多每秒一次 API 调用），以落在 Slack 各方法的速率限制内。工具调用标记在发送前始终会被剥离。如果原生流式调用返回永久性错误（`channel_type_not_supported`、`missing_scope`、`invalid_thread_ts` 等），nullclaw 会对该账号停止尝试原生方法，之后改用编辑消息。若追加调用返回 `msg_too_long`，实时更新会切换到编辑消息并继续推送受限预览。预览按 Slack 转义后的文本长度保留最新内容；最终分片均按转义预算适配 Slack 限制，发送首条消息与最多八条后续消息（超出上限部分会被记录告警并在最后一个分片标注截断提示）。
 当最终回复超过 `long_reply_file_threshold_chunks`（默认 9）片时，nullclaw 只发送可读的首片，并把完整 Markdown 回复作为 `reply.md` 上传到同一线程/DM，不再发送后续消息。上传失败则回退为上述分片投递。上传沿用现有的 `files:write` 权限，无需新增 scope。
 
-关于 Slack 的 `tool_progress`：为与 Telegram 保持对称而接受该配置，但当前不生效——Slack 在任何模式下都不渲染工具进度区块。原生通路（thread 目标上的 `chat.startStream`/`chat.appendStream`）是只追加的，无法展示滚动日志。编辑消息通路（顶层目标的 `chat.postMessage` + `chat.update`）持有一条可变的预览消息，但 nullclaw 只从流式内容启动它：通常是第一个可见回答增量，使用 `/reasoning stream` 时则是第一段流式推理引用——因此预览可能在出现任何回答文本之前就已存在，但工具进度仍不会渲染进去。nullclaw 不会为了显示进度而额外发一条消息，该配置预留给未来的 pre-text 预览。
+关于 Slack 的 `tool_progress`：默认开启。当一轮对话在 thread 中运行时，nullclaw 会把 assistant thread 状态设为 `is working…`，并通过 `loading_messages` 传入最新的工具操作（例如 `🔧 web_fetch example.com`），让长时间、多次工具调用的回合能看到 agent 正在做什么。状态每约 6 秒刷新一次，以免被 Slack 的两分钟状态超时清除；更新会合并，每个 thread 每秒最多一次 API 调用。提示是保守的：文件路径只保留文件名，URL 只保留主机名，搜索查询会截断，shell/未知工具只显示工具名——原始参数永远不会被渲染。该功能使用 `assistant.threads.setStatus`，沿用现有的 `chat:write` 权限，无需新增 OAuth scope，并且在 `streaming` 关闭时也能工作。该 API 仅支持 thread：顶层消息（没有 `thread_ts`）仍以状态 reaction（默认沙漏）作为进度信号，nullclaw 不会为此额外发送进度消息。将 `tool_progress` 设为 `false` 可只保留简单的 `is typing...` 状态。
 
 #### 草稿中的实时推理
 

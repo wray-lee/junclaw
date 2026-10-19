@@ -353,7 +353,7 @@ fn hostFromUrl(url: []const u8) []const u8 {
     return host;
 }
 
-fn clampUtf8(allocator: std.mem.Allocator, text: []const u8, max_chars: usize) ![]u8 {
+pub fn clampUtf8(allocator: std.mem.Allocator, text: []const u8, max_chars: usize) ![]u8 {
     var count: usize = 0;
     var i: usize = 0;
     while (i < text.len and count < max_chars) {

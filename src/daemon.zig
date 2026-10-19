@@ -1605,12 +1605,14 @@ fn processInboundMessage(
 
     // Tool progress on the daemon path: forward each tool event straight to the
     // outbound channel's live preview (the polling path does the same through
-    // channel_loop). Only wired when the turn streams outbound; channels with no
-    // draft transport leave the vtable slot null and ignore it.
+    // channel_loop). Wired when the turn streams outbound or the channel has a
+    // progress transport of its own (Slack's assistant status, which works with
+    // streaming off). Channels with no transport leave the vtable slot null and
+    // ignore the events.
     var tool_progress_ctx: DaemonToolProgressCtx = undefined;
     const tool_progress_sink: ?agent_mod.ProgressSink = blk: {
-        if (!use_streaming_outbound) break :blk null;
         const ch = outbound_channel orelse break :blk null;
+        if (!use_streaming_outbound and !ch.supportsToolProgress()) break :blk null;
         tool_progress_ctx = .{ .channel = ch, .chat_id = routing_plan.outbound_chat_id };
         break :blk .{ .callback = daemonToolProgressCallback, .ctx = @ptrCast(&tool_progress_ctx) };
     };
