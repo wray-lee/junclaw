@@ -235,8 +235,8 @@ pub const DshClient = struct {
     pub fn deinit(self: *DshClient) void {
         if (self.shared) |shared| {
             if (shared.ws) |*ws| {
-                ws.stream.shutdown(.both) catch {};
                 ws.writeClose();
+                ws.stream.shutdown(.both) catch {};
             }
             if (self.reader) |thread| thread.join();
             self.reader = null;
