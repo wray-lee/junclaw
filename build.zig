@@ -381,6 +381,7 @@ pub fn build(b: *std.Build) void {
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
     const enable_embedded_wasm3 = b.option(bool, "embedded_wasm3", "Embed wasm3 runtime into nullclaw binary (default: true; use -Dembedded_wasm3=false to disable)") orelse true;
+    const harness_dsh = b.option(bool, "harness_dsh", "Build dsh sidecar harness (default false)") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
     const channels_raw = b.option(
         []const u8,
@@ -504,6 +505,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     build_options.addOption(bool, "enable_channel_max", enable_channel_max);
+    build_options.addOption(bool, "enable_harness_dsh", harness_dsh);
     build_options.addOption(bool, "enable_embedded_wasm3", enable_embedded_wasm3);
     const build_options_module = build_options.createModule();
     const compat_module = b.createModule(.{

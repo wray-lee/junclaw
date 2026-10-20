@@ -65,6 +65,7 @@ pub const gateway = @import("gateway.zig");
 pub const channels = @import("channels/root.zig");
 pub const a2a = @import("a2a.zig");
 pub const acp = @import("acp.zig");
+pub const harness_dsh = if (@import("build_options").enable_harness_dsh) @import("harness/dsh/root.zig") else struct {};
 
 // Phase 4: Extensions
 pub const security = @import("security/root.zig");
