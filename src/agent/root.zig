@@ -2142,6 +2142,12 @@ pub const Agent = struct {
         defer interim_text.deinit(self.allocator);
         var last_interim_segment: ?[]u8 = null;
         defer if (last_interim_segment) |segment| self.allocator.free(segment);
+        // The "\n\n" between the previous round and the next one is emitted
+        // when that round starts streaming, not when the separator is decided:
+        // the provider has already streamed this round's text by then, so
+        // emitting it here would put it after text the final reply places
+        // before it, and the preview would stop being a prefix of the reply.
+        var interim_separator_pending = false;
 
         const turn_input = commands.planTurnInput(user_message);
         // A /stop that landed before the turn started (requestTurnInterruptAtStart)
@@ -2433,6 +2439,12 @@ pub const Agent = struct {
             @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
             defer @import("../http_util.zig").setThreadInterruptFlag(null);
             if (is_streaming) {
+                // Separator decided at the end of the previous round, before
+                // this round's text is streamed.
+                if (interim_separator_pending) {
+                    interim_separator_pending = false;
+                    self.stream_callback.?(self.stream_ctx.?, providers.StreamChunk.textDelta("\n\n"));
+                }
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -2951,9 +2963,12 @@ pub const Agent = struct {
                 }
 
                 // No tool calls — final response. Prepend text from earlier
-                // tool-call rounds unless the model repeated it here.
+                // tool-call rounds unless the model repeated it here. On the
+                // streaming path the repeat already reached the screen, so
+                // keep it: suppressing it would leave the final reply shorter
+                // than the streamed preview and force a second post.
                 const interim_visible = std.mem.trim(u8, interim_text.items, " \t\r\n");
-                const interim_duplicated = interim_visible.len > 0 and
+                const interim_duplicated = !is_streaming and interim_visible.len > 0 and
                     std.mem.indexOf(u8, display_text, interim_visible) != null;
                 var base_text = if (interim_text.items.len > 0 and !interim_duplicated)
                     try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ interim_text.items, display_text })
@@ -3056,15 +3071,18 @@ pub const Agent = struct {
             else
                 "";
             const trimmed_interim = std.mem.trim(u8, interim_segment, " \t\r\n");
-            if (trimmed_interim.len > 0 and
-                (last_interim_segment == null or !std.mem.eql(u8, last_interim_segment.?, trimmed_interim)))
-            {
-                if (interim_text.items.len > 0) {
-                    try interim_text.appendSlice(self.allocator, "\n\n");
-                    // The preview must stay a byte prefix of the final reply.
-                    if (is_streaming) self.stream_callback.?(self.stream_ctx.?, providers.StreamChunk.textDelta("\n\n"));
-                }
+            // In streaming mode a repeated segment is kept: it is already on
+            // the user's screen, so dropping it would make the final reply
+            // shorter than the preview.
+            const repeats_last = last_interim_segment != null and
+                std.mem.eql(u8, last_interim_segment.?, trimmed_interim);
+            if (trimmed_interim.len > 0 and (!repeats_last or is_streaming)) {
+                if (interim_text.items.len > 0) try interim_text.appendSlice(self.allocator, "\n\n");
                 try interim_text.appendSlice(self.allocator, interim_segment);
+                // The preview must stay a byte prefix of the final reply: the
+                // separator goes out at the start of the next round, before
+                // that round's text.
+                if (is_streaming) interim_separator_pending = true;
                 const segment_copy = try self.allocator.dupe(u8, trimmed_interim);
                 if (last_interim_segment) |old| self.allocator.free(old);
                 last_interim_segment = segment_copy;
@@ -14021,6 +14039,106 @@ fn scriptedProvider(state: *ScriptedTurnProvider) Provider {
     return Provider{ .ptr = @ptrCast(state), .vtable = &vtable };
 }
 
+/// One scripted streaming response: the text streamed to the sink and whether
+/// the round also returns a native tool call.
+const StreamTurnScript = struct {
+    text: []const u8,
+    tool_call: bool = false,
+};
+
+/// Streaming provider that replays a fixed script of responses by call index.
+const ScriptedStreamProvider = struct {
+    scripts: []const StreamTurnScript,
+    idx: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return error.ShouldNotUseBlockingChat;
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreaming(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreamingNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn streamChat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const script: StreamTurnScript = if (self.idx < self.scripts.len)
+            self.scripts[self.idx]
+        else
+            StreamTurnScript{ .text = "done" };
+        self.idx += 1;
+
+        if (script.text.len > 0) callback(callback_ctx, providers.StreamChunk.textDelta(script.text));
+        callback(callback_ctx, providers.StreamChunk.finalChunk());
+
+        const tool_calls = if (script.tool_call) blk: {
+            const calls = try allocator.alloc(providers.ToolCall, 1);
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call_test"),
+                .name = try allocator.dupe(u8, "probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            break :blk calls;
+        } else &.{};
+
+        return .{
+            .content = try allocator.dupe(u8, script.text),
+            .tool_calls = tool_calls,
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "scripted-stream-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+fn scriptedStreamProvider(state: *ScriptedStreamProvider) Provider {
+    const vtable = Provider.VTable{
+        .chatWithSystem = ScriptedStreamProvider.chatWithSystem,
+        .chat = ScriptedStreamProvider.chat,
+        .supportsNativeTools = ScriptedStreamProvider.supportsNativeTools,
+        .supports_streaming = ScriptedStreamProvider.supportsStreaming,
+        .supports_streaming_native_tools = ScriptedStreamProvider.supportsStreamingNativeTools,
+        .stream_chat = ScriptedStreamProvider.streamChat,
+        .getName = ScriptedStreamProvider.getName,
+        .deinit = ScriptedStreamProvider.deinitFn,
+    };
+    return Provider{ .ptr = @ptrCast(state), .vtable = &vtable };
+}
+
+/// Concatenates every non-final text chunk the agent emits.
+const StreamTextCapture = struct {
+    text: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (chunk.is_final) return;
+        self.text.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+    }
+};
+
 fn makeTurnAgent(
     allocator: std.mem.Allocator,
     provider: Provider,
@@ -14461,4 +14579,60 @@ test "Agent turn preserves XML-path interim text without leaking tool-call marku
     const last_msg = agent.history.items[agent.history.items.len - 1];
     try std.testing.expect(last_msg.role == .assistant);
     try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", last_msg.content);
+}
+
+/// Runs a streaming turn and asserts the concatenated streamed chunks are a
+/// byte prefix of the reply and that both equal `expected`.
+fn expectStreamedReplyEqual(scripts: []const StreamTurnScript, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var state = ScriptedStreamProvider{ .scripts = scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings(expected, capture.text.items);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+}
+
+test "Agent turn streams the interim separator before the final round's text" {
+    // Regression: the separator was emitted after the provider had already
+    // streamed the next round, so the preview was "i1final" while the reply
+    // was "i1\n\nfinal" — not a prefix, so Slack posted the reply a second time.
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "i1", .tool_call = true },
+        .{ .text = "final" },
+    };
+    try expectStreamedReplyEqual(&scripts, "i1\n\nfinal");
+}
+
+test "Agent turn streams separators between two tool-call rounds" {
+    // Regression: the preview was "i1i2\n\nfinal" while the reply was
+    // "i1\n\ni2\n\nfinal" — not a prefix, so Slack posted the reply twice.
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "i1", .tool_call = true },
+        .{ .text = "i2", .tool_call = true },
+        .{ .text = "final" },
+    };
+    try expectStreamedReplyEqual(&scripts, "i1\n\ni2\n\nfinal");
+}
+
+test "Agent turn keeps a repeated interim in the streaming reply" {
+    // Regression: the dedupe suppressed the interim from the reply, giving
+    // "i1" while the preview was "i1i1"; not a prefix, so Slack posted twice.
+    // Streaming keeps the repeat because the user already saw it.
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "i1", .tool_call = true },
+        .{ .text = "i1" },
+    };
+    try expectStreamedReplyEqual(&scripts, "i1\n\ni1");
 }
