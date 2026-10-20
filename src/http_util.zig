@@ -630,16 +630,14 @@ const CappedBody = struct {
 /// Longest prefix of `bytes` that ends on a UTF-8 sequence boundary. Truncation
 /// may cut a multi-byte code point in half; the returned slice must stay valid
 /// UTF-8 for the tool result.
-fn trimToUtf8Prefix(bytes: []u8) usize {
+fn trimToUtf8Prefix(bytes: []const u8) usize {
     var end = bytes.len;
-    var back: usize = 0;
-    while (back < 3 and end > 0 and (bytes[end - 1] & 0xC0) == 0x80) : (back += 1) end -= 1;
+    while (end > 0 and (bytes[end - 1] & 0xC0) == 0x80) end -= 1;
     if (end == 0) return 0;
-    if ((bytes[end - 1] & 0xC0) == 0x80) return 0;
-    const need = std.unicode.utf8ByteSequenceLength(bytes[end - 1]) catch return end - 1;
-    if (need == 1) return end;
-    if (end - 1 + need <= bytes.len) return end;
-    return end - 1;
+    const lead = end - 1;
+    const need = std.unicode.utf8ByteSequenceLength(bytes[lead]) catch return lead;
+    // Keep the code point whole when the cap did not cut it, otherwise drop it.
+    return if (lead + need <= bytes.len) lead + need else lead;
 }
 
 fn readCapped(
@@ -3347,6 +3345,64 @@ test "web fetch get truncates an oversized body at a utf-8 boundary" {
     try std.testing.expect(response.truncated);
     try std.testing.expectEqual(@as(usize, 1023), response.body.len);
     try std.testing.expect(std.unicode.utf8ValidateSlice(response.body));
+}
+
+// Regression: complete code points at the cap were cut to a bare lead byte,
+// leaving the tool result invalid UTF-8.
+test "trimToUtf8Prefix keeps complete code points and drops cut ones" {
+    const three = [_]u8{ 'a', 0xE4, 0xB8, 0xAD };
+    const three_end = trimToUtf8Prefix(&three);
+    try std.testing.expectEqual(@as(usize, 4), three_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(three[0..three_end]));
+
+    const four = [_]u8{ 'a', 0xF0, 0x9F, 0x98, 0x80 };
+    const four_end = trimToUtf8Prefix(&four);
+    try std.testing.expectEqual(@as(usize, 5), four_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(four[0..four_end]));
+
+    const three_cut = [_]u8{ 'a', 0xE4, 0xB8 };
+    const three_cut_end = trimToUtf8Prefix(&three_cut);
+    try std.testing.expectEqual(@as(usize, 1), three_cut_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(three_cut[0..three_cut_end]));
+
+    const four_cut = [_]u8{ 'a', 0xF0, 0x9F, 0x98 };
+    const four_cut_end = trimToUtf8Prefix(&four_cut);
+    try std.testing.expectEqual(@as(usize, 1), four_cut_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(four_cut[0..four_cut_end]));
+}
+
+// Regression: trimToUtf8Prefix 在完整码点边界截断时留下裸 lead byte，工具结果非法 UTF-8
+test "web fetch get keeps a complete code point at the truncation cap" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    // 1021 ASCII bytes then a complete 3-byte code point ending exactly at the cap.
+    var body = try allocator.alloc(u8, 2048);
+    defer allocator.free(body);
+    @memset(body, 'x');
+    body[1021] = 0xE4;
+    body[1022] = 0xB8;
+    body[1023] = 0xAD;
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/large", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, 1024);
+    thread.join();
+    defer allocator.free(response.body);
+    defer allocator.free(response.headers);
+
+    try std.testing.expect(response.truncated);
+    try std.testing.expectEqual(@as(usize, 1024), response.body.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(response.body));
+    try std.testing.expectEqualSlices(u8, &.{ 0xE4, 0xB8, 0xAD }, response.body[1021..1024]);
 }
 
 // Regression: web_fetch only received error.CurlFailed for any 4xx; the status
