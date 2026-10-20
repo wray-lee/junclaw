@@ -1,4 +1,4 @@
-//! dsh Remote API client: HTTP RPC over the curl subprocess and the
+//! dsh Remote API client: HTTP RPC over std.http and the
 //! `/api/remote.mux` WebSocket event stream.
 //!
 //! Ownership: `DshClient` owns its `base_url`/`cookie` copies. Events returned
