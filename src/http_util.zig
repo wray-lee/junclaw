@@ -656,6 +656,8 @@ fn readCapped(
         const n = file.read(&buf) catch return error.CurlReadError;
         if (n == 0) break;
         // Keep draining after the cut so curl never blocks on a full pipe.
+        // shortcut: the rest of an oversized body is still downloaded, not
+        // aborted; upgrade if bandwidth becomes a concern.
         if (truncated) continue;
         if (n > max_bytes - out.items.len) {
             if (!truncate) return error.CurlReadError;
