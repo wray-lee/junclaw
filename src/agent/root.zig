@@ -2967,10 +2967,15 @@ pub const Agent = struct {
                 // streaming path the repeat already reached the screen, so
                 // keep it: suppressing it would leave the final reply shorter
                 // than the streamed preview and force a second post.
+                //
+                // A silent-token final round must reach the channel as the
+                // bare token: merging interim text would surface both and
+                // defeat shouldSuppressReply.
+                const silent_final = util.isSilentTokenReply(display_text);
                 const interim_visible = std.mem.trim(u8, interim_text.items, " \t\r\n");
                 const interim_duplicated = !is_streaming and interim_visible.len > 0 and
                     std.mem.indexOf(u8, display_text, interim_visible) != null;
-                var base_text = if (interim_text.items.len > 0 and !interim_duplicated)
+                var base_text = if (interim_text.items.len > 0 and !interim_duplicated and !silent_final)
                     try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ interim_text.items, display_text })
                 else
                     try self.allocator.dupe(u8, display_text);
@@ -2978,9 +2983,11 @@ pub const Agent = struct {
 
                 if (self.context_was_compacted) {
                     self.context_was_compacted = false;
-                    const prefixed = try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{base_text});
-                    self.allocator.free(base_text);
-                    base_text = prefixed;
+                    if (!silent_final) {
+                        const prefixed = try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{base_text});
+                        self.allocator.free(base_text);
+                        base_text = prefixed;
+                    }
                 }
 
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
@@ -14555,6 +14562,55 @@ test "Agent turn deduplicates interim text repeated in the final reply" {
     const last_msg = agent.history.items[agent.history.items.len - 1];
     try std.testing.expect(last_msg.role == .assistant);
     try std.testing.expectEqualStrings("答案", last_msg.content);
+}
+
+// Regression: a final [NO_REPLY] round was merged with the interim text, so
+// the channel received the interim prose plus the token and posted it instead
+// of staying silent.
+test "Agent turn returns only the silent token when the final round is NO_REPLY" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{}", .content = "正在查询数据库。" } },
+        .{ .text = "[NO_REPLY]" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查一下数据库");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("[NO_REPLY]", response);
+}
+
+// Regression: same turn on the streaming path returned the streamed interim
+// text plus the token. The preview may already show both (the channel clears
+// its draft), but the final reply must be the bare token so it is suppressed.
+test "Agent turn returns only the silent token when the streamed final round is NO_REPLY" {
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "正在查询数据库。", .tool_call = true },
+        .{ .text = "[NO_REPLY]" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("查一下数据库");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[NO_REPLY]", response);
+    // The live preview already carried the interim text and the token.
+    try std.testing.expectEqualStrings("正在查询数据库。\n\n[NO_REPLY]", capture.text.items);
 }
 
 test "Agent turn preserves XML-path interim text without leaking tool-call markup" {
