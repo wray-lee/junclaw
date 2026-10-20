@@ -8,7 +8,7 @@ pub const TurnPersistenceState = struct {
     total_tokens: u64,
 };
 
-fn persistedAssistantReply(history: []const Agent.OwnedMessage, response: []const u8) []const u8 {
+pub fn persistedAssistantReply(history: []const Agent.OwnedMessage, response: []const u8) []const u8 {
     if (history.len == 0) return response;
     const last = history[history.len - 1];
     if (last.role != .assistant) return response;
