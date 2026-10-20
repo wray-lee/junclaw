@@ -1363,6 +1363,7 @@ nullclaw channel status
   - **示例**：如果你的 SearXNG 运行在 `192.168.1.10`，添加 `"192.168.1.10"` 即可通过 `http_request` 工具访问它。
   - **安全权衡**：白名单域名跳过 DNS 钉扎，允许访问私有 IP。这是用 DNS 重绑定防护换取操作灵活性。
   - **HTTPS-only 策略**：`http_request` 和 `web_fetch` 工具要求使用 `https://` URL。明文 HTTP 因安全原因被拒绝。注意：这不影响 `web_search` 工具的 `search_base_url`，后者允许本地主机使用 HTTP。
+  - **失败说明**：`web_fetch` 返回 HTTP 状态码和可操作的原因，而不是笼统的 curl 失败——429 表示站点正在限流本服务器，403 表示站点拦截了请求，404 表示页面不存在，超时/DNS/TLS 错误分别说明。超过 4 MiB 的响应会被截断并标注 `[truncated: response exceeded N bytes]`，而不是直接报错。重定向不会自动跟随；错误信息会给出目标 URL，便于直接重试。
   - **检查顺序**：白名单在 DNS 解析之前检查，防止 DNS 渗漏攻击。
 
 ## 配置变更后的验证
