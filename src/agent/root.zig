@@ -14637,6 +14637,87 @@ test "Agent turn preserves XML-path interim text without leaking tool-call marku
     try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", last_msg.content);
 }
 
+/// True when `text` carries any dispatcher tool-call marker (V1 of the interim
+/// markup fix); none may reach a user-visible surface.
+fn containsAnyToolCallMarker(text: []const u8) bool {
+    const markers = [_][]const u8{
+        "<tool_call>", "</tool_call>", "[/tool_call]",
+        "[tool_call]", "[TOOL_CALL]",  "[/TOOL_CALL]",
+    };
+    for (markers) |marker| {
+        if (std.mem.indexOf(u8, text, marker) != null) return true;
+    }
+    return false;
+}
+
+test "Agent turn hides an unclosed tool opener after a valid text tool call" {
+    // Regression: with a valid call in the same response, the shared parse
+    // released the trailing unclosed `<tool_call>` verbatim, so the marker
+    // reached the interim text, the final reply and the assistant history.
+    const allocator = std.testing.allocator;
+    const xml_response = "准备中<tool_call>\n{\"name\": \"probe\", \"arguments\": {\"value\": 1}}\n</tool_call>继续<tool_call>未闭合的散文";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = xml_response },
+        .{ .text = "查询完成。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查数据");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("准备中\n继续\n未闭合的散文\n\n查询完成。", response);
+    try std.testing.expect(!containsAnyToolCallMarker(response));
+    try std.testing.expect(std.mem.indexOf(u8, response, "未闭合的散文") != null);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expect(!containsAnyToolCallMarker(last_msg.content));
+    try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "未闭合的散文") != null);
+}
+
+test "Agent turn hides a stray tool-call closer after a valid text tool call" {
+    // Regression: a stray `</tool_call>` in the prose following a valid call
+    // survived into the visible text and the history entry.
+    const allocator = std.testing.allocator;
+    const xml_response = "准备中<tool_call>\n{\"name\": \"probe\", \"arguments\": {\"value\": 1}}\n</tool_call>继续</tool_call>[/TOOL_CALL]";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = xml_response },
+        .{ .text = "查询完成。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查数据");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("准备中\n继续\n\n查询完成。", response);
+    try std.testing.expect(!containsAnyToolCallMarker(response));
+    try std.testing.expect(std.mem.indexOf(u8, response, "继续") != null);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(!containsAnyToolCallMarker(last_msg.content));
+
+    // The interim display path is separate from the final strip: the text
+    // `selectDisplayText` hands to the interim accumulator must be clean too.
+    const parsed = try dispatcher.parseToolCalls(allocator, xml_response);
+    defer {
+        allocator.free(parsed.text);
+        for (parsed.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(parsed.calls);
+    }
+    const display = Agent.selectDisplayText(xml_response, parsed.text, parsed.calls.len);
+    try std.testing.expect(!containsAnyToolCallMarker(display));
+}
+
 /// Runs a streaming turn and asserts the concatenated streamed chunks are a
 /// byte prefix of the reply and that both equal `expected`.
 fn expectStreamedReplyEqual(scripts: []const StreamTurnScript, expected: []const u8) !void {

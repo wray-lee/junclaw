@@ -742,9 +742,10 @@ test "parseToolCalls unclosed tag" {
         if (result.text.len > 0) allocator.free(result.text);
         allocator.free(result.calls);
     }
-    // Unclosed tag should not duplicate prefix text.
+    // Unclosed tag should not duplicate prefix text, and the opener is markup:
+    // the prose around it is kept, the tag itself never reaches the reply.
     try std.testing.expectEqual(@as(usize, 0), result.calls.len);
-    try std.testing.expectEqualStrings(response, result.text);
+    try std.testing.expectEqualStrings("Some text\n{\"name\":\"shell\",\"arguments\":{}} and more", result.text);
 }
 
 test "parseToolCalls compact call with malformed closing tag" {

@@ -577,6 +577,54 @@ fn isDispatcherMarkerAt(text: []const u8, start: usize) bool {
         std.mem.startsWith(u8, rest, "<tool_result");
 }
 
+/// Length of the exact dispatcher open marker at `start`, or null.
+fn dispatcherMarkerLenAt(text: []const u8, start: usize) ?usize {
+    const rest = text[start..];
+    for (dispatcher_marker_tags) |tag| {
+        if (std.mem.startsWith(u8, rest, tag)) return tag.len;
+    }
+    return null;
+}
+
+/// Remove every dispatcher-marker token from `text`, keeping all other bytes.
+///
+/// Release paths (a prose block, the shared parse's visible text) must show the
+/// prose but never the tags, so only the tokens are dropped here; a body between
+/// a nested pair stays, because the parse has already claimed every executable
+/// block. Mirrors the streaming `TagFilter`'s token handling.
+pub fn stripDispatcherMarkerTokens(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '<' or text[i] == '[') {
+            if (dispatcherMarkerLenAt(text, i)) |len| {
+                i += len;
+                continue;
+            }
+            // Only the `tool_call` closers: `</tool_result>`/`</function>`
+            // samples are ordinary text here.
+            if (text[i] == '<') {
+                if (std.mem.startsWith(u8, text[i..], "</tool_call")) {
+                    if (matchToolCallClose(text, i, true)) |end| {
+                        i = end;
+                        continue;
+                    }
+                }
+            } else if (std.mem.startsWith(u8, text[i..], "[/tool_call]")) {
+                i += "[/tool_call]".len;
+                continue;
+            } else if (std.mem.startsWith(u8, text[i..], "[/TOOL_CALL]")) {
+                i += "[/TOOL_CALL]".len;
+                continue;
+            }
+        }
+        try out.append(allocator, text[i]);
+        i += 1;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// Case-insensitive substring test, matching the dispatcher's strict-close rule
 /// (`containsIgnoreCase(tag_content, "tool_call")` in `parseXmlToolCalls`).
 pub fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1534,10 +1582,12 @@ pub fn parseDispatcherXmlToolCalls(
             }
 
             if (!recovered) {
-                const unresolved = std.mem.trim(u8, remaining, " \t\r\n");
-                if (unresolved.len > 0) {
-                    try text_parts.append(allocator, unresolved);
-                }
+                // Release the prose on both sides of the opener as separate
+                // parts; the marker itself is dropped by the text filter below.
+                const before = std.mem.trim(u8, remaining[0..info.start], " \t\r\n");
+                if (before.len > 0) try text_parts.append(allocator, before);
+                const unresolved = std.mem.trim(u8, after_open, " \t\r\n");
+                if (unresolved.len > 0) try text_parts.append(allocator, unresolved);
             }
 
             // Only a block the dispatcher would *execute* swallows the rest
@@ -1558,10 +1608,18 @@ pub fn parseDispatcherXmlToolCalls(
         try text_parts.append(allocator, trailing);
     }
 
-    const text = if (text_parts.items.len == 0)
-        try allocator.dupe(u8, "")
-    else
-        try std.mem.join(allocator, "\n", text_parts.items);
+    // The text the dispatcher shows must never carry dispatcher markers: a
+    // stray close tag can sit in the prose between two blocks, and an unclosed
+    // opener is released as prose. The join is freed in its own scope so a
+    // later failure cannot free it twice.
+    const text = blk: {
+        const joined = if (text_parts.items.len == 0)
+            try allocator.dupe(u8, "")
+        else
+            try std.mem.join(allocator, "\n", text_parts.items);
+        defer allocator.free(joined);
+        break :blk try stripDispatcherMarkerTokens(allocator, joined);
+    };
     errdefer allocator.free(text);
 
     const calls_slice = try calls.toOwnedSlice(allocator);
@@ -1970,13 +2028,23 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
             // region a block is always hidden, again matching the filter.
             if (think_depth == 0) {
                 if (dispatcherBlockReleaseEnd(allocator, text, i, &scanner)) |end| {
-                    try out.appendSlice(allocator, text[i..end]);
+                    // A prose block is released without its tags.
+                    const released = try stripDispatcherMarkerTokens(allocator, text[i..end]);
+                    defer allocator.free(released);
+                    try out.appendSlice(allocator, released);
                     i = end;
                     continue;
                 }
             }
             if (skipToolCallBlock(text, i, &scanner)) |end| {
                 i = end;
+                continue;
+            }
+            // An exact dispatcher opener that never closes and whose payload is
+            // prose (an executable payload is already a parse block above): drop
+            // the marker itself and keep the prose.
+            if (dispatcherMarkerLenAt(text, i)) |len| {
+                i += len;
                 continue;
             }
             // A `=`-dialect opener (`<function=NAME>` / `<parameter=NAME>`) that
@@ -2002,13 +2070,20 @@ pub fn stripToolCallMarkup(allocator: std.mem.Allocator, text: []const u8) ![]co
         } else if (text[i] == '[') {
             if (think_depth == 0) {
                 if (dispatcherBlockReleaseEnd(allocator, text, i, &scanner)) |end| {
-                    try out.appendSlice(allocator, text[i..end]);
+                    // A prose block is released without its tags.
+                    const released = try stripDispatcherMarkerTokens(allocator, text[i..end]);
+                    defer allocator.free(released);
+                    try out.appendSlice(allocator, released);
                     i = end;
                     continue;
                 }
             }
             if (skipBracketToolCall(text, i)) |end| {
                 i = end;
+                continue;
+            }
+            if (dispatcherMarkerLenAt(text, i)) |len| {
+                i += len;
                 continue;
             }
         }
@@ -3380,12 +3455,14 @@ test "stripToolCallMarkup still strips a dispatcher call inside a code fence" {
     try std.testing.expect(std.mem.indexOf(u8, out, "tool_call") == null);
 }
 
-test "stripToolCallMarkup leaves prose and code naming tool_call untouched" {
+test "stripToolCallMarkup drops a bare bracket marker but keeps the prose" {
+    // A mention is not a block, so the prose survives; the marker bytes never
+    // reach a user-visible surface.
     const allocator = std.testing.allocator;
     const input = "Call the `tool_call` helper, or the [tool_call] section.";
     const out = try stripToolCallMarkup(allocator, input);
     defer allocator.free(out);
-    try std.testing.expectEqualStrings(input, out);
+    try std.testing.expectEqualStrings("Call the `tool_call` helper, or the  section.", out);
 }
 
 test "stripToolCallMarkup drops provider DSML markers" {
@@ -3416,11 +3493,12 @@ test "stripToolCallMarkup removes pipe-delimited begin blocks" {
 
 test "stripToolCallMarkup does not swallow text after an unmatched tool open tag" {
     // Regression: an unmatched `<tool_call>` in prose ate the rest of the text.
+    // Only the opener is dropped; the prose after it stays.
     const allocator = std.testing.allocator;
     const input = "See the <tool_call> docs for details.";
     const out = try stripToolCallMarkup(allocator, input);
     defer allocator.free(out);
-    try std.testing.expectEqualStrings(input, out);
+    try std.testing.expectEqualStrings("See the  docs for details.", out);
 }
 
 test "stripToolCallMarkup removes blocks with a whitespace-delimited close tag" {
@@ -3588,18 +3666,56 @@ test "stripToolCallMarkup hides an unterminated tool call the dispatcher would e
 
 test "stripToolCallMarkup releases an unterminated tool opener that is prose" {
     // Only an executable payload is dropped; an opener that is an ordinary
-    // mention is kept verbatim so no visible text is lost.
+    // mention releases its prose with the marker bytes removed.
     const allocator = std.testing.allocator;
-    const cases = [_][]const u8{
-        "intro <tool_call> trailing prose with no close",
-        "<tool_call>{\"not\":\"a call\"}",
-        "<tool_call>{\"name\":\"shell\",\"arguments\":{}} trailing prose",
+    const cases = [_][2][]const u8{
+        .{ "intro <tool_call> trailing prose with no close", "intro  trailing prose with no close" },
+        .{ "<tool_call>{\"not\":\"a call\"}", "{\"not\":\"a call\"}" },
+        .{ "<tool_call>{\"name\":\"shell\",\"arguments\":{}} trailing prose", "{\"name\":\"shell\",\"arguments\":{}} trailing prose" },
     };
-    for (cases) |input| {
-        const out = try stripToolCallMarkup(allocator, input);
+    for (cases) |case| {
+        const out = try stripToolCallMarkup(allocator, case[0]);
         defer allocator.free(out);
-        try std.testing.expectEqualStrings(input, out);
+        try std.testing.expectEqualStrings(case[1], out);
     }
+}
+
+test "parseDispatcherXmlToolCalls keeps the prose of an unclosed trailing opener" {
+    // Regression: the unclosed opener was appended to the visible text with its
+    // marker, so `selectDisplayText` put `<tool_call>` into the interim text.
+    const a = std.testing.allocator;
+    const input = "Q1<tool_call>{\"name\":\"probe\",\"arguments\":{\"value\":1}}</tool_call>Q2<tool_call>unclosed prose";
+    const parsed = try parseDispatcherXmlToolCalls(a, input);
+    defer {
+        a.free(parsed.text);
+        for (parsed.calls) |call| {
+            a.free(call.name);
+            a.free(call.arguments_json);
+        }
+        a.free(parsed.calls);
+        a.free(parsed.blocks);
+    }
+    try std.testing.expectEqual(@as(usize, 1), parsed.calls.len);
+    try std.testing.expectEqualStrings("Q1\nQ2\nunclosed prose", parsed.text);
+}
+
+test "stripToolCallMarkup hides an unclosed opener that trails a valid call" {
+    // Regression: with a valid call in the same response the trailing unclosed
+    // opener was released verbatim, so `<tool_call>` reached the final reply and
+    // the stored history entry.
+    const a = std.testing.allocator;
+    const input = "Q1<tool_call>{\"name\":\"probe\",\"arguments\":{\"value\":1}}</tool_call>Q2<tool_call>unclosed prose";
+    const out = try stripToolCallMarkup(a, input);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("Q1Q2unclosed prose", out);
+}
+
+test "stripToolCallMarkup drops a stray closer that trails a valid call" {
+    const a = std.testing.allocator;
+    const input = "Q1<tool_call>{\"name\":\"probe\",\"arguments\":{\"value\":1}}</tool_call>Q2</tool_call>[/TOOL_CALL]";
+    const out = try stripToolCallMarkup(a, input);
+    defer a.free(out);
+    try std.testing.expectEqualStrings("Q1Q2", out);
 }
 
 test "stripToolCallMarkup hides the bracket tool-call dialect the dispatcher accepts" {
@@ -3655,7 +3771,8 @@ test "stripToolCallMarkup keeps prose that only mentions a mismatched close tag"
     const text = "Call the tool with <tool_call> then close it with </arg_value>.";
     const out = try stripToolCallMarkup(allocator, text);
     defer allocator.free(out);
-    try std.testing.expectEqualStrings(text, out);
+    // The opener is dropped; the fallback close tag is not tool_call markup.
+    try std.testing.expectEqualStrings("Call the tool with  then close it with </arg_value>.", out);
 }
 
 // ---------------------------------------------------------------------------

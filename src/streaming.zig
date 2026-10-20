@@ -549,7 +549,7 @@ pub const TagFilter = struct {
                         if (self.dispatcher_block and !self.tool_in_think and
                             !providers.helpers.hidesDispatcherBlock(self.allocator, self.bodyBytes()))
                         {
-                            self.emitRegion(self.bodyBytes());
+                            self.releaseDispatcherBody();
                         }
                         self.resetBody();
                         self.buf_len = 0;
@@ -731,10 +731,10 @@ pub const TagFilter = struct {
                     if (result.calls.len > 0) {
                         self.emitRegion(result.text);
                     } else {
-                        self.emitRegion(body);
+                        self.releaseDispatcherBody();
                     }
                 } else |_| {
-                    self.emitRegion(body);
+                    self.releaseDispatcherBody();
                 }
             } else if (providers.helpers.isFunctionDialectOpenAt(body, 0)) {
                 // An unterminated `=`-dialect call (`<function=NAME>` /
@@ -795,6 +795,17 @@ pub const TagFilter = struct {
     fn bodyBytes(self: *const TagFilter) []const u8 {
         if (self.body_heap) |heap| return heap.items;
         return self.body[0..self.body_len];
+    }
+
+    /// Release a prose block's body without its dispatcher marker tokens.
+    fn releaseDispatcherBody(self: *TagFilter) void {
+        const body = self.bodyBytes();
+        const released = providers.helpers.stripDispatcherMarkerTokens(self.allocator, body) catch {
+            self.emitRegion(body);
+            return;
+        };
+        defer self.allocator.free(released);
+        self.emitRegion(released);
     }
 
     /// Drop the buffered block body, freeing any spilled buffer.
@@ -1560,9 +1571,11 @@ test "TagFilter passthrough drops the inner tool call but keeps the reasoning" {
 }
 
 test "TagFilter keeps prose and code that only name tool_call" {
+    // The prose survives; the bare marker bytes never reach the preview.
     const text = "Call the `tool_call` helper, or use the [tool_call] section.";
+    const expected = "Call the `tool_call` helper, or use the  section.";
     inline for (.{ ThinkMode.strip, ThinkMode.passthrough, ThinkMode.render }) |mode| {
-        try assertFilteredEquals(mode, &.{text}, text);
+        try assertFilteredEquals(mode, &.{text}, expected);
     }
 }
 
@@ -1609,17 +1622,19 @@ test "TagFilter swallows a standalone tool close tag in every mode and region" {
 
 test "TagFilter releases an unmatched tool open tag at a paragraph break" {
     // Regression: an unmatched `<tool_call>` in prose swallowed everything to
-    // the end of the stream. The opener is now released as ordinary text.
+    // the end of the stream. The prose is released; the marker bytes are not.
     const input = "intro <tool_call> not really a call\n\nsecond paragraph";
+    const expected = "intro  not really a call\n\nsecond paragraph";
     inline for (.{ ThinkMode.strip, ThinkMode.passthrough, ThinkMode.render }) |mode| {
-        try assertFilteredEquals(mode, &.{input}, input);
+        try assertFilteredEquals(mode, &.{input}, expected);
     }
 }
 
 test "TagFilter releases an unmatched tool open tag at end of stream" {
     const input = "intro <tool_call> trailing prose with no close";
+    const expected = "intro  trailing prose with no close";
     inline for (.{ ThinkMode.strip, ThinkMode.passthrough, ThinkMode.render }) |mode| {
-        try assertFilteredEquals(mode, &.{input}, input);
+        try assertFilteredEquals(mode, &.{input}, expected);
     }
 }
 
@@ -2108,17 +2123,29 @@ test "TagFilter hides an unclosed repairable tool call in every mode and split" 
 
 test "TagFilter releases an unclosed tool opener that is prose" {
     // The opener may be an ordinary mention; only an executable payload is
-    // dropped, so the tail of the answer is never lost.
-    const cases = [_][]const u8{
-        "intro <tool_call> trailing prose with no close",
-        "<tool_call>{\"not\":\"a call\"}",
-        "<tool_call>{\"name\":\"shell\",\"arguments\":{}} trailing prose",
+    // dropped, and the released prose never carries the marker bytes.
+    const cases = [_][2][]const u8{
+        .{ "intro <tool_call> trailing prose with no close", "intro  trailing prose with no close" },
+        .{ "<tool_call>{\"not\":\"a call\"}", "{\"not\":\"a call\"}" },
+        .{ "<tool_call>{\"name\":\"shell\",\"arguments\":{}} trailing prose", "{\"name\":\"shell\",\"arguments\":{}} trailing prose" },
     };
     inline for (.{ ThinkMode.strip, ThinkMode.passthrough, ThinkMode.render }) |mode| {
-        for (cases) |input| {
-            try assertFilteredEquals(mode, &.{input}, input);
+        for (cases) |case| {
+            try assertFilteredEquals(mode, &.{case[0]}, case[1]);
         }
     }
+}
+
+test "TagFilter drops an unclosed opener that trails a valid call" {
+    // Regression: the buffered block was released verbatim, so `<tool_call>`
+    // leaked into the live preview as well as the batch output.
+    const input = "Q1<tool_call>{\"name\":\"probe\",\"arguments\":{\"value\":1}}</tool_call>Q2<tool_call>unclosed prose";
+    try assertEverySplit(input, "Q1Q2unclosed prose", "Q1Q2unclosed prose", "Q1Q2unclosed prose");
+}
+
+test "TagFilter drops a stray closer that trails a valid call" {
+    const input = "Q1<tool_call>{\"name\":\"probe\",\"arguments\":{\"value\":1}}</tool_call>Q2</tool_call>[/TOOL_CALL]";
+    try assertEverySplit(input, "Q1Q2", "Q1Q2", "Q1Q2");
 }
 
 test "TagFilter hides the bracket tool-call dialect the dispatcher accepts" {
@@ -2136,8 +2163,9 @@ test "TagFilter hides the bracket tool-call dialect the dispatcher accepts" {
 
 test "TagFilter keeps prose and code that only name the bracket marker" {
     const text = "Call the `tool_call` helper, or use the [tool_call] section.";
+    const expected = "Call the `tool_call` helper, or use the  section.";
     inline for (.{ ThinkMode.strip, ThinkMode.passthrough, ThinkMode.render }) |mode| {
-        try assertFilteredEquals(mode, &.{text}, text);
+        try assertFilteredEquals(mode, &.{text}, expected);
     }
 }
 
@@ -2171,11 +2199,12 @@ test "TagFilter hides a bracket tool call closed by a mismatched close tag" {
 }
 
 test "TagFilter keeps prose that only mentions a mismatched close tag" {
-    // The tag names appear, but there is no executable call between them, so
-    // every byte stays visible (in all modes and at every split).
+    // There is no executable call between the tags, so the prose stays visible
+    // in all modes and at every split; the opener itself is markup.
     const text = "Call the tool with <tool_call> then close it with </arg_value>.";
+    const expected = "Call the tool with  then close it with </arg_value>.";
     inline for (.{ ThinkMode.strip, ThinkMode.passthrough, ThinkMode.render }) |mode| {
-        try assertFilteredEquals(mode, &.{text}, text);
+        try assertFilteredEquals(mode, &.{text}, expected);
     }
 }
 
@@ -2214,11 +2243,12 @@ test "TagFilter hides a >16KiB tool call closed by a fallback tag" {
 
 test "TagFilter keeps prose that only names the tool markers" {
     // Chinese prose that *names* the markers (`<tool_call>` ... `</tool_call>`)
-    // with no call between them: the dispatcher executes nothing, so the whole
-    // sentence — markers included — must pass through untouched in every mode
-    // and at every split, in step with `stripToolCallMarkup`.
+    // with no call between them: the dispatcher executes nothing, so the
+    // sentence is released without the marker bytes in every mode and at every
+    // split, in step with `stripToolCallMarkup`.
     const input = "文档中 <tool_call> 是调用开始标记，调用使用 </tool_call> 结束。";
-    try assertEverySplit(input, input, input, input);
+    const expected = "文档中  是调用开始标记，调用使用  结束。";
+    try assertEverySplit(input, expected, expected, expected);
 }
 
 test "TagFilter hides a call closed by a whitespace-delimited close tag" {
@@ -2258,8 +2288,11 @@ test "TagFilter strips a dense run of unclosed openers in one pass" {
     const a = std.testing.allocator;
     var input: std.ArrayListUnmanaged(u8) = .empty;
     defer input.deinit(a);
+    var expected: std.ArrayListUnmanaged(u8) = .empty;
+    defer expected.deinit(a);
     while (input.items.len < 120 * 1024) {
         try input.appendSlice(a, "<tool_call>literal ");
+        try expected.appendSlice(a, "literal ");
     }
 
     providers.helpers.scan_work = 0;
@@ -2267,8 +2300,8 @@ test "TagFilter strips a dense run of unclosed openers in one pass" {
     defer a.free(batch);
 
     // No opener here closes and none is a call the dispatcher would execute, so
-    // every byte is released verbatim.
-    try std.testing.expectEqualStrings(input.items, batch);
+    // the prose is released and every marker byte is dropped.
+    try std.testing.expectEqualStrings(expected.items, batch);
     try expectStripWorkLinear(input.items.len);
 }
 
@@ -2280,7 +2313,8 @@ test "TagFilter keeps a dense run of unclosed openers in step with the batch str
     var input: std.ArrayListUnmanaged(u8) = .empty;
     defer input.deinit(a);
     for (0..12) |_| try input.appendSlice(a, "<tool_call>literal ");
-    try assertEverySplit(input.items, input.items, input.items, input.items);
+    const expected = "literal " ** 12;
+    try assertEverySplit(input.items, expected, expected, expected);
 }
 
 test "TagFilter strips a large dense run of closed calls in one pass" {
