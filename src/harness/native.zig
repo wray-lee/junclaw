@@ -203,7 +203,22 @@ pub const NativeHarness = struct {
                 if (maybe_response) |response| agent.allocator.free(response);
                 continue;
             }
-            agent.loadHistory(&.{entry}) catch continue;
+
+            const role: providers.Role = if (std.mem.eql(u8, entry.role, "assistant"))
+                .assistant
+            else if (std.mem.eql(u8, entry.role, "system"))
+                .system
+            else
+                .user;
+
+            const content = agent.allocator.dupe(u8, entry.content) catch continue;
+            agent.history.append(agent.allocator, .{
+                .role = role,
+                .content = content,
+            }) catch {
+                agent.allocator.free(content);
+                continue;
+            };
         }
         agent.total_tokens = input.total_tokens;
         agent.compaction_count = input.compaction_count;
@@ -238,7 +253,10 @@ pub const NativeHarness = struct {
 
     fn handleLocalCommand(ptr: *anyopaque, content: []const u8) anyerror!?[]u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        return self.agent.handleSlashCommand(content) catch null;
+        const owned: ?[]const u8 = self.agent.handleSlashCommand(content) catch return null;
+        // The vtable promises `[]u8`; the agent allocates the reply on its own
+        // allocator, so hand it over without a copy.
+        return if (owned) |reply| @constCast(reply) else null;
     }
 
     fn deinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {

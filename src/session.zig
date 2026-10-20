@@ -44,6 +44,8 @@ const streaming = @import("streaming.zig");
 const outbound_mod = @import("outbound.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
+const harness_port = @import("harness/port.zig");
+const native_harness = @import("harness/native.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -371,6 +373,9 @@ fn finalizeSteerRefs(
 
 pub const Session = struct {
     agent: Agent,
+    /// The turn port for this session. Wraps `agent` for now; the host reaches
+    /// `agent` directly through `nativeAgent()` until every call site moves.
+    harness: native_harness.NativeHarness = undefined,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
     owned_memory_session_id: ?[]u8 = null,
@@ -401,6 +406,15 @@ pub const Session = struct {
     /// finalizes them `.failed` so their acknowledgement reaction is not left
     /// stuck.
     discarded_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty,
+
+    /// The native `Agent` behind this session's port. Kept so the host's
+    /// not-yet-ported call sites (restore, interrupt/status, reset, persistence,
+    /// queue/reasoning reads, attachment filtering, prompt invalidation) keep
+    /// working without a rewrite. `Session` is NOT a union yet: that is a later
+    /// phase, when a second engine exists.
+    pub fn nativeAgent(self: *Session) *Agent {
+        return &self.agent;
+    }
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -1925,6 +1939,9 @@ pub const SessionManager = struct {
         const session_owned_provider_api_key = session.owned_provider_api_key;
         session.* = .{
             .agent = agent,
+            // The adapter borrows the agent it wraps, so it must be seeded
+            // after `session.*` takes the agent.
+            .harness = .{ .agent = undefined },
             .provider_holder = session_provider_holder,
             .owned_provider_api_key = session_owned_provider_api_key,
             .owned_memory_session_id = owned_memory_session_id,
@@ -1938,6 +1955,7 @@ pub const SessionManager = struct {
             .turn_closing = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
+        session.harness = native_harness.NativeHarness.init(&session.agent);
         key_owned_by_session = true;
         session_initialized = true;
 
@@ -2061,27 +2079,34 @@ pub const SessionManager = struct {
         };
     }
 
-    const StreamAdapterCtx = struct {
-        sink: streaming.Sink,
-        suppress_live: bool = false,
-    };
+    /// The host side of the port: maps the engine's `Event` union back onto the
+    /// two sinks the channels already own. A host that wants to watch usage
+    /// events adds an `Event.usage` arm here; the engine never touches
+    /// `usage_record_callback`, which stays installed once at session creation.
+    const PortEventSink = struct {
+        stream: ?streaming.Sink,
+        progress: ?agent_mod.ProgressSink,
 
-    fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
-        const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
-        if (adapter.suppress_live and !chunk.is_final) return;
-        streaming.forwardProviderChunk(adapter.sink, chunk);
-    }
+        fn emit(ctx: *anyopaque, event: harness_port.Event) void {
+            const self: *PortEventSink = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .delta => |chunk| {
+                    if (self.stream) |sink| streaming.forwardProviderChunk(sink, chunk);
+                },
+                .progress => |hint| {
+                    if (self.progress) |sink| sink.emit(hint);
+                },
+                // The host keeps writing the usage ledger from the agent's own
+                // usage_record_callback; nothing consumes this today.
+                .usage => {},
+            }
+        }
+    };
 
     fn shouldRehydrateDisplay(session_key: []const u8, conversation_context: ?ConversationContext) bool {
         const channel = if (conversation_context) |ctx| ctx.channel else null;
         const is_group = if (conversation_context) |ctx| ctx.is_group else null;
         return governance.shouldRehydrateDisplay(session_key, channel, is_group);
-    }
-
-    fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8, display_rehydrate_allowed: bool) bool {
-        if (!display_rehydrate_allowed) return false;
-        const r = redactor orelse return false;
-        return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
     }
 
     fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
@@ -2354,10 +2379,13 @@ pub const SessionManager = struct {
         session: *Session,
         response: []const u8,
     ) ![]const u8 {
-        if (!session.agent.has_own_autonomy) return response;
+        // The port has no attachment-scope surface yet, so reach the native
+        // agent for this one field set.
+        const agent = session.nativeAgent();
+        if (!agent.has_own_autonomy) return response;
         const scope = outbound_mod.AttachmentScope{
-            .workspace_dir = session.agent.workspace_dir,
-            .allowed_paths = session.agent.allowed_paths,
+            .workspace_dir = agent.workspace_dir,
+            .allowed_paths = agent.allowed_paths,
         };
         const filtered = try outbound_mod.stripEscapingAttachmentMarkers(self.allocator, response, scope);
         self.allocator.free(response);
@@ -2377,25 +2405,24 @@ pub const SessionManager = struct {
 
     /// Track every message consumed by one Agent.turn, including messages
     /// drained while a post-turn follow-up is itself running.
+    ///
+    /// `drain_enabled` reproduces the old guard "only install the per-turn
+    /// drain when the streaming entry point already installed one": a
+    /// standalone drain helper never installs it, so a real turn does.
     fn runTurnWithSteerSink(
         self: *SessionManager,
         session: *Session,
-        content: []const u8,
         refs: *std.ArrayListUnmanaged(ConsumedRef),
-        sink: ?SteerReactionSink,
+        steer_sink: ?SteerReactionSink,
+        turn_input: harness_port.TurnInput,
+        drain_enabled: bool,
     ) ![]const u8 {
         var ctx = SteerDrainContext{ .session = session, .allocator = self.allocator, .refs = refs };
-        const previous_callback = session.agent.drain_injection_cb;
-        const previous_ctx = session.agent.drain_injection_ctx;
-        // A standalone drain helper has no in-turn drain installed. Preserve
-        // that contract; the streaming entry point installs it for real turns.
-        if (previous_callback != null) {
-            session.agent.drain_injection_cb = SteerDrainContext.callback;
-            session.agent.drain_injection_ctx = @ptrCast(&ctx);
-        }
-        defer {
-            session.agent.drain_injection_cb = previous_callback;
-            session.agent.drain_injection_ctx = previous_ctx;
+        var drain: ?agent_mod.DrainCallback = null;
+        var drain_ctx: ?*anyopaque = null;
+        if (drain_enabled) {
+            drain = SteerDrainContext.callback;
+            drain_ctx = @ptrCast(&ctx);
         }
         // A /stop that landed during this turn is spent once the turn returns,
         // even when the turn failed before Agent.turn could consume the flag
@@ -2403,11 +2430,16 @@ pub const SessionManager = struct {
         // message cannot inherit it and answer "Interrupted by /stop" without
         // ever calling the provider.
         defer session.agent.clearInterruptRequest();
-        const response = session.agent.turn(content) catch |err| {
-            finalizeSteerRefs(sink, self.allocator, refs, .failed);
-            return err;
+        const response = blk: {
+            var input = turn_input;
+            input.drain = drain;
+            input.drain_ctx = drain_ctx;
+            break :blk (session.harness.harness().runTurn(input) catch |err| {
+                finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                return err;
+            }).reply;
         };
-        finalizeSteerRefs(sink, self.allocator, refs, .done);
+        finalizeSteerRefs(steer_sink, self.allocator, refs, .done);
         return response;
     }
 
@@ -2428,7 +2460,11 @@ pub const SessionManager = struct {
         const late_content = (try session.drainInjectionWithRefs(self.allocator, self.allocator, &refs)) orelse return false;
         defer self.allocator.free(late_content);
 
-        const follow_up_response = self.runTurnWithSteerSink(session, late_content, &refs, steer_sink) catch |err| {
+        const follow_up_response = self.runTurnWithSteerSink(session, &refs, steer_sink, .{
+            .user_message = late_content,
+            .conversation_context = session.agent.conversation_context,
+            .memory_session_id = session.agent.memory_session_id,
+        }, true) catch |err| {
             // Regression: a failed tail-window follow-up dropped the acked
             // injection, so the user's steered message vanished. Keep the
             // completed primary reply and tell the sender to resend it.
@@ -2509,7 +2545,11 @@ pub const SessionManager = struct {
             } orelse break;
             defer self.allocator.free(late_content);
 
-            const follow_up_response = self.runTurnWithSteerSink(session, late_content, &refs, steer_sink) catch |err| {
+            const follow_up_response = self.runTurnWithSteerSink(session, &refs, steer_sink, .{
+                .user_message = late_content,
+                .conversation_context = session.agent.conversation_context,
+                .memory_session_id = session.agent.memory_session_id,
+            }, false) catch |err| {
                 log.warn("post-turn injection after failed turn also failed session=0x{x} err={}", .{ session_hash, err });
                 self.persistTurnResult(session, session_key, late_content, null);
                 var err_buf: [256]u8 = undefined;
@@ -2736,63 +2776,31 @@ pub const SessionManager = struct {
         defer session.agent.conversation_context = null;
         setTurnToolContext(session.agent.tools, session_key, conversation_context);
 
-        const prev_stream_callback = session.agent.stream_callback;
-        const prev_stream_ctx = session.agent.stream_ctx;
-        defer {
-            session.agent.stream_callback = prev_stream_callback;
-            session.agent.stream_ctx = prev_stream_ctx;
-        }
-
+        // The stream/progress install block and the agent_start observer event
+        // moved verbatim into the native adapter (src/harness/native.zig
+        // runTurn); the host now only describes what it wants observed.
         const display_rehydrate_allowed = shouldRehydrateDisplay(session_key, conversation_context);
 
-        var stream_adapter: StreamAdapterCtx = undefined;
-        if (stream_sink) |sink| {
-            const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content, display_rehydrate_allowed);
-            stream_adapter = .{ .sink = sink, .suppress_live = suppress_live };
-            session.agent.stream_callback = streamChunkForwarder;
-            session.agent.stream_ctx = @ptrCast(&stream_adapter);
-        } else {
-            session.agent.stream_callback = null;
-            session.agent.stream_ctx = null;
-        }
-
-        const prev_progress_callback = session.agent.progress_callback;
-        const prev_progress_ctx = session.agent.progress_ctx;
-        defer {
-            session.agent.progress_callback = prev_progress_callback;
-            session.agent.progress_ctx = prev_progress_ctx;
-        }
-        if (progress_sink) |ps| {
-            session.agent.progress_callback = ps.callback;
-            session.agent.progress_ctx = ps.ctx;
-        } else {
-            session.agent.progress_callback = null;
-            session.agent.progress_ctx = null;
-        }
-
-        // Record agent start event with channel attribution
-        const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
-            .provider = session.agent.provider.getName(),
-            .model = session.agent.model_name,
-            .channel = if (conversation_context) |ctx| ctx.channel else null,
-            .bot_account = if (conversation_context) |ctx| ctx.account_id else null,
-        } };
-        session.agent.observer.recordEvent(&start_event);
+        var port_sink_ctx = PortEventSink{ .stream = stream_sink, .progress = progress_sink };
+        const port_sink: ?harness_port.Sink = if (stream_sink != null or progress_sink != null)
+            .{ .ctx = @ptrCast(&port_sink_ctx), .emit = PortEventSink.emit }
+        else
+            null;
 
         var completed_turns: u64 = 0;
         var primary_failed = false;
         var primary_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
         defer freeConsumedRefs(self.allocator, &primary_refs);
-        var drain_ctx = SteerDrainContext{ .session = session, .allocator = self.allocator, .refs = &primary_refs };
-        const previous_drain_callback = session.agent.drain_injection_cb;
-        const previous_drain_ctx = session.agent.drain_injection_ctx;
-        session.agent.drain_injection_cb = SteerDrainContext.callback;
-        session.agent.drain_injection_ctx = @ptrCast(&drain_ctx);
-        defer {
-            session.agent.drain_injection_cb = previous_drain_callback;
-            session.agent.drain_injection_ctx = previous_drain_ctx;
-        }
-        var response = self.runTurnWithSteerSink(session, content, &primary_refs, steer_sink) catch |turn_err| blk: {
+        // The drain callback is installed (and restored) inside the adapter
+        // around Agent.turn; the host only has to say "yes, drain this turn".
+        const turn_input = harness_port.TurnInput{
+            .user_message = content,
+            .conversation_context = conversation_context,
+            .memory_session_id = session.agent.memory_session_id,
+            .live_stream = stream_sink != null,
+            .sink = port_sink,
+        };
+        var response = self.runTurnWithSteerSink(session, &primary_refs, steer_sink, turn_input, true) catch |turn_err| blk: {
             log.warn("session turn failed session=0x{x}: {}", .{ session_hash, turn_err });
             // Regression: both post-turn drain loops were skipped on error, so
             // a message the router had already acknowledged as steered stayed
