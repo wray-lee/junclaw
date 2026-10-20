@@ -9,7 +9,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const std_compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
-const http_util = @import("../../http_util.zig");
 const protocol = @import("protocol.zig");
 const client = @import("client.zig");
 
@@ -212,15 +211,11 @@ pub const Sidecar = struct {
         const url = try client.connectUrl(self.allocator, boot_url);
         defer self.allocator.free(url);
 
-        const response = try http_util.curlRequestWithStatusAndHeaders(self.allocator, .{
-            .method = .GET,
-            .url = url,
-            .max_time = "30",
-        });
+        const response = try client.httpRequest(self.allocator, .GET, url, &.{}, null);
         defer self.allocator.free(response.headers);
         defer self.allocator.free(response.body);
 
-        if (response.status_code != 302) return error.OwnerConnectRejected;
+        if (response.status != 302) return error.OwnerConnectRejected;
 
         var values: std.ArrayListUnmanaged([]const u8) = .empty;
         defer values.deinit(self.allocator);

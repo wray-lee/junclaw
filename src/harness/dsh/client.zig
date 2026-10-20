@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const std_compat = @import("compat");
-const http_util = @import("../../http_util.zig");
 const websocket = @import("../../websocket.zig");
 const protocol = @import("protocol.zig");
 
@@ -73,6 +72,76 @@ pub fn cookieHeader(allocator: Allocator, cookie: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "Cookie: {s}", .{cookie});
 }
 
+pub const HttpResponse = struct {
+    status: u16,
+    /// Raw response head (status line + headers), used to read Set-Cookie.
+    headers: []u8,
+    body: []u8,
+};
+
+/// Minimal HTTP/1.1 request to the local sidecar over std.http. No curl
+/// dependency: the dsh image is a bare Node image.
+/// Redirects are never followed: the connect call needs the 302 that carries
+/// the owner cookie, and an RPC redirect is an error, not a new transport.
+pub fn httpRequest(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    headers: []const []const u8,
+    body: ?[]const u8,
+) !HttpResponse {
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    defer client.deinit();
+
+    var header_buf: [8]std.http.Header = undefined;
+    if (headers.len > header_buf.len) return error.TooManyHeaders;
+    for (headers, 0..) |header, index| {
+        const colon = std.mem.indexOfScalar(u8, header, ':') orelse return error.InvalidHeader;
+        header_buf[index] = .{
+            .name = std.mem.trim(u8, header[0..colon], " \t"),
+            .value = std.mem.trim(u8, header[colon + 1 ..], " \t"),
+        };
+    }
+
+    const uri = try std.Uri.parse(url);
+    var req = try client.request(method, uri, .{
+        .redirect_behavior = .unhandled,
+        .headers = .{ .accept_encoding = .omit },
+        .extra_headers = header_buf[0..headers.len],
+    });
+    defer req.deinit();
+
+    if (body) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var request_body = try req.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(payload);
+        try request_body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    const response_headers = try allocator.dupe(u8, response.head.bytes);
+    errdefer allocator.free(response_headers);
+
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
+    var transfer_buffer: [256]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+
+    return .{
+        .status = @intFromEnum(response.head.status),
+        .headers = response_headers,
+        .body = try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]),
+    };
+}
+
 fn parsePort(base_url: []const u8) !u16 {
     const scheme_end = std.mem.indexOf(u8, base_url, "://") orelse return error.InvalidBaseUrl;
     const authority_start = scheme_end + 3;
@@ -126,6 +195,7 @@ fn freeServerEvent(allocator: Allocator, event: protocol.ServerEvent) void {
             allocator.free(request.tool_name);
             allocator.free(request.call_id);
             if (request.display_reason) |reason| allocator.free(reason);
+            if (request.event_id) |id| allocator.free(id);
         },
         .ignored => |kind| allocator.free(kind),
         .unknown => |raw| allocator.free(raw),
@@ -262,10 +332,16 @@ pub const DshClient = struct {
         const header = try cookieHeader(self.allocator, self.cookie);
         defer self.allocator.free(header);
         const headers = [_][]const u8{header};
-        shared.ws = try websocket.WsClient.connectPlain(
+        // dsh signs the owner cookie for the Host authority, so the handshake
+        // Host header must carry the port (unlike the bare connectTcp host).
+        const handshake_host = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ WS_HOST, self.port });
+        defer self.allocator.free(handshake_host);
+        const stream = try websocket.WsClient.connectTcp(self.allocator, WS_HOST, self.port);
+        errdefer stream.close();
+        shared.ws = try websocket.WsClient.connectPlainFromStream(
             self.allocator,
-            WS_HOST,
-            self.port,
+            stream,
+            handshake_host,
             WS_PATH,
             &headers,
         );
@@ -296,18 +372,14 @@ pub const DshClient = struct {
         const header = try cookieHeader(self.allocator, self.cookie);
         defer self.allocator.free(header);
 
-        const response = try http_util.curlRequestWithStatusAndHeaders(self.allocator, .{
-            .method = .POST,
-            .url = url,
-            .body = body,
-            .headers = &.{header},
-            .content_type = "application/json",
-            .max_time = "30",
-        });
+        const response = try httpRequest(self.allocator, .POST, url, &.{
+            header,
+            "Content-Type: application/json",
+        }, body);
         defer self.allocator.free(response.headers);
         defer self.allocator.free(response.body);
 
-        if (response.status_code != 200) return error.UnexpectedStatus;
+        if (response.status != 200) return error.UnexpectedStatus;
         return protocol.parseRpcBody(self.allocator, response.body);
     }
 

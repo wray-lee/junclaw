@@ -596,6 +596,30 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // ---------- dsh sidecar P0 spike (opt-in) ----------
+    // Only -Dharness_dsh=true creates this artifact; the default build and the
+    // default `test` step never compile or install it.
+    if (harness_dsh and !is_wasi) {
+        const spike_module = b.createModule(.{
+            .root_source_file = b.path("src/harness/dsh/spike.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullclaw", .module = lib_mod.? },
+                .{ .name = "compat", .module = compat_module },
+            },
+        });
+        const spike_exe = b.addExecutable(.{
+            .name = "dsh-spike",
+            .root_module = spike_module,
+            // Static musl so the binary runs in the bare dsh Node image.
+            .linkage = if (target.result.os.tag == .linux) .static else null,
+        });
+        const spike_step = b.step("dsh-spike", "Build the dsh sidecar P0 spike (requires -Dharness_dsh=true)");
+        const install_spike = b.addInstallArtifact(spike_exe, .{});
+        spike_step.dependOn(&install_spike.step);
+    }
+
     // macOS host+target only: strip local symbols post-install.
     // Host `strip` cannot process ELF/PE during cross-builds.
     if (optimize != .Debug and builtin.os.tag == .macos and target.result.os.tag == .macos) {

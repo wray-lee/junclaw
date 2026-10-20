@@ -168,6 +168,8 @@ pub const ServerEvent = union(enum) {
         tool_name: []const u8,
         call_id: []const u8,
         display_reason: ?[]const u8,
+        /// Waterfall request id needed to answer the approval via RPC.
+        event_id: ?[]const u8,
     },
     /// Known but uninteresting event; holds the event type.
     ignored: []const u8,
@@ -289,8 +291,16 @@ fn parseToolResult(allocator: Allocator, event: ObjectMap) !ServerEvent {
 
 fn toolResultChunk(allocator: Allocator, data: ObjectMap) !Chunk {
     const message = objectField(data, "message") orelse data;
-    const call_id = stringField(message, "callId") orelse
-        stringField(data, "callId") orelse stringField(data, "id") orelse "";
+    // The tool message carries `toolCallId` (and `source.callId`); older
+    // shapes used `callId`.
+    var call_id: ?[]const u8 = stringField(message, "callId") orelse
+        stringField(message, "toolCallId");
+    if (call_id == null) {
+        if (objectField(message, "source")) |source| call_id = stringField(source, "callId");
+    }
+    if (call_id == null) {
+        call_id = stringField(data, "callId") orelse stringField(data, "id");
+    }
     const content = message.get("content") orelse
         data.get("result") orelse data.get("output");
     const content_json = if (content) |value|
@@ -299,7 +309,7 @@ fn toolResultChunk(allocator: Allocator, data: ObjectMap) !Chunk {
         try allocator.dupe(u8, "null");
     errdefer allocator.free(content_json);
     return .{ .tool_result = .{
-        .call_id = try allocator.dupe(u8, call_id),
+        .call_id = try allocator.dupe(u8, call_id orelse ""),
         .content_json = content_json,
         .is_error = boolField(message, "isError") orelse boolField(data, "isError") orelse false,
     } };
@@ -335,16 +345,21 @@ fn parseWaterfall(allocator: Allocator, raw: []const u8, object: ObjectMap) !Ser
     const event_name = stringField(object, "event") orelse return unknownEvent(allocator, raw);
     if (!std.mem.eql(u8, event_name, "approval/request")) return unknownEvent(allocator, raw);
     const request = objectField(object, "request") orelse return unknownEvent(allocator, raw);
-    return parseApprovalRequest(allocator, raw, request);
+    return parseApprovalRequest(allocator, raw, request, stringField(object, "eventId"));
 }
 
 fn parseApproval(allocator: Allocator, raw: []const u8, event: ObjectMap) !ServerEvent {
     const request = objectField(event, "data") orelse
         objectField(event, "request") orelse event;
-    return parseApprovalRequest(allocator, raw, request);
+    return parseApprovalRequest(allocator, raw, request, stringField(event, "eventId"));
 }
 
-fn parseApprovalRequest(allocator: Allocator, raw: []const u8, request: ObjectMap) !ServerEvent {
+fn parseApprovalRequest(
+    allocator: Allocator,
+    raw: []const u8,
+    request: ObjectMap,
+    event_id: ?[]const u8,
+) !ServerEvent {
     const tool_name = stringField(request, "toolName") orelse return unknownEvent(allocator, raw);
     const call_id = stringField(request, "callId") orelse return unknownEvent(allocator, raw);
 
@@ -356,10 +371,13 @@ fn parseApprovalRequest(allocator: Allocator, raw: []const u8, request: ObjectMa
         try allocator.dupe(u8, display)
     else
         null;
+    errdefer if (display_copy) |copy| allocator.free(copy);
+    const event_copy: ?[]const u8 = if (event_id) |id| try allocator.dupe(u8, id) else null;
     return .{ .approval_request = .{
         .tool_name = tool_copy,
         .call_id = call_copy,
         .display_reason = display_copy,
+        .event_id = event_copy,
     } };
 }
 
@@ -565,6 +583,7 @@ fn freeServerEvent(allocator: Allocator, event: ServerEvent) void {
             allocator.free(request.tool_name);
             allocator.free(request.call_id);
             if (request.display_reason) |reason| allocator.free(reason);
+            if (request.event_id) |id| allocator.free(id);
         },
         .ignored => |kind| allocator.free(kind),
         .unknown => |raw| allocator.free(raw),
@@ -759,6 +778,29 @@ test "parseServerFrame maps tool call and tool result events" {
     }
 }
 
+test "tool result reads toolCallId and source.callId" {
+    // Regression: dsh tool messages carry `toolCallId` plus `source.callId`;
+    // the older `callId` path left the reported id empty.
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"event\",\"event\":{\"type\":\"tool/result\",\"seq\":13,\"data\":{" ++
+        "\"turn\":1,\"step\":1,\"message\":{\"toolCallId\":\"call-live\"," ++
+        "\"source\":{\"kind\":\"tool\",\"callId\":\"call-live\"}," ++
+        "\"content\":\"ok\",\"isError\":false}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .tool_result => |tool| {
+                try std.testing.expectEqualStrings("call-live", tool.call_id);
+                try std.testing.expectEqualStrings("\"ok\"", tool.content_json);
+            },
+            else => return error.TestUnexpectedChunk,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
 test "parseServerFrame keeps uninterpreted chunks verbatim" {
     const allocator = std.testing.allocator;
     const frame =
@@ -828,6 +870,7 @@ test "parseServerFrame maps approval waterfalls" {
             try std.testing.expectEqualStrings("bash", request.tool_name);
             try std.testing.expectEqualStrings("call-2", request.call_id);
             try std.testing.expectEqualStrings("Run bash outside workspace", request.display_reason.?);
+            try std.testing.expectEqualStrings("evt-1", request.event_id.?);
         },
         else => return error.TestUnexpectedEvent,
     }
