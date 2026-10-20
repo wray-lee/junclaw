@@ -2136,6 +2136,13 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        // Text the model wrote alongside tool calls. Channels only receive the
+        // final reply, so it must be merged into that reply or it is lost.
+        var interim_text: std.ArrayListUnmanaged(u8) = .empty;
+        defer interim_text.deinit(self.allocator);
+        var last_interim_segment: ?[]u8 = null;
+        defer if (last_interim_segment) |segment| self.allocator.free(segment);
+
         const turn_input = commands.planTurnInput(user_message);
         // A /stop that landed before the turn started (requestTurnInterruptAtStart)
         // must also stop a local slash command: the tool loop's interrupt check
@@ -2943,12 +2950,23 @@ pub const Agent = struct {
                     }
                 }
 
-                // No tool calls — final response
-                const base_text = if (self.context_was_compacted) blk: {
-                    self.context_was_compacted = false;
-                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
-                } else try self.allocator.dupe(u8, display_text);
+                // No tool calls — final response. Prepend text from earlier
+                // tool-call rounds unless the model repeated it here.
+                const interim_visible = std.mem.trim(u8, interim_text.items, " \t\r\n");
+                const interim_duplicated = interim_visible.len > 0 and
+                    std.mem.indexOf(u8, display_text, interim_visible) != null;
+                var base_text = if (interim_text.items.len > 0 and !interim_duplicated)
+                    try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ interim_text.items, display_text })
+                else
+                    try self.allocator.dupe(u8, display_text);
                 errdefer self.allocator.free(base_text);
+
+                if (self.context_was_compacted) {
+                    self.context_was_compacted = false;
+                    const prefixed = try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{base_text});
+                    self.allocator.free(base_text);
+                    base_text = prefixed;
+                }
 
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 errdefer self.allocator.free(final_text);
@@ -2957,7 +2975,7 @@ pub const Agent = struct {
                 // strips tool-call markup for delivery, so history must match it
                 // (a re-render of history must not leak the closer, and the model
                 // must not re-read its own garbled text tool call next turn).
-                const history_text = try providers.stripToolCallMarkup(self.allocator, display_text);
+                const history_text = try providers.stripToolCallMarkup(self.allocator, base_text);
                 defer self.allocator.free(history_text);
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
@@ -3027,15 +3045,29 @@ pub const Agent = struct {
                 return final_text;
             }
 
-            // There are tool calls — print intermediary text.
-            // In tests, stdout is used by Zig's test runner protocol (`--listen`),
-            // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
-                var out_buf: [4096]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
-                const w = &bw.interface;
-                w.print("{s}", .{display_text}) catch {};
-                w.flush() catch {};
+            // Keep the text this round wrote alongside its tool calls. Native
+            // responses carry plain text in content (parsed_text stays empty);
+            // on the XML path only parsed_text is safe — raw response_text
+            // would leak <tool_call> markup.
+            const interim_segment = if (display_text.len > 0)
+                display_text
+            else if (use_native and parsed_text.len == 0)
+                response_text
+            else
+                "";
+            const trimmed_interim = std.mem.trim(u8, interim_segment, " \t\r\n");
+            if (trimmed_interim.len > 0 and
+                (last_interim_segment == null or !std.mem.eql(u8, last_interim_segment.?, trimmed_interim)))
+            {
+                if (interim_text.items.len > 0) {
+                    try interim_text.appendSlice(self.allocator, "\n\n");
+                    // The preview must stay a byte prefix of the final reply.
+                    if (is_streaming) self.stream_callback.?(self.stream_ctx.?, providers.StreamChunk.textDelta("\n\n"));
+                }
+                try interim_text.appendSlice(self.allocator, interim_segment);
+                const segment_copy = try self.allocator.dupe(u8, trimmed_interim);
+                if (last_interim_segment) |old| self.allocator.free(old);
+                last_interim_segment = segment_copy;
             }
 
             // Record assistant message with tool calls in history.
@@ -9449,7 +9481,7 @@ test "Agent turn skips replayed tool_call_id across iterations" {
     const response = try agent.turn("run probe");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("replaying\n\ndone", response);
     try std.testing.expectEqual(@as(usize, 1), probe_count);
     try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
 }
@@ -9603,7 +9635,7 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
     const response = try agent.turn("update tools guidance");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("applying\n\ndone", response);
     try std.testing.expectEqual(@as(usize, 1), file_write_count);
     try std.testing.expectEqual(@as(usize, 0), memory_store_count);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
@@ -10199,7 +10231,7 @@ test "Agent tool loop frees dynamic tool outputs" {
     const response = try agent.turn("run tool");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("Running tool\n\ndone", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
@@ -10342,7 +10374,7 @@ test "Agent shell failure with normalized output does not poison next turn" {
     const response = try agent.turn("run failing shell");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqualStrings("Run shell\n\nrecovered", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(provider_state.saw_tool_results);
     try std.testing.expect(provider_state.saw_error_tool_result);
@@ -12023,7 +12055,7 @@ test "Agent executes native tool calls returned from streaming provider" {
     defer allocator.free(response);
 
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("calling shell\n\ndone", response);
 }
 
 test "Agent discards tool calls from a truncated provider response" {
@@ -14359,4 +14391,74 @@ test "Agent turn nudges on a lone closer after an unclosed fence" {
     defer allocator.free(response);
     try std.testing.expectEqual(@as(usize, 2), state.idx);
     try std.testing.expectEqualStrings("最终答案。", response);
+}
+
+// Regression: interim text written in the same response as a tool call was dropped; only the post-tool reply reached the user
+test "Agent turn keeps interim text from native tool-call round in final reply" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "调研结论：发现目标配置" } },
+        .{ .text = "已存入笔记" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("开始调研");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("调研结论：发现目标配置\n\n已存入笔记", response);
+
+    // Persistence: the stored reply must match the delivered visible text.
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expectEqualStrings("调研结论：发现目标配置\n\n已存入笔记", last_msg.content);
+}
+
+test "Agent turn deduplicates interim text repeated in the final reply" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "答案" } },
+        .{ .text = "答案" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("求答案");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("答案", response);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expectEqualStrings("答案", last_msg.content);
+}
+
+test "Agent turn preserves XML-path interim text without leaking tool-call markup" {
+    const allocator = std.testing.allocator;
+    const xml_response = "正在准备查询...\n<tool_call>\n{\"name\": \"probe\", \"arguments\": {\"value\": 1}}\n</tool_call>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = xml_response },
+        .{ .text = "查询完成。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查数据");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "<tool_call>") == null);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", last_msg.content);
 }
