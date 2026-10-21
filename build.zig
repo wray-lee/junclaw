@@ -381,6 +381,7 @@ pub fn build(b: *std.Build) void {
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
     const enable_embedded_wasm3 = b.option(bool, "embedded_wasm3", "Embed wasm3 runtime into nullclaw binary (default: true; use -Dembedded_wasm3=false to disable)") orelse true;
+    const harness_dsh = b.option(bool, "harness_dsh", "Build dsh sidecar harness (default false)") orelse false;
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
     const channels_raw = b.option(
         []const u8,
@@ -504,6 +505,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     build_options.addOption(bool, "enable_channel_max", enable_channel_max);
+    build_options.addOption(bool, "enable_harness_dsh", harness_dsh);
     build_options.addOption(bool, "enable_embedded_wasm3", enable_embedded_wasm3);
     const build_options_module = build_options.createModule();
     const compat_module = b.createModule(.{
@@ -593,6 +595,30 @@ pub fn build(b: *std.Build) void {
     }
 
     b.installArtifact(exe);
+
+    // ---------- dsh sidecar P0 spike (opt-in) ----------
+    // Only -Dharness_dsh=true creates this artifact; the default build and the
+    // default `test` step never compile or install it.
+    if (harness_dsh and !is_wasi) {
+        const spike_module = b.createModule(.{
+            .root_source_file = b.path("src/harness/dsh/spike.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nullclaw", .module = lib_mod.? },
+                .{ .name = "compat", .module = compat_module },
+            },
+        });
+        const spike_exe = b.addExecutable(.{
+            .name = "dsh-spike",
+            .root_module = spike_module,
+            // Static musl so the binary runs in the bare dsh Node image.
+            .linkage = if (target.result.os.tag == .linux) .static else null,
+        });
+        const spike_step = b.step("dsh-spike", "Build the dsh sidecar P0 spike (requires -Dharness_dsh=true)");
+        const install_spike = b.addInstallArtifact(spike_exe, .{});
+        spike_step.dependOn(&install_spike.step);
+    }
 
     // macOS host+target only: strip local symbols post-install.
     // Host `strip` cannot process ELF/PE during cross-builds.
