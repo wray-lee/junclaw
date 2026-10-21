@@ -8,6 +8,8 @@ test {
     _ = @import("protocol.zig");
     _ = @import("client.zig");
     _ = @import("sidecar.zig");
+    _ = @import("mock.zig");
+    _ = @import("mock_test.zig");
 }
 
 test "harness_dsh scaffold compiles" {}
