@@ -666,6 +666,7 @@ fn readCapped(
         try out.appendSlice(allocator, buf[0..n]);
     }
     const owned = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(owned);
     if (!truncated) return .{ .body = owned, .truncated = false };
     const end = trimToUtf8Prefix(owned);
     if (end == owned.len) return .{ .body = owned, .truncated = true };
