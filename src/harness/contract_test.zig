@@ -389,7 +389,9 @@ test "golden: progress hints and observer events for one tool turn" {
     );
     defer std.testing.allocator.free(reply);
 
-    try std.testing.expectEqualStrings("final answer", reply);
+    // Golden redetermined after origin/main 5ae2741c: the interim text of a
+    // tool round is now part of the reply.
+    try std.testing.expectEqualStrings("calling probe\n\nfinal answer", reply);
     try std.testing.expectEqual(@as(usize, 1), probe.executions);
     try std.testing.expectEqual(@as(usize, 2), provider.call_count);
     // Tools stay offered to the provider after a tool result.
@@ -492,7 +494,9 @@ test "golden: mid-turn injection is drained before the next provider call" {
     );
     defer std.testing.allocator.free(reply);
 
-    try std.testing.expectEqualStrings("final answer", reply);
+    // Golden redetermined after origin/main 5ae2741c: the interim text of a
+    // tool round is now part of the reply.
+    try std.testing.expectEqualStrings("calling probe\n\nfinal answer", reply);
     try std.testing.expectEqual(SessionManager.InboundRouteAction.steered, ctx.action.?);
     try std.testing.expectEqual(@as(usize, 2), provider.call_count);
 
@@ -570,9 +574,9 @@ test "golden: /stop during a tool call ends the turn and drops follow-ups" {
     );
     defer std.testing.allocator.free(reply);
 
-    const expected_prefix = "Interrupted by /stop. Halting tool execution for this turn.";
+    const expected_prefix = "calling probe\n\nInterrupted by /stop. Halting tool execution for this turn.";
     try std.testing.expectEqualStrings(
-        "Interrupted by /stop. Halting tool execution for this turn.\n\n[Pending message(s) discarded by /stop. Please resend.]",
+        "calling probe\n\nInterrupted by /stop. Halting tool execution for this turn.\n\n[Pending message(s) discarded by /stop. Please resend.]",
         reply,
     );
     try std.testing.expectEqual(SessionManager.InboundRouteAction.steered, probe.injected.?);

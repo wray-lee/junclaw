@@ -449,7 +449,9 @@ test "differential: ported and direct produce identical stream, progress and rep
 
     // Identical results.
     try std.testing.expectEqualStrings(direct_reply, ported_result.reply);
-    try std.testing.expectEqualStrings("final answer", ported_result.reply);
+    // Golden redetermined after origin/main 5ae2741c: the interim text of a
+    // tool round is now part of the reply.
+    try std.testing.expectEqualStrings("calling probe\n\nfinal answer", ported_result.reply);
     try std.testing.expectEqual(direct_session.agent.total_tokens, ported_result.total_tokens);
     try std.testing.expectEqual(@as(usize, 1), direct_probe.executions);
     try std.testing.expectEqual(@as(usize, 1), ported_probe.executions);
@@ -869,7 +871,9 @@ test "differential: a progress-only sink installs progress but not the stream" {
     defer std.testing.allocator.free(ported_result.reply);
 
     try std.testing.expectEqualStrings(direct_reply, ported_result.reply);
-    try std.testing.expectEqualStrings("final answer", ported_result.reply);
+    // Golden redetermined after origin/main 5ae2741c: the interim text of a
+    // tool round is now part of the reply.
+    try std.testing.expectEqualStrings("calling probe\n\nfinal answer", ported_result.reply);
     try direct_progress.sameAs(&ported_progress);
     try std.testing.expect(ported_progress.count > 0);
     // Progress was observed on both paths, streaming was not.
@@ -928,7 +932,9 @@ test "differential: drain injection points and history are identical" {
     defer std.testing.allocator.free(ported_result.reply);
 
     try std.testing.expectEqualStrings(direct_reply, ported_result.reply);
-    try std.testing.expectEqualStrings("final answer", ported_result.reply);
+    // Golden redetermined after origin/main 5ae2741c: the interim text of a
+    // tool round is now part of the reply.
+    try std.testing.expectEqualStrings("calling probe\n\nfinal answer", ported_result.reply);
     // Same number of drain boundaries, same provider call count.
     try std.testing.expectEqual(direct_drain.count, ported_drain.count);
     try std.testing.expectEqual(direct_provider.call_count, ported_provider.call_count);
