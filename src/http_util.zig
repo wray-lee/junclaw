@@ -3372,6 +3372,15 @@ test "trimToUtf8Prefix keeps complete code points and drops cut ones" {
     try std.testing.expect(std.unicode.utf8ValidateSlice(four_cut[0..four_cut_end]));
 }
 
+// Regression: a body ending in four or more continuation bytes was trimmed to
+// zero, discarding the entire page instead of keeping the valid prefix.
+test "trimToUtf8Prefix keeps the valid prefix when trailing continuations run long" {
+    const body = [_]u8{ 'a', 0xE4, 0xB8, 0xAD, 0x80, 0x80, 0x80 };
+    const end = trimToUtf8Prefix(&body);
+    try std.testing.expectEqual(@as(usize, 4), end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body[0..end]));
+}
+
 // Regression: trimToUtf8Prefix 在完整码点边界截断时留下裸 lead byte，工具结果非法 UTF-8
 test "web fetch get keeps a complete code point at the truncation cap" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
