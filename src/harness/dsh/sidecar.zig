@@ -157,6 +157,31 @@ fn killTree(child: *std_compat.process.Child) void {
     }
 }
 
+/// Exchange a launch URL for its owner cookie without spawning a process.
+/// Used by the harness when `boot_url` is injected (tests/external sidecar).
+pub fn fetchOwnerCookieForUrl(allocator: Allocator, boot_url: []const u8) ![]u8 {
+    const url = try client.connectUrl(allocator, boot_url);
+    defer allocator.free(url);
+
+    const response = try client.httpRequest(allocator, .GET, url, &.{}, null);
+    defer allocator.free(response.headers);
+    defer allocator.free(response.body);
+
+    if (response.status != 302) return error.OwnerConnectRejected;
+
+    var values: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer values.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, response.headers, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.ascii.startsWithIgnoreCase(trimmed, "set-cookie:")) continue;
+        const value = std.mem.trim(u8, trimmed["set-cookie:".len..], " \t");
+        if (value.len > 0) try values.append(allocator, value);
+    }
+    if (values.items.len == 0) return error.OwnerCookieMissing;
+    return protocol.ownerCookieFromSetCookie(allocator, values.items);
+}
+
 pub const Sidecar = struct {
     allocator: Allocator,
     opts: Options,
@@ -208,26 +233,7 @@ pub const Sidecar = struct {
     /// GET `/connect?token=…&interactions=answer` and return the owner cookie.
     pub fn fetchOwnerCookie(self: *Sidecar) ![]u8 {
         const boot_url = self.boot_url orelse return error.SidecarNotStarted;
-        const url = try client.connectUrl(self.allocator, boot_url);
-        defer self.allocator.free(url);
-
-        const response = try client.httpRequest(self.allocator, .GET, url, &.{}, null);
-        defer self.allocator.free(response.headers);
-        defer self.allocator.free(response.body);
-
-        if (response.status != 302) return error.OwnerConnectRejected;
-
-        var values: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer values.deinit(self.allocator);
-        var lines = std.mem.splitScalar(u8, response.headers, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (!std.ascii.startsWithIgnoreCase(trimmed, "set-cookie:")) continue;
-            const value = std.mem.trim(u8, trimmed["set-cookie:".len..], " \t");
-            if (value.len > 0) try values.append(self.allocator, value);
-        }
-        if (values.items.len == 0) return error.OwnerCookieMissing;
-        return protocol.ownerCookieFromSetCookie(self.allocator, values.items);
+        return fetchOwnerCookieForUrl(self.allocator, boot_url);
     }
 
     fn initSpawnArgs(self: *Sidecar) !void {
@@ -244,6 +250,12 @@ pub const Sidecar = struct {
         const env_map = try arena.create(std_compat.process.EnvMap);
         env_map.* = try buildEnvMap(arena, self.opts);
         self.env_map = env_map;
+    }
+
+    /// Take ownership of `url` as the boot URL, freeing any previous value.
+    fn adoptBootUrl(self: *Sidecar, url: []u8) void {
+        if (self.boot_url) |old| self.allocator.free(old);
+        self.boot_url = url;
     }
 
     fn spawnAndBoot(self: *Sidecar) !void {
@@ -267,10 +279,11 @@ pub const Sidecar = struct {
         self.stderr_thread = try std.Thread.spawn(.{}, stderrMain, .{stderr_file});
 
         const boot_url = try self.waitBootUrl();
-        errdefer self.allocator.free(boot_url);
+        // Adopt before any fallible step: from here the Sidecar owns the URL,
+        // so error paths must not free it (clearSessionState does).
+        self.adoptBootUrl(boot_url);
         const endpoint = try client.parseBootEndpoint(boot_url);
 
-        self.boot_url = boot_url;
         self.base_url = try self.allocator.dupe(u8, endpoint.base_url);
         self.port = endpoint.port;
         self.cookie = try self.fetchOwnerCookie();
@@ -385,4 +398,22 @@ test "missing session id file loads as null" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expect((try loadSessionId(std.testing.allocator, path)) == null);
+}
+
+test "boot URL has one owner across adopt and teardown" {
+    // Regression: error path + deinit double-freed boot_url.
+    const allocator = std.testing.allocator;
+    var sidecar = Sidecar{
+        .allocator = allocator,
+        .opts = .{ .bin_js = "/nonexistent/bin.js", .workspace = "/tmp", .dsh_home = "/tmp" },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer sidecar.arena.deinit();
+
+    sidecar.adoptBootUrl(try allocator.dupe(u8, "http://127.0.0.1:1/?token=test-token"));
+    sidecar.adoptBootUrl(try allocator.dupe(u8, "http://127.0.0.1:2/?token=test-token"));
+    try std.testing.expectEqualStrings("http://127.0.0.1:2/?token=test-token", sidecar.boot_url.?);
+
+    sidecar.clearSessionState();
+    try std.testing.expect(sidecar.boot_url == null);
 }

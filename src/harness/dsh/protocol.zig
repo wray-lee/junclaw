@@ -139,16 +139,21 @@ fn stringifyField(allocator: Allocator, object: ObjectMap, key: []const u8) ![]c
 // Server frames
 // ---------------------------------------------------------------------------
 
+pub const ToolCall = struct {
+    call_id: []const u8,
+    name: []const u8,
+    /// Full call: the `arguments` value as JSON. Delta: a raw argument
+    /// fragment, folded by `ToolCallAccumulator`.
+    arguments_json: []const u8,
+    is_delta: bool = false,
+};
+
 pub const Chunk = union(enum) {
     text_delta: struct {
         index: u32,
         text: []const u8,
     },
-    tool_call: struct {
-        call_id: []const u8,
-        name: []const u8,
-        arguments_json: []const u8,
-    },
+    tool_call: ToolCall,
     tool_result: struct {
         call_id: []const u8,
         content_json: []const u8,
@@ -160,13 +165,20 @@ pub const Chunk = union(enum) {
 
 pub const ServerEvent = union(enum) {
     assistant_chunk: Chunk,
+    /// Committed `assistant/message`: one step's finalized assistant text.
+    /// A turn cancelled mid-stream commits its delivered prefix here.
+    committed: []const u8,
     turn_end: struct {
         kind: []const u8,
         reason_kind: ?[]const u8,
+        /// dsh's failure text for `kind == "error"`; null for other ends.
+        error_message: ?[]const u8,
     },
     approval_request: struct {
         tool_name: []const u8,
         call_id: []const u8,
+        /// One display string: the plain form as-is, or the `en` then `zh`
+        /// translation of the `{en, zh}` object form.
         display_reason: ?[]const u8,
         /// Waterfall request id needed to answer the approval via RPC.
         event_id: ?[]const u8,
@@ -175,6 +187,90 @@ pub const ServerEvent = union(enum) {
     ignored: []const u8,
     /// Unrecognized frame, kept verbatim so callers can log it losslessly.
     unknown: []const u8,
+};
+
+fn freeToolCall(allocator: Allocator, call: ToolCall) void {
+    allocator.free(call.call_id);
+    allocator.free(call.name);
+    allocator.free(call.arguments_json);
+}
+
+/// Folds streamed tool calls by callId: `tool-call-delta` fragments append to
+/// one pending call (never emitted) and a full `tool-call` completes it, so a
+/// callId is emitted once. The frame parser stays stateless; `client.Shared`
+/// owns one accumulator.
+pub const ToolCallAccumulator = struct {
+    pending: std.ArrayListUnmanaged(Pending) = .empty,
+
+    const Pending = struct {
+        call_id: []u8,
+        arguments: std.ArrayListUnmanaged(u8) = .empty,
+    };
+
+    pub fn deinit(self: *ToolCallAccumulator, allocator: Allocator) void {
+        for (self.pending.items) |*call| {
+            allocator.free(call.call_id);
+            call.arguments.deinit(allocator);
+        }
+        self.pending.deinit(allocator);
+    }
+
+    /// Consumes one parsed event. Returns the event to emit, or null when a
+    /// delta was folded into its pending call. `event` is freed on error.
+    pub fn absorb(self: *ToolCallAccumulator, allocator: Allocator, event: ServerEvent) !?ServerEvent {
+        const call = switch (event) {
+            .assistant_chunk => |chunk| switch (chunk) {
+                .tool_call => |tool| tool,
+                else => return event,
+            },
+            else => return event,
+        };
+
+        if (!call.is_delta) {
+            // Full call: replace (drop) any accumulated delta for this callId.
+            self.discard(allocator, call.call_id);
+            return event;
+        }
+
+        for (self.pending.items) |*pending| {
+            if (!std.mem.eql(u8, pending.call_id, call.call_id)) continue;
+            pending.arguments.appendSlice(allocator, call.arguments_json) catch |err| {
+                freeToolCall(allocator, call);
+                return err;
+            };
+            freeToolCall(allocator, call);
+            return null;
+        }
+
+        var arguments: std.ArrayListUnmanaged(u8) = .empty;
+        arguments.appendSlice(allocator, call.arguments_json) catch |err| {
+            freeToolCall(allocator, call);
+            return err;
+        };
+        const call_id = allocator.dupe(u8, call.call_id) catch |err| {
+            arguments.deinit(allocator);
+            freeToolCall(allocator, call);
+            return err;
+        };
+        self.pending.append(allocator, .{ .call_id = call_id, .arguments = arguments }) catch |err| {
+            allocator.free(call_id);
+            arguments.deinit(allocator);
+            freeToolCall(allocator, call);
+            return err;
+        };
+        freeToolCall(allocator, call);
+        return null;
+    }
+
+    fn discard(self: *ToolCallAccumulator, allocator: Allocator, call_id: []const u8) void {
+        for (self.pending.items, 0..) |*pending, index| {
+            if (!std.mem.eql(u8, pending.call_id, call_id)) continue;
+            var removed = self.pending.swapRemove(index);
+            allocator.free(removed.call_id);
+            removed.arguments.deinit(allocator);
+            return;
+        }
+    }
 };
 
 /// Parse one WebSocket `item` (or a bare event / `server-event` envelope).
@@ -209,6 +305,7 @@ fn parseEvent(allocator: Allocator, raw: []const u8, value: Value) !ServerEvent 
     const kind = stringField(object, "type") orelse return unknownEvent(allocator, raw);
 
     if (std.mem.eql(u8, kind, "assistant-stream")) return parseAssistant(allocator, raw, object);
+    if (std.mem.eql(u8, kind, "assistant/message")) return parseCommitted(allocator, raw, object);
     if (std.mem.eql(u8, kind, "turn/end")) return parseTurnEnd(allocator, raw, object);
     if (std.mem.eql(u8, kind, "tool/call")) return parseToolCall(allocator, object);
     if (std.mem.eql(u8, kind, "tool/result")) return parseToolResult(allocator, object);
@@ -231,6 +328,27 @@ fn parseAssistant(allocator: Allocator, raw: []const u8, object: ObjectMap) !Ser
     return .{ .assistant_chunk = try parseChunk(allocator, chunk_value) };
 }
 
+/// `assistant/message.data.message.content` text blocks form the finalized
+/// step text; reasoning and tool blocks are not part of the reply.
+fn parseCommitted(allocator: Allocator, raw: []const u8, event: ObjectMap) !ServerEvent {
+    const data = objectField(event, "data") orelse event;
+    const message = objectField(data, "message") orelse return unknownEvent(allocator, raw);
+    const content = message.get("content") orelse return unknownEvent(allocator, raw);
+    const blocks = switch (content) {
+        .array => |array| array,
+        else => return unknownEvent(allocator, raw),
+    };
+
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(allocator);
+    for (blocks.items) |block| {
+        const object = asObject(block) orelse continue;
+        if (!std.mem.eql(u8, stringField(object, "type") orelse "", "text")) continue;
+        if (stringField(object, "text")) |fragment| try text.appendSlice(allocator, fragment);
+    }
+    return .{ .committed = try text.toOwnedSlice(allocator) };
+}
+
 fn parseChunk(allocator: Allocator, value: Value) !Chunk {
     const object = asObject(value) orelse return .{ .other = try stringifyValue(allocator, value) };
     const kind = stringField(object, "type") orelse
@@ -244,12 +362,13 @@ fn parseChunk(allocator: Allocator, value: Value) !Chunk {
     }
 
     if (std.mem.eql(u8, kind, "tool-call") or std.mem.eql(u8, kind, "tool-call-delta")) {
+        const is_delta = std.mem.eql(u8, kind, "tool-call-delta");
         const call_id = stringField(object, "callId") orelse stringField(object, "id") orelse "";
         const name = stringField(object, "name") orelse stringField(object, "toolName") orelse "";
-        const arguments_json = if (object.get("arguments")) |arguments|
+        const arguments_json = if (is_delta)
+            try allocator.dupe(u8, stringField(object, "argumentsDelta") orelse "")
+        else if (object.get("arguments")) |arguments|
             try stringifyValue(allocator, arguments)
-        else if (stringField(object, "argumentsDelta")) |delta|
-            try std.json.Stringify.valueAlloc(allocator, delta, .{})
         else
             try allocator.dupe(u8, "null");
         errdefer allocator.free(arguments_json);
@@ -259,6 +378,7 @@ fn parseChunk(allocator: Allocator, value: Value) !Chunk {
             .call_id = call_id_copy,
             .name = try allocator.dupe(u8, name),
             .arguments_json = arguments_json,
+            .is_delta = is_delta,
         } };
     }
 
@@ -338,7 +458,28 @@ fn parseTurnEnd(allocator: Allocator, raw: []const u8, event: ObjectMap) !Server
         try allocator.dupe(u8, nested_kind)
     else
         null;
-    return .{ .turn_end = .{ .kind = kind_copy, .reason_kind = reason_kind_copy } };
+    errdefer if (reason_kind_copy) |nested_kind| allocator.free(nested_kind);
+    // Current dsh: `reason.error.message`. Older logs keep it on `reason`, and
+    // some frames put it on `data`.
+    var error_message: ?[]const u8 = null;
+    if (std.mem.eql(u8, kind, "error")) {
+        if (reason_value) |value| {
+            const reason = asObject(value).?;
+            if (objectField(reason, "error")) |failure|
+                error_message = stringField(failure, "message");
+            if (error_message == null) error_message = stringField(reason, "message");
+        }
+        if (error_message == null) error_message = stringField(data, "message");
+    }
+    const error_message_copy: ?[]const u8 = if (error_message) |message|
+        try allocator.dupe(u8, message)
+    else
+        null;
+    return .{ .turn_end = .{
+        .kind = kind_copy,
+        .reason_kind = reason_kind_copy,
+        .error_message = error_message_copy,
+    } };
 }
 
 fn parseWaterfall(allocator: Allocator, raw: []const u8, object: ObjectMap) !ServerEvent {
@@ -367,7 +508,7 @@ fn parseApprovalRequest(
     errdefer allocator.free(tool_copy);
     const call_copy = try allocator.dupe(u8, call_id);
     errdefer allocator.free(call_copy);
-    const display_copy: ?[]const u8 = if (stringField(request, "displayReason")) |display|
+    const display_copy: ?[]const u8 = if (displayReasonField(request)) |display|
         try allocator.dupe(u8, display)
     else
         null;
@@ -379,6 +520,16 @@ fn parseApprovalRequest(
         .display_reason = display_copy,
         .event_id = event_copy,
     } };
+}
+
+/// `displayReason` is a plain string or a localized `{en, zh}` object.
+fn displayReasonField(request: ObjectMap) ?[]const u8 {
+    const value = request.get("displayReason") orelse return null;
+    return switch (value) {
+        .string => |text| text,
+        .object => |locales| stringField(locales, "en") orelse stringField(locales, "zh"),
+        else => null,
+    };
 }
 
 fn unknownEvent(allocator: Allocator, raw: []const u8) !ServerEvent {
@@ -575,9 +726,11 @@ fn freeChunk(allocator: Allocator, chunk: Chunk) void {
 fn freeServerEvent(allocator: Allocator, event: ServerEvent) void {
     switch (event) {
         .assistant_chunk => |chunk| freeChunk(allocator, chunk),
+        .committed => |text| allocator.free(text),
         .turn_end => |turn| {
             allocator.free(turn.kind);
             if (turn.reason_kind) |kind| allocator.free(kind);
+            if (turn.error_message) |message| allocator.free(message);
         },
         .approval_request => |request| {
             allocator.free(request.tool_name);
@@ -702,6 +855,26 @@ test "parseServerFrame handles wrapped text-delta chunks" {
     }
 }
 
+test "parseServerFrame: committed assistant/message carries finalized text" {
+    // Regression: committed assistant/message was parsed as .unknown and dropped.
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{\"type\":\"event\"," ++
+        "\"event\":{\"type\":\"assistant/message\",\"seq\":9,\"time\":1,\"surfaceOp\":\"append\"," ++
+        "\"data\":{\"turn\":1,\"step\":1,\"interrupted\":true,\"stream\":[]," ++
+        "\"message\":{\"id\":\"msg-1\",\"role\":\"assistant\"," ++
+        "\"content\":[{\"type\":\"text\",\"text\":\"partial \"}," ++
+        "{\"type\":\"reasoning\",\"text\":\"hidden\"}," ++
+        "{\"type\":\"text\",\"text\":\"answer\"}]," ++
+        "\"source\":{\"kind\":\"model\",\"provider\":\"mock\",\"model\":\"mock\"}}}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .committed => |text| try std.testing.expectEqualStrings("partial answer", text),
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
 test "parseServerFrame accepts server-event and bare assistant-stream envelopes" {
     const allocator = std.testing.allocator;
     const server_event =
@@ -801,6 +974,49 @@ test "tool result reads toolCallId and source.callId" {
     }
 }
 
+test "streamed tool-call deltas fold into one full tool-call" {
+    // Regression: tool-call after tool-call-delta produced two identical tool_call events.
+    const allocator = std.testing.allocator;
+    var calls: ToolCallAccumulator = .{};
+    defer calls.deinit(allocator);
+
+    const delta = "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\"," ++
+        "\"callId\":\"call-1\",\"name\":\"read\",\"argumentsDelta\":\"{\\\"path\\\":\"}}";
+    if (try calls.absorb(allocator, try parseServerFrame(allocator, delta))) |emitted| {
+        freeServerEvent(allocator, emitted);
+        return error.TestUnexpectedEvent;
+    }
+
+    const delta_tail = "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\"," ++
+        "\"callId\":\"call-1\",\"argumentsDelta\":\"\\\"example.com\\\"}\"}}";
+    if (try calls.absorb(allocator, try parseServerFrame(allocator, delta_tail))) |emitted| {
+        freeServerEvent(allocator, emitted);
+        return error.TestUnexpectedEvent;
+    }
+    try std.testing.expectEqualStrings(
+        "{\"path\":\"example.com\"}",
+        calls.pending.items[0].arguments.items,
+    );
+
+    const full = "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call\"," ++
+        "\"callId\":\"call-1\",\"name\":\"read\",\"arguments\":{\"path\":\"example.com\"}}}";
+    const kept = (try calls.absorb(allocator, try parseServerFrame(allocator, full))) orelse
+        return error.TestExpectedToolCall;
+    defer freeServerEvent(allocator, kept);
+    switch (kept) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .tool_call => |call| {
+                try std.testing.expectEqualStrings("call-1", call.call_id);
+                try std.testing.expectEqualStrings("{\"path\":\"example.com\"}", call.arguments_json);
+                try std.testing.expect(!call.is_delta);
+            },
+            else => return error.TestUnexpectedChunk,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+    try std.testing.expectEqual(@as(usize, 0), calls.pending.items.len);
+}
+
 test "parseServerFrame keeps uninterpreted chunks verbatim" {
     const allocator = std.testing.allocator;
     const frame =
@@ -856,6 +1072,36 @@ test "parseServerFrame: turn/end kind and nested abort reason" {
     try std.testing.expect(unknown == .unknown);
 }
 
+test "parseServerFrame: turn/end error keeps the failure message" {
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"turn\":3," ++
+        "\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"provider exploded\"," ++
+        "\"code\":\"UNKNOWN\"}}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .turn_end => |turn| {
+            try std.testing.expectEqualStrings("error", turn.kind);
+            try std.testing.expectEqualStrings("provider exploded", turn.error_message.?);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
+test "parseServerFrame: turn/end error falls back to a direct message" {
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"event\",\"event\":{\"type\":\"turn/end\"," ++
+        "\"data\":{\"reason\":{\"kind\":\"error\",\"message\":\"old log shape\"}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .turn_end => |turn| try std.testing.expectEqualStrings("old log shape", turn.error_message.?),
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
 test "parseServerFrame maps approval waterfalls" {
     const allocator = std.testing.allocator;
     const frame =
@@ -881,6 +1127,49 @@ test "parseServerFrame maps approval waterfalls" {
     const unknown = try parseServerFrame(allocator, other_waterfall);
     defer freeServerEvent(allocator, unknown);
     try std.testing.expect(unknown == .unknown);
+}
+
+test "approval displayReason accepts localized objects" {
+    // Regression: displayReason object was dropped, display_reason was null for {en,zh}.
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"waterfall\",\"event\":\"approval/request\",\"eventId\":\"evt-1\"," ++
+        "\"request\":{\"toolName\":\"bash\",\"callId\":\"call-1\"," ++
+        "\"displayReason\":{\"en\":\"Run outside workspace\",\"zh\":\"在工作区外运行\"}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .approval_request => |request| {
+            try std.testing.expectEqualStrings("Run outside workspace", request.display_reason.?);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+
+    const zh_only =
+        "{\"type\":\"waterfall\",\"event\":\"approval/request\"," ++
+        "\"request\":{\"toolName\":\"bash\",\"callId\":\"call-2\"," ++
+        "\"displayReason\":{\"zh\":\"需要写入\"}}}";
+    const zh_event = try parseServerFrame(allocator, zh_only);
+    defer freeServerEvent(allocator, zh_event);
+    switch (zh_event) {
+        .approval_request => |request| {
+            try std.testing.expectEqualStrings("需要写入", request.display_reason.?);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+
+    const plain =
+        "{\"type\":\"waterfall\",\"event\":\"approval/request\"," ++
+        "\"request\":{\"toolName\":\"bash\",\"callId\":\"call-3\"," ++
+        "\"displayReason\":\"needs write\"}}";
+    const plain_event = try parseServerFrame(allocator, plain);
+    defer freeServerEvent(allocator, plain_event);
+    switch (plain_event) {
+        .approval_request => |request| {
+            try std.testing.expectEqualStrings("needs write", request.display_reason.?);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
 }
 
 test "parseServerFrame ignores bookkeeping events and preserves unknown frames" {

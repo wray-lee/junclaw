@@ -46,6 +46,75 @@ const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const harness_port = @import("harness/port.zig");
 const native_harness = @import("harness/native.zig");
+const build_options = @import("build_options");
+const dsh_enabled = build_options.enable_harness_dsh;
+const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
+    pub const DshHarness = void;
+    pub const DshEngine = void;
+};
+
+/// Per-session dsh handle. The sidecar and the key→session table live in the
+/// process-wide `DshEngine`; this only owns the handle's key copy.
+const DshState = if (dsh_enabled) struct {
+    harness: dsh_harness_mod.DshHarness,
+
+    fn deinit(self: *@This()) void {
+        self.harness.deinit();
+    }
+} else struct {
+    fn deinit(self: *@This()) void {
+        _ = self;
+    }
+};
+
+/// The process-wide dsh engine plus the option strings its `Options` borrow.
+/// Created lazily by the manager; the sidecar itself boots on the first turn.
+const DshEngineState = if (dsh_enabled) struct {
+    allocator: Allocator,
+    engine: *dsh_harness_mod.DshEngine,
+    dsh_home: []u8,
+    session_base: []u8,
+
+    fn deinit(self: *@This()) void {
+        self.engine.deinit();
+        self.allocator.destroy(self.engine);
+        self.allocator.free(self.dsh_home);
+        self.allocator.free(self.session_base);
+    }
+} else struct {
+    fn deinit(self: *@This()) void {
+        _ = self;
+    }
+};
+
+/// Dsh builds carry the lazily created engine; a default build compiles the
+/// slot to an empty struct, so the native path is unchanged.
+const DshEngineSlot = if (dsh_enabled) struct {
+    mutex: std_compat.sync.Mutex = .{},
+    state: ?DshEngineState = null,
+} else struct {};
+
+/// Test seam: point session-created dsh harnesses at an in-process mock
+/// instead of spawning a sidecar. Production never sets it.
+var dsh_test_boot_url: ?[]const u8 = null;
+
+/// Log the ignored `harness: "dsh"` selection once per process.
+var warned_dsh_ignored = std.atomic.Value(bool).init(false);
+
+fn warnDshIgnored() void {
+    if (!warned_dsh_ignored.swap(true, .acq_rel)) {
+        log.warn("agent.harness=\"dsh\" ignored: this build has no dsh harness (-Dharness_dsh=true); using native", .{});
+    }
+}
+
+/// Build this session's lightweight dsh handle. The shared engine is created
+/// on first use, which only allocates and fills fields; the sidecar boots
+/// later, on the first dsh turn, outside the session-table lock.
+fn startDshHarness(manager: *SessionManager, session_key: []const u8) !DshState {
+    const engine = try manager.ensureDshEngine();
+    return .{ .harness = try dsh_harness_mod.DshHarness.init(engine, session_key) };
+}
+
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -184,7 +253,7 @@ fn dropRowsBeforeLastCompactionSummary(entries: []const memory_mod.MessageEntry)
 fn restorePersistedSessionState(session: *Session, entries: []const memory_mod.MessageEntry) void {
     for (entries) |entry| {
         if (memory_mod.isRuntimeCommandRole(entry.role)) {
-            const maybe_response = session.agent.handleSlashCommand(entry.content) catch null;
+            const maybe_response = session.handleLocalCommand(entry.content) catch null;
             if (maybe_response) |response| session.agent.allocator.free(response);
             continue;
         }
@@ -376,6 +445,9 @@ pub const Session = struct {
     /// The turn port for this session. Wraps `agent` for now; the host reaches
     /// `agent` directly through `nativeAgent()` until every call site moves.
     harness: native_harness.NativeHarness = undefined,
+    /// Set only when `agent.harness = "dsh"`, this build has the adapter and
+    /// the sidecar started; `turnHarness()` prefers it over `harness`.
+    dsh: ?DshState = null,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
     owned_memory_session_id: ?[]u8 = null,
@@ -416,7 +488,66 @@ pub const Session = struct {
         return &self.agent;
     }
 
+    /// The engine this session's turns run on: dsh when selected, otherwise
+    /// the native adapter. The dsh handle owns an immutable key copy; the
+    /// native adapter still refreshes its key because a legacy key can be
+    /// canonicalized after session creation.
+    fn turnHarness(self: *Session) harness_port.Harness {
+        if (comptime dsh_enabled) {
+            if (self.dsh) |*d| {
+                return d.harness.harness();
+            }
+        }
+        self.harness.session_key = self.session_key;
+        return self.harness.harness();
+    }
+
+    /// Answer a host-side slash command on the engine that owns this session's
+    /// turns. A dsh session never runs `Agent.turn`, so its command dispatch
+    /// would miss `/stop` and `/new` and send them to dsh as prompt text.
+    /// Native calls the agent exactly once: probing `NativeHarness` first
+    /// would run every native command twice, because that adapter *is* the
+    /// agent call.
+    fn handleLocalCommand(self: *Session, content: []const u8) !?[]const u8 {
+        if (comptime dsh_enabled) {
+            if (self.dsh) |*d| {
+                if (try d.harness.harness().handleLocalCommand(content)) |reply| {
+                    // The engine's reply is borrowed; host replies are owned.
+                    return try self.agent.allocator.dupe(u8, reply);
+                }
+                // Commands the dsh engine does not own (e.g. /status) stay host-side.
+                return self.agent.handleSlashCommand(content);
+            }
+        }
+        return self.agent.handleSlashCommand(content);
+    }
+
+    /// Interrupt the engine that owns this session's turns. Native resolves to
+    /// the same `Agent` call, so the default path is unchanged.
+    pub fn requestInterrupt(self: *Session) void {
+        if (comptime dsh_enabled) {
+            if (self.dsh) |*d| {
+                d.harness.harness().requestInterrupt();
+                return;
+            }
+        }
+        self.agent.requestInterrupt();
+    }
+
+    /// Clear an interrupt that no turn consumed, e.g. a `/stop` that landed
+    /// during reply delivery. Native resolves to the same `Agent` call.
+    pub fn clearInterrupt(self: *Session) void {
+        if (comptime dsh_enabled) {
+            if (self.dsh) |*d| {
+                d.harness.harness().clearInterrupt();
+                return;
+            }
+        }
+        self.agent.clearInterruptRequest();
+    }
+
     pub fn deinit(self: *Session, allocator: Allocator) void {
+        if (self.dsh) |*d| d.deinit();
         self.agent.deinit();
         if (self.provider_holder) |*holder| holder.deinit();
         if (self.owned_provider_api_key) |key| allocator.free(key);
@@ -669,6 +800,9 @@ pub const SessionManager = struct {
     vision_capable: ?bool = null,
 
     mutex: std_compat.sync.Mutex,
+    /// Process-wide dsh engine, created lazily under its own lock. Empty in a
+    /// default build (the field is compiled away).
+    dsh_engine: DshEngineSlot = .{},
     usage_log_mutex: std_compat.sync.Mutex,
     claim_state_io_mutex: std_compat.sync.Mutex,
     usage_ledger_state_initialized: bool,
@@ -748,6 +882,12 @@ pub const SessionManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit(self.allocator);
+
+        // Every session released its key above; tear down the shared sidecar
+        // last.
+        if (comptime dsh_enabled) {
+            if (self.dsh_engine.state) |*state| state.deinit();
+        }
 
         var rt_it = self.agent_runtimes.iterator();
         while (rt_it.next()) |entry| {
@@ -1820,6 +1960,45 @@ pub const SessionManager = struct {
         }
     }
 
+    /// Lazily create the process-wide dsh engine. Allocation only: no spawn,
+    /// no network, so it is safe under the session-table lock.
+    fn ensureDshEngine(self: *SessionManager) !*dsh_harness_mod.DshEngine {
+        if (comptime dsh_enabled) {
+            self.dsh_engine.mutex.lock();
+            defer self.dsh_engine.mutex.unlock();
+            if (self.dsh_engine.state) |*state| return state.engine;
+
+            const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse ".";
+            const dsh_home = try std_compat.fs.path.join(self.allocator, &.{ config_dir, ".dsh" });
+            errdefer self.allocator.free(dsh_home);
+            const sessions_dir = try std_compat.fs.path.join(self.allocator, &.{ config_dir, "dsh-sessions" });
+            defer self.allocator.free(sessions_dir);
+            // Only the directory matters; each key derives its own file.
+            const session_base = try std.fmt.allocPrint(self.allocator, "{s}/session.json", .{sessions_dir});
+            errdefer self.allocator.free(session_base);
+
+            const engine = try self.allocator.create(dsh_harness_mod.DshEngine);
+            errdefer self.allocator.destroy(engine);
+            engine.* = dsh_harness_mod.DshEngine.init(self.allocator, .{
+                .sidecar = .{
+                    // Empty: resolved from NULLCLAW_DSH_BIN at boot.
+                    .bin_js = "",
+                    .workspace = self.config.workspace_dir,
+                    .dsh_home = dsh_home,
+                },
+                .boot_url = dsh_test_boot_url,
+                .session_file = session_base,
+            });
+            self.dsh_engine.state = .{
+                .allocator = self.allocator,
+                .engine = engine,
+                .dsh_home = dsh_home,
+                .session_base = session_base,
+            };
+            return engine;
+        } else unreachable;
+    }
+
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         return self.getOrCreateForTurn(session_key, false);
@@ -1958,6 +2137,15 @@ pub const SessionManager = struct {
         session.harness = native_harness.NativeHarness.init(&session.agent);
         key_owned_by_session = true;
         session_initialized = true;
+
+        if (comptime dsh_enabled) {
+            if (selected_config.agent.harness == .dsh) {
+                // Attach the handle now; the sidecar boots on the first turn.
+                session.dsh = try startDshHarness(self, owned_key);
+            }
+        } else if (selected_config.agent.harness == .dsh) {
+            warnDshIgnored();
+        }
 
         if (selected_session_store) |store| {
             self.resetStaleRestoredSessionLocked(session, store, now);
@@ -2375,7 +2563,7 @@ pub const SessionManager = struct {
         defer session.agent.conversation_context = null;
         setTurnToolContext(session.agent.tools, session_key, conversation_context);
 
-        const maybe_response = try session.agent.handleSlashCommand(content);
+        const maybe_response = try session.handleLocalCommand(content);
         if (maybe_response == null) return null;
 
         session.turn_count += 1;
@@ -2463,22 +2651,42 @@ pub const SessionManager = struct {
         // (e.g. error.RateLimited). Clear it so a follow-up turn for a steered
         // message cannot inherit it and answer "Interrupted by /stop" without
         // ever calling the provider.
-        defer session.agent.clearInterruptRequest();
-        const response = blk: {
+        defer session.clearInterrupt();
+        const turn_result = blk: {
+            // `Agent.turn` is native-only: a dsh engine receives the prompt
+            // itself, so a local command would reach dsh as text. Answer known
+            // commands on the engine instead. A pre-turn /stop still wins like
+            // native's: leave it for runTurn, which aborts before the prompt.
+            if (comptime dsh_enabled) {
+                if (session.dsh) |*d| {
+                    if (!d.harness.interruptPending() and
+                        agent_mod.commands.isKnownSlashCommand(turn_input.user_message))
+                    {
+                        break :blk harness_port.TurnResult{
+                            .reply = try session.handleLocalCommand(turn_input.user_message) orelse
+                                return error.SlashCommandDispatchMismatch,
+                        };
+                    }
+                }
+            }
             // The adapter is the session's turn engine; hand it the real key so
             // its display-trust decisions match the host's (the key can be
             // renamed when a legacy session is canonicalized, so set it per turn).
-            session.harness.session_key = session.session_key;
             var input = turn_input;
             input.drain = drain;
             input.drain_ctx = drain_ctx;
-            break :blk (session.harness.harness().runTurn(input) catch |err| {
+            break :blk session.turnHarness().runTurn(input) catch |err| {
                 finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
                 return err;
-            }).reply;
+            };
         };
+        // Only `reply` is returned; the port hands failure text to the host.
+        defer if (turn_result.@"error") |message| self.allocator.free(message);
+        // dsh reports interruption through the port; the host's /stop tail
+        // (pending-injection discard and notices) reads the agent flag.
+        session.agent.last_turn_interrupted = turn_result.end_reason == .interrupted;
         finalizeSteerRefs(steer_sink, self.allocator, refs, .done);
-        return response;
+        return turn_result.reply;
     }
 
     /// Drain one pending post-turn injection and run it as a follow-up turn.
@@ -2804,7 +3012,7 @@ pub const SessionManager = struct {
             self.mutex.lock();
             const pending_start = self.takePendingStartInterruptLocked(session_key);
             self.mutex.unlock();
-            if (pending_start) session.agent.requestInterrupt();
+            if (pending_start) session.requestInterrupt();
         }
 
         lockSessionForTurn(session);
@@ -2816,7 +3024,7 @@ pub const SessionManager = struct {
             // deposit into a turn that is already gone.
             session.turn_running.store(false, .release);
             session.turn_closing.store(false, .release);
-            session.agent.clearInterruptRequest();
+            session.clearInterrupt();
         }
 
         // Keep the handoff under the turn mutex, after closing injections, so
@@ -3188,7 +3396,7 @@ pub const SessionManager = struct {
 
         const session = self.sessions.get(session_key) orelse return .{};
         if (!session.turn_running.load(.acquire)) return .{};
-        session.agent.requestInterrupt();
+        session.requestInterrupt();
         return .{
             .requested = true,
             .active_tool = session.agent.snapshotActiveToolName(self.allocator) catch null,
@@ -3206,7 +3414,7 @@ pub const SessionManager = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.sessions.get(session_key)) |session| {
-            session.agent.requestInterrupt();
+            session.requestInterrupt();
             return true;
         }
         if (!self.pending_start_interrupts.contains(session_key)) {
@@ -3245,7 +3453,7 @@ pub const SessionManager = struct {
         defer self.mutex.unlock();
         const session = self.sessions.get(session_key) orelse return;
         if (session.turn_running.load(.acquire)) return;
-        session.agent.clearInterruptRequest();
+        session.clearInterrupt();
     }
 
     /// Request interruption of a running turn for `session_key` together with
@@ -3263,7 +3471,7 @@ pub const SessionManager = struct {
         var requested = false;
         if (self.sessions.get(session_key)) |session| {
             if (session.turn_running.load(.acquire)) {
-                session.agent.requestInterrupt();
+                session.requestInterrupt();
                 requested = true;
             }
         }
@@ -3274,7 +3482,7 @@ pub const SessionManager = struct {
             if (!std.mem.eql(u8, parent, session_key)) continue;
             const session = entry.value_ptr.*;
             if (!session.turn_running.load(.acquire)) continue;
-            session.agent.requestInterrupt();
+            session.requestInterrupt();
             requested = true;
         }
         return requested;
@@ -4095,7 +4303,7 @@ const StopDuringToolProbe = struct {
         // for a message that arrives during the tool call, then reproduce the
         // state a real /stop leaves behind when it kills the tool.
         _ = try self.session.?.appendMidTurnIfRunning(testing.allocator, "steered while busy");
-        self.session.?.agent.requestInterrupt();
+        self.session.?.requestInterrupt();
         return .{ .success = false, .output = "", .error_msg = "Interrupted by /stop" };
     }
 };
@@ -5881,7 +6089,7 @@ test "routeInbound interrupts a busy session for /stop instead of dropping" {
     const session_key = "route:stop";
     const session = try sm.getOrCreate(session_key);
     session.agent.queue_mode = .off;
-    session.agent.clearInterruptRequest();
+    session.clearInterrupt();
     defer session.turn_running.store(false, .release);
 
     session.turn_running.store(true, .release);
@@ -5895,7 +6103,7 @@ test "routeInbound interrupts a busy session for /stop instead of dropping" {
     try testing.expect(session.agent.interrupt_requested.load(.acquire));
 
     // A non-stop message in the same state is still dropped without interrupt.
-    session.agent.clearInterruptRequest();
+    session.clearInterrupt();
     try testing.expectEqual(
         SessionManager.InboundRouteAction.dropped,
         sm.routeInbound(session_key, "just a message"),
@@ -5960,7 +6168,7 @@ test "lockSessionForTurn waits without interrupting active serial turn" {
     const session = try sm.getOrCreate("interrupt:contention");
     session.turn_running.store(true, .release);
     defer session.turn_running.store(false, .release);
-    session.agent.clearInterruptRequest();
+    session.clearInterrupt();
 
     session.mutex.lock();
     var session_unlocked = false;
@@ -6199,6 +6407,282 @@ test "processMessageStreaming does not rehydrate placeholders for group sessions
     for (detailed) |message| {
         try testing.expect(std.mem.indexOf(u8, message.content, "alice@example.com") == null);
     }
+}
+
+test "agent.harness default keeps the native turn path" {
+    // Regression: adding a second engine must not change sessions that never
+    // opt in.
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:local");
+    try testing.expect(session.dsh == null);
+    const h = session.turnHarness();
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), h.ptr);
+    try testing.expectEqualStrings(session.session_key, session.harness.session_key);
+}
+
+test "agent.harness=dsh is ignored in a default build" {
+    if (comptime dsh_enabled) return error.SkipZigTest;
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.agent.harness = .dsh;
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:local");
+    try testing.expect(session.dsh == null);
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), session.turnHarness().ptr);
+}
+
+test "agent.harness=dsh selects the dsh engine in a dsh build" {
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agent.harness = .dsh;
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:local");
+    try testing.expect(session.dsh != null);
+    const h = session.turnHarness();
+    if (session.dsh) |*d| {
+        try testing.expectEqual(@as(*anyopaque, @ptrCast(&d.harness)), h.ptr);
+    }
+}
+
+/// Runs one host turn on a worker thread and counts the live deltas it gets.
+/// Counting (not collecting) keeps the main thread's read race-free.
+const HostDshTurn = struct {
+    mgr: *SessionManager,
+    session_key: []const u8,
+    content: []const u8,
+    chunks: std.atomic.Value(usize) = .init(0),
+    reply: ?[]const u8 = null,
+    failure: ?anyerror = null,
+
+    fn onEvent(ctx: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
+        const self: *HostDshTurn = @ptrCast(@alignCast(ctx));
+        _ = self.chunks.fetchAdd(1, .acq_rel);
+    }
+
+    fn main(self: *@This()) void {
+        self.reply = self.mgr.processMessageStreaming(self.session_key, self.content, null, .{
+            .callback = onEvent,
+            .ctx = @ptrCast(self),
+        }, null) catch |err| {
+            self.failure = err;
+            return;
+        };
+    }
+};
+
+fn waitForDshDelta(turn: *HostDshTurn) void {
+    const deadline = std_compat.time.milliTimestamp() + 5_000;
+    while (turn.chunks.load(.acquire) == 0 and std_compat.time.milliTimestamp() < deadline) {
+        std_compat.thread.sleep(std.time.ns_per_ms);
+    }
+}
+
+fn dshSessionTestConfig(tmp: *std.testing.TmpDir) !struct { base: []u8, config_path: []u8, cfg: Config } {
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    errdefer testing.allocator.free(base);
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    errdefer testing.allocator.free(config_path);
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agent.harness = .dsh;
+    return .{ .base = base, .config_path = config_path, .cfg = cfg };
+}
+
+test "host /stop cancels an in-flight dsh turn and keeps the partial reply" {
+    // Regression: host /stop never reached the dsh harness, so dsh turns could
+    // not be cancelled.
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try dshSessionTestConfig(&tmp);
+    defer testing.allocator.free(setup.base);
+    defer testing.allocator.free(setup.config_path);
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &setup.cfg);
+    defer sm.deinit();
+
+    // No terminal frame: the turn stays in flight until /stop lands.
+    const frames = [_][]const u8{
+        try mock_mod.textDeltaFrame(testing.allocator, 0, "part one "),
+        try mock_mod.textDeltaFrame(testing.allocator, 1, "part two"),
+    };
+    defer for (frames) |frame| testing.allocator.free(frame);
+    try dsh_mock.setTurnFrames(&frames);
+
+    const session_key = "cli:main:dsh-stop";
+    var turn = HostDshTurn{ .mgr = &sm, .session_key = session_key, .content = "hello" };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        HostDshTurn.main,
+        .{&turn},
+    );
+    waitForDshDelta(&turn);
+    try testing.expect(turn.chunks.load(.acquire) > 0);
+
+    try testing.expectEqual(SessionManager.InboundRouteAction.skip, sm.routeInbound(session_key, "/stop"));
+    thread.join();
+
+    try testing.expect(turn.failure == null);
+    const reply = turn.reply.?;
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("part one part two", reply);
+    try testing.expectEqual(@as(u32, 1), dsh_mock.cancelCount());
+    try testing.expect((try sm.getOrCreate(session_key)).agent.last_turn_interrupted);
+}
+
+test "host /new starts a fresh dsh session and rewrites the mapping" {
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    const sidecar_mod = @import("harness/dsh/sidecar.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try dshSessionTestConfig(&tmp);
+    defer testing.allocator.free(setup.base);
+    defer testing.allocator.free(setup.config_path);
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &setup.cfg);
+    defer sm.deinit();
+
+    const session_key = "cli:main:dsh-new";
+    try dsh_mock.setTurnFrames(&.{ "first", mock_mod.turn_completed_frame });
+    const first = try sm.processMessageStreaming(session_key, "one", null, null, null);
+    defer testing.allocator.free(first);
+    try testing.expectEqual(@as(u32, 1), dsh_mock.createCount());
+
+    const ack = try sm.processMessageStreaming(session_key, "/new", null, null, null);
+    defer testing.allocator.free(ack);
+    try testing.expectEqualStrings("Session cleared.", ack);
+    // A new dsh session was created, and the command never reached dsh as a prompt.
+    try testing.expectEqual(@as(u32, 2), dsh_mock.createCount());
+    try testing.expectEqual(@as(u32, 1), dsh_mock.promptCount());
+
+    const session_file = try std.fmt.allocPrint(testing.allocator, "{s}/dsh-sessions/{x}.json", .{
+        setup.base,
+        std.hash.Wyhash.hash(0, session_key),
+    });
+    defer testing.allocator.free(session_file);
+    const persisted = (try sidecar_mod.loadSessionId(testing.allocator, session_file)).?;
+    defer testing.allocator.free(persisted);
+    try testing.expectEqualStrings("mock-sess-2", persisted);
+}
+
+test "dsh boot does not block session creation under the manager lock" {
+    // Regression: the sidecar spawned synchronously inside getOrCreate's
+    // SessionManager.mutex hold, so a slow boot stalled every session.
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var gate = mock_mod.ConnectGate{};
+    dsh_mock.setConnectGate(&gate);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try dshSessionTestConfig(&tmp);
+    defer testing.allocator.free(setup.base);
+    defer testing.allocator.free(setup.config_path);
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &setup.cfg);
+    defer sm.deinit();
+
+    const slow_delta = try mock_mod.textDeltaFrame(testing.allocator, 0, "slow boot");
+    defer testing.allocator.free(slow_delta);
+    try dsh_mock.setTurnFrames(&.{ slow_delta, mock_mod.turn_completed_frame });
+
+    const dsh_key = "cli:main:dsh-slow-boot";
+    var turn = HostDshTurn{ .mgr = &sm, .session_key = dsh_key, .content = "hello" };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        HostDshTurn.main,
+        .{&turn},
+    );
+
+    // The turn is parked inside the sidecar boot. Creating another session
+    // must still complete: boot is not under the session-table lock.
+    gate.waitEntered();
+    setup.cfg.agent.harness = .native;
+    const native_session = try sm.getOrCreate("cli:main:native-during-boot");
+    try testing.expect(native_session.dsh == null);
+    try testing.expectEqual(
+        @as(*anyopaque, @ptrCast(&native_session.harness)),
+        native_session.turnHarness().ptr,
+    );
+    setup.cfg.agent.harness = .dsh;
+
+    gate.open();
+    thread.join();
+    try testing.expect(turn.failure == null);
+    const reply = turn.reply.?;
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("slow boot", reply);
 }
 
 test "harness display trust uses the real session key for shared channels" {
@@ -6618,7 +7102,7 @@ test "clearTurnInterruptIfIdle drops a stale stop flag but keeps a running one" 
     sm.clearTurnInterruptIfIdle(session_key);
     try testing.expect(session.agent.interrupt_requested.load(.acquire));
     session.turn_running.store(false, .release);
-    session.agent.clearInterruptRequest();
+    session.clearInterrupt();
 }
 
 test "drainLateInjection keeps the primary reply and asks the sender to resend" {
@@ -9036,7 +9520,7 @@ test "steered message reaction is finalized after its consuming turn is interrup
         session: *Session,
         fn hook(ctx: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            self.session.agent.requestInterrupt();
+            self.session.requestInterrupt();
         }
     };
     var interrupt = Interrupt{ .session = session };
@@ -9079,7 +9563,7 @@ test "steered follow-up does not inherit a stop from the failed primary turn" {
             if (self.fired) return;
             self.fired = true;
             _ = self.session.appendMidTurnIfRunning(testing.allocator, "steered while busy") catch false;
-            self.session.agent.requestInterrupt();
+            self.session.requestInterrupt();
         }
     };
     var hook_ctx = SteerAndStop{ .session = session };

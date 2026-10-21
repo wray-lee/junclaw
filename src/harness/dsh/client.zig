@@ -187,9 +187,11 @@ fn freeServerEvent(allocator: Allocator, event: protocol.ServerEvent) void {
             },
             .other => |raw| allocator.free(raw),
         },
+        .committed => |message| allocator.free(message),
         .turn_end => |turn| {
             allocator.free(turn.kind);
             if (turn.reason_kind) |kind| allocator.free(kind);
+            if (turn.error_message) |message| allocator.free(message);
         },
         .approval_request => |request| {
             allocator.free(request.tool_name);
@@ -202,6 +204,25 @@ fn freeServerEvent(allocator: Allocator, event: protocol.ServerEvent) void {
     }
 }
 
+pub const CancelResult = struct {
+    /// Terminal `turn/end` kind (normally "aborted").
+    kind: []const u8,
+    /// Nested terminal reason (e.g. "user"), when dsh reports one.
+    reason_kind: ?[]const u8,
+    /// Assistant text emitted before the turn ended; caller frees. When
+    /// `committed` is set this is the latest committed `assistant/message`
+    /// (dsh's finalized prefix), otherwise the sum of `text-delta`s.
+    partial_text: []u8,
+    /// True when `partial_text` came from a committed `assistant/message`.
+    committed: bool,
+};
+
+pub fn freeCancelResult(allocator: Allocator, result: *CancelResult) void {
+    allocator.free(result.kind);
+    if (result.reason_kind) |kind| allocator.free(kind);
+    allocator.free(result.partial_text);
+}
+
 /// State shared with the reader thread. Heap-allocated so moving `DshClient`
 /// after `connect` does not invalidate the thread's pointer.
 const Shared = struct {
@@ -209,11 +230,14 @@ const Shared = struct {
     session_id: []u8,
     ws: ?websocket.WsClient = null,
     queue: std.ArrayListUnmanaged(Event) = .empty,
+    tool_calls: protocol.ToolCallAccumulator = .{},
     mutex: std_compat.sync.Mutex = .{},
     lost: bool = false,
 
     fn enqueueFrame(self: *Shared, frame_json: []const u8) !void {
-        const event = protocol.parseServerFrame(self.allocator, frame_json) catch return;
+        const parsed = protocol.parseServerFrame(self.allocator, frame_json) catch return;
+        // Deltas fold into their pending call and produce no event.
+        const event = (try self.tool_calls.absorb(self.allocator, parsed)) orelse return;
         const session_id = self.allocator.dupe(u8, self.session_id) catch |err| {
             freeServerEvent(self.allocator, event);
             return err;
@@ -258,9 +282,74 @@ const Shared = struct {
             freeEvent(self.allocator, &event);
         }
         self.queue.deinit(self.allocator);
+        self.tool_calls.deinit(self.allocator);
         self.allocator.free(self.session_id);
     }
 };
+
+/// Wait for the aborted `turn/end`, keeping assistant text seen on the way.
+fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
+    const allocator = shared.allocator;
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(allocator);
+    // A cancelled turn commits its delivered prefix before `turn/end`; that
+    // finalized text wins over the deltas that produced it.
+    var committed: ?[]u8 = null;
+    errdefer if (committed) |message| allocator.free(message);
+
+    const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        const remaining = deadline - std_compat.time.milliTimestamp();
+        if (remaining <= 0) return error.CancelTimeout;
+        var event = shared.nextEvent(@intCast(remaining)) catch |err| switch (err) {
+            error.Timeout => return error.CancelTimeout,
+            else => return err,
+        };
+
+        switch (event.event) {
+            .turn_end => |turn| if (std.mem.eql(u8, turn.kind, "aborted")) {
+                // Move the terminal reason out of the queue event.
+                const from_committed = committed != null;
+                const partial_text = if (committed) |message| blk: {
+                    committed = null;
+                    break :blk message;
+                } else text.toOwnedSlice(allocator) catch |err| {
+                    allocator.free(event.session_id);
+                    allocator.free(turn.kind);
+                    if (turn.reason_kind) |kind| allocator.free(kind);
+                    if (turn.error_message) |message| allocator.free(message);
+                    return err;
+                };
+                if (from_committed) text.deinit(allocator);
+                allocator.free(event.session_id);
+                if (turn.error_message) |message| allocator.free(message);
+                return .{
+                    .kind = turn.kind,
+                    .reason_kind = turn.reason_kind,
+                    .partial_text = partial_text,
+                    .committed = from_committed,
+                };
+            },
+            .assistant_chunk => |chunk| switch (chunk) {
+                .text_delta => |delta| text.appendSlice(allocator, delta.text) catch |err| {
+                    freeEvent(allocator, &event);
+                    return err;
+                },
+                else => {},
+            },
+            .committed => |message| if (message.len > 0) {
+                const copy = allocator.dupe(u8, message) catch |err| {
+                    freeEvent(allocator, &event);
+                    return err;
+                };
+                if (committed) |old| allocator.free(old);
+                committed = copy;
+            },
+            else => {},
+        }
+        freeEvent(allocator, &event);
+    }
+}
 
 fn readerMain(shared: *Shared) void {
     while (true) {
@@ -439,9 +528,9 @@ pub const DshClient = struct {
         if (!reply.ok) return error.RpcFailed;
     }
 
-    /// Cancel the active turn and wait for its `turn/end` (drop-in events seen
-    /// while waiting; the turn is terminal at that point).
-    pub fn cancel(self: *DshClient, session_id: []const u8, timeout_ms: u64) !void {
+    /// Cancel the active turn and return the terminal `turn/end` plus any
+    /// assistant text emitted before it (queued deltas are otherwise dropped).
+    pub fn cancel(self: *DshClient, session_id: []const u8, timeout_ms: u64) !CancelResult {
         const shared = self.shared orelse return error.NotConnected;
         const args = try std.json.Stringify.valueAlloc(self.allocator, .{ .request = .{ .sessionId = session_id } }, .{});
         defer self.allocator.free(args);
@@ -450,21 +539,7 @@ pub const DshClient = struct {
         defer self.freeReply(&reply);
         if (!reply.ok) return error.RpcFailed;
 
-        const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-        while (true) {
-            const remaining = deadline - std_compat.time.milliTimestamp();
-            if (remaining <= 0) return error.CancelTimeout;
-            var event = shared.nextEvent(@intCast(remaining)) catch |err| switch (err) {
-                error.Timeout => return error.CancelTimeout,
-                else => return err,
-            };
-            const ended = switch (event.event) {
-                .turn_end => |turn| std.mem.eql(u8, turn.kind, "aborted"),
-                else => false,
-            };
-            freeEvent(self.allocator, &event);
-            if (ended) return;
-        }
+        return waitForTurnEnd(shared, timeout_ms);
     }
 
     pub fn closeSession(self: *DshClient, session_id: []const u8) !void {
@@ -577,4 +652,60 @@ test "event queue routes parsed frames and tags the session" {
     freeEvent(std.testing.allocator, &chunk);
 
     try std.testing.expectError(error.Timeout, shared.nextEvent(0));
+}
+
+test "streamed tool call frames enqueue one tool_call event" {
+    // Regression: tool-call after tool-call-delta produced two identical tool_call events.
+    const allocator = std.testing.allocator;
+    var shared = Shared{
+        .allocator = allocator,
+        .session_id = try allocator.dupe(u8, "session-test"),
+    };
+    defer shared.deinitContents();
+
+    try shared.enqueueFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\",\"callId\":\"call-1\"," ++
+            "\"name\":\"read\",\"argumentsDelta\":\"{\\\"path\\\":\\\"example.com\\\"}\"}}",
+    );
+    try shared.enqueueFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call\",\"callId\":\"call-1\"," ++
+            "\"name\":\"read\",\"arguments\":{\"path\":\"example.com\"}}}",
+    );
+
+    var event = try shared.nextEvent(0);
+    defer freeEvent(allocator, &event);
+    switch (event.event) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .tool_call => |call| {
+                try std.testing.expectEqualStrings("call-1", call.call_id);
+                try std.testing.expectEqualStrings("{\"path\":\"example.com\"}", call.arguments_json);
+            },
+            else => return error.TestUnexpectedChunk,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+    try std.testing.expectError(error.Timeout, shared.nextEvent(0));
+}
+
+test "cancel result surfaces the aborted turn/end and partial text" {
+    // Regression: cancel() returned without exposing turn/end aborted.
+    const allocator = std.testing.allocator;
+    var shared = Shared{
+        .allocator = allocator,
+        .session_id = try allocator.dupe(u8, "session-test"),
+    };
+    defer shared.deinitContents();
+
+    try shared.enqueueFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"text-delta\",\"index\":0,\"text\":\"partial answer\"}}",
+    );
+    try shared.enqueueFrame(
+        "{\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"reason\":{\"kind\":\"aborted\",\"reason\":{\"kind\":\"user\"}}}}}",
+    );
+
+    var result = try waitForTurnEnd(&shared, 1000);
+    defer freeCancelResult(allocator, &result);
+    try std.testing.expectEqualStrings("aborted", result.kind);
+    try std.testing.expectEqualStrings("user", result.reason_kind.?);
+    try std.testing.expectEqualStrings("partial answer", result.partial_text);
 }

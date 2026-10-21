@@ -98,6 +98,9 @@ pub const TurnResult = struct {
     /// The text that belongs in the session store (no /usage footer, no
     /// reasoning block). Borrowed from the engine's history.
     persisted_reply: ?[]const u8 = null,
+    /// Engine-reported failure text for `end_reason == .failed`. Owned by the
+    /// engine's allocator; the host frees it like `reply`. Null otherwise.
+    @"error": ?[]const u8 = null,
     total_tokens: u64 = 0,
     end_reason: EndReason = .completed,
     /// True when this turn compacted the history.
