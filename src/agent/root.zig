@@ -805,7 +805,7 @@ pub const Agent = struct {
         return null;
     }
 
-    fn interruptedReply(self: *Agent) ![]const u8 {
+    fn interruptedReply(self: *Agent, interim_text: []const u8) ![]const u8 {
         self.clearInterruptRequest();
         const summary = try self.takeInterruptedToolsSummary();
         defer if (summary) |s| self.allocator.free(s);
@@ -814,14 +814,25 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
         errdefer self.allocator.free(msg);
+        // Regression: text the model had already written (and, when streaming,
+        // the user had already seen in the preview) was dropped from the /stop
+        // reply. Keep it, so the preview stays a prefix and no content is lost.
+        const visible = std.mem.trim(u8, interim_text, " \t\r\n");
+        var reply = msg;
+        if (visible.len > 0) {
+            const merged = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ visible, msg });
+            self.allocator.free(msg);
+            reply = merged;
+        }
+        errdefer self.allocator.free(reply);
         try self.history.append(self.allocator, .{
             .role = .assistant,
-            .content = try self.dupeForHistory(msg),
+            .content = try self.dupeForHistory(reply),
         });
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         self.last_turn_interrupted = true;
-        return msg;
+        return reply;
     }
 
     /// Forward a provider retry notice to the live draft. Retry text is built
@@ -2163,7 +2174,7 @@ pub const Agent = struct {
         // is never reached for commands handled here, so without this the stop
         // was acknowledged but the command still ran.
         if (turn_input.invoke_local_handler and self.isInterruptRequested()) {
-            return self.interruptedReply();
+            return self.interruptedReply(interim_text.items);
         }
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
@@ -2402,7 +2413,7 @@ pub const Agent = struct {
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
             if (self.isInterruptRequested()) {
-                return self.interruptedReply();
+                return self.interruptedReply(interim_text.items);
             }
 
             // Drain any mid-turn injection at each tool boundary.
@@ -2479,7 +2490,7 @@ pub const Agent = struct {
                     // failure: end the turn with the normal interrupt reply
                     // rather than recording a failure, retrying, or surfacing a
                     // generic provider error to the channel.
-                    if (isInterruptError(err)) return self.interruptedReply();
+                    if (isInterruptError(err)) return self.interruptedReply(interim_text.items);
 
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
@@ -2522,7 +2533,7 @@ pub const Agent = struct {
                             // retry stream is running. End the turn with the
                             // interrupt reply instead of surfacing the raw error
                             // and degrading the route for a user-initiated stop.
-                            if (isInterruptError(retry_err)) return self.interruptedReply();
+                            if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
@@ -2569,7 +2580,7 @@ pub const Agent = struct {
                     // or the stream before it produced output (Interrupted). End
                     // the turn with the interrupt reply instead of recording a
                     // failure, retrying, or surfacing a provider error.
-                    if (isInterruptError(err)) return self.interruptedReply();
+                    if (isInterruptError(err)) return self.interruptedReply(interim_text.items);
 
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
@@ -2607,7 +2618,7 @@ pub const Agent = struct {
                             turn_model_name,
                             self.temperature,
                         ) catch |retry_err| {
-                            if (isInterruptError(retry_err)) return self.interruptedReply();
+                            if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
@@ -2647,7 +2658,7 @@ pub const Agent = struct {
                             turn_model_name,
                             self.temperature,
                         ) catch |retry_after_compact_err| {
-                            if (isInterruptError(retry_after_compact_err)) return self.interruptedReply();
+                            if (isInterruptError(retry_after_compact_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_after_compact_err;
@@ -2681,7 +2692,7 @@ pub const Agent = struct {
                         turn_model_name,
                         self.temperature,
                     ) catch |retry_err| {
-                        if (isInterruptError(retry_err)) return self.interruptedReply();
+                        if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
@@ -2712,7 +2723,7 @@ pub const Agent = struct {
                                 turn_model_name,
                                 self.temperature,
                             ) catch |retry_after_compact_err| {
-                                if (isInterruptError(retry_after_compact_err)) return self.interruptedReply();
+                                if (isInterruptError(retry_after_compact_err)) return self.interruptedReply(interim_text.items);
                                 if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                                 self.emitUsageFailure(turn_model_name);
                                 return retry_after_compact_err;
@@ -2731,7 +2742,7 @@ pub const Agent = struct {
             // returned as if the turn had completed.
             if (self.isInterruptRequested()) {
                 self.freeResponseFields(&response);
-                return self.interruptedReply();
+                return self.interruptedReply(interim_text.items);
             }
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
@@ -3129,7 +3140,7 @@ pub const Agent = struct {
             for (parsed_calls, 0..) |call, idx| {
                 if (self.isInterruptRequested()) {
                     self.freeResponseFields(&response);
-                    return self.interruptedReply();
+                    return self.interruptedReply(interim_text.items);
                 }
 
                 // Per-call logging stays at debug: on the turn's hot path an
@@ -14663,6 +14674,75 @@ test "Agent turn preserves XML-path interim text without leaking tool-call marku
     const last_msg = agent.history.items[agent.history.items.len - 1];
     try std.testing.expect(last_msg.role == .assistant);
     try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", last_msg.content);
+}
+
+const StopProbeTool = struct {
+    agent: ?*Agent = null,
+};
+
+fn stopProbeToolVTable() tools_mod.Tool.VTable {
+    return .{
+        .name = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "probe";
+            }
+        }.f,
+        .description = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "probe";
+            }
+        }.f,
+        .parameters_json = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "{}";
+            }
+        }.f,
+        .execute = struct {
+            fn f(ptr: *anyopaque, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) anyerror!tools_mod.ToolResult {
+                const self: *StopProbeTool = @ptrCast(@alignCast(ptr));
+                self.agent.?.requestInterrupt();
+                return tools_mod.ToolResult.ok("ok");
+            }
+        }.f,
+    };
+}
+
+test "Agent /stop reply keeps the interim text the preview already showed" {
+    // Regression: a /stop after a tool-call round dropped the text of that
+    // round, so the reply was just "Interrupted by /stop..." while the preview
+    // still showed the interim text (not a prefix of the reply) and the content
+    // was lost from the reply and from history.
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "正在查询数据库。", .tool_call = true },
+        .{ .text = "不会被调用" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var tool_state = StopProbeTool{};
+    const vt = stopProbeToolVTable();
+    const tools = [_]Tool{.{ .ptr = @ptrCast(&tool_state), .vtable = &vt }};
+    const specs = try allocator.alloc(ToolSpec, 1);
+    specs[0] = .{ .name = "probe", .description = "probe", .parameters_json = "{}" };
+
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tools, specs, noop.observer());
+    defer agent.deinit();
+    tool_state.agent = &agent;
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("查一下数据库");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "正在查询数据库。") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "正在查询数据库。") != null);
 }
 
 test "Agent turn keeps the body of a closed non-call tool_call block" {
