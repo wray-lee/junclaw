@@ -250,8 +250,12 @@ pub const DshHarness = struct {
                 };
                 defer client_mod.freeCancelResult(self.allocator, &cancelled);
                 if (cancelled.partial_text.len > 0) {
+                    // A committed prefix replaces the deltas it finalizes.
+                    if (cancelled.committed) text.clearRetainingCapacity();
                     try text.appendSlice(self.allocator, cancelled.partial_text);
-                    if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta(cancelled.partial_text) });
+                    if (!cancelled.committed) {
+                        if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta(cancelled.partial_text) });
+                    }
                 }
                 return .{
                     .reply = try text.toOwnedSlice(self.allocator),
@@ -289,6 +293,15 @@ pub const DshHarness = struct {
                         .success = !result.is_error,
                     } }),
                     .other => {},
+                },
+                .committed => |message| {
+                    // dsh's finalized step text replaces the delta view it
+                    // finalizes, so a turn that streams and commits replies once.
+                    // An empty commit (tool-call-only step) is not a reply.
+                    if (message.len > 0) {
+                        text.clearRetainingCapacity();
+                        try text.appendSlice(self.allocator, message);
+                    }
                 },
                 .turn_end => |turn| {
                     const reply = try text.toOwnedSlice(self.allocator);

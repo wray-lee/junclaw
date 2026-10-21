@@ -143,6 +143,14 @@ fn waitForSink(sink: *RecordingSink, at_least: usize) void {
     }
 }
 
+/// Hang guard, never asserted: returns after 5s even if no prompt arrived.
+fn waitForPrompt(mock: *MockDsh, at_least: u32) void {
+    const deadline = std_compat.time.milliTimestamp() + 5_000;
+    while (mock.promptCount() < at_least and std_compat.time.milliTimestamp() < deadline) {
+        std_compat.thread.sleep(std.time.ns_per_ms);
+    }
+}
+
 test "dsh harness boots the sidecar contract and connects" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -190,6 +198,110 @@ test "dsh harness streams ordered deltas and completes" {
     try std.testing.expectEqualStrings("alpha beta gamma", result.reply);
     try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
+}
+
+test "dsh committed assistant/message is the turn reply" {
+    // Regression: committed assistant/message was parsed as .unknown and dropped.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, null);
+    defer h.deinit();
+
+    const committed = try mock_mod.committedMessageFrame(allocator, "final answer", false);
+    defer allocator.free(committed);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ committed, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("final answer", result.reply);
+    try std.testing.expectEqualStrings("", sink.text());
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+}
+
+test "dsh delta and committed reply exactly once" {
+    // Regression: committed assistant/message was parsed as .unknown and dropped.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, null);
+    defer h.deinit();
+
+    const delta = try mock_mod.textDeltaFrame(allocator, 0, "alpha ");
+    defer allocator.free(delta);
+    const committed = try mock_mod.committedMessageFrame(allocator, "alpha beta", false);
+    defer allocator.free(committed);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ delta, committed, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("alpha ", sink.text());
+    try std.testing.expectEqualStrings("alpha beta", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+}
+
+test "dsh /stop keeps a committed partial with no deltas" {
+    // Regression: committed assistant/message was parsed as .unknown and dropped.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, null);
+    defer h.deinit();
+
+    // No terminal frame from the prompt: the turn stays in flight until /stop;
+    // cancelling then commits the delivered prefix before the aborted turn/end.
+    const partial = try mock_mod.committedMessageFrame(allocator, "partial answer", true);
+    defer allocator.free(partial);
+    try mock.setCancelFrames(&.{partial});
+
+    var sink = RecordingSink{};
+    var turn = TurnThread{ .harness = &h, .input = .{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+
+    waitForPrompt(mock, 1);
+    const ack = try h.harness().handleLocalCommand("/stop");
+    try std.testing.expectEqualStrings("No active background task to stop.", ack.?);
+
+    thread.join();
+    try std.testing.expect(turn.failure == null);
+    const result = turn.result.?;
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("partial answer", result.reply);
+    try std.testing.expectEqual(port.EndReason.interrupted, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
 }
 
 test "dsh turn/end kinds map to port end reasons" {

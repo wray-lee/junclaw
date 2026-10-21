@@ -187,6 +187,7 @@ fn freeServerEvent(allocator: Allocator, event: protocol.ServerEvent) void {
             },
             .other => |raw| allocator.free(raw),
         },
+        .committed => |message| allocator.free(message),
         .turn_end => |turn| {
             allocator.free(turn.kind);
             if (turn.reason_kind) |kind| allocator.free(kind);
@@ -208,8 +209,12 @@ pub const CancelResult = struct {
     kind: []const u8,
     /// Nested terminal reason (e.g. "user"), when dsh reports one.
     reason_kind: ?[]const u8,
-    /// Assistant text emitted before the turn ended; caller frees.
+    /// Assistant text emitted before the turn ended; caller frees. When
+    /// `committed` is set this is the latest committed `assistant/message`
+    /// (dsh's finalized prefix), otherwise the sum of `text-delta`s.
     partial_text: []u8,
+    /// True when `partial_text` came from a committed `assistant/message`.
+    committed: bool,
 };
 
 pub fn freeCancelResult(allocator: Allocator, result: *CancelResult) void {
@@ -287,6 +292,10 @@ fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
     const allocator = shared.allocator;
     var text: std.ArrayListUnmanaged(u8) = .empty;
     errdefer text.deinit(allocator);
+    // A cancelled turn commits its delivered prefix before `turn/end`; that
+    // finalized text wins over the deltas that produced it.
+    var committed: ?[]u8 = null;
+    errdefer if (committed) |message| allocator.free(message);
 
     const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (true) {
@@ -300,16 +309,25 @@ fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
         switch (event.event) {
             .turn_end => |turn| if (std.mem.eql(u8, turn.kind, "aborted")) {
                 // Move the terminal reason out of the queue event.
-                allocator.free(event.session_id);
-                const partial_text = text.toOwnedSlice(allocator) catch |err| {
+                const from_committed = committed != null;
+                const partial_text = if (committed) |message| blk: {
+                    committed = null;
+                    break :blk message;
+                } else text.toOwnedSlice(allocator) catch |err| {
+                    allocator.free(event.session_id);
                     allocator.free(turn.kind);
                     if (turn.reason_kind) |kind| allocator.free(kind);
+                    if (turn.error_message) |message| allocator.free(message);
                     return err;
                 };
+                if (from_committed) text.deinit(allocator);
+                allocator.free(event.session_id);
+                if (turn.error_message) |message| allocator.free(message);
                 return .{
                     .kind = turn.kind,
                     .reason_kind = turn.reason_kind,
                     .partial_text = partial_text,
+                    .committed = from_committed,
                 };
             },
             .assistant_chunk => |chunk| switch (chunk) {
@@ -318,6 +336,14 @@ fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
                     return err;
                 },
                 else => {},
+            },
+            .committed => |message| if (message.len > 0) {
+                const copy = allocator.dupe(u8, message) catch |err| {
+                    freeEvent(allocator, &event);
+                    return err;
+                };
+                if (committed) |old| allocator.free(old);
+                committed = copy;
             },
             else => {},
         }

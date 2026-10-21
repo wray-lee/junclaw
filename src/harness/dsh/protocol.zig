@@ -165,6 +165,9 @@ pub const Chunk = union(enum) {
 
 pub const ServerEvent = union(enum) {
     assistant_chunk: Chunk,
+    /// Committed `assistant/message`: one step's finalized assistant text.
+    /// A turn cancelled mid-stream commits its delivered prefix here.
+    committed: []const u8,
     turn_end: struct {
         kind: []const u8,
         reason_kind: ?[]const u8,
@@ -302,6 +305,7 @@ fn parseEvent(allocator: Allocator, raw: []const u8, value: Value) !ServerEvent 
     const kind = stringField(object, "type") orelse return unknownEvent(allocator, raw);
 
     if (std.mem.eql(u8, kind, "assistant-stream")) return parseAssistant(allocator, raw, object);
+    if (std.mem.eql(u8, kind, "assistant/message")) return parseCommitted(allocator, raw, object);
     if (std.mem.eql(u8, kind, "turn/end")) return parseTurnEnd(allocator, raw, object);
     if (std.mem.eql(u8, kind, "tool/call")) return parseToolCall(allocator, object);
     if (std.mem.eql(u8, kind, "tool/result")) return parseToolResult(allocator, object);
@@ -322,6 +326,27 @@ fn parseAssistant(allocator: Allocator, raw: []const u8, object: ObjectMap) !Ser
     } else Value{ .object = object };
 
     return .{ .assistant_chunk = try parseChunk(allocator, chunk_value) };
+}
+
+/// `assistant/message.data.message.content` text blocks form the finalized
+/// step text; reasoning and tool blocks are not part of the reply.
+fn parseCommitted(allocator: Allocator, raw: []const u8, event: ObjectMap) !ServerEvent {
+    const data = objectField(event, "data") orelse event;
+    const message = objectField(data, "message") orelse return unknownEvent(allocator, raw);
+    const content = message.get("content") orelse return unknownEvent(allocator, raw);
+    const blocks = switch (content) {
+        .array => |array| array,
+        else => return unknownEvent(allocator, raw),
+    };
+
+    var text: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer text.deinit(allocator);
+    for (blocks.items) |block| {
+        const object = asObject(block) orelse continue;
+        if (!std.mem.eql(u8, stringField(object, "type") orelse "", "text")) continue;
+        if (stringField(object, "text")) |fragment| try text.appendSlice(allocator, fragment);
+    }
+    return .{ .committed = try text.toOwnedSlice(allocator) };
 }
 
 fn parseChunk(allocator: Allocator, value: Value) !Chunk {
@@ -701,6 +726,7 @@ fn freeChunk(allocator: Allocator, chunk: Chunk) void {
 fn freeServerEvent(allocator: Allocator, event: ServerEvent) void {
     switch (event) {
         .assistant_chunk => |chunk| freeChunk(allocator, chunk),
+        .committed => |text| allocator.free(text),
         .turn_end => |turn| {
             allocator.free(turn.kind);
             if (turn.reason_kind) |kind| allocator.free(kind);
@@ -825,6 +851,26 @@ test "parseServerFrame handles wrapped text-delta chunks" {
             },
             else => return error.TestUnexpectedChunk,
         },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
+test "parseServerFrame: committed assistant/message carries finalized text" {
+    // Regression: committed assistant/message was parsed as .unknown and dropped.
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{\"type\":\"event\"," ++
+        "\"event\":{\"type\":\"assistant/message\",\"seq\":9,\"time\":1,\"surfaceOp\":\"append\"," ++
+        "\"data\":{\"turn\":1,\"step\":1,\"interrupted\":true,\"stream\":[]," ++
+        "\"message\":{\"id\":\"msg-1\",\"role\":\"assistant\"," ++
+        "\"content\":[{\"type\":\"text\",\"text\":\"partial \"}," ++
+        "{\"type\":\"reasoning\",\"text\":\"hidden\"}," ++
+        "{\"type\":\"text\",\"text\":\"answer\"}]," ++
+        "\"source\":{\"kind\":\"model\",\"provider\":\"mock\",\"model\":\"mock\"}}}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .committed => |text| try std.testing.expectEqualStrings("partial answer", text),
         else => return error.TestUnexpectedEvent,
     }
 }

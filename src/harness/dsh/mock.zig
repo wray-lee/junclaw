@@ -33,6 +33,21 @@ pub fn textDeltaFrame(allocator: Allocator, index: u32, text: []const u8) ![]u8 
     );
 }
 
+/// One committed `assistant/message` frame in the `item` envelope. dsh sets
+/// `interrupted` when a cancelled turn commits its delivered prefix.
+pub fn committedMessageFrame(allocator: Allocator, text: []const u8, interrupted: bool) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{{\"type\":\"event\"," ++
+            "\"event\":{{\"type\":\"assistant/message\",\"seq\":9,\"time\":1," ++
+            "\"surfaceOp\":\"append\",\"data\":{{\"turn\":1,\"step\":1,{s}" ++
+            "\"stream\":[],\"message\":{{\"id\":\"msg-1\",\"role\":\"assistant\"," ++
+            "\"content\":[{{\"type\":\"text\",\"text\":{f}}}]," ++
+            "\"source\":{{\"kind\":\"model\",\"provider\":\"mock\",\"model\":\"mock\"}}}}}}}}}}}}",
+        .{ if (interrupted) "\"interrupted\":true," else "", std.json.fmt(text, .{}) },
+    );
+}
+
 /// History returned by `session/follow`: only records with `seq` past the
 /// requested cursor are included.
 const follow_records = [_]struct { seq: u64, json: []const u8 }{
@@ -49,6 +64,8 @@ pub const MockDsh = struct {
     mutex: std_compat.sync.Mutex = .{},
     /// Frames streamed after the next `session/prompt` reply, in test order.
     turn_frames: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Frames streamed by `session/cancel` before the aborted `turn/end`.
+    cancel_frames: std.ArrayListUnmanaged([]u8) = .empty,
     ws: ?std_compat.net.Stream = null,
     /// Harness-test observability; guarded by `mutex`.
     create_count: u32 = 0,
@@ -81,6 +98,8 @@ pub const MockDsh = struct {
         if (self.last_prompt_session) |session| self.allocator.free(session);
         clearFrames(self.allocator, &self.turn_frames);
         self.turn_frames.deinit(self.allocator);
+        clearFrames(self.allocator, &self.cancel_frames);
+        self.cancel_frames.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -94,13 +113,26 @@ pub const MockDsh = struct {
 
     /// Replace the frames streamed after the next `session/prompt` reply.
     pub fn setTurnFrames(self: *MockDsh, frames: []const []const u8) !void {
+        return self.replaceFrames(&self.turn_frames, frames);
+    }
+
+    /// Replace the frames streamed by the next `session/cancel`.
+    pub fn setCancelFrames(self: *MockDsh, frames: []const []const u8) !void {
+        return self.replaceFrames(&self.cancel_frames, frames);
+    }
+
+    fn replaceFrames(
+        self: *MockDsh,
+        list: *std.ArrayListUnmanaged([]u8),
+        frames: []const []const u8,
+    ) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        clearFrames(self.allocator, &self.turn_frames);
+        clearFrames(self.allocator, list);
         for (frames) |frame| {
             const copy = try self.allocator.dupe(u8, frame);
             errdefer self.allocator.free(copy);
-            try self.turn_frames.append(self.allocator, copy);
+            try list.append(self.allocator, copy);
         }
     }
 
@@ -188,7 +220,7 @@ pub const MockDsh = struct {
         if (is_prompt) {
             try self.sendTurnFrames();
         } else if (std.mem.eql(u8, method, "session/cancel")) {
-            try self.sendFrame(turn_aborted_frame);
+            try self.sendCancelFrames();
         }
     }
 
@@ -255,11 +287,13 @@ pub const MockDsh = struct {
         for (self.turn_frames.items) |frame| try writeTextFrame(ws, frame);
     }
 
-    fn sendFrame(self: *MockDsh, frame: []const u8) !void {
+    /// A cancelled turn commits its delivered prefix before the terminal frame.
+    fn sendCancelFrames(self: *MockDsh) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
         const ws = self.ws orelse return;
-        try writeTextFrame(ws, frame);
+        for (self.cancel_frames.items) |frame| try writeTextFrame(ws, frame);
+        try writeTextFrame(ws, turn_aborted_frame);
     }
 
     fn buildSnapshot(self: *MockDsh, body: []const u8) ![]u8 {
