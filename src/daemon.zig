@@ -1712,7 +1712,13 @@ fn processInboundMessage(
         return;
     }
 
-    if ((parsed_meta.fields.replace_message orelse false) and parsed_meta.fields.message_id != null) {
+    // Regression: the edit path neither strips attachment markers nor uploads
+    // files, so the edited message showed the literal `[FILE:/abs/path]` and no
+    // file was sent. Fall through to the normal outbound for such a reply.
+    if ((parsed_meta.fields.replace_message orelse false) and
+        parsed_meta.fields.message_id != null and
+        !outbound.has_legacy_attachment_markers(reply))
+    {
         if (outbound_channel) |channel| {
             var payload = makeAssistantReplyPayload(allocator, reply) catch |err| {
                 log.warn("failed to build edit payload: {}", .{err});

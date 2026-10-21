@@ -150,6 +150,9 @@ pub fn has_legacy_attachment_markers(text: []const u8) bool {
 test "outbound has_legacy_attachment_markers detects supported markers" {
     try std.testing.expect(has_legacy_attachment_markers("See [IMAGE:/tmp/photo.png]"));
     try std.testing.expect(has_legacy_attachment_markers("See [file:/tmp/report.pdf]"));
+    // The daemon's replace_message guard keys on this: an edit cannot upload,
+    // so a marker reply must take the normal outbound path.
+    try std.testing.expect(has_legacy_attachment_markers("See [FILE:/tmp/report.pdf]"));
     try std.testing.expect(has_legacy_attachment_markers("See [VOICE:/tmp/note.ogg]"));
 }
 

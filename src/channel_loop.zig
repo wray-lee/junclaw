@@ -1167,6 +1167,18 @@ fn processTelegramMessage(
             return;
         };
         defer payload.deinit(allocator);
+        // Regression: the edit path cannot upload files, so a reply carrying
+        // attachment markers was stripped of them and the attachment was never
+        // sent. Deliver a normal message instead.
+        if (telegram.payloadRequiresNormalSend(payload.payload())) {
+            tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
+                tg_ptr.setTaskReaction(sender, message_id, .failed);
+                log.warn("Send error: {}", .{err});
+                return;
+            };
+            tg_ptr.setTaskReaction(sender, message_id, .done);
+            return;
+        }
         const edit_message_id = std.fmt.allocPrint(allocator, "{d}", .{message_id.?}) catch {
             tg_ptr.setTaskReaction(sender, message_id, .failed);
             return;
