@@ -208,11 +208,11 @@ fn headerValue(headers: []const u8, name: []const u8) ?[]const u8 {
 fn isSupportedContentType(value: []const u8) bool {
     const media_end = std.mem.indexOfScalar(u8, value, ';') orelse value.len;
     const media = std.mem.trim(u8, value[0..media_end], " \t");
-    if (std.mem.startsWith(u8, media, "text/")) return true;
-    if (std.mem.eql(u8, media, "application/json") or
-        std.mem.eql(u8, media, "application/xml") or
-        std.mem.eql(u8, media, "application/xhtml+xml")) return true;
-    return std.mem.endsWith(u8, media, "+json") or std.mem.endsWith(u8, media, "+xml");
+    if (std.ascii.startsWithIgnoreCase(media, "text/")) return true;
+    if (std.ascii.eqlIgnoreCase(media, "application/json") or
+        std.ascii.eqlIgnoreCase(media, "application/xml") or
+        std.ascii.eqlIgnoreCase(media, "application/xhtml+xml")) return true;
+    return std.ascii.endsWithIgnoreCase(media, "+json") or std.ascii.endsWithIgnoreCase(media, "+xml");
 }
 
 fn statusFailureMessage(allocator: std.mem.Allocator, status: u16, reason: []const u8) ![]u8 {
@@ -793,6 +793,23 @@ test "web_fetch content type support" {
     try testing.expect(isSupportedContentType("application/xhtml+xml"));
     try testing.expect(!isSupportedContentType("application/pdf"));
     try testing.expect(!isSupportedContentType("image/png"));
+    // Regression: Content-Type: Application/Json was rejected as unsupported
+    // because media types were compared case-sensitively.
+    for ([_][]const u8{
+        "TEXT/HTML",
+        "Text/Plain",
+        "Application/Json",
+        "APPLICATION/JSON",
+        "Application/XHTML+XML",
+        "APPLICATION/LD+JSON",
+    }) |value| try testing.expect(isSupportedContentType(value));
+    for ([_][]const u8{
+        "application/pdf",
+        "APPLICATION/PDF",
+        "image/png",
+        "application/octet-stream",
+        "application/zip",
+    }) |value| try testing.expect(!isSupportedContentType(value));
 }
 
 test "htmlToText br becomes newline" {
