@@ -246,6 +246,12 @@ pub const Sidecar = struct {
         self.env_map = env_map;
     }
 
+    /// Take ownership of `url` as the boot URL, freeing any previous value.
+    fn adoptBootUrl(self: *Sidecar, url: []u8) void {
+        if (self.boot_url) |old| self.allocator.free(old);
+        self.boot_url = url;
+    }
+
     fn spawnAndBoot(self: *Sidecar) !void {
         var child = std_compat.process.Child.init(self.argv, self.allocator);
         child.cwd = self.opts.workspace;
@@ -267,10 +273,11 @@ pub const Sidecar = struct {
         self.stderr_thread = try std.Thread.spawn(.{}, stderrMain, .{stderr_file});
 
         const boot_url = try self.waitBootUrl();
-        errdefer self.allocator.free(boot_url);
+        // Adopt before any fallible step: from here the Sidecar owns the URL,
+        // so error paths must not free it (clearSessionState does).
+        self.adoptBootUrl(boot_url);
         const endpoint = try client.parseBootEndpoint(boot_url);
 
-        self.boot_url = boot_url;
         self.base_url = try self.allocator.dupe(u8, endpoint.base_url);
         self.port = endpoint.port;
         self.cookie = try self.fetchOwnerCookie();
@@ -385,4 +392,22 @@ test "missing session id file loads as null" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expect((try loadSessionId(std.testing.allocator, path)) == null);
+}
+
+test "boot URL has one owner across adopt and teardown" {
+    // Regression: error path + deinit double-freed boot_url.
+    const allocator = std.testing.allocator;
+    var sidecar = Sidecar{
+        .allocator = allocator,
+        .opts = .{ .bin_js = "/nonexistent/bin.js", .workspace = "/tmp", .dsh_home = "/tmp" },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer sidecar.arena.deinit();
+
+    sidecar.adoptBootUrl(try allocator.dupe(u8, "http://127.0.0.1:1/?token=test-token"));
+    sidecar.adoptBootUrl(try allocator.dupe(u8, "http://127.0.0.1:2/?token=test-token"));
+    try std.testing.expectEqualStrings("http://127.0.0.1:2/?token=test-token", sidecar.boot_url.?);
+
+    sidecar.clearSessionState();
+    try std.testing.expect(sidecar.boot_url == null);
 }
