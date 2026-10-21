@@ -224,6 +224,8 @@ pub const HttpResponseWithHeaders = struct {
     status_code: u16,
     headers: []u8,
     body: []u8,
+    /// Only set by `truncate_response` requests: the body was cut at the cap.
+    truncated: bool = false,
 };
 
 fn headerName(header: []const u8) []const u8 {
@@ -508,6 +510,10 @@ pub const CurlRequestOptions = struct {
     std_http_defaults: bool = false,
     generated_redirect_headers_only: bool = false,
     fail_on_http_error: bool = false,
+    /// Return the first `max_response_bytes` of an oversized body instead of
+    /// `error.CurlReadError`. Only web_fetch opts in; every other caller keeps
+    /// the reject-on-oversize contract.
+    truncate_response: bool = false,
 };
 
 const CurlRequestSpec = CurlRequestOptions;
@@ -614,6 +620,57 @@ fn safeCurlMaxRedirects(spec: CurlRequestSpec) ?u16 {
     if (spec.method != .GET or spec.body != null or spec.content_type != null) return null;
     if (spec.headers.len != 0 and !spec.generated_redirect_headers_only) return null;
     return spec.max_redirects;
+}
+
+const CappedBody = struct {
+    body: []u8,
+    truncated: bool,
+};
+
+/// Longest prefix of the input that ends on a UTF-8 sequence boundary. The cap
+/// may split a multi-byte code point; it is dropped whole so the returned slice
+/// stays valid UTF-8 for the tool result.
+fn trimToUtf8Prefix(bytes: []const u8) usize {
+    var end = bytes.len;
+    while (end > 0 and (bytes[end - 1] & 0xC0) == 0x80) end -= 1;
+    if (end == 0) return 0;
+    const lead = end - 1;
+    const need = std.unicode.utf8ByteSequenceLength(bytes[lead]) catch return lead;
+    // Keep the code point whole when the cap did not cut it, otherwise drop it.
+    return if (lead + need <= bytes.len) lead + need else lead;
+}
+
+fn readCapped(
+    allocator: Allocator,
+    file: std_compat.fs.File,
+    max_bytes: usize,
+    truncate: bool,
+) !CappedBody {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    var buf: [8192]u8 = undefined;
+    var truncated = false;
+    while (true) {
+        const n = file.read(&buf) catch return error.CurlReadError;
+        if (n == 0) break;
+        // Keep draining after the cut so curl never blocks on a full pipe.
+        // shortcut: the rest of an oversized body is still downloaded, not
+        // aborted; upgrade if bandwidth becomes a concern.
+        if (truncated) continue;
+        if (n > max_bytes - out.items.len) {
+            if (!truncate) return error.CurlReadError;
+            try out.appendSlice(allocator, buf[0 .. max_bytes - out.items.len]);
+            truncated = true;
+            continue;
+        }
+        try out.appendSlice(allocator, buf[0..n]);
+    }
+    const owned = try out.toOwnedSlice(allocator);
+    errdefer allocator.free(owned);
+    if (!truncated) return .{ .body = owned, .truncated = false };
+    const end = trimToUtf8Prefix(owned);
+    if (end == owned.len) return .{ .body = owned, .truncated = true };
+    return .{ .body = try allocator.realloc(owned, end), .truncated = true };
 }
 
 fn streamCurlStdout(file: std_compat.fs.File, writer: ?*std.Io.Writer, max_bytes: usize) !void {
@@ -730,6 +787,7 @@ fn secureCurlRequestWithStatusAndHeaders(
     }
 
     var buffered_body: ?[]u8 = null;
+    var response_truncated = false;
     errdefer if (buffered_body) |body| allocator.free(body);
     if (spec.discard_response_body or spec.method == .HEAD) {
         streamCurlStdout(child.stdout.?, null, 0) catch |err| {
@@ -743,11 +801,21 @@ fn secureCurlRequestWithStatusAndHeaders(
                 return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else err;
             };
         } else {
-            buffered_body = child.stdout.?.readToEndAlloc(allocator, spec.max_response_bytes) catch |err| {
+            // Regression: readToEndAlloc(allocator, .limited(n)) reported
+            // StreamTooLong for a body exactly n bytes long; read one byte at a
+            // time through readCapped so a body at the cap succeeds.
+            const capped = readCapped(
+                allocator,
+                child.stdout.?,
+                spec.max_response_bytes,
+                spec.truncate_response,
+            ) catch |err| {
                 abortCurlChild(&child, &cancel_done, &cancel_watcher, &stderr_thread, &stderr_capture);
                 if (err == error.OutOfMemory) return error.OutOfMemory;
-                return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
+                return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else err;
             };
+            buffered_body = capped.body;
+            response_truncated = capped.truncated;
         }
     }
 
@@ -786,6 +854,7 @@ fn secureCurlRequestWithStatusAndHeaders(
         .status_code = status_code,
         .headers = response_headers,
         .body = response_body,
+        .truncated = response_truncated,
     };
 }
 
@@ -1703,6 +1772,29 @@ pub fn curlGetWithResolve(
 /// HTTP GET via curl subprocess (no proxy).
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
+}
+
+/// GET for web_fetch. Unlike `curlGetWithResolve` it keeps non-2xx responses
+/// (no curl `--fail`) and returns the status line, so the caller can name the
+/// failure, and it truncates oversized bodies instead of rejecting them.
+/// Redirects stay unfollowed, matching `curlGet`: no `--location` is passed.
+pub fn curlGetForWebFetch(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    resolve_entry: ?[]const u8,
+    max_bytes: usize,
+) !HttpResponseWithHeaders {
+    return secureCurlRequestWithStatusAndHeaders(allocator, .{
+        .method = .GET,
+        .url = url,
+        .headers = headers,
+        .max_time = timeout_secs,
+        .max_response_bytes = max_bytes,
+        .resolve_entry = resolve_entry,
+        .truncate_response = true,
+    });
 }
 
 /// HTTP GET via curl subprocess with a caller-provided response size cap.
@@ -3192,6 +3284,190 @@ test "bounded http get enforces the response size cap" {
     } else |err| {
         try std.testing.expectEqual(@as(anyerror, error.CurlReadError), err);
     }
+}
+
+// Regression: readToEndAlloc(.limited(n)) returned StreamTooLong for a body
+// exactly n bytes long, so a response at the cap surfaced as CurlReadError.
+test "bounded http get accepts a body exactly at the size cap" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    const body = try allocator.alloc(u8, 4096);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/doc", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", body.len);
+    thread.join();
+
+    const fetched = try result;
+    defer allocator.free(fetched);
+    try std.testing.expectEqualStrings(body, fetched);
+}
+
+// Regression: web_fetch turned a 4 MiB+ page into "Fetch failed:
+// error.CurlReadError" instead of returning the content it could read.
+test "web fetch get truncates an oversized body at a utf-8 boundary" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    // 1023 ASCII bytes then a 2-byte code point: a 1024-byte cut splits it.
+    var body = try allocator.alloc(u8, 2048);
+    defer allocator.free(body);
+    @memset(body, 'x');
+    body[1023] = 0xC3;
+    body[1024] = 0xA9;
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/large", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, 1024);
+    thread.join();
+    defer allocator.free(response.body);
+    defer allocator.free(response.headers);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expect(response.truncated);
+    try std.testing.expectEqual(@as(usize, 1023), response.body.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(response.body));
+}
+
+// Regression: complete code points at the cap were cut to a bare lead byte,
+// leaving the tool result invalid UTF-8.
+test "trimToUtf8Prefix keeps complete code points and drops cut ones" {
+    const three = [_]u8{ 'a', 0xE4, 0xB8, 0xAD };
+    const three_end = trimToUtf8Prefix(&three);
+    try std.testing.expectEqual(@as(usize, 4), three_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(three[0..three_end]));
+
+    const four = [_]u8{ 'a', 0xF0, 0x9F, 0x98, 0x80 };
+    const four_end = trimToUtf8Prefix(&four);
+    try std.testing.expectEqual(@as(usize, 5), four_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(four[0..four_end]));
+
+    const three_cut = [_]u8{ 'a', 0xE4, 0xB8 };
+    const three_cut_end = trimToUtf8Prefix(&three_cut);
+    try std.testing.expectEqual(@as(usize, 1), three_cut_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(three_cut[0..three_cut_end]));
+
+    const four_cut = [_]u8{ 'a', 0xF0, 0x9F, 0x98 };
+    const four_cut_end = trimToUtf8Prefix(&four_cut);
+    try std.testing.expectEqual(@as(usize, 1), four_cut_end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(four_cut[0..four_cut_end]));
+}
+
+// Regression: a body ending in four or more continuation bytes was trimmed to
+// zero, discarding the entire page instead of keeping the valid prefix.
+test "trimToUtf8Prefix keeps the valid prefix when trailing continuations run long" {
+    const body = [_]u8{ 'a', 0xE4, 0xB8, 0xAD, 0x80, 0x80, 0x80 };
+    const end = trimToUtf8Prefix(&body);
+    try std.testing.expectEqual(@as(usize, 4), end);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(body[0..end]));
+}
+
+// Regression: trimToUtf8Prefix 在完整码点边界截断时留下裸 lead byte，工具结果非法 UTF-8
+test "web fetch get keeps a complete code point at the truncation cap" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    // 1021 ASCII bytes then a complete 3-byte code point ending exactly at the cap.
+    var body = try allocator.alloc(u8, 2048);
+    defer allocator.free(body);
+    @memset(body, 'x');
+    body[1021] = 0xE4;
+    body[1022] = 0xB8;
+    body[1023] = 0xAD;
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/large", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, 1024);
+    thread.join();
+    defer allocator.free(response.body);
+    defer allocator.free(response.headers);
+
+    try std.testing.expect(response.truncated);
+    try std.testing.expectEqual(@as(usize, 1024), response.body.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(response.body));
+    try std.testing.expectEqualSlices(u8, &.{ 0xE4, 0xB8, 0xAD }, response.body[1021..1024]);
+}
+
+// Regression: web_fetch only received error.CurlFailed for any 4xx; the status
+// and body must survive so the tool can explain the failure.
+test "web fetch get keeps a non-2xx status and body" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 429 Too Many Requests", .body = "slow down" };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/limited", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, DEFAULT_CURL_GET_MAX_BYTES);
+    thread.join();
+    defer allocator.free(response.body);
+    defer allocator.free(response.headers);
+
+    try std.testing.expectEqual(@as(u16, 429), response.status_code);
+    try std.testing.expectEqualStrings("slow down", response.body);
+    try std.testing.expect(std.mem.indexOf(u8, response.headers, "429 Too Many Requests") != null);
+}
+
+// Regression: a stalled web_fetch connection used to end as a generic fetch
+// failure; it must stay distinguishable as a timeout.
+test "web fetch get reports a timeout" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = StalledSocketCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveStalledSocket, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/stall", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const result = curlGetForWebFetch(allocator, url, &.{}, "1", null, DEFAULT_CURL_GET_MAX_BYTES);
+    if (result) |response| {
+        allocator.free(response.body);
+        allocator.free(response.headers);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.CurlTimeout), err);
+    }
+
+    ctx.release.store(true, .release);
+    thread.join();
 }
 
 const StalledCredentialCtx = struct {

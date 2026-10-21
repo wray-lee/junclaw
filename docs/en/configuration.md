@@ -1661,6 +1661,7 @@ Notes:
   - **Example**: If your SearXNG runs on `192.168.1.10`, add `"192.168.1.10"` to access it via `http_request` tool.
   - **Security trade-off**: Allowlisted domains skip DNS pinning, allowing access to private IPs. This trades DNS rebinding protection for operational flexibility.
   - **HTTPS-only policy**: The `http_request` and `web_fetch` tools require `https://` URLs. Plain HTTP is rejected for security. Note: This does not affect `web_search` tool's `search_base_url` which allows HTTP for local hosts.
+  - **Failure reporting**: `web_fetch` reports the HTTP status and an actionable reason instead of a generic curl failure — 429 says the site is rate-limiting this server, 403 says the site blocked the request, 404 says the page was not found, and timeouts/DNS/TLS errors are named separately. Responses larger than 4 MiB are truncated and marked `[truncated: response exceeded N bytes]` instead of failing. Redirects are not followed automatically; the error names the target URL to retry directly.
   - **Check order**: Allowlist is checked BEFORE DNS resolution to prevent DNS exfiltration attacks.
 
 ## Validate After Config Changes
