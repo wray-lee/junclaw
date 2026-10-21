@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  packages: write
 
 jobs:
   release:
@@ -21,6 +22,7 @@ jobs:
     uses: nullclaw/nullbuilder/.github/workflows/zig-release.yml@2b9c2f2e7bb0ac085baea1c33b4f08beaf5c7fac
     permissions:
       contents: write
+      packages: write # the called workflow declares a docker job that needs it, even when publish_docker is off
     with:
       binary_name: nullclaw
       artifact_prefix: junclaw
