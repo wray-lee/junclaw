@@ -2149,6 +2149,21 @@ pub const Agent = struct {
         return self.prioritizeToolSpecsForTurn(arena, try result.toOwnedSlice(arena), user_message);
     }
 
+    /// Merge text written in earlier tool-call rounds with the degraded tail
+    /// and record the delivered bytes in history so a re-render matches.
+    fn exhaustedReply(self: *Agent, interim_text: []const u8, tail: []const u8) ![]const u8 {
+        const reply = if (interim_text.len > 0)
+            try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ interim_text, tail })
+        else
+            try self.allocator.dupe(u8, tail);
+        errdefer self.allocator.free(reply);
+        try self.history.append(self.allocator, .{
+            .role = .assistant,
+            .content = try self.dupeForHistory(reply),
+        });
+        return reply;
+    }
+
     /// Execute a single conversation turn: send messages to LLM, parse tool calls,
     /// execute tools, and loop until a final text response is produced.
     pub fn turn(self: *Agent, user_message: []const u8) ![]const u8 {
@@ -3276,9 +3291,11 @@ pub const Agent = struct {
         // Build messages for the summary call
         const summary_messages = self.buildMessageSlice() catch {
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            defer self.allocator.free(fallback);
+            const reply = try self.exhaustedReply(interim_text.items, fallback);
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            return fallback;
+            return reply;
         };
         defer self.allocator.free(summary_messages);
         const summary_max_tokens = self.effectiveMaxTokensForMessages(summary_messages, false);
@@ -3314,9 +3331,11 @@ pub const Agent = struct {
             const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
             self.recordLlmFailureEvent(self.model_name, fail_duration, @errorName(err));
             const fallback = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.", .{ self.max_tool_iterations, self.max_tool_iterations });
+            defer self.allocator.free(fallback);
+            const reply = try self.exhaustedReply(interim_text.items, fallback);
             const complete_event = ObserverEvent{ .turn_complete = {} };
             self.observer.recordEvent(&complete_event);
-            return fallback;
+            return reply;
         };
         self.logLlmResponse(self.max_tool_iterations + 1, 1, &summary_response);
         const summary_duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - summary_timer_start)));
@@ -3348,13 +3367,8 @@ pub const Agent = struct {
         defer self.freeResponseFields(&summary_response);
 
         const prefixed = try std.fmt.allocPrint(self.allocator, "[Tool iteration limit: {d}/{d}]\n\n{s}", .{ self.max_tool_iterations, self.max_tool_iterations, summary_text });
-        errdefer self.allocator.free(prefixed);
-
-        // Store in history (dupe the raw summary, not the prefixed version)
-        try self.history.append(self.allocator, .{
-            .role = .assistant,
-            .content = try self.dupeForHistory(summary_text),
-        });
+        defer self.allocator.free(prefixed);
+        const reply = try self.exhaustedReply(interim_text.items, prefixed);
 
         // Compact/trim history so the next turn doesn't start with bloated context
         self.last_turn_compacted = self.maybeAutoCompactHistory();
@@ -3363,7 +3377,7 @@ pub const Agent = struct {
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
 
-        return prefixed;
+        return reply;
     }
 
     /// Execute a tool by name lookup.
@@ -9815,7 +9829,7 @@ test "Agent tool-limit summary preserves provider session_id" {
     const response = try agent.turn("trigger summary");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqualStrings("running tool\n\n[Tool iteration limit: 1/1]\n\nsummary", response);
     try std.testing.expectEqualStrings("telegram:chat123", provider_state.summary_session_id.?);
 }
 
@@ -9935,7 +9949,7 @@ test "Agent tool-limit summary records observer events and token metric" {
     const response = try agent.turn("trigger summary");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqualStrings("running tool\n\n[Tool iteration limit: 1/1]\n\nsummary", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
@@ -10059,7 +10073,7 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
     const response = try agent.turn("trigger summary failure");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
+    try std.testing.expectEqualStrings("running tool\n\n[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
@@ -10067,6 +10081,269 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
     try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
     try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
     try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool")), observer.tokens_used_metric_total);
+}
+
+const IterLimitNoopTool = struct {
+    const Self = @This();
+    pub const tool_name = "noop";
+    pub const tool_description = "noop";
+    pub const tool_params = "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}";
+    pub const vtable = tools_mod.ToolVTable(Self);
+
+    fn tool(self: *Self) Tool {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    pub fn execute(_: *Self, allocator: std.mem.Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+        return .{ .success = true, .output = try allocator.dupe(u8, "ok") };
+    }
+};
+
+test "Agent tool-limit reply keeps interim text in reply and history" {
+    // Regression: when tool iterations ran out, the reply and the last history
+    // entry held only the summary, dropping text the model wrote in earlier
+    // tool-call rounds.
+    const allocator = std.testing.allocator;
+    const scripts = [_]TurnScript{
+        .{ .tool_call = .{ .name = "noop", .args = "{}", .content = "interim finding" } },
+        .{ .text = "summary" },
+    };
+    var state = ScriptedTurnProvider{ .scripts = &scripts };
+    const provider = scriptedProvider(&state);
+    var tool_state = IterLimitNoopTool{};
+    const tool_list = [_]Tool{tool_state.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+    agent.max_tool_iterations = 1;
+
+    const response = try agent.turn("find the record");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("interim finding\n\n[Tool iteration limit: 1/1]\n\nsummary", response);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last.role == .assistant);
+    try std.testing.expectEqualStrings(response, last.content);
+    try std.testing.expect(std.mem.indexOf(u8, response, "<function") == null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "</function") == null);
+}
+
+test "Agent tool-limit reply keeps interim text when the summary call fails" {
+    // Regression: a failed summary call returned only the fallback notice,
+    // dropping text the model wrote in earlier tool-call rounds from the reply
+    // and from history.
+    const FailingSummaryProvider = struct {
+        const Self = @This();
+        calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            if (self.calls == 1) {
+                const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+                tool_calls[0] = .{
+                    .id = try allocator.dupe(u8, "call-noop"),
+                    .name = try allocator.dupe(u8, "noop"),
+                    .arguments = try allocator.dupe(u8, "{}"),
+                };
+                return .{
+                    .content = try allocator.dupe(u8, "interim finding"),
+                    .tool_calls = tool_calls,
+                    .usage = .{},
+                    .model = try allocator.dupe(u8, "test-model"),
+                };
+            }
+            return error.ProviderFailed;
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn getName(_: *anyopaque) []const u8 {
+            return "iter-limit-fail-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var state = FailingSummaryProvider{};
+    const vtable = Provider.VTable{
+        .chatWithSystem = FailingSummaryProvider.chatWithSystem,
+        .chat = FailingSummaryProvider.chat,
+        .supportsNativeTools = FailingSummaryProvider.supportsNativeTools,
+        .getName = FailingSummaryProvider.getName,
+        .deinit = FailingSummaryProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+    var tool_state = IterLimitNoopTool{};
+    const tool_list = [_]Tool{tool_state.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+    agent.max_tool_iterations = 1;
+
+    const response = try agent.turn("find the record");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("interim finding\n\n[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last.role == .assistant);
+    try std.testing.expectEqualStrings(response, last.content);
+}
+
+test "Agent tool-limit reply keeps pre-fix bytes when interim text is empty" {
+    // Regression: empty interim text must keep the pre-fix reply bytes, with no
+    // leading "\n\n" before the end-reason tail.
+    const allocator = std.testing.allocator;
+    const scripts = [_]TurnScript{
+        .{ .tool_call = .{ .name = "noop", .args = "{}", .content = "" } },
+        .{ .text = "summary" },
+    };
+    var state = ScriptedTurnProvider{ .scripts = &scripts };
+    const provider = scriptedProvider(&state);
+    var tool_state = IterLimitNoopTool{};
+    const tool_list = [_]Tool{tool_state.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+    agent.max_tool_iterations = 1;
+
+    const response = try agent.turn("find the record");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last.role == .assistant);
+    try std.testing.expectEqualStrings(response, last.content);
+}
+
+test "Agent tool-limit streaming reply keeps the preview as a byte prefix" {
+    // Regression: the iteration-limit reply dropped the interim text, so the
+    // streamed preview was not a prefix of the reply.
+    const StreamingSummaryProvider = struct {
+        const Self = @This();
+        stream_calls: usize = 0,
+
+        fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+            return allocator.dupe(u8, "");
+        }
+
+        fn chat(_: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+            return .{
+                .content = try allocator.dupe(u8, "summary"),
+                .tool_calls = &.{},
+                .usage = .{},
+                .model = try allocator.dupe(u8, "test-model"),
+            };
+        }
+
+        fn supportsNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreaming(_: *anyopaque) bool {
+            return true;
+        }
+        fn supportsStreamingNativeTools(_: *anyopaque) bool {
+            return true;
+        }
+
+        fn streamChat(ptr: *anyopaque, allocator: std.mem.Allocator, _: providers.ChatRequest, model: []const u8, _: f64, callback: providers.StreamCallback, callback_ctx: *anyopaque) anyerror!providers.StreamChatResult {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            self.stream_calls += 1;
+            if (self.stream_calls > 1) {
+                callback(callback_ctx, providers.StreamChunk.finalChunk());
+                return .{ .content = try allocator.dupe(u8, ""), .tool_calls = &.{}, .model = try allocator.dupe(u8, model) };
+            }
+            callback(callback_ctx, providers.StreamChunk.textDelta("interim finding"));
+            callback(callback_ctx, providers.StreamChunk.finalChunk());
+            const tool_calls = try allocator.alloc(providers.ToolCall, 1);
+            tool_calls[0] = .{
+                .id = try allocator.dupe(u8, "call-noop"),
+                .name = try allocator.dupe(u8, "noop"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            return .{
+                .content = try allocator.dupe(u8, "interim finding"),
+                .tool_calls = tool_calls,
+                .model = try allocator.dupe(u8, model),
+            };
+        }
+
+        fn getName(_: *anyopaque) []const u8 {
+            return "iter-limit-stream-provider";
+        }
+        fn deinitFn(_: *anyopaque) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var state = StreamingSummaryProvider{};
+    const vtable = Provider.VTable{
+        .chatWithSystem = StreamingSummaryProvider.chatWithSystem,
+        .chat = StreamingSummaryProvider.chat,
+        .supportsNativeTools = StreamingSummaryProvider.supportsNativeTools,
+        .supports_streaming = StreamingSummaryProvider.supportsStreaming,
+        .supports_streaming_native_tools = StreamingSummaryProvider.supportsStreamingNativeTools,
+        .stream_chat = StreamingSummaryProvider.streamChat,
+        .getName = StreamingSummaryProvider.getName,
+        .deinit = StreamingSummaryProvider.deinitFn,
+    };
+    const provider = Provider{ .ptr = @ptrCast(&state), .vtable = &vtable };
+    var tool_state = IterLimitNoopTool{};
+    const tool_list = [_]Tool{tool_state.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+    agent.max_tool_iterations = 1;
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("find the record");
+    defer allocator.free(response);
+
+    try std.testing.expect(capture.text.items.len > 0);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+    try std.testing.expectEqualStrings("interim finding\n\n[Tool iteration limit: 1/1]\n\nsummary", response);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expectEqualStrings(response, last.content);
 }
 
 test "bindMemoryTools wires memory tools to sqlite backend" {
