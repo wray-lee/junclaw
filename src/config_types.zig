@@ -461,6 +461,27 @@ pub const ReasoningMode = enum {
     }
 };
 
+/// Turn engine for newly created sessions (`agent.harness`). `dsh` only takes
+/// effect in a binary built with `-Dharness_dsh=true`; the default build
+/// ignores it and keeps using `native`.
+pub const HarnessKind = enum {
+    native,
+    dsh,
+
+    pub fn toSlice(self: HarnessKind) []const u8 {
+        return switch (self) {
+            .native => "native",
+            .dsh => "dsh",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?HarnessKind {
+        if (std.ascii.eqlIgnoreCase(s, "native")) return .native;
+        if (std.ascii.eqlIgnoreCase(s, "dsh")) return .dsh;
+        return null;
+    }
+};
+
 pub const AgentConfig = struct {
     /// When true (default), history is auto-compacted once it crosses the
     /// token / message thresholds. Set to false to skip proactive LLM
@@ -481,6 +502,9 @@ pub const AgentConfig = struct {
     /// message that arrives mid-turn is injected into the active turn instead
     /// of being silently dropped.
     default_queue_mode: QueueMode = .steer,
+    /// Turn engine for newly created sessions. Defaults to the native agent;
+    /// `dsh` requires a build with `-Dharness_dsh=true`.
+    harness: HarnessKind = .native,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.

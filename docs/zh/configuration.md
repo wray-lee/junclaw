@@ -213,6 +213,23 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 }
 ```
 
+### `agent.harness`
+
+- 选择新建会话使用的回合引擎，可选值为 `native`（默认）和 `dsh`。省略该键即保持 `native`。
+- `dsh` 需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。未设置 `NULLCLAW_DSH_BIN` 或 sidecar 启动失败时也会回退到 native（同样记录警告）。
+- 在 dsh 构建中，`NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。sidecar 使用 agent 的工作目录，profile 保存在 `<配置目录>/.dsh`，dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
+- P1 的 dsh 模式覆盖聊天回合和流式回复。steer 注入、审批、用户提问，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话尚未接入；junclaw 仍会为自己的通道历史保留一份对话记录。
+
+示例：
+
+```json
+{
+  "agent": {
+    "harness": "dsh"
+  }
+}
+```
+
 ### `agent.reasoning_mode`
 
 - 设置新建会话的推理展示模式。可选值为 `off`、`on` 和 `stream`，默认值为 `off`。

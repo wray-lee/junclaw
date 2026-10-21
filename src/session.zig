@@ -46,6 +46,90 @@ const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const harness_port = @import("harness/port.zig");
 const native_harness = @import("harness/native.zig");
+const build_options = @import("build_options");
+const dsh_enabled = build_options.enable_harness_dsh;
+const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
+    pub const DshHarness = void;
+};
+
+/// A dsh engine plus the owned strings its `Options` borrows.
+const DshState = if (dsh_enabled) struct {
+    allocator: Allocator,
+    harness: dsh_harness_mod.DshHarness,
+    bin_js: []u8,
+    dsh_home: []u8,
+    session_file: []u8,
+
+    fn deinit(self: *@This()) void {
+        self.harness.deinit();
+        self.allocator.free(self.bin_js);
+        self.allocator.free(self.dsh_home);
+        self.allocator.free(self.session_file);
+    }
+} else struct {
+    fn deinit(self: *@This()) void {
+        _ = self;
+    }
+};
+
+/// Test seam: point session-created dsh harnesses at an in-process mock
+/// instead of spawning a sidecar. Production never sets it.
+var dsh_test_boot_url: ?[]const u8 = null;
+
+/// Log the ignored `harness: "dsh"` selection once per process.
+var warned_dsh_ignored = std.atomic.Value(bool).init(false);
+
+fn warnDshIgnored() void {
+    if (!warned_dsh_ignored.swap(true, .acq_rel)) {
+        log.warn("agent.harness=\"dsh\" ignored: this build has no dsh harness (-Dharness_dsh=true); using native", .{});
+    }
+}
+
+/// Start this session's dsh engine. `NULLCLAW_DSH_BIN` names dsh's
+/// `lib/bin.js`; the profile and the session mapping live next to config.json.
+/// Callers fall back to native on any error.
+fn startDshHarness(allocator: Allocator, config: *const Config, workspace: []const u8, session_key: []const u8) !DshState {
+    const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
+    const dsh_home = try std_compat.fs.path.join(allocator, &.{ config_dir, ".dsh" });
+    errdefer allocator.free(dsh_home);
+    try fs_compat.makePath(dsh_home);
+    const sessions_dir = try std_compat.fs.path.join(allocator, &.{ config_dir, "dsh-sessions" });
+    defer allocator.free(sessions_dir);
+    try fs_compat.makePath(sessions_dir);
+    const session_file = try std.fmt.allocPrint(allocator, "{s}/{x}.json", .{
+        sessions_dir,
+        std.hash.Wyhash.hash(0, session_key),
+    });
+    errdefer allocator.free(session_file);
+    const bin_js = if (dsh_test_boot_url != null)
+        // An injected boot URL means an external sidecar; no binary to spawn.
+        try allocator.dupe(u8, "unused")
+    else
+        std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_DSH_BIN") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return error.DshBinNotConfigured,
+            else => return err,
+        };
+    errdefer allocator.free(bin_js);
+
+    var state = DshState{
+        .allocator = allocator,
+        .harness = undefined,
+        .bin_js = bin_js,
+        .dsh_home = dsh_home,
+        .session_file = session_file,
+    };
+    state.harness = try dsh_harness_mod.DshHarness.init(allocator, .{
+        .sidecar = .{
+            .bin_js = state.bin_js,
+            .workspace = workspace,
+            .dsh_home = state.dsh_home,
+        },
+        .boot_url = dsh_test_boot_url,
+        .session_file = state.session_file,
+    });
+    return state;
+}
+
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -376,6 +460,9 @@ pub const Session = struct {
     /// The turn port for this session. Wraps `agent` for now; the host reaches
     /// `agent` directly through `nativeAgent()` until every call site moves.
     harness: native_harness.NativeHarness = undefined,
+    /// Set only when `agent.harness = "dsh"`, this build has the adapter and
+    /// the sidecar started; `turnHarness()` prefers it over `harness`.
+    dsh: ?DshState = null,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
     owned_memory_session_id: ?[]u8 = null,
@@ -416,7 +503,22 @@ pub const Session = struct {
         return &self.agent;
     }
 
+    /// The engine this session's turns run on: dsh when selected and started,
+    /// otherwise the native adapter. Refreshes the engine's session_key first
+    /// because a legacy key can be canonicalized after session creation.
+    fn turnHarness(self: *Session) harness_port.Harness {
+        if (comptime dsh_enabled) {
+            if (self.dsh) |*d| {
+                d.harness.session_key = self.session_key;
+                return d.harness.harness();
+            }
+        }
+        self.harness.session_key = self.session_key;
+        return self.harness.harness();
+    }
+
     pub fn deinit(self: *Session, allocator: Allocator) void {
+        if (self.dsh) |*d| d.deinit();
         self.agent.deinit();
         if (self.provider_holder) |*holder| holder.deinit();
         if (self.owned_provider_api_key) |key| allocator.free(key);
@@ -1959,6 +2061,22 @@ pub const SessionManager = struct {
         key_owned_by_session = true;
         session_initialized = true;
 
+        if (comptime dsh_enabled) {
+            if (selected_config.agent.harness == .dsh) {
+                session.dsh = startDshHarness(
+                    self.allocator,
+                    selected_config,
+                    session.agent.workspace_dir,
+                    owned_key,
+                ) catch |err| blk: {
+                    log.warn("agent.harness=\"dsh\" not started ({s}); using native", .{@errorName(err)});
+                    break :blk null;
+                };
+            }
+        } else if (selected_config.agent.harness == .dsh) {
+            warnDshIgnored();
+        }
+
         if (selected_session_store) |store| {
             self.resetStaleRestoredSessionLocked(session, store, now);
         }
@@ -2468,11 +2586,10 @@ pub const SessionManager = struct {
             // The adapter is the session's turn engine; hand it the real key so
             // its display-trust decisions match the host's (the key can be
             // renamed when a legacy session is canonicalized, so set it per turn).
-            session.harness.session_key = session.session_key;
             var input = turn_input;
             input.drain = drain;
             input.drain_ctx = drain_ctx;
-            break :blk (session.harness.harness().runTurn(input) catch |err| {
+            break :blk (session.turnHarness().runTurn(input) catch |err| {
                 finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
                 return err;
             }).reply;
@@ -6198,6 +6315,72 @@ test "processMessageStreaming does not rehydrate placeholders for group sessions
     try testing.expectEqual(@as(usize, 2), detailed.len);
     for (detailed) |message| {
         try testing.expect(std.mem.indexOf(u8, message.content, "alice@example.com") == null);
+    }
+}
+
+test "agent.harness default keeps the native turn path" {
+    // Regression: adding a second engine must not change sessions that never
+    // opt in.
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:local");
+    try testing.expect(session.dsh == null);
+    const h = session.turnHarness();
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), h.ptr);
+    try testing.expectEqualStrings(session.session_key, session.harness.session_key);
+}
+
+test "agent.harness=dsh is ignored in a default build" {
+    if (comptime dsh_enabled) return error.SkipZigTest;
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.agent.harness = .dsh;
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:local");
+    try testing.expect(session.dsh == null);
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), session.turnHarness().ptr);
+}
+
+test "agent.harness=dsh selects the dsh engine in a dsh build" {
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std_compat.fs.path.join(testing.allocator, &.{ base, "config.json" });
+    defer testing.allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agent.harness = .dsh;
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:local");
+    try testing.expect(session.dsh != null);
+    const h = session.turnHarness();
+    if (session.dsh) |*d| {
+        try testing.expectEqual(@as(*anyopaque, @ptrCast(&d.harness)), h.ptr);
     }
 }
 

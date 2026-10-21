@@ -1367,6 +1367,7 @@ pub const Config = struct {
             .tool_dispatcher = self.agent.tool_dispatcher,
             .reasoning_mode = self.agent.reasoning_mode,
             .default_queue_mode = self.agent.default_queue_mode,
+            .harness = self.agent.harness.toSlice(),
             .session_idle_timeout_secs = self.agent.session_idle_timeout_secs,
             .compaction_keep_recent = self.agent.compaction_keep_recent,
             .compaction_max_summary_chars = self.agent.compaction_max_summary_chars,
@@ -3022,6 +3023,7 @@ test "save outputs pretty-printed nested sections" {
     cfg.agent.compact_context = true;
     cfg.agent.max_tool_iterations = 42;
     cfg.agent.default_queue_mode = .latest;
+    cfg.agent.harness = .dsh;
     try cfg.save();
 
     const file = try std_compat.fs.openFileAbsolute(config_path, .{});
@@ -3042,6 +3044,7 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expect(std.mem.indexOf(u8, content, "      \"enabled\": true") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "    \"max_tool_iterations\": 42") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "    \"default_queue_mode\": \"latest\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"harness\": \"dsh\"") != null);
 
     // Roundtrip: values must survive parse
     var arena = std.heap.ArenaAllocator.init(allocator);
@@ -3058,6 +3061,7 @@ test "save outputs pretty-printed nested sections" {
     try std.testing.expectEqual(@as(u32, 42), loaded.agent.max_tool_iterations);
     // Regression: Config.save must not silently erase a non-off queue default.
     try std.testing.expectEqual(config_types.QueueMode.latest, loaded.agent.default_queue_mode);
+    try std.testing.expectEqual(config_types.HarnessKind.dsh, loaded.agent.harness);
 }
 
 test "save escapes string arrays safely" {
@@ -6931,6 +6935,39 @@ test "agent.default_queue_mode rejects invalid values" {
     try std.testing.expectError(
         error.InvalidDefaultQueueMode,
         cfg.parseJson("{\"agent\":{\"default_queue_mode\":42}}"),
+    );
+}
+
+test "agent.harness defaults to native" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{}");
+    try std.testing.expectEqual(config_types.HarnessKind.native, cfg.agent.harness);
+}
+
+test "parse agent.harness" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson("{\"agent\":{\"harness\":\"native\"}}");
+    try std.testing.expectEqual(config_types.HarnessKind.native, cfg.agent.harness);
+    try cfg.parseJson("{\"agent\":{\"harness\":\"dsh\"}}");
+    try std.testing.expectEqual(config_types.HarnessKind.dsh, cfg.agent.harness);
+}
+
+test "agent.harness rejects invalid values" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try std.testing.expectError(
+        error.InvalidHarness,
+        cfg.parseJson("{\"agent\":{\"harness\":\"dhs\"}}"),
+    );
+    try std.testing.expectError(
+        error.InvalidHarness,
+        cfg.parseJson("{\"agent\":{\"harness\":true}}"),
     );
 }
 

@@ -233,6 +233,23 @@ Example:
 }
 ```
 
+### `agent.harness`
+
+- Selects the turn engine for newly created sessions: `native` (default) or `dsh`. Omitting the key keeps `native`.
+- `dsh` requires a binary built with `-Dharness_dsh=true`. A default build ignores the value, logs one warning, and keeps running the native engine; it never starts a dsh sidecar. The same fallback (with a warning) applies when `NULLCLAW_DSH_BIN` is unset or the sidecar fails to start.
+- In a dsh build, `NULLCLAW_DSH_BIN` must point at dsh's `lib/bin.js`. The sidecar uses the agent workspace, keeps its profile in `<config dir>/.dsh`, and persists the dsh session id in `<config dir>/dsh-sessions/`.
+- P1 dsh mode covers chat turns and streamed replies. Steer injection, approvals, user questions, and routing host-side `/stop` and `/new` to the dsh session are not wired yet; junclaw still keeps its own transcript for channel history.
+
+Example:
+
+```json
+{
+  "agent": {
+    "harness": "dsh"
+  }
+}
+```
+
 ### `agent.reasoning_mode`
 
 - Sets the reasoning display mode for newly created sessions. Accepted values are `off`, `on`, and `stream`; the default is `off`.
