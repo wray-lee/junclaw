@@ -7433,7 +7433,7 @@ test "session restore keeps compaction summary and drops pre-compaction history"
     try testing.expectEqual(@as(u64, 1), restored.agent.compaction_count);
 }
 
-test "persisted session falls back to rendered response when degraded turn has no final assistant history entry" {
+test "persisted session keeps the delivered reply when a degraded turn ends with an assistant history entry" {
     var provider = SummaryFailureProvider{};
     var probe_tool = ProbeTool{};
     const tools = [_]Tool{probe_tool.tool()};
@@ -7468,7 +7468,10 @@ test "persisted session falls back to rendered response when degraded turn has n
 
     try testing.expect(std.mem.indexOf(u8, response, "Could not produce a summary") != null);
     try testing.expect(session.agent.history.items.len > 0);
-    try testing.expect(session.agent.history.items[session.agent.history.items.len - 1].role != .assistant);
+    // D2: degraded turns now record the delivered reply in history, so the
+    // last entry is the assistant reply the caller received.
+    try testing.expect(session.agent.history.items[session.agent.history.items.len - 1].role == .assistant);
+    try testing.expectEqualStrings(response, session.agent.history.items[session.agent.history.items.len - 1].content);
 
     const entries = try sqlite_mem.loadMessages(testing.allocator, session_key);
     defer memory_mod.freeMessages(testing.allocator, entries);

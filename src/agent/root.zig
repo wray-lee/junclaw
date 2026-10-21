@@ -9748,7 +9748,7 @@ test "Agent tool-limit summary preserves provider session_id" {
                     .arguments = try allocator.dupe(u8, "{}"),
                 };
                 return .{
-                    .content = null,
+                    .content = try allocator.dupe(u8, "running tool"),
                     .tool_calls = tool_calls,
                     .usage = .{},
                     .model = try allocator.dupe(u8, "test-model"),
@@ -9829,7 +9829,7 @@ test "Agent tool-limit summary preserves provider session_id" {
     const response = try agent.turn("trigger summary");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqualStrings("running tool\n\n[Tool iteration limit: 1/1]\n\nsummary", response);
     try std.testing.expectEqualStrings("telegram:chat123", provider_state.summary_session_id.?);
 }
 
@@ -9870,7 +9870,7 @@ test "Agent tool-limit summary records observer events and token metric" {
                     .arguments = try allocator.dupe(u8, "{}"),
                 };
                 return .{
-                    .content = null,
+                    .content = try allocator.dupe(u8, "running tool"),
                     .tool_calls = tool_calls,
                     .usage = .{},
                     .model = try allocator.dupe(u8, "test-model"),
@@ -9949,16 +9949,16 @@ test "Agent tool-limit summary records observer events and token metric" {
     const response = try agent.turn("trigger summary");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
+    try std.testing.expectEqualStrings("running tool\n\n[Tool iteration limit: 1/1]\n\nsummary", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
     try std.testing.expectEqual(@as(usize, 0), observer.llm_failure_count);
     try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
     try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
-    try std.testing.expectEqual(@as(u64, 5), observer.tokens_used_metric_total);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), observer.tokens_used_metric_total);
     try std.testing.expectEqual(@as(?u32, 5), observer.last_llm_response_total_tokens);
-    try std.testing.expectEqual(@as(u64, 5), agent.tokensUsed());
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool") + 5), agent.tokensUsed());
     try std.testing.expectEqual(@as(u32, 5), agent.last_turn_usage.total_tokens);
 }
 
@@ -9999,7 +9999,7 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
                     .arguments = try allocator.dupe(u8, "{}"),
                 };
                 return .{
-                    .content = null,
+                    .content = try allocator.dupe(u8, "running tool"),
                     .tool_calls = tool_calls,
                     .usage = .{},
                     .model = try allocator.dupe(u8, "test-model"),
@@ -10073,14 +10073,14 @@ test "Agent tool-limit summary records llm failure when summary call fails" {
     const response = try agent.turn("trigger summary failure");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
+    try std.testing.expectEqualStrings("running tool\n\n[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_request_count);
     try std.testing.expectEqual(@as(usize, 2), observer.llm_response_count);
     try std.testing.expectEqual(@as(usize, 1), observer.llm_failure_count);
     try std.testing.expectEqual(@as(usize, 1), observer.tool_iterations_exhausted_count);
     try std.testing.expectEqual(@as(usize, 1), observer.turn_complete_count);
-    try std.testing.expectEqual(@as(u64, 0), observer.tokens_used_metric_total);
+    try std.testing.expectEqual(@as(u64, estimate_text_tokens("running tool")), observer.tokens_used_metric_total);
 }
 
 const IterLimitNoopTool = struct {
@@ -10206,6 +10206,40 @@ test "Agent tool-limit reply keeps interim text when the summary call fails" {
     defer allocator.free(response);
 
     try std.testing.expectEqualStrings("interim finding\n\n[Tool iteration limit: 1/1] Could not produce a summary. Try /new and repeat your request.", response);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last.role == .assistant);
+    try std.testing.expectEqualStrings(response, last.content);
+}
+
+test "Agent tool-limit reply keeps pre-fix bytes when interim text is empty" {
+    // Regression: empty interim text must keep the pre-fix reply bytes, with no
+    // leading "\n\n" before the end-reason tail.
+    const allocator = std.testing.allocator;
+    const scripts = [_]TurnScript{
+        .{ .tool_call = .{ .name = "noop", .args = "{}", .content = "" } },
+        .{ .text = "summary" },
+    };
+    var state = ScriptedTurnProvider{ .scripts = &scripts };
+    const provider = scriptedProvider(&state);
+    var tool_state = IterLimitNoopTool{};
+    const tool_list = [_]Tool{tool_state.tool()};
+    const specs = try allocator.alloc(ToolSpec, tool_list.len);
+    for (tool_list, 0..) |t, i| {
+        specs[i] = .{
+            .name = t.name(),
+            .description = t.description(),
+            .parameters_json = t.parametersJson(),
+        };
+    }
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tool_list, specs, noop.observer());
+    defer agent.deinit();
+    agent.max_tool_iterations = 1;
+
+    const response = try agent.turn("find the record");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary", response);
     const last = agent.history.items[agent.history.items.len - 1];
     try std.testing.expect(last.role == .assistant);
     try std.testing.expectEqualStrings(response, last.content);
