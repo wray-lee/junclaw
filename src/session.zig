@@ -2431,6 +2431,10 @@ pub const SessionManager = struct {
         // ever calling the provider.
         defer session.agent.clearInterruptRequest();
         const response = blk: {
+            // The adapter is the session's turn engine; hand it the real key so
+            // its display-trust decisions match the host's (the key can be
+            // renamed when a legacy session is canonicalized, so set it per turn).
+            session.harness.session_key = session.session_key;
             var input = turn_input;
             input.drain = drain;
             input.drain_ctx = drain_ctx;
@@ -6038,6 +6042,65 @@ test "processMessageStreaming does not rehydrate placeholders for group sessions
     for (detailed) |message| {
         try testing.expect(std.mem.indexOf(u8, message.content, "alice@example.com") == null);
     }
+}
+
+test "harness display trust uses the real session key for shared channels" {
+    // Regression: the adapter read its own session_key, which no production
+    // path assigned, so a shared-channel key with is_group=false looked
+    // single-user and the live draft was suppressed.
+    var mock = MockStreamingProvider{ .response = "sent to [EMAIL_1]" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const session_key = "telegram:main:group:-1001";
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "please email alice@example.com",
+        .{
+            .channel = "telegram",
+            .is_group = false,
+        },
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+        null,
+    );
+    defer testing.allocator.free(resp);
+
+    // The manager must hand the real key to the adapter it drives.
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqualStrings(session_key, live_session.harness.session_key);
+    try testing.expectEqual(
+        governance.DisplayTrustScope.shared_channel,
+        governance.displayTrustScope(live_session.harness.session_key, "telegram", false),
+    );
+    try testing.expectEqual(
+        governance.displayTrustScope(session_key, "telegram", false),
+        governance.displayTrustScope(live_session.harness.session_key, "telegram", false),
+    );
+
+    // Shared channel: no rehydration, so the live draft is not suppressed.
+    try testing.expectEqualStrings("sent to [EMAIL_1]", resp);
+    try testing.expectEqualStrings("sent to [EMAIL_1]", collector.data.items);
 }
 
 test "processMessageStreaming forwards tool progress hints" {
