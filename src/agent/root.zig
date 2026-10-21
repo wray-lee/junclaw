@@ -1085,6 +1085,14 @@ pub const Agent = struct {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
     }
 
+    /// Truncate the delivered reply to ~100 bytes on a valid UTF-8 boundary.
+    fn autosaveSummary(text: []const u8) []const u8 {
+        if (text.len <= 100) return text;
+        var end: usize = 100;
+        while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+        return text[0..end];
+    }
+
     fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
         if (parsed_calls_len > 0) return parsed_text;
         if (parsed_text.len > 0) {
@@ -3011,12 +3019,10 @@ pub const Agent = struct {
                 // Auto-save assistant response
                 if (self.auto_save) {
                     if (self.mem) |mem| {
-                        // Truncate to ~100 bytes on a valid UTF-8 boundary
-                        const summary = if (base_text.len > 100) blk: {
-                            var end: usize = 100;
-                            while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
-                            break :blk base_text[0..end];
-                        } else base_text;
+                        // Regression: the autosave summary was cut from the
+                        // pre-strip base_text, so it could store tool-call
+                        // markup the user never saw. Use the delivered text.
+                        const summary = autosaveSummary(history_text);
                         const safe_summary = if (self.redactor) |r|
                             r.redact(arena, summary) catch null
                         else
@@ -10694,6 +10700,28 @@ test "Agent shouldForceActionFollowThrough ignores russian duration nouns" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent autosave summary is cut from the delivered markup-free text" {
+    // Regression: the autosave summary was cut from the pre-strip base_text, so
+    // a reply containing `<function=...>` markup stored markup the user never
+    // saw. It is now cut from the same stripped text that goes to history.
+    const a = std.testing.allocator;
+    const input = "answer <function=web_search><parameter=query>x</parameter></function> tail";
+    const clean = try providers.stripToolCallMarkup(a, input);
+    defer a.free(clean);
+    const summary = Agent.autosaveSummary(clean);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<function") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<parameter") == null);
+    try std.testing.expect(std.mem.startsWith(u8, summary, "answer"));
+}
+
+test "Agent autosave summary truncates on a UTF-8 boundary" {
+    const long = "中" ** 60; // 180 bytes
+    const summary = Agent.autosaveSummary(long);
+    try std.testing.expect(summary.len <= 100);
+    try std.testing.expectEqual(@as(usize, 0), summary.len % 3);
+    try std.testing.expectEqualStrings("中" ** 33, summary);
 }
 
 test "Agent selectDisplayText hides malformed tool markup payload" {
