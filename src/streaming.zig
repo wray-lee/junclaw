@@ -1753,6 +1753,15 @@ test "TagFilter strips standalone control tokens with an omitted delimiter" {
 // agree (parity).
 // ---------------------------------------------------------------------------
 
+// Regression: a closed <tool_call> block whose body is prose (not a call) was
+// dropped by the shared parse, so the delivered reply lost text the preview
+// had shown. The preview and the batch strip keep it; the parse must agree.
+test "TagFilter and the batch strip keep a closed non-call block body" {
+    const input = "A<tool_call>中文</tool_call>B";
+    try assertFilteredEquals(.passthrough, &.{input}, "A中文B");
+    try assertBatchParity(&.{input}, input);
+}
+
 /// The batch mirror of the streaming filter's tool-markup stripping is
 /// `stripToolCallMarkup`; in `.passthrough` the streaming filter keeps the
 /// `<think>` tags and drops tool markup, which is exactly what the batch helper

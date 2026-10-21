@@ -1527,6 +1527,13 @@ pub fn parseDispatcherXmlToolCalls(
                     allocator.free(call.arguments_json);
                 }
                 try calls.append(allocator, call);
+            } else if (!bodyLooksLikeCallPayload(after_open[0..selected_end])) {
+                // Regression: a closed block whose body is prose that merely
+                // names the marker had its text dropped from the reply, while
+                // the streaming preview and the batch strip kept it. Release
+                // the body here too; the block is still consumed.
+                const inner = std.mem.trim(u8, after_open[0..selected_end], " \t\r\n");
+                if (inner.len > 0) try text_parts.append(allocator, inner);
             }
             // A block is only a block the *display* must hide when the
             // dispatcher would execute a call from it. Markup around a block
@@ -3697,6 +3704,32 @@ test "parseDispatcherXmlToolCalls keeps the prose of an unclosed trailing opener
     }
     try std.testing.expectEqual(@as(usize, 1), parsed.calls.len);
     try std.testing.expectEqualStrings("Q1\nQ2\nunclosed prose", parsed.text);
+}
+
+test "parseDispatcherXmlToolCalls keeps the body of a closed non-call block" {
+    // Regression: a closed <tool_call> block whose body was prose (not a call)
+    // was consumed whole, so `A<tool_call>中文</tool_call>B` parsed to "A\nB"
+    // and the reply lost 中文, while the streaming preview and the batch strip
+    // kept it. A block-only prose reply vanished entirely.
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "A<tool_call>中文</tool_call>B", "中文" },
+        .{ "<tool_call>中文</tool_call>", "中文" },
+    };
+    for (cases) |case| {
+        const parsed = try parseDispatcherXmlToolCalls(a, case[0]);
+        defer {
+            a.free(parsed.text);
+            for (parsed.calls) |call| {
+                a.free(call.name);
+                a.free(call.arguments_json);
+            }
+            a.free(parsed.calls);
+            a.free(parsed.blocks);
+        }
+        try std.testing.expectEqual(@as(usize, 0), parsed.calls.len);
+        try std.testing.expect(std.mem.indexOf(u8, parsed.text, case[1]) != null);
+    }
 }
 
 test "stripToolCallMarkup hides an unclosed opener that trails a valid call" {

@@ -14637,6 +14637,34 @@ test "Agent turn preserves XML-path interim text without leaking tool-call marku
     try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", last_msg.content);
 }
 
+test "Agent turn keeps the body of a closed non-call tool_call block" {
+    // Regression: a closed <tool_call> block whose body was prose (not a call)
+    // was consumed whole, so the reply and history lost the text the streaming
+    // preview had shown; a block-only reply vanished entirely.
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "A<tool_call>中文</tool_call>B", .tool_call = true },
+        .{ .text = "C" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "中文") != null);
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "中文") != null);
+}
+
 /// True when `text` carries any dispatcher tool-call marker (V1 of the interim
 /// markup fix); none may reach a user-visible surface.
 fn containsAnyToolCallMarker(text: []const u8) bool {
