@@ -221,3 +221,34 @@ test "previewUtf8 reports truncation without splitting multi-byte sequences" {
     try std.testing.expectEqualStrings("plain ascii", full.slice);
     try std.testing.expect(!full.truncated);
 }
+
+// ── Silent reply token ──────────────────────────────────────────
+
+/// True when the reply is nothing but the silent token (e.g. `[NO_REPLY]`):
+/// every whitespace-separated word, with edge punctuation stripped, must be
+/// that token. Prose that merely mentions the token is not silent.
+pub fn isSilentTokenReply(reply: []const u8) bool {
+    var saw_token = false;
+    var words = std.mem.tokenizeAny(u8, reply, " \t\r\n");
+    while (words.next()) |word| {
+        var start: usize = 0;
+        var end: usize = word.len;
+        while (start < end and std.ascii.isPunctuation(word[start])) start += 1;
+        while (end > start and std.ascii.isPunctuation(word[end - 1])) end -= 1;
+        const bare = word[start..end];
+        if (bare.len == 0) continue; // Punctuation alone is neither content nor a token.
+        if (!std.ascii.eqlIgnoreCase(bare, "NO_REPLY")) return false;
+        saw_token = true;
+    }
+    return saw_token;
+}
+
+test "isSilentTokenReply matches token-only replies" {
+    try std.testing.expect(isSilentTokenReply("[NO_REPLY]"));
+    try std.testing.expect(isSilentTokenReply("  NO_REPLY  "));
+    try std.testing.expect(isSilentTokenReply("NO_REPLY."));
+    try std.testing.expect(isSilentTokenReply("[NO_REPLY] [NO_REPLY]"));
+    try std.testing.expect(!isSilentTokenReply("regular reply"));
+    try std.testing.expect(!isSilentTokenReply("ok [NO_REPLY]"));
+    try std.testing.expect(!isSilentTokenReply("Use the `[NO_REPLY]` marker to stay silent."));
+}
