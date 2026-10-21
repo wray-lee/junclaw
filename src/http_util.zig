@@ -627,9 +627,9 @@ const CappedBody = struct {
     truncated: bool,
 };
 
-/// Longest prefix of `bytes` that ends on a UTF-8 sequence boundary. Truncation
-/// may cut a multi-byte code point in half; the returned slice must stay valid
-/// UTF-8 for the tool result.
+/// Longest prefix of the input that ends on a UTF-8 sequence boundary. The cap
+/// may split a multi-byte code point; it is dropped whole so the returned slice
+/// stays valid UTF-8 for the tool result.
 fn trimToUtf8Prefix(bytes: []const u8) usize {
     var end = bytes.len;
     while (end > 0 and (bytes[end - 1] & 0xC0) == 0x80) end -= 1;
