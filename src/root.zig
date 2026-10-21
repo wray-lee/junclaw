@@ -55,6 +55,7 @@ pub const error_reply_policy = @import("error_reply_policy.zig");
 // Phase 2: Agent core
 pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
+pub const harness = @import("harness/root.zig");
 pub const session_reset = @import("session_reset.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
@@ -107,4 +108,7 @@ pub const voice = @import("voice.zig");
 test {
     // Run tests from all imported modules
     @import("std").testing.refAllDecls(@This());
+    // Zig does not collect tests from nested module files on its own.
+    _ = @import("harness/contract_test.zig");
+    _ = @import("harness/differential_test.zig");
 }

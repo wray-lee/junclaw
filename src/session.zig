@@ -44,6 +44,8 @@ const streaming = @import("streaming.zig");
 const outbound_mod = @import("outbound.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
+const harness_port = @import("harness/port.zig");
+const native_harness = @import("harness/native.zig");
 const log = std.log.scoped(.session);
 const MESSAGE_LOG_MAX_BYTES: usize = 4096;
 const MAX_POST_TURN_INJECTION_DRAINS: u32 = 8;
@@ -371,6 +373,9 @@ fn finalizeSteerRefs(
 
 pub const Session = struct {
     agent: Agent,
+    /// The turn port for this session. Wraps `agent` for now; the host reaches
+    /// `agent` directly through `nativeAgent()` until every call site moves.
+    harness: native_harness.NativeHarness = undefined,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
     owned_memory_session_id: ?[]u8 = null,
@@ -401,6 +406,15 @@ pub const Session = struct {
     /// finalizes them `.failed` so their acknowledgement reaction is not left
     /// stuck.
     discarded_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty,
+
+    /// The native `Agent` behind this session's port. Kept so the host's
+    /// not-yet-ported call sites (restore, interrupt/status, reset, persistence,
+    /// queue/reasoning reads, attachment filtering, prompt invalidation) keep
+    /// working without a rewrite. `Session` is NOT a union yet: that is a later
+    /// phase, when a second engine exists.
+    pub fn nativeAgent(self: *Session) *Agent {
+        return &self.agent;
+    }
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
@@ -1925,6 +1939,9 @@ pub const SessionManager = struct {
         const session_owned_provider_api_key = session.owned_provider_api_key;
         session.* = .{
             .agent = agent,
+            // The adapter borrows the agent it wraps, so it must be seeded
+            // after `session.*` takes the agent.
+            .harness = .{ .agent = undefined },
             .provider_holder = session_provider_holder,
             .owned_provider_api_key = session_owned_provider_api_key,
             .owned_memory_session_id = owned_memory_session_id,
@@ -1938,6 +1955,7 @@ pub const SessionManager = struct {
             .turn_closing = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
+        session.harness = native_harness.NativeHarness.init(&session.agent);
         key_owned_by_session = true;
         session_initialized = true;
 
@@ -2061,16 +2079,53 @@ pub const SessionManager = struct {
         };
     }
 
-    const StreamAdapterCtx = struct {
-        sink: streaming.Sink,
-        suppress_live: bool = false,
+    /// The host side of the port: maps the engine's `Event` union back onto the
+    /// two sinks the channels already own. A host that wants to watch usage
+    /// events adds an `Event.usage` arm here; the engine never touches
+    /// `usage_record_callback`, which stays installed once at session creation.
+    const PortEventSink = struct {
+        stream: ?streaming.Sink,
+        progress: ?agent_mod.ProgressSink,
+
+        fn emit(ctx: *anyopaque, event: harness_port.Event) void {
+            const self: *PortEventSink = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .delta => |chunk| {
+                    if (self.stream) |sink| streaming.forwardProviderChunk(sink, chunk);
+                },
+                .progress => |hint| {
+                    if (self.progress) |sink| sink.emit(hint);
+                },
+                // The host keeps writing the usage ledger from the agent's own
+                // usage_record_callback; nothing consumes this today.
+                .usage => {},
+            }
+        }
     };
 
-    fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
-        const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
-        if (adapter.suppress_live and !chunk.is_final) return;
-        streaming.forwardProviderChunk(adapter.sink, chunk);
-    }
+    /// Pre-port live-draft rule: when the rendered draft would expose text that
+    /// must stay redacted, drop non-final deltas and let the final reply print
+    /// path display the rehydrated text. The host computes the decision once per
+    /// turn, so follow-up turns share the primary turn's decision.
+    const SuppressingSink = struct {
+        inner: harness_port.Sink,
+        suppress_live: bool,
+
+        fn emit(ctx: *anyopaque, event: harness_port.Event) void {
+            const self: *SuppressingSink = @ptrCast(@alignCast(ctx));
+            if (self.suppress_live) {
+                switch (event) {
+                    .delta => |chunk| if (!chunk.is_final) return,
+                    else => {},
+                }
+            }
+            self.inner.send(event);
+        }
+
+        fn sink(self: *SuppressingSink) harness_port.Sink {
+            return .{ .ctx = @ptrCast(self), .emit = emit };
+        }
+    };
 
     fn shouldRehydrateDisplay(session_key: []const u8, conversation_context: ?ConversationContext) bool {
         const channel = if (conversation_context) |ctx| ctx.channel else null;
@@ -2078,9 +2133,13 @@ pub const SessionManager = struct {
         return governance.shouldRehydrateDisplay(session_key, channel, is_group);
     }
 
-    fn shouldSuppressLiveForRedaction(redactor: ?*redaction.Redactor, content: []const u8, display_rehydrate_allowed: bool) bool {
+    fn shouldSuppressLiveForRedaction(
+        redactor_: ?*redaction.Redactor,
+        content: []const u8,
+        display_rehydrate_allowed: bool,
+    ) bool {
         if (!display_rehydrate_allowed) return false;
-        const r = redactor orelse return false;
+        const r = redactor_ orelse return false;
         return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
     }
 
@@ -2354,10 +2413,13 @@ pub const SessionManager = struct {
         session: *Session,
         response: []const u8,
     ) ![]const u8 {
-        if (!session.agent.has_own_autonomy) return response;
+        // The port has no attachment-scope surface yet, so reach the native
+        // agent for this one field set.
+        const agent = session.nativeAgent();
+        if (!agent.has_own_autonomy) return response;
         const scope = outbound_mod.AttachmentScope{
-            .workspace_dir = session.agent.workspace_dir,
-            .allowed_paths = session.agent.allowed_paths,
+            .workspace_dir = agent.workspace_dir,
+            .allowed_paths = agent.allowed_paths,
         };
         const filtered = try outbound_mod.stripEscapingAttachmentMarkers(self.allocator, response, scope);
         self.allocator.free(response);
@@ -2377,25 +2439,24 @@ pub const SessionManager = struct {
 
     /// Track every message consumed by one Agent.turn, including messages
     /// drained while a post-turn follow-up is itself running.
+    ///
+    /// `drain_enabled` reproduces the old guard "only install the per-turn
+    /// drain when the streaming entry point already installed one": a
+    /// standalone drain helper never installs it, so a real turn does.
     fn runTurnWithSteerSink(
         self: *SessionManager,
         session: *Session,
-        content: []const u8,
         refs: *std.ArrayListUnmanaged(ConsumedRef),
-        sink: ?SteerReactionSink,
+        steer_sink: ?SteerReactionSink,
+        turn_input: harness_port.TurnInput,
+        drain_enabled: bool,
     ) ![]const u8 {
         var ctx = SteerDrainContext{ .session = session, .allocator = self.allocator, .refs = refs };
-        const previous_callback = session.agent.drain_injection_cb;
-        const previous_ctx = session.agent.drain_injection_ctx;
-        // A standalone drain helper has no in-turn drain installed. Preserve
-        // that contract; the streaming entry point installs it for real turns.
-        if (previous_callback != null) {
-            session.agent.drain_injection_cb = SteerDrainContext.callback;
-            session.agent.drain_injection_ctx = @ptrCast(&ctx);
-        }
-        defer {
-            session.agent.drain_injection_cb = previous_callback;
-            session.agent.drain_injection_ctx = previous_ctx;
+        var drain: ?agent_mod.DrainCallback = null;
+        var drain_ctx: ?*anyopaque = null;
+        if (drain_enabled) {
+            drain = SteerDrainContext.callback;
+            drain_ctx = @ptrCast(&ctx);
         }
         // A /stop that landed during this turn is spent once the turn returns,
         // even when the turn failed before Agent.turn could consume the flag
@@ -2403,11 +2464,20 @@ pub const SessionManager = struct {
         // message cannot inherit it and answer "Interrupted by /stop" without
         // ever calling the provider.
         defer session.agent.clearInterruptRequest();
-        const response = session.agent.turn(content) catch |err| {
-            finalizeSteerRefs(sink, self.allocator, refs, .failed);
-            return err;
+        const response = blk: {
+            // The adapter is the session's turn engine; hand it the real key so
+            // its display-trust decisions match the host's (the key can be
+            // renamed when a legacy session is canonicalized, so set it per turn).
+            session.harness.session_key = session.session_key;
+            var input = turn_input;
+            input.drain = drain;
+            input.drain_ctx = drain_ctx;
+            break :blk (session.harness.harness().runTurn(input) catch |err| {
+                finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                return err;
+            }).reply;
         };
-        finalizeSteerRefs(sink, self.allocator, refs, .done);
+        finalizeSteerRefs(steer_sink, self.allocator, refs, .done);
         return response;
     }
 
@@ -2422,6 +2492,8 @@ pub const SessionManager = struct {
         response: *[]const u8,
         completed_turns: *u64,
         steer_sink: ?SteerReactionSink,
+        live_stream: bool,
+        sink: ?harness_port.Sink,
     ) !bool {
         var refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
         defer freeConsumedRefs(self.allocator, &refs);
@@ -2431,11 +2503,20 @@ pub const SessionManager = struct {
         // Regression: the combined reply joins the two turns with "\n\n" but
         // nothing streamed that separator, so the preview (primary followed by
         // the follow-up's own stream) was not a prefix of the reply. Emit it
-        // before the follow-up turn starts streaming.
-        if (session.agent.stream_callback) |cb| {
-            if (session.agent.stream_ctx) |ctx| cb(ctx, providers.StreamChunk.textDelta("\n\n"));
+        // before the follow-up turn starts streaming. The adapter restores the
+        // agent callback after every turn, so writing to agent.stream_callback
+        // here would be dropped; go through the host's suppressing sink so the
+        // live-draft rule applies to the separator exactly as before the port.
+        if (live_stream) {
+            if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta("\n\n") });
         }
-        const follow_up_response = self.runTurnWithSteerSink(session, late_content, &refs, steer_sink) catch |err| {
+        const follow_up_response = self.runTurnWithSteerSink(session, &refs, steer_sink, .{
+            .user_message = late_content,
+            .conversation_context = session.agent.conversation_context,
+            .memory_session_id = session.agent.memory_session_id,
+            .live_stream = live_stream,
+            .sink = sink,
+        }, true) catch |err| {
             // Regression: a failed tail-window follow-up dropped the acked
             // injection, so the user's steered message vanished. Keep the
             // completed primary reply and tell the sender to resend it.
@@ -2499,6 +2580,8 @@ pub const SessionManager = struct {
         completed_turns: *u64,
         session_hash: u64,
         steer_sink: ?SteerReactionSink,
+        live_stream: bool,
+        sink: ?harness_port.Sink,
     ) !?[]const u8 {
         var reply: ?[]const u8 = null;
         // Notices for failed follow-ups. Held separately so they are only
@@ -2516,7 +2599,13 @@ pub const SessionManager = struct {
             } orelse break;
             defer self.allocator.free(late_content);
 
-            const follow_up_response = self.runTurnWithSteerSink(session, late_content, &refs, steer_sink) catch |err| {
+            const follow_up_response = self.runTurnWithSteerSink(session, &refs, steer_sink, .{
+                .user_message = late_content,
+                .conversation_context = session.agent.conversation_context,
+                .memory_session_id = session.agent.memory_session_id,
+                .live_stream = live_stream,
+                .sink = sink,
+            }, false) catch |err| {
                 log.warn("post-turn injection after failed turn also failed session=0x{x} err={}", .{ session_hash, err });
                 self.persistTurnResult(session, session_key, late_content, null);
                 var err_buf: [256]u8 = undefined;
@@ -2743,63 +2832,38 @@ pub const SessionManager = struct {
         defer session.agent.conversation_context = null;
         setTurnToolContext(session.agent.tools, session_key, conversation_context);
 
-        const prev_stream_callback = session.agent.stream_callback;
-        const prev_stream_ctx = session.agent.stream_ctx;
-        defer {
-            session.agent.stream_callback = prev_stream_callback;
-            session.agent.stream_ctx = prev_stream_ctx;
-        }
-
+        // The stream/progress install block and the agent_start observer event
+        // moved verbatim into the native adapter (src/harness/native.zig
+        // runTurn); the host now only describes what it wants observed.
         const display_rehydrate_allowed = shouldRehydrateDisplay(session_key, conversation_context);
+        // The adapter forwards raw chunks; live-draft suppression is the host's
+        // policy, decided once from the primary content (as before the port).
+        const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content, display_rehydrate_allowed);
 
-        var stream_adapter: StreamAdapterCtx = undefined;
-        if (stream_sink) |sink| {
-            const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content, display_rehydrate_allowed);
-            stream_adapter = .{ .sink = sink, .suppress_live = suppress_live };
-            session.agent.stream_callback = streamChunkForwarder;
-            session.agent.stream_ctx = @ptrCast(&stream_adapter);
-        } else {
-            session.agent.stream_callback = null;
-            session.agent.stream_ctx = null;
-        }
-
-        const prev_progress_callback = session.agent.progress_callback;
-        const prev_progress_ctx = session.agent.progress_ctx;
-        defer {
-            session.agent.progress_callback = prev_progress_callback;
-            session.agent.progress_ctx = prev_progress_ctx;
-        }
-        if (progress_sink) |ps| {
-            session.agent.progress_callback = ps.callback;
-            session.agent.progress_ctx = ps.ctx;
-        } else {
-            session.agent.progress_callback = null;
-            session.agent.progress_ctx = null;
-        }
-
-        // Record agent start event with channel attribution
-        const start_event = @import("observability.zig").ObserverEvent{ .agent_start = .{
-            .provider = session.agent.provider.getName(),
-            .model = session.agent.model_name,
-            .channel = if (conversation_context) |ctx| ctx.channel else null,
-            .bot_account = if (conversation_context) |ctx| ctx.account_id else null,
-        } };
-        session.agent.observer.recordEvent(&start_event);
+        var port_sink_ctx = PortEventSink{ .stream = stream_sink, .progress = progress_sink };
+        var suppressing_sink = SuppressingSink{
+            .inner = .{ .ctx = @ptrCast(&port_sink_ctx), .emit = PortEventSink.emit },
+            .suppress_live = suppress_live,
+        };
+        const port_sink: ?harness_port.Sink = if (stream_sink != null or progress_sink != null)
+            suppressing_sink.sink()
+        else
+            null;
 
         var completed_turns: u64 = 0;
         var primary_failed = false;
         var primary_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
         defer freeConsumedRefs(self.allocator, &primary_refs);
-        var drain_ctx = SteerDrainContext{ .session = session, .allocator = self.allocator, .refs = &primary_refs };
-        const previous_drain_callback = session.agent.drain_injection_cb;
-        const previous_drain_ctx = session.agent.drain_injection_ctx;
-        session.agent.drain_injection_cb = SteerDrainContext.callback;
-        session.agent.drain_injection_ctx = @ptrCast(&drain_ctx);
-        defer {
-            session.agent.drain_injection_cb = previous_drain_callback;
-            session.agent.drain_injection_ctx = previous_drain_ctx;
-        }
-        var response = self.runTurnWithSteerSink(session, content, &primary_refs, steer_sink) catch |turn_err| blk: {
+        // The drain callback is installed (and restored) inside the adapter
+        // around Agent.turn; the host only has to say "yes, drain this turn".
+        const turn_input = harness_port.TurnInput{
+            .user_message = content,
+            .conversation_context = conversation_context,
+            .memory_session_id = session.agent.memory_session_id,
+            .live_stream = stream_sink != null,
+            .sink = port_sink,
+        };
+        var response = self.runTurnWithSteerSink(session, &primary_refs, steer_sink, turn_input, true) catch |turn_err| blk: {
             log.warn("session turn failed session=0x{x}: {}", .{ session_hash, turn_err });
             // Regression: both post-turn drain loops were skipped on error, so
             // a message the router had already acknowledged as steered stayed
@@ -2813,7 +2877,7 @@ pub const SessionManager = struct {
             // Persist the failed prompt before any follow-up runs: otherwise a
             // follow-up reply would be stored as the answer to this message.
             self.persistTurnResult(session, session_key, content, null);
-            break :blk (try self.drainInjectionsAfterFailedTurn(session, session_key, &completed_turns, session_hash, steer_sink)) orelse return turn_err;
+            break :blk (try self.drainInjectionsAfterFailedTurn(session, session_key, &completed_turns, session_hash, steer_sink, stream_sink != null, port_sink)) orelse return turn_err;
         };
         if (!primary_failed) {
             completed_turns += 1;
@@ -2851,7 +2915,7 @@ pub const SessionManager = struct {
             // must not be left pending (a slash-command turn never drains them).
             var late_drain_count: u32 = 0;
             while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-                if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
+                if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink, stream_sink != null, port_sink)) break;
             }
 
             // Regression: a message that arrived after the last drain but before the
@@ -2864,7 +2928,7 @@ pub const SessionManager = struct {
             session.closeInjectionWindow();
             late_drain_count = 0;
             while (late_drain_count < MAX_POST_TURN_INJECTION_DRAINS) : (late_drain_count += 1) {
-                if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink)) break;
+                if (!try self.drainLateInjection(session, session_key, &response, &completed_turns, steer_sink, stream_sink != null, port_sink)) break;
             }
             if (late_drain_count == MAX_POST_TURN_INJECTION_DRAINS and session.hasInjection()) {
                 log.warn("post-turn injection drain limit reached session=0x{x}", .{session_hash});
@@ -3777,6 +3841,10 @@ const CapturePromptProvider = struct {
 
 const MockStreamingProvider = struct {
     response: []const u8,
+    /// Test hook invoked from stream_chat() so a test can simulate a mid-turn
+    /// message arriving while the provider stream is in flight.
+    on_stream: ?*const fn (*anyopaque) void = null,
+    on_stream_ctx: ?*anyopaque = null,
 
     const vtable = Provider.VTable{
         .chatWithSystem = mockChatWithSystem,
@@ -3839,6 +3907,9 @@ const MockStreamingProvider = struct {
         callback_ctx: *anyopaque,
     ) anyerror!providers.StreamChatResult {
         const self: *MockStreamingProvider = @ptrCast(@alignCast(ptr));
+        if (self.on_stream) |hook| {
+            if (self.on_stream_ctx) |ctx| hook(ctx);
+        }
         const mid = self.response.len / 2;
         if (mid > 0) callback(callback_ctx, providers.StreamChunk.textDelta(self.response[0..mid]));
         callback(callback_ctx, providers.StreamChunk.textDelta(self.response[mid..]));
@@ -3863,6 +3934,97 @@ const DeltaCollector = struct {
     fn deinit(self: *DeltaCollector) void {
         self.data.deinit(self.allocator);
     }
+};
+
+const PortDeltaCollector = struct {
+    allocator: Allocator,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn emit(ctx_ptr: *anyopaque, event: harness_port.Event) void {
+        switch (event) {
+            .delta => |chunk| if (!chunk.is_final and chunk.delta.len > 0) {
+                const self: *PortDeltaCollector = @ptrCast(@alignCast(ctx_ptr));
+                self.data.appendSlice(self.allocator, chunk.delta) catch {};
+            },
+            else => {},
+        }
+    }
+
+    fn sink(self: *PortDeltaCollector) harness_port.Sink {
+        return .{ .ctx = @ptrCast(self), .emit = emit };
+    }
+
+    fn deinit(self: *PortDeltaCollector) void {
+        self.data.deinit(self.allocator);
+    }
+};
+
+/// Records the live deltas a production turn's stream sink receives and counts
+/// provider calls, so a test can tell the primary turn from its follow-up.
+const StreamTurnProbe = struct {
+    allocator: Allocator,
+    provider_calls: usize = 0,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn onStream(ctx_ptr: *anyopaque) void {
+        const self: *StreamTurnProbe = @ptrCast(@alignCast(ctx_ptr));
+        self.provider_calls += 1;
+    }
+
+    fn onEvent(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        if (event.stage != .chunk or event.text.len == 0) return;
+        const self: *StreamTurnProbe = @ptrCast(@alignCast(ctx_ptr));
+        self.data.appendSlice(self.allocator, event.text) catch {};
+    }
+
+    fn deinit(self: *StreamTurnProbe) void {
+        self.data.deinit(self.allocator);
+    }
+};
+
+/// Deposits one steer from `turn_complete`: that fires after the agent's own
+/// last drain and before the turn returns, i.e. the tail window that
+/// drainLateInjection exists for.
+const TailInjectObserver = struct {
+    session: ?*Session = null,
+    injected: bool = false,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = noopMetric,
+        .flush = noopFlush,
+        .name = name,
+        .get_trace_id = noTrace,
+        .set_trace_id = noSetTrace,
+    };
+
+    fn observer(self: *@This()) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        switch (event.*) {
+            .turn_complete => {
+                if (self.injected) return;
+                self.injected = true;
+                if (self.session) |session| {
+                    _ = session.appendMidTurnIfRunning(testing.allocator, "steered while busy") catch {};
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn noopMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn noopFlush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "tail_inject";
+    }
+    fn noTrace(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn noSetTrace(_: *anyopaque, _: [32]u8) void {}
 };
 
 const ProgressCollector = struct {
@@ -6039,6 +6201,127 @@ test "processMessageStreaming does not rehydrate placeholders for group sessions
     }
 }
 
+test "harness display trust uses the real session key for shared channels" {
+    // Regression: the adapter read its own session_key, which no production
+    // path assigned, so a shared-channel key with is_group=false looked
+    // single-user and the live draft was suppressed.
+    var mock = MockStreamingProvider{ .response = "sent to [EMAIL_1]" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    var collector = DeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+
+    const session_key = "telegram:main:group:-1001";
+    const resp = try sm.processMessageStreaming(
+        session_key,
+        "please email alice@example.com",
+        .{
+            .channel = "telegram",
+            .is_group = false,
+        },
+        .{
+            .callback = DeltaCollector.onEvent,
+            .ctx = @ptrCast(&collector),
+        },
+        null,
+    );
+    defer testing.allocator.free(resp);
+
+    // The manager must hand the real key to the adapter it drives.
+    const live_session = try sm.getOrCreate(session_key);
+    try testing.expectEqualStrings(session_key, live_session.harness.session_key);
+    try testing.expectEqual(
+        governance.DisplayTrustScope.shared_channel,
+        governance.displayTrustScope(live_session.harness.session_key, "telegram", false),
+    );
+    try testing.expectEqual(
+        governance.displayTrustScope(session_key, "telegram", false),
+        governance.displayTrustScope(live_session.harness.session_key, "telegram", false),
+    );
+
+    // Shared channel: no rehydration, so the live draft is not suppressed.
+    try testing.expectEqualStrings("sent to [EMAIL_1]", resp);
+    try testing.expectEqualStrings("sent to [EMAIL_1]", collector.data.items);
+}
+
+test "live-draft suppression is fixed by the primary turn and covers follow-ups" {
+    var mock = MockStreamingProvider{ .response = "plain answer" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("follow-up:suppression");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    const redactor = session.agent.redactor.?;
+    try testing.expect(!redactor.wouldRehydrate());
+
+    // Pre-port rule: the decision comes from the primary content, once.
+    const primary = "hello";
+    const follow_up = "my email is alice@example.com";
+    try testing.expect(!redactor.wouldRedact(primary));
+    try testing.expect(redactor.wouldRedact(follow_up));
+    const suppress_live = SessionManager.shouldSuppressLiveForRedaction(redactor, primary, true);
+    try testing.expect(!suppress_live);
+
+    var collector = PortDeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+    var suppressing = SessionManager.SuppressingSink{
+        .inner = collector.sink(),
+        .suppress_live = suppress_live,
+    };
+
+    const first = try session.harness.harness().runTurn(.{
+        .user_message = primary,
+        .live_stream = true,
+        .sink = suppressing.sink(),
+    });
+    defer testing.allocator.free(first.reply);
+    const primary_bytes = collector.data.items.len;
+    try testing.expect(primary_bytes > 0);
+
+    // A follow-up whose own content would be redacted must not flip the
+    // decision: it shares the wrapper built for the primary turn.
+    const second = try session.harness.harness().runTurn(.{
+        .user_message = follow_up,
+        .live_stream = true,
+        .sink = suppressing.sink(),
+    });
+    defer testing.allocator.free(second.reply);
+    try testing.expect(collector.data.items.len > primary_bytes);
+}
+
 test "processMessageStreaming forwards tool progress hints" {
     var provider = SummaryFailureProvider{};
     var probe_tool = ProbeTool{};
@@ -6354,7 +6637,7 @@ test "drainLateInjection keeps the primary reply and asks the sender to resend" 
 
     // Regression: a failed tail-window follow-up freed the completed primary
     // reply and propagated the error, so the user lost the main answer.
-    try testing.expect(try sm.drainLateInjection(session, "failed:follow-up:reply", &response, &completed_turns, null));
+    try testing.expect(try sm.drainLateInjection(session, "failed:follow-up:reply", &response, &completed_turns, null, false, null));
     defer testing.allocator.free(response);
     try testing.expect(std.mem.startsWith(u8, response, "primary answer"));
     try testing.expect(std.mem.indexOf(u8, response, "Follow-up turn failed") != null);
@@ -6408,7 +6691,7 @@ test "failed-turn injection drain combines successes and reports the failure" {
     mock.on_chat_ctx = @ptrCast(&inject);
 
     var completed_turns: u64 = 0;
-    const reply = (try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:mixed", &completed_turns, 0xabc, null)) orelse
+    const reply = (try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:mixed", &completed_turns, 0xabc, null, false, null)) orelse
         return error.TestExpectedEqual;
     defer alloc.free(reply);
 
@@ -6439,7 +6722,7 @@ test "failed-turn injection drain returns the primary error when every follow-up
     // Regression: a notice-only reply replaced the original primary error when
     // every follow-up failed, so the sender never learned why the primary turn
     // failed.
-    try testing.expect((try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:all-failed", &completed_turns, 0xdef, null)) == null);
+    try testing.expect((try sm.drainInjectionsAfterFailedTurn(session, "failed:inject:all-failed", &completed_turns, 0xdef, null, false, null)) == null);
     try testing.expectEqual(@as(u64, 0), completed_turns);
     // The failed follow-up is consumed exactly once and never re-queued.
     try testing.expect(!session.hasInjection());
@@ -8478,7 +8761,7 @@ test "a failed post-turn follow-up finalizes its steered ref as failed" {
     var response: []const u8 = try testing.allocator.dupe(u8, "primary answer");
     var completed_turns: u64 = 1;
     var probe = SteerSinkProbe{};
-    try testing.expect(try sm.drainLateInjection(session, session_key, &response, &completed_turns, probe.sink()));
+    try testing.expect(try sm.drainLateInjection(session, session_key, &response, &completed_turns, probe.sink(), false, null));
     defer testing.allocator.free(response);
     try testing.expectEqual(SteerOutcome.failed, probe.outcomeFor("1700.2").?);
 }
@@ -8623,42 +8906,84 @@ test "post-turn follow-up streams the separator its reply joins with" {
     // Regression: the combined reply is primary + "\n\n" + follow-up, but the
     // follow-up turn's own stream went out with no separator, so the preview
     // (primary followed by follow-up) was not a prefix of the reply.
-    var mock = MockProvider{ .response = "unused", .responses = &[_][]const u8{"follow-up answer"} };
+    //
+    // Rewritten to drive processMessageStreaming: the ported adapter installs
+    // and restores the agent callback per turn, so a test that pokes
+    // agent.stream_callback by hand passes even while the production path
+    // drops the separator.
+    var mock = MockStreamingProvider{ .response = "follow-up answer" };
     const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    var observer = TailInjectObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        observer.observer(),
+        null,
+        null,
+    );
     defer sm.deinit();
     const key = "followup:streamed-separator";
     const session = try sm.getOrCreate(key);
-    session.turn_running.store(true, .release);
-    try testing.expect(try session.appendMidTurnIfRunning(testing.allocator, "steered while busy"));
-    session.turn_running.store(false, .release);
+    observer.session = session;
 
-    const StreamProbe = struct {
-        seen: [16]u8 = undefined,
-        len: usize = 0,
-        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (chunk.is_final) return;
-            const n = @min(chunk.delta.len, self.seen.len - self.len);
-            @memcpy(self.seen[self.len..][0..n], chunk.delta[0..n]);
-            self.len += n;
-        }
-    };
-    var probe = StreamProbe{};
-    session.agent.stream_callback = StreamProbe.callback;
-    session.agent.stream_ctx = @ptrCast(&probe);
-    defer {
-        session.agent.stream_callback = null;
-        session.agent.stream_ctx = null;
-    }
+    var probe = StreamTurnProbe{ .allocator = testing.allocator };
+    defer probe.deinit();
+    mock.on_stream = StreamTurnProbe.onStream;
+    mock.on_stream_ctx = @ptrCast(&probe);
 
-    var response: []const u8 = try testing.allocator.dupe(u8, "primary answer");
-    defer testing.allocator.free(response);
-    var completed_turns: u64 = 1;
-    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed_turns, null));
+    const resp = try sm.processMessageStreaming(key, "hello", null, .{
+        .callback = StreamTurnProbe.onEvent,
+        .ctx = @ptrCast(&probe),
+    }, null);
+    defer testing.allocator.free(resp);
 
-    try testing.expectEqualStrings("\n\n", probe.seen[0..probe.len]);
-    try testing.expectEqualStrings("primary answer\n\nfollow-up answer", response);
+    // The steer landed after the agent's last drain, so it ran as a follow-up
+    // turn: primary deltas, the separator, then the follow-up's own deltas.
+    try testing.expectEqual(@as(usize, 2), probe.provider_calls);
+    try testing.expectEqualStrings("follow-up answer\n\nfollow-up answer", resp);
+    try testing.expectEqualStrings("follow-up answer\n\nfollow-up answer", probe.data.items);
+}
+
+test "suppressed live draft drops the follow-up separator too" {
+    // The separator must go through the same suppression wrapper as the turns
+    // it joins: with live-draft suppression on, no delta (separator included)
+    // may reach the channel.
+    var mock = MockStreamingProvider{ .response = "follow-up answer" };
+    const cfg = testConfig();
+    var observer = TailInjectObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        null,
+        observer.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+    const key = "followup:suppressed-separator";
+    const session = try sm.getOrCreate(key);
+    observer.session = session;
+
+    var probe = StreamTurnProbe{ .allocator = testing.allocator };
+    defer probe.deinit();
+    mock.on_stream = StreamTurnProbe.onStream;
+    mock.on_stream_ctx = @ptrCast(&probe);
+
+    // PII in the primary content turns the once-per-turn live-draft rule on.
+    const resp = try sm.processMessageStreaming(key, "my email is alice@example.com", null, .{
+        .callback = StreamTurnProbe.onEvent,
+        .ctx = @ptrCast(&probe),
+    }, null);
+    defer testing.allocator.free(resp);
+
+    try testing.expectEqual(@as(usize, 2), probe.provider_calls);
+    try testing.expectEqualStrings("follow-up answer\n\nfollow-up answer", resp);
+    try testing.expectEqual(@as(usize, 0), probe.data.items.len);
 }
 
 test "steer failed follow up uses its originating reaction sink" {
@@ -8683,7 +9008,7 @@ test "steer failed follow up uses its originating reaction sink" {
     var response: []const u8 = try testing.allocator.dupe(u8, "primary answer");
     defer testing.allocator.free(response);
     var completed_turns: u64 = 1;
-    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed_turns, consumer.sink()));
+    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed_turns, consumer.sink(), false, null));
     try testing.expectEqual(@as(usize, 0), consumer.count);
     try testing.expectEqual(SteerOutcome.failed, origin.outcomeFor("1.1").?);
 }

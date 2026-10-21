@@ -32,6 +32,8 @@ const onboard = @import("../onboard.zig");
 const streaming = @import("../streaming.zig");
 const verbose = @import("../verbose.zig");
 const redaction = @import("../redaction.zig");
+const harness_native = @import("../harness/native.zig");
+const harness_port = @import("../harness/port.zig");
 
 const Agent = @import("root.zig").Agent;
 const turn_persistence = @import("turn_persistence.zig");
@@ -197,6 +199,16 @@ fn makeCliStreamSinkPassthrough(raw_sink: streaming.Sink, filter: *streaming.Thi
 fn cliStreamCallback(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
     const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
     streaming.forwardProviderChunk(stream_ctx.sink, chunk);
+}
+
+/// Port sink for CLI turns: `Event.delta` goes through the same CLI stream chain
+/// `cliStreamCallback` feeds today.
+fn cliTurnSinkEmit(ctx_ptr: *anyopaque, event: harness_port.Event) void {
+    const stream_ctx: *CliStreamCtx = @ptrCast(@alignCast(ctx_ptr));
+    switch (event) {
+        .delta => |chunk| streaming.forwardProviderChunk(stream_ctx.sink, chunk),
+        else => {},
+    }
 }
 
 fn hasOpenAiCodexCredential(allocator: std.mem.Allocator) bool {
@@ -678,13 +690,17 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
         } else {
             stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
         }
-        if (supports_streaming) {
-            agent.stream_callback = cliStreamCallback;
-            agent.stream_ctx = @ptrCast(&stream_ctx);
-        }
-
         stream_ctx.emitted_text = false;
-        const response = agent.turn(message) catch |err| {
+        var cli_harness = harness_native.NativeHarness.init(&agent);
+        cli_harness.emit_start_event = false;
+        const turn_result = cli_harness.harness().runTurn(.{
+            .user_message = message,
+            .live_stream = supports_streaming,
+            .sink = if (supports_streaming) harness_port.Sink{
+                .ctx = @ptrCast(&stream_ctx),
+                .emit = cliTurnSinkEmit,
+            } else null,
+        }) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
                 try w.flush();
@@ -704,6 +720,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             }
             return err;
         };
+        const response = turn_result.reply;
         defer allocator.free(response);
 
         persistCliTurn(&agent, message, response);
@@ -818,11 +835,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else {
         stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
     }
-    if (supports_streaming) {
-        agent.stream_callback = cliStreamCallback;
-        agent.stream_ctx = @ptrCast(&stream_ctx);
-    }
-
     const stdin = std_compat.fs.File.stdin();
     var line_buf: [4096]u8 = undefined;
     var pending_line: ?[]u8 = null;
@@ -886,7 +898,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
 
         stream_ctx.emitted_text = false;
         stream_ctx.suppress_live = shouldSuppressLiveForRedaction(agent.redactor, debounced_input.current);
-        const response = agent.turn(debounced_input.current) catch |err| {
+        var repl_harness = harness_native.NativeHarness.init(&agent);
+        repl_harness.emit_start_event = false;
+        const turn_result = repl_harness.harness().runTurn(.{
+            .user_message = debounced_input.current,
+            .live_stream = supports_streaming,
+            .sink = if (supports_streaming) harness_port.Sink{
+                .ctx = @ptrCast(&stream_ctx),
+                .emit = cliTurnSinkEmit,
+            } else null,
+        }) catch |err| {
             if (err == error.ProviderDoesNotSupportVision) {
                 try w.print("Error: The current provider does not support image input. Switch to a vision-capable provider or remove [IMAGE:] attachments.\n", .{});
             } else if (err == error.RateLimited) {
@@ -904,6 +925,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
             try w.flush();
             continue;
         };
+        const response = turn_result.reply;
         defer allocator.free(response);
 
         persistCliTurn(&agent, debounced_input.current, response);

@@ -10,6 +10,7 @@ const subagent_mod = @import("subagent.zig");
 const tools_mod = @import("tools/root.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
+const harness_native = @import("harness/native.zig");
 
 fn findProviderEntry(
     provider_name: []const u8,
@@ -172,7 +173,10 @@ pub fn runTaskWithTools(
     agent.system_prompt_conversation_context_fingerprint = null;
     agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap, null) catch null;
 
-    return agent.turn(request.task);
+    var harness = harness_native.NativeHarness.init(&agent);
+    harness.emit_start_event = false;
+    const result = try harness.harness().runTurn(.{ .user_message = request.task });
+    return result.reply;
 }
 
 test "findProviderEntry matches case-insensitively" {
