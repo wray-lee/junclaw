@@ -50,6 +50,12 @@ pub const MockDsh = struct {
     /// Frames streamed after the next `session/prompt` reply, in test order.
     turn_frames: std.ArrayListUnmanaged([]u8) = .empty,
     ws: ?std_compat.net.Stream = null,
+    /// Harness-test observability; guarded by `mutex`.
+    create_count: u32 = 0,
+    prompt_count: u32 = 0,
+    cancel_count: u32 = 0,
+    ws_connections: u32 = 0,
+    last_prompt_session: ?[]u8 = null,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -72,6 +78,7 @@ pub const MockDsh = struct {
         if (self.thread) |thread| thread.join();
         self.server.deinit();
         if (self.ws) |stream| stream.close();
+        if (self.last_prompt_session) |session| self.allocator.free(session);
         clearFrames(self.allocator, &self.turn_frames);
         self.turn_frames.deinit(self.allocator);
         self.allocator.destroy(self);
@@ -122,6 +129,7 @@ pub const MockDsh = struct {
             self.upgrade(stream, request.head) catch return;
             self.mutex.lock();
             self.ws = stream;
+            self.ws_connections += 1;
             self.mutex.unlock();
             keep_open = true;
             return;
@@ -156,13 +164,18 @@ pub const MockDsh = struct {
     fn serveRpc(self: *MockDsh, stream: std_compat.net.Stream, method: []const u8, body: []const u8) !void {
         var value: []u8 = undefined;
         if (std.mem.eql(u8, method, "session/create")) {
-            value = try self.allocator.dupe(u8, "{\"sessionId\":\"" ++ session_id ++ "\"}");
+            value = try self.nextSessionValue();
         } else if (std.mem.eql(u8, method, "session/follow")) {
             value = try self.buildSnapshot(body);
         } else {
             value = try self.allocator.dupe(u8, "{}");
         }
         defer self.allocator.free(value);
+
+        // Record before the reply: the client may return as soon as it reads it.
+        const is_prompt = std.mem.eql(u8, method, "session/prompt");
+        if (is_prompt) self.recordPrompt(body);
+        if (std.mem.eql(u8, method, "session/cancel")) self.recordCancel();
 
         const response = try std.fmt.allocPrint(
             self.allocator,
@@ -172,11 +185,67 @@ pub const MockDsh = struct {
         defer self.allocator.free(response);
 
         try writeHttp(stream, "200 OK", "Content-Type: application/json\r\n", response);
-        if (std.mem.eql(u8, method, "session/prompt")) {
+        if (is_prompt) {
             try self.sendTurnFrames();
         } else if (std.mem.eql(u8, method, "session/cancel")) {
             try self.sendFrame(turn_aborted_frame);
         }
+    }
+
+    /// Unique ids prove a harness created a fresh session instead of reusing one.
+    fn nextSessionValue(self: *MockDsh) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.create_count += 1;
+        const session = try std.fmt.allocPrint(self.allocator, "mock-sess-{d}", .{self.create_count});
+        defer self.allocator.free(session);
+        return std.json.Stringify.valueAlloc(self.allocator, .{ .sessionId = session }, .{});
+    }
+
+    fn recordPrompt(self: *MockDsh, body: []const u8) void {
+        const session = requestSessionId(self.allocator, body) orelse return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.prompt_count += 1;
+        if (self.last_prompt_session) |old| self.allocator.free(old);
+        self.last_prompt_session = session;
+    }
+
+    fn recordCancel(self: *MockDsh) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_count += 1;
+    }
+
+    pub fn createCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.create_count;
+    }
+
+    pub fn promptCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.prompt_count;
+    }
+
+    pub fn cancelCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.cancel_count;
+    }
+
+    pub fn wsConnections(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.ws_connections;
+    }
+
+    /// Caller frees. Null before any prompt.
+    pub fn lastPromptSession(self: *MockDsh, allocator: Allocator) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.last_prompt_session) |session| try allocator.dupe(u8, session) else null;
     }
 
     fn sendTurnFrames(self: *MockDsh) !void {
@@ -316,6 +385,20 @@ fn requestCursor(allocator: Allocator, body: []const u8) ?u64 {
         .integer => |value| if (value >= 0) @intCast(value) else null,
         else => null,
     };
+}
+
+fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    const root = asObject(parsed.value) orelse return null;
+    const payload = asObject(root.get("payload")) orelse return null;
+    const args = asObject(payload.get("args")) orelse return null;
+    const request = asObject(args.get("request")) orelse return null;
+    const session = switch (request.get("sessionId") orelse return null) {
+        .string => |text| text,
+        else => return null,
+    };
+    return allocator.dupe(u8, session) catch null;
 }
 
 fn asObject(value: ?std.json.Value) ?std.json.ObjectMap {

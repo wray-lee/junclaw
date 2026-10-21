@@ -157,6 +157,31 @@ fn killTree(child: *std_compat.process.Child) void {
     }
 }
 
+/// Exchange a launch URL for its owner cookie without spawning a process.
+/// Used by the harness when `boot_url` is injected (tests/external sidecar).
+pub fn fetchOwnerCookieForUrl(allocator: Allocator, boot_url: []const u8) ![]u8 {
+    const url = try client.connectUrl(allocator, boot_url);
+    defer allocator.free(url);
+
+    const response = try client.httpRequest(allocator, .GET, url, &.{}, null);
+    defer allocator.free(response.headers);
+    defer allocator.free(response.body);
+
+    if (response.status != 302) return error.OwnerConnectRejected;
+
+    var values: std.ArrayListUnmanaged([]const u8) = .empty;
+    defer values.deinit(allocator);
+    var lines = std.mem.splitScalar(u8, response.headers, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.ascii.startsWithIgnoreCase(trimmed, "set-cookie:")) continue;
+        const value = std.mem.trim(u8, trimmed["set-cookie:".len..], " \t");
+        if (value.len > 0) try values.append(allocator, value);
+    }
+    if (values.items.len == 0) return error.OwnerCookieMissing;
+    return protocol.ownerCookieFromSetCookie(allocator, values.items);
+}
+
 pub const Sidecar = struct {
     allocator: Allocator,
     opts: Options,
@@ -208,26 +233,7 @@ pub const Sidecar = struct {
     /// GET `/connect?token=…&interactions=answer` and return the owner cookie.
     pub fn fetchOwnerCookie(self: *Sidecar) ![]u8 {
         const boot_url = self.boot_url orelse return error.SidecarNotStarted;
-        const url = try client.connectUrl(self.allocator, boot_url);
-        defer self.allocator.free(url);
-
-        const response = try client.httpRequest(self.allocator, .GET, url, &.{}, null);
-        defer self.allocator.free(response.headers);
-        defer self.allocator.free(response.body);
-
-        if (response.status != 302) return error.OwnerConnectRejected;
-
-        var values: std.ArrayListUnmanaged([]const u8) = .empty;
-        defer values.deinit(self.allocator);
-        var lines = std.mem.splitScalar(u8, response.headers, '\n');
-        while (lines.next()) |line| {
-            const trimmed = std.mem.trim(u8, line, " \t\r");
-            if (!std.ascii.startsWithIgnoreCase(trimmed, "set-cookie:")) continue;
-            const value = std.mem.trim(u8, trimmed["set-cookie:".len..], " \t");
-            if (value.len > 0) try values.append(self.allocator, value);
-        }
-        if (values.items.len == 0) return error.OwnerCookieMissing;
-        return protocol.ownerCookieFromSetCookie(self.allocator, values.items);
+        return fetchOwnerCookieForUrl(self.allocator, boot_url);
     }
 
     fn initSpawnArgs(self: *Sidecar) !void {
