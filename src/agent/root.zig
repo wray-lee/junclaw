@@ -1096,6 +1096,13 @@ pub const Agent = struct {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
     }
 
+    /// The text stored in the response cache: the delivered reply without the
+    /// one-shot "[Context compacted]" notice, which a cache hit must not replay.
+    fn cacheableReplyText(text: []const u8) []const u8 {
+        const prefix = "[Context compacted]\n\n";
+        return if (std.mem.startsWith(u8, text, prefix)) text[prefix.len..] else text;
+    }
+
     /// Truncate the delivered reply to ~100 bytes on a valid UTF-8 boundary.
     fn autosaveSummary(text: []const u8) []const u8 {
         if (text.len <= 100) return text;
@@ -3077,7 +3084,10 @@ pub const Agent = struct {
                             null;
                         const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, safe_user_message);
                         const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
-                        rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
+                        // Regression: the one-shot "[Context compacted]" notice
+                        // was cached with the reply, so a later cache hit
+                        // replayed it although nothing was compacted.
+                        rc.put(self.allocator, store_key_hex, turn_model_name, cacheableReplyText(final_text), token_count) catch {};
                     }
                 }
 
@@ -10711,6 +10721,13 @@ test "Agent shouldForceActionFollowThrough ignores russian duration nouns" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent response cache never stores the context-compacted notice" {
+    // Regression: the reply was cached verbatim, so a later cache hit replayed
+    // "[Context compacted]" even though nothing was compacted in that turn.
+    try std.testing.expectEqualStrings("answer", Agent.cacheableReplyText("[Context compacted]\n\nanswer"));
+    try std.testing.expectEqualStrings("answer", Agent.cacheableReplyText("answer"));
 }
 
 test "Agent autosave summary is cut from the delivered markup-free text" {
