@@ -1,0 +1,30 @@
+name: release-fork
+
+# Fork-only: cross-compile every release target and, on a v* tag, publish a
+# GitHub release. Upstream's release.yml is gated to nullclaw/nullclaw, so this
+# separate file keeps the fork out of upstream's way (no merge conflicts).
+# workflow_dispatch builds all targets and keeps them as run artifacts without
+# publishing anything; only a pushed v* tag creates a release.
+# The container image is built by image.yml, so publish_docker stays off here.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    # Pinned to the commit behind nullbuilder v1; no secrets are passed.
+    uses: nullclaw/nullbuilder/.github/workflows/zig-release.yml@2b9c2f2e7bb0ac085baea1c33b4f08beaf5c7fac
+    permissions:
+      contents: write
+    with:
+      binary_name: nullclaw
+      artifact_prefix: junclaw
+      zig_version: "0.16.0"
+      source_archive: true
+      source_archive_name: junclaw-source-${{ github.ref_name }}.tar.gz
+      publish_docker: false
