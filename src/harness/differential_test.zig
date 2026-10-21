@@ -724,6 +724,62 @@ test "differential: CLI reasoning passthrough turn matches direct agent.turn" {
     try runCliDiff(true, true, "hello", &script);
 }
 
+test "differential: CLI redactor suppression gate matches direct agent.turn" {
+    const script = [_]scripted.Response{
+        .{ .text = "sent to [EMAIL_1]", .chunks = &.{ "sent to ", "[EMAIL_1]" } },
+        .{ .text = "second answer", .chunks = &.{ "second ", "answer" } },
+    };
+    const cfg = testConfig();
+    const no_tools = [_]Tool{};
+    var noop = observability.NoopObserver{};
+
+    var direct_provider = scripted.ScriptedProvider{ .responses = &script };
+    var direct_sm = initManager(&cfg, &direct_provider, &no_tools, null, noop.observer());
+    defer direct_sm.deinit();
+    const direct_session = try direct_sm.getOrCreate("cli:redact:direct");
+    // Warm-up records the placeholder, so wouldRehydrate() is true and the
+    // CLI sink suppresses the live draft exactly as it does in production.
+    const direct_warm = try direct_session.agent.turn("email alice@example.com");
+    defer std.testing.allocator.free(direct_warm);
+    try std.testing.expect(direct_session.agent.redactor.?.wouldRehydrate());
+
+    const direct_suppress = direct_session.agent.redactor.?.wouldRehydrate();
+    try std.testing.expect(direct_suppress);
+    var direct_recorder = StreamRecorder{};
+    var direct_ctx = CliSinkCtx{ .recorder = &direct_recorder, .suppress_live = direct_suppress };
+    var direct_filter = streaming.TagFilter{};
+    var direct_think = streaming.ThinkPassthroughFilter{};
+    _ = cliSinkChain(&direct_recorder, &direct_ctx, false, &direct_filter, &direct_think);
+    const direct_reply = try cliDirectTurn(&direct_session.agent, "hello", true, &direct_ctx);
+    defer std.testing.allocator.free(direct_reply);
+
+    var ported_provider = scripted.ScriptedProvider{ .responses = &script };
+    var ported_sm = initManager(&cfg, &ported_provider, &no_tools, null, noop.observer());
+    defer ported_sm.deinit();
+    const ported_session = try ported_sm.getOrCreate("cli:redact:ported");
+    const ported_warm = try ported_session.agent.turn("email alice@example.com");
+    defer std.testing.allocator.free(ported_warm);
+    try std.testing.expect(ported_session.agent.redactor.?.wouldRehydrate());
+
+    const ported_suppress = ported_session.agent.redactor.?.wouldRehydrate();
+    try std.testing.expect(ported_suppress);
+    var ported_recorder = StreamRecorder{};
+    var ported_ctx = CliSinkCtx{ .recorder = &ported_recorder, .suppress_live = ported_suppress };
+    var ported_filter = streaming.TagFilter{};
+    var ported_think = streaming.ThinkPassthroughFilter{};
+    _ = cliSinkChain(&ported_recorder, &ported_ctx, false, &ported_filter, &ported_think);
+    const ported_reply = try cliPortedTurn(&ported_session.agent, "hello", true, &ported_ctx);
+    defer std.testing.allocator.free(ported_reply);
+
+    try std.testing.expectEqualStrings(direct_reply, ported_reply);
+    try direct_recorder.sameAs(&ported_recorder);
+    try std.testing.expectEqual(@as(usize, 0), direct_recorder.count);
+    try std.testing.expectEqual(@as(usize, 0), ported_recorder.count);
+    try std.testing.expect(!direct_ctx.emitted_text);
+    try std.testing.expect(!ported_ctx.emitted_text);
+    try expectSameHistory(&direct_session.agent, &ported_session.agent);
+}
+
 test "differential: subagent bare turn matches direct agent.turn" {
     const script = [_]scripted.Response{
         .{ .text = "subagent answer" },
