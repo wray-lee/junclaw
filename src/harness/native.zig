@@ -251,12 +251,9 @@ pub const NativeHarness = struct {
         };
     }
 
-    fn handleLocalCommand(ptr: *anyopaque, content: []const u8) anyerror!?[]u8 {
+    fn handleLocalCommand(ptr: *anyopaque, content: []const u8) anyerror!?[]const u8 {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        const owned: ?[]const u8 = self.agent.handleSlashCommand(content) catch return null;
-        // The vtable promises `[]u8`; the agent allocates the reply on its own
-        // allocator, so hand it over without a copy.
-        return if (owned) |reply| @constCast(reply) else null;
+        return self.agent.handleSlashCommand(content);
     }
 
     fn deinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {

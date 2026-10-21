@@ -142,7 +142,9 @@ pub const Harness = struct {
         info: *const fn (ptr: *anyopaque) Info,
         /// Host-side slash pre-routing. Optional: an engine that cannot answer
         /// local commands itself leaves it null and the host runs them.
-        handleLocalCommand: ?*const fn (ptr: *anyopaque, content: []const u8) anyerror!?[]u8 = null,
+        /// A non-null reply is borrowed from the engine; the caller must not
+        /// free it.
+        handleLocalCommand: ?*const fn (ptr: *anyopaque, content: []const u8) anyerror!?[]const u8 = null,
         deinit: *const fn (ptr: *anyopaque, allocator: std.mem.Allocator) void,
     };
 
@@ -178,7 +180,8 @@ pub const Harness = struct {
         return self.vtable.info(self.ptr);
     }
 
-    pub fn handleLocalCommand(self: Harness, content: []const u8) anyerror!?[]u8 {
+    /// The reply is borrowed; the caller must not free it.
+    pub fn handleLocalCommand(self: Harness, content: []const u8) anyerror!?[]const u8 {
         const f = self.vtable.handleLocalCommand orelse return null;
         return f(self.ptr, content);
     }
