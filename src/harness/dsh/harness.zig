@@ -145,6 +145,13 @@ pub const DshHarness = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
+    /// True while a stop is waiting for the next turn to consume it. The host
+    /// checks this before pre-routing a local command: a pre-turn /stop must
+    /// abort that command the way native's `Agent.turn` check does.
+    pub fn interruptPending(self: *Self) bool {
+        return self.interrupt_requested.load(.acquire);
+    }
+
     // ── session mapping ─────────────────────────────────────────────────────
 
     /// Junclaw key → dsh session id. The first turn after a restart adopts the
@@ -348,8 +355,14 @@ pub const DshHarness = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const command = std.mem.trim(u8, content, " \t\r\n");
         if (std.mem.eql(u8, command, "/stop") or std.mem.eql(u8, command, "/abort")) {
-            // Do NOT take turn_mutex: an active turn owns it. That turn's loop
-            // sends session/cancel and returns the accumulated partial text.
+            // Do NOT wait on turn_mutex: an active turn owns it, and that
+            // turn's loop sends session/cancel and returns the partial text.
+            // An idle stop only acks, like native: arming it here would cancel
+            // the next prompt (tryLock succeeds only between turns).
+            if (self.turn_mutex.tryLock()) {
+                self.turn_mutex.unlock();
+                return stop_ack;
+            }
             self.interrupt_requested.store(true, .release);
             return stop_ack;
         }

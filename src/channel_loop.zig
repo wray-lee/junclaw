@@ -4506,7 +4506,7 @@ test "a /stop racing the end of a turn does not cancel the next message" {
     // Even a flag that lands in the gap between the turn's own cleanup and
     // the worker clearing the marker is dropped.
     try std.testing.expect(worker.shouldRun(task));
-    session.agent.requestInterrupt();
+    session.requestInterrupt();
     worker.clearInFlight(task, &runtime.session_mgr);
     try std.testing.expect(!session.agent.interrupt_requested.load(.acquire));
 

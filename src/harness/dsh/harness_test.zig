@@ -247,6 +247,36 @@ test "dsh /stop cancels mid-stream and keeps partial text" {
     try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
 }
 
+test "dsh idle /stop acks without cancelling the next turn" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_file = try tempSessionFile(allocator, &tmp);
+    defer allocator.free(session_file);
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, session_file);
+    defer h.deinit();
+
+    // Regression: an idle /stop armed the interrupt flag, so the next prompt
+    // was answered with an empty interrupted reply instead of being sent.
+    const ack = try h.harness().handleLocalCommand("/stop");
+    try std.testing.expectEqualStrings("No active background task to stop.", ack.?);
+
+    try setTurnFrames(mock, allocator, &.{"after"}, "completed");
+    const result = try h.harness().runTurn(.{ .user_message = "hi" });
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("after", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.promptCount());
+    try std.testing.expectEqual(@as(u32, 0), mock.cancelCount());
+}
+
 test "dsh /new starts a fresh dsh session" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
