@@ -2103,10 +2103,44 @@ pub const SessionManager = struct {
         }
     };
 
+    /// Pre-port live-draft rule: when the rendered draft would expose text that
+    /// must stay redacted, drop non-final deltas and let the final reply print
+    /// path display the rehydrated text. The host computes the decision once per
+    /// turn, so follow-up turns share the primary turn's decision.
+    const SuppressingSink = struct {
+        inner: harness_port.Sink,
+        suppress_live: bool,
+
+        fn emit(ctx: *anyopaque, event: harness_port.Event) void {
+            const self: *SuppressingSink = @ptrCast(@alignCast(ctx));
+            if (self.suppress_live) {
+                switch (event) {
+                    .delta => |chunk| if (!chunk.is_final) return,
+                    else => {},
+                }
+            }
+            self.inner.send(event);
+        }
+
+        fn sink(self: *SuppressingSink) harness_port.Sink {
+            return .{ .ctx = @ptrCast(self), .emit = emit };
+        }
+    };
+
     fn shouldRehydrateDisplay(session_key: []const u8, conversation_context: ?ConversationContext) bool {
         const channel = if (conversation_context) |ctx| ctx.channel else null;
         const is_group = if (conversation_context) |ctx| ctx.is_group else null;
         return governance.shouldRehydrateDisplay(session_key, channel, is_group);
+    }
+
+    fn shouldSuppressLiveForRedaction(
+        redactor_: ?*redaction.Redactor,
+        content: []const u8,
+        display_rehydrate_allowed: bool,
+    ) bool {
+        if (!display_rehydrate_allowed) return false;
+        const r = redactor_ orelse return false;
+        return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
     }
 
     fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
@@ -2784,10 +2818,17 @@ pub const SessionManager = struct {
         // moved verbatim into the native adapter (src/harness/native.zig
         // runTurn); the host now only describes what it wants observed.
         const display_rehydrate_allowed = shouldRehydrateDisplay(session_key, conversation_context);
+        // The adapter forwards raw chunks; live-draft suppression is the host's
+        // policy, decided once from the primary content (as before the port).
+        const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content, display_rehydrate_allowed);
 
         var port_sink_ctx = PortEventSink{ .stream = stream_sink, .progress = progress_sink };
+        var suppressing_sink = SuppressingSink{
+            .inner = .{ .ctx = @ptrCast(&port_sink_ctx), .emit = PortEventSink.emit },
+            .suppress_live = suppress_live,
+        };
         const port_sink: ?harness_port.Sink = if (stream_sink != null or progress_sink != null)
-            .{ .ctx = @ptrCast(&port_sink_ctx), .emit = PortEventSink.emit }
+            suppressing_sink.sink()
         else
             null;
 
@@ -3866,6 +3907,29 @@ const DeltaCollector = struct {
     }
 
     fn deinit(self: *DeltaCollector) void {
+        self.data.deinit(self.allocator);
+    }
+};
+
+const PortDeltaCollector = struct {
+    allocator: Allocator,
+    data: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn emit(ctx_ptr: *anyopaque, event: harness_port.Event) void {
+        switch (event) {
+            .delta => |chunk| if (!chunk.is_final and chunk.delta.len > 0) {
+                const self: *PortDeltaCollector = @ptrCast(@alignCast(ctx_ptr));
+                self.data.appendSlice(self.allocator, chunk.delta) catch {};
+            },
+            else => {},
+        }
+    }
+
+    fn sink(self: *PortDeltaCollector) harness_port.Sink {
+        return .{ .ctx = @ptrCast(self), .emit = emit };
+    }
+
+    fn deinit(self: *PortDeltaCollector) void {
         self.data.deinit(self.allocator);
     }
 };
@@ -6101,6 +6165,68 @@ test "harness display trust uses the real session key for shared channels" {
     // Shared channel: no rehydration, so the live draft is not suppressed.
     try testing.expectEqualStrings("sent to [EMAIL_1]", resp);
     try testing.expectEqualStrings("sent to [EMAIL_1]", collector.data.items);
+}
+
+test "live-draft suppression is fixed by the primary turn and covers follow-ups" {
+    var mock = MockStreamingProvider{ .response = "plain answer" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        sqlite_mem.sessionStore(),
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("follow-up:suppression");
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    const redactor = session.agent.redactor.?;
+    try testing.expect(!redactor.wouldRehydrate());
+
+    // Pre-port rule: the decision comes from the primary content, once.
+    const primary = "hello";
+    const follow_up = "my email is alice@example.com";
+    try testing.expect(!redactor.wouldRedact(primary));
+    try testing.expect(redactor.wouldRedact(follow_up));
+    const suppress_live = SessionManager.shouldSuppressLiveForRedaction(redactor, primary, true);
+    try testing.expect(!suppress_live);
+
+    var collector = PortDeltaCollector{ .allocator = testing.allocator };
+    defer collector.deinit();
+    var suppressing = SessionManager.SuppressingSink{
+        .inner = collector.sink(),
+        .suppress_live = suppress_live,
+    };
+
+    const first = try session.harness.harness().runTurn(.{
+        .user_message = primary,
+        .live_stream = true,
+        .sink = suppressing.sink(),
+    });
+    defer testing.allocator.free(first.reply);
+    const primary_bytes = collector.data.items.len;
+    try testing.expect(primary_bytes > 0);
+
+    // A follow-up whose own content would be redacted must not flip the
+    // decision: it shares the wrapper built for the primary turn.
+    const second = try session.harness.harness().runTurn(.{
+        .user_message = follow_up,
+        .live_stream = true,
+        .sink = suppressing.sink(),
+    });
+    defer testing.allocator.free(second.reply);
+    try testing.expect(collector.data.items.len > primary_bytes);
 }
 
 test "processMessageStreaming forwards tool progress hints" {

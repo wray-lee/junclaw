@@ -12,8 +12,6 @@
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const providers = @import("../providers/root.zig");
-const governance = @import("../governance.zig");
-const redaction = @import("../redaction.zig");
 const turn_persistence = @import("../agent/turn_persistence.zig");
 const prompt = @import("../agent/prompt.zig");
 const observability = @import("../observability.zig");
@@ -29,8 +27,7 @@ pub const NativeHarness = struct {
     agent: *Agent,
     /// Borrowed for the duration of `runTurn`; the host keeps it alive.
     conversation_context: ?prompt.ConversationContext = null,
-    /// Session key used for the `agent_start` observer event's display-trust
-    /// decision (see `runTurn`).
+    /// Session key for this turn; the host sets it before every turn.
     session_key: []const u8 = "",
     /// The session host records `agent_start`; direct CLI/subagent callers
     /// never did, so they turn this off to stay behavior-identical.
@@ -44,37 +41,13 @@ pub const NativeHarness = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
-    // ── stream adapter ────────────────────────────────────────────────
-    // Copied verbatim from src/session.zig (StreamAdapterCtx +
-    // streamChunkForwarder) so the live-draft suppression rule is identical.
-
-    const StreamAdapterCtx = struct {
-        sink: *port.Sink,
-        suppress_live: bool = false,
-    };
-
+    // ── stream forwarder ────────────────────────────────────────────────────
     /// The port's delta is the raw provider chunk, so forward it untouched:
-    /// the host derives the rendered text exactly as `streaming.Sink` does.
+    /// the host derives the rendered text (and any live-draft suppression)
+    /// exactly as `streaming.Sink` does.
     fn streamChunkForwarder(ctx_ptr: *anyopaque, chunk: providers.StreamChunk) void {
-        const adapter: *StreamAdapterCtx = @ptrCast(@alignCast(ctx_ptr));
-        if (adapter.suppress_live and !chunk.is_final) return;
-        adapter.sink.send(.{ .delta = chunk });
-    }
-
-    fn shouldRehydrateDisplay(session_key: []const u8, conversation_context: ?prompt.ConversationContext) bool {
-        const channel = if (conversation_context) |ctx| ctx.channel else null;
-        const is_group = if (conversation_context) |ctx| ctx.is_group else null;
-        return governance.shouldRehydrateDisplay(session_key, channel, is_group);
-    }
-
-    fn shouldSuppressLiveForRedaction(
-        redactor_: ?*redaction.Redactor,
-        content: []const u8,
-        display_rehydrate_allowed: bool,
-    ) bool {
-        if (!display_rehydrate_allowed) return false;
-        const r = redactor_ orelse return false;
-        return r.wouldRehydrate() or (r.config.record_originals and r.wouldRedact(content));
+        const sink: *port.Sink = @ptrCast(@alignCast(ctx_ptr));
+        sink.send(.{ .delta = chunk });
     }
 
     // ── vtable ────────────────────────────────────────────────────────
@@ -93,24 +66,19 @@ pub const NativeHarness = struct {
             agent.stream_ctx = prev_stream_ctx;
         }
 
-        const display_rehydrate_allowed = shouldRehydrateDisplay(self.session_key, input.conversation_context);
-
         // The agent's callbacks take a *anyopaque, and `input` is a by-value
         // parameter whose address would not outlive the call, so keep a stable
         // local copy of the sink for the lifetime of the turn.
         var sink_holder: ?port.Sink = input.sink;
         const sink_ptr: ?*port.Sink = if (sink_holder) |*s| s else null;
 
-        var stream_adapter: StreamAdapterCtx = undefined;
         // The host installs the stream callback only when it has a live draft
         // (`stream_callback != null`); a null sink means "no observer this
         // turn", which is the `else` branch the host already had.
         if (input.live_stream) {
             if (sink_ptr) |s| {
-                const suppress_live = shouldSuppressLiveForRedaction(agent.redactor, input.user_message, display_rehydrate_allowed);
-                stream_adapter = .{ .sink = s, .suppress_live = suppress_live };
                 agent.stream_callback = streamChunkForwarder;
-                agent.stream_ctx = @ptrCast(&stream_adapter);
+                agent.stream_ctx = @ptrCast(s);
             } else {
                 agent.stream_callback = null;
                 agent.stream_ctx = null;
