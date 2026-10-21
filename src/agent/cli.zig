@@ -835,11 +835,6 @@ pub fn run(allocator: std.mem.Allocator, args: []const [:0]const u8) !void {
     } else {
         stream_ctx.sink = makeCliStreamSink(raw_stream_sink, &stream_ctx.filter);
     }
-    if (supports_streaming) {
-        agent.stream_callback = cliStreamCallback;
-        agent.stream_ctx = @ptrCast(&stream_ctx);
-    }
-
     const stdin = std_compat.fs.File.stdin();
     var line_buf: [4096]u8 = undefined;
     var pending_line: ?[]u8 = null;
