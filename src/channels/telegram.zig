@@ -518,6 +518,13 @@ fn buildChoicesDirectiveFromPayload(
     };
 }
 
+/// True when a payload must be delivered by a normal send: an in-place edit
+/// cannot upload files, and the attachment markers have already been stripped
+/// from the text, so an edit would silently drop the attachment.
+pub fn payloadRequiresNormalSend(payload: root.Channel.OutboundPayload) bool {
+    return payload.attachments.len > 0;
+}
+
 pub fn buildOwnedOutboundPayloadFromLegacy(
     allocator: std.mem.Allocator,
     text: []const u8,
@@ -2154,10 +2161,14 @@ pub const TelegramChannel = struct {
         message_id: i64,
         text: []const u8,
     ) !void {
-        _ = owner_identity;
-        _ = is_group;
         var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, text, &.{}, true);
         defer payload.deinit(self.allocator);
+        // Regression: an in-place edit cannot upload files, so a reply with
+        // attachment markers lost the file (the marker was stripped first).
+        // Deliver a normal message instead.
+        if (payloadRequiresNormalSend(payload.payload())) {
+            return self.sendRichMessageWithReply(target, owner_identity, is_group, payload.payload(), null);
+        }
         const owned_message_id = try std.fmt.allocPrint(self.allocator, "{d}", .{message_id});
         defer self.allocator.free(owned_message_id);
         try self.editRichMessage(.{
@@ -3701,6 +3712,9 @@ pub const TelegramChannel = struct {
         // Editing a message in place finalizes replace_message turns: release
         // the chat's live draft so the next turn starts clean.
         self.clearLiveDraft(edit.target);
+        // Regression: an edit cannot upload files. Refuse so the caller falls
+        // back to a normal outbound, which strips the markers and uploads.
+        if (payloadRequiresNormalSend(edit.payload)) return error.NotSupported;
         try self.editRichMessage(edit);
     }
 
@@ -4749,6 +4763,22 @@ test "telegram parseAttachmentMarkers FILE alias" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
     try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[0].kind);
+}
+
+test "telegram edit paths fall back to a normal send when attachments exist" {
+    // Regression: an in-place edit cannot upload files, so a reply carrying
+    // `[FILE:...]` lost the attachment (the marker was stripped first and the
+    // edit only rewrote the text).
+    const a = std.testing.allocator;
+    var with_file = try buildOwnedOutboundPayloadFromLegacy(a, "报告 [FILE:/tmp/report.pdf]", &.{}, true);
+    defer with_file.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), with_file.payload().attachments.len);
+    try std.testing.expectEqualStrings("报告", with_file.text);
+    try std.testing.expect(payloadRequiresNormalSend(with_file.payload()));
+
+    var plain = try buildOwnedOutboundPayloadFromLegacy(a, "纯文本回复", &.{}, true);
+    defer plain.deinit(a);
+    try std.testing.expect(!payloadRequiresNormalSend(plain.payload()));
 }
 
 test "telegram buildOwnedOutboundPayloadFromLegacy lifts choices into structured payload" {

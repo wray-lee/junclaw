@@ -805,7 +805,7 @@ pub const Agent = struct {
         return null;
     }
 
-    fn interruptedReply(self: *Agent) ![]const u8 {
+    fn interruptedReply(self: *Agent, interim_text: []const u8) ![]const u8 {
         self.clearInterruptRequest();
         const summary = try self.takeInterruptedToolsSummary();
         defer if (summary) |s| self.allocator.free(s);
@@ -814,14 +814,25 @@ pub const Agent = struct {
         else
             try self.allocator.dupe(u8, "Interrupted by /stop. Halting tool execution for this turn.");
         errdefer self.allocator.free(msg);
+        // Regression: text the model had already written (and, when streaming,
+        // the user had already seen in the preview) was dropped from the /stop
+        // reply. Keep it, so the preview stays a prefix and no content is lost.
+        const visible = std.mem.trim(u8, interim_text, " \t\r\n");
+        var reply = msg;
+        if (visible.len > 0) {
+            const merged = try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ visible, msg });
+            self.allocator.free(msg);
+            reply = merged;
+        }
+        errdefer self.allocator.free(reply);
         try self.history.append(self.allocator, .{
             .role = .assistant,
-            .content = try self.dupeForHistory(msg),
+            .content = try self.dupeForHistory(reply),
         });
         const complete_event = ObserverEvent{ .turn_complete = {} };
         self.observer.recordEvent(&complete_event);
         self.last_turn_interrupted = true;
-        return msg;
+        return reply;
     }
 
     /// Forward a provider retry notice to the live draft. Retry text is built
@@ -1083,6 +1094,21 @@ pub const Agent = struct {
 
     fn composeFinalReply(self: *const Agent, base_text: []const u8, reasoning_content: ?[]const u8, usage: providers.TokenUsage) ![]const u8 {
         return commands.composeFinalReply(self, base_text, reasoning_content, usage);
+    }
+
+    /// The text stored in the response cache: the delivered reply without the
+    /// one-shot "[Context compacted]" notice, which a cache hit must not replay.
+    fn cacheableReplyText(text: []const u8) []const u8 {
+        const prefix = "[Context compacted]\n\n";
+        return if (std.mem.startsWith(u8, text, prefix)) text[prefix.len..] else text;
+    }
+
+    /// Truncate the delivered reply to ~100 bytes on a valid UTF-8 boundary.
+    fn autosaveSummary(text: []const u8) []const u8 {
+        if (text.len <= 100) return text;
+        var end: usize = 100;
+        while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;
+        return text[0..end];
     }
 
     fn selectDisplayText(response_text: []const u8, parsed_text: []const u8, parsed_calls_len: usize) []const u8 {
@@ -2136,13 +2162,26 @@ pub const Agent = struct {
         self.context_was_compacted = false;
         commands.refreshSubagentToolContext(self);
 
+        // Text the model wrote alongside tool calls. Channels only receive the
+        // final reply, so it must be merged into that reply or it is lost.
+        var interim_text: std.ArrayListUnmanaged(u8) = .empty;
+        defer interim_text.deinit(self.allocator);
+        var last_interim_segment: ?[]u8 = null;
+        defer if (last_interim_segment) |segment| self.allocator.free(segment);
+        // The "\n\n" between the previous round and the next one is emitted
+        // when that round starts streaming, not when the separator is decided:
+        // the provider has already streamed this round's text by then, so
+        // emitting it here would put it after text the final reply places
+        // before it, and the preview would stop being a prefix of the reply.
+        var interim_separator_pending = false;
+
         const turn_input = commands.planTurnInput(user_message);
         // A /stop that landed before the turn started (requestTurnInterruptAtStart)
         // must also stop a local slash command: the tool loop's interrupt check
         // is never reached for commands handled here, so without this the stop
         // was acknowledged but the command still ran.
         if (turn_input.invoke_local_handler and self.isInterruptRequested()) {
-            return self.interruptedReply();
+            return self.interruptedReply(interim_text.items);
         }
         const effective_user_message = blk: {
             if (turn_input.invoke_local_handler) {
@@ -2381,7 +2420,7 @@ pub const Agent = struct {
         defer deinitSeenToolCallResults(self.allocator, &seen_tool_call_results);
         while (iteration < self.max_tool_iterations +| injection_followups) : (iteration += 1) {
             if (self.isInterruptRequested()) {
-                return self.interruptedReply();
+                return self.interruptedReply(interim_text.items);
             }
 
             // Drain any mid-turn injection at each tool boundary.
@@ -2426,6 +2465,12 @@ pub const Agent = struct {
             @import("../http_util.zig").setThreadInterruptFlag(&self.interrupt_requested);
             defer @import("../http_util.zig").setThreadInterruptFlag(null);
             if (is_streaming) {
+                // Separator decided at the end of the previous round, before
+                // this round's text is streamed.
+                if (interim_separator_pending) {
+                    interim_separator_pending = false;
+                    self.stream_callback.?(self.stream_ctx.?, providers.StreamChunk.textDelta("\n\n"));
+                }
                 self.recordLlmRequestEvent(turn_model_name, messages);
                 self.logLlmRequest(iteration + 1, 1, turn_model_name, messages, native_tools_enabled, true);
                 const stream_result = self.provider.streamChat(
@@ -2452,7 +2497,7 @@ pub const Agent = struct {
                     // failure: end the turn with the normal interrupt reply
                     // rather than recording a failure, retrying, or surfacing a
                     // generic provider error to the channel.
-                    if (isInterruptError(err)) return self.interruptedReply();
+                    if (isInterruptError(err)) return self.interruptedReply(interim_text.items);
 
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
                     self.recordLlmFailureEvent(turn_model_name, fail_duration, @errorName(err));
@@ -2495,7 +2540,7 @@ pub const Agent = struct {
                             // retry stream is running. End the turn with the
                             // interrupt reply instead of surfacing the raw error
                             // and degrading the route for a user-initiated stop.
-                            if (isInterruptError(retry_err)) return self.interruptedReply();
+                            if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
@@ -2542,7 +2587,7 @@ pub const Agent = struct {
                     // or the stream before it produced output (Interrupted). End
                     // the turn with the interrupt reply instead of recording a
                     // failure, retrying, or surfacing a provider error.
-                    if (isInterruptError(err)) return self.interruptedReply();
+                    if (isInterruptError(err)) return self.interruptedReply(interim_text.items);
 
                     // Record the failed attempt
                     const fail_duration: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
@@ -2580,7 +2625,7 @@ pub const Agent = struct {
                             turn_model_name,
                             self.temperature,
                         ) catch |retry_err| {
-                            if (isInterruptError(retry_err)) return self.interruptedReply();
+                            if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_err;
@@ -2620,7 +2665,7 @@ pub const Agent = struct {
                             turn_model_name,
                             self.temperature,
                         ) catch |retry_after_compact_err| {
-                            if (isInterruptError(retry_after_compact_err)) return self.interruptedReply();
+                            if (isInterruptError(retry_after_compact_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                             self.emitUsageFailure(turn_model_name);
                             return retry_after_compact_err;
@@ -2654,7 +2699,7 @@ pub const Agent = struct {
                         turn_model_name,
                         self.temperature,
                     ) catch |retry_err| {
-                        if (isInterruptError(retry_err)) return self.interruptedReply();
+                        if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                         // Context exhaustion recovery: if we have enough history,
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
@@ -2685,7 +2730,7 @@ pub const Agent = struct {
                                 turn_model_name,
                                 self.temperature,
                             ) catch |retry_after_compact_err| {
-                                if (isInterruptError(retry_after_compact_err)) return self.interruptedReply();
+                                if (isInterruptError(retry_after_compact_err)) return self.interruptedReply(interim_text.items);
                                 if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                                 self.emitUsageFailure(turn_model_name);
                                 return retry_after_compact_err;
@@ -2704,7 +2749,7 @@ pub const Agent = struct {
             // returned as if the turn had completed.
             if (self.isInterruptRequested()) {
                 self.freeResponseFields(&response);
-                return self.interruptedReply();
+                return self.interruptedReply(interim_text.items);
             }
 
             const duration_ms: u64 = @as(u64, @intCast(@max(0, std_compat.time.milliTimestamp() - timer_start)));
@@ -2943,12 +2988,33 @@ pub const Agent = struct {
                     }
                 }
 
-                // No tool calls — final response
-                const base_text = if (self.context_was_compacted) blk: {
-                    self.context_was_compacted = false;
-                    break :blk try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{display_text});
-                } else try self.allocator.dupe(u8, display_text);
+                // No tool calls — final response. Prepend text from earlier
+                // tool-call rounds unless the model repeated it here. On the
+                // streaming path the repeat already reached the screen, so
+                // keep it: suppressing it would leave the final reply shorter
+                // than the streamed preview and force a second post.
+                //
+                // A silent-token final round must reach the channel as the
+                // bare token: merging interim text would surface both and
+                // defeat shouldSuppressReply.
+                const silent_final = util.isSilentTokenReply(display_text);
+                const interim_visible = std.mem.trim(u8, interim_text.items, " \t\r\n");
+                const interim_duplicated = !is_streaming and interim_visible.len > 0 and
+                    std.mem.indexOf(u8, display_text, interim_visible) != null;
+                var base_text = if (interim_text.items.len > 0 and !interim_duplicated and !silent_final)
+                    try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ interim_text.items, display_text })
+                else
+                    try self.allocator.dupe(u8, display_text);
                 errdefer self.allocator.free(base_text);
+
+                if (self.context_was_compacted) {
+                    self.context_was_compacted = false;
+                    if (!silent_final) {
+                        const prefixed = try std.fmt.allocPrint(self.allocator, "[Context compacted]\n\n{s}", .{base_text});
+                        self.allocator.free(base_text);
+                        base_text = prefixed;
+                    }
+                }
 
                 const final_text = try self.composeFinalReply(base_text, response.reasoning_content, response.usage);
                 errdefer self.allocator.free(final_text);
@@ -2957,7 +3023,7 @@ pub const Agent = struct {
                 // strips tool-call markup for delivery, so history must match it
                 // (a re-render of history must not leak the closer, and the model
                 // must not re-read its own garbled text tool call next turn).
-                const history_text = try providers.stripToolCallMarkup(self.allocator, display_text);
+                const history_text = try providers.stripToolCallMarkup(self.allocator, base_text);
                 defer self.allocator.free(history_text);
                 try self.history.append(self.allocator, .{
                     .role = .assistant,
@@ -2971,12 +3037,10 @@ pub const Agent = struct {
                 // Auto-save assistant response
                 if (self.auto_save) {
                     if (self.mem) |mem| {
-                        // Truncate to ~100 bytes on a valid UTF-8 boundary
-                        const summary = if (base_text.len > 100) blk: {
-                            var end: usize = 100;
-                            while (end > 0 and base_text[end] & 0xC0 == 0x80) end -= 1;
-                            break :blk base_text[0..end];
-                        } else base_text;
+                        // Regression: the autosave summary was cut from the
+                        // pre-strip base_text, so it could store tool-call
+                        // markup the user never saw. Use the delivered text.
+                        const summary = autosaveSummary(history_text);
                         const safe_summary = if (self.redactor) |r|
                             r.redact(arena, summary) catch null
                         else
@@ -3020,22 +3084,42 @@ pub const Agent = struct {
                             null;
                         const store_key_hex = cache.ResponseCache.cacheKeyHex(&store_key_buf, turn_model_name, sys_prompt, safe_user_message);
                         const token_count: u32 = @intCast(@min(self.last_turn_usage.total_tokens, std.math.maxInt(u32)));
-                        rc.put(self.allocator, store_key_hex, turn_model_name, final_text, token_count) catch {};
+                        // Regression: the one-shot "[Context compacted]" notice
+                        // was cached with the reply, so a later cache hit
+                        // replayed it although nothing was compacted.
+                        rc.put(self.allocator, store_key_hex, turn_model_name, cacheableReplyText(final_text), token_count) catch {};
                     }
                 }
 
                 return final_text;
             }
 
-            // There are tool calls — print intermediary text.
-            // In tests, stdout is used by Zig's test runner protocol (`--listen`),
-            // so avoid writing arbitrary text that can corrupt the control channel.
-            if (!builtin.is_test and display_text.len > 0 and parsed_calls.len > 0 and !is_streaming) {
-                var out_buf: [4096]u8 = undefined;
-                var bw = std_compat.fs.File.stdout().writerStreaming(&out_buf);
-                const w = &bw.interface;
-                w.print("{s}", .{display_text}) catch {};
-                w.flush() catch {};
+            // Keep the text this round wrote alongside its tool calls. Native
+            // responses carry plain text in content (parsed_text stays empty);
+            // on the XML path only parsed_text is safe — raw response_text
+            // would leak <tool_call> markup.
+            const interim_segment = if (display_text.len > 0)
+                display_text
+            else if (use_native and parsed_text.len == 0)
+                response_text
+            else
+                "";
+            const trimmed_interim = std.mem.trim(u8, interim_segment, " \t\r\n");
+            // In streaming mode a repeated segment is kept: it is already on
+            // the user's screen, so dropping it would make the final reply
+            // shorter than the preview.
+            const repeats_last = last_interim_segment != null and
+                std.mem.eql(u8, last_interim_segment.?, trimmed_interim);
+            if (trimmed_interim.len > 0 and (!repeats_last or is_streaming)) {
+                if (interim_text.items.len > 0) try interim_text.appendSlice(self.allocator, "\n\n");
+                try interim_text.appendSlice(self.allocator, interim_segment);
+                // The preview must stay a byte prefix of the final reply: the
+                // separator goes out at the start of the next round, before
+                // that round's text.
+                if (is_streaming) interim_separator_pending = true;
+                const segment_copy = try self.allocator.dupe(u8, trimmed_interim);
+                if (last_interim_segment) |old| self.allocator.free(old);
+                last_interim_segment = segment_copy;
             }
 
             // Record assistant message with tool calls in history.
@@ -3066,7 +3150,7 @@ pub const Agent = struct {
             for (parsed_calls, 0..) |call, idx| {
                 if (self.isInterruptRequested()) {
                     self.freeResponseFields(&response);
-                    return self.interruptedReply();
+                    return self.interruptedReply(interim_text.items);
                 }
 
                 // Per-call logging stays at debug: on the turn's hot path an
@@ -9449,7 +9533,7 @@ test "Agent turn skips replayed tool_call_id across iterations" {
     const response = try agent.turn("run probe");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("replaying\n\ndone", response);
     try std.testing.expectEqual(@as(usize, 1), probe_count);
     try std.testing.expectEqual(@as(usize, 3), provider_state.call_count);
 }
@@ -9603,7 +9687,7 @@ test "Agent turn skips duplicate memory_store when TOOLS.md is updated in same b
     const response = try agent.turn("update tools guidance");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("applying\n\ndone", response);
     try std.testing.expectEqual(@as(usize, 1), file_write_count);
     try std.testing.expectEqual(@as(usize, 0), memory_store_count);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
@@ -10199,7 +10283,7 @@ test "Agent tool loop frees dynamic tool outputs" {
     const response = try agent.turn("run tool");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("Running tool\n\ndone", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
 }
 
@@ -10342,7 +10426,7 @@ test "Agent shell failure with normalized output does not poison next turn" {
     const response = try agent.turn("run failing shell");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("recovered", response);
+    try std.testing.expectEqualStrings("Run shell\n\nrecovered", response);
     try std.testing.expectEqual(@as(usize, 2), provider_state.call_count);
     try std.testing.expect(provider_state.saw_tool_results);
     try std.testing.expect(provider_state.saw_error_tool_result);
@@ -10637,6 +10721,35 @@ test "Agent shouldForceActionFollowThrough ignores russian duration nouns" {
 test "Agent shouldForceActionFollowThrough ignores normal final answer" {
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("Вот результат: файл успешно отправлен."));
     try std.testing.expect(!Agent.shouldForceActionFollowThrough("I cannot do that in this environment."));
+}
+
+test "Agent response cache never stores the context-compacted notice" {
+    // Regression: the reply was cached verbatim, so a later cache hit replayed
+    // "[Context compacted]" even though nothing was compacted in that turn.
+    try std.testing.expectEqualStrings("answer", Agent.cacheableReplyText("[Context compacted]\n\nanswer"));
+    try std.testing.expectEqualStrings("answer", Agent.cacheableReplyText("answer"));
+}
+
+test "Agent autosave summary is cut from the delivered markup-free text" {
+    // Regression: the autosave summary was cut from the pre-strip base_text, so
+    // a reply containing `<function=...>` markup stored markup the user never
+    // saw. It is now cut from the same stripped text that goes to history.
+    const a = std.testing.allocator;
+    const input = "answer <function=web_search><parameter=query>x</parameter></function> tail";
+    const clean = try providers.stripToolCallMarkup(a, input);
+    defer a.free(clean);
+    const summary = Agent.autosaveSummary(clean);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<function") == null);
+    try std.testing.expect(std.mem.indexOf(u8, summary, "<parameter") == null);
+    try std.testing.expect(std.mem.startsWith(u8, summary, "answer"));
+}
+
+test "Agent autosave summary truncates on a UTF-8 boundary" {
+    const long = "中" ** 60; // 180 bytes
+    const summary = Agent.autosaveSummary(long);
+    try std.testing.expect(summary.len <= 100);
+    try std.testing.expectEqual(@as(usize, 0), summary.len % 3);
+    try std.testing.expectEqualStrings("中" ** 33, summary);
 }
 
 test "Agent selectDisplayText hides malformed tool markup payload" {
@@ -12023,7 +12136,7 @@ test "Agent executes native tool calls returned from streaming provider" {
     defer allocator.free(response);
 
     try std.testing.expectEqual(@as(usize, 2), provider_state.calls);
-    try std.testing.expectEqualStrings("done", response);
+    try std.testing.expectEqualStrings("calling shell\n\ndone", response);
 }
 
 test "Agent discards tool calls from a truncated provider response" {
@@ -13989,6 +14102,106 @@ fn scriptedProvider(state: *ScriptedTurnProvider) Provider {
     return Provider{ .ptr = @ptrCast(state), .vtable = &vtable };
 }
 
+/// One scripted streaming response: the text streamed to the sink and whether
+/// the round also returns a native tool call.
+const StreamTurnScript = struct {
+    text: []const u8,
+    tool_call: bool = false,
+};
+
+/// Streaming provider that replays a fixed script of responses by call index.
+const ScriptedStreamProvider = struct {
+    scripts: []const StreamTurnScript,
+    idx: usize = 0,
+
+    fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(_: *anyopaque, _: std.mem.Allocator, _: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        return error.ShouldNotUseBlockingChat;
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreaming(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreamingNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn streamChat(
+        ptr: *anyopaque,
+        allocator: std.mem.Allocator,
+        _: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        const script: StreamTurnScript = if (self.idx < self.scripts.len)
+            self.scripts[self.idx]
+        else
+            StreamTurnScript{ .text = "done" };
+        self.idx += 1;
+
+        if (script.text.len > 0) callback(callback_ctx, providers.StreamChunk.textDelta(script.text));
+        callback(callback_ctx, providers.StreamChunk.finalChunk());
+
+        const tool_calls = if (script.tool_call) blk: {
+            const calls = try allocator.alloc(providers.ToolCall, 1);
+            calls[0] = .{
+                .id = try allocator.dupe(u8, "call_test"),
+                .name = try allocator.dupe(u8, "probe"),
+                .arguments = try allocator.dupe(u8, "{}"),
+            };
+            break :blk calls;
+        } else &.{};
+
+        return .{
+            .content = try allocator.dupe(u8, script.text),
+            .tool_calls = tool_calls,
+            .model = try allocator.dupe(u8, model),
+        };
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "scripted-stream-provider";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+fn scriptedStreamProvider(state: *ScriptedStreamProvider) Provider {
+    const vtable = Provider.VTable{
+        .chatWithSystem = ScriptedStreamProvider.chatWithSystem,
+        .chat = ScriptedStreamProvider.chat,
+        .supportsNativeTools = ScriptedStreamProvider.supportsNativeTools,
+        .supports_streaming = ScriptedStreamProvider.supportsStreaming,
+        .supports_streaming_native_tools = ScriptedStreamProvider.supportsStreamingNativeTools,
+        .stream_chat = ScriptedStreamProvider.streamChat,
+        .getName = ScriptedStreamProvider.getName,
+        .deinit = ScriptedStreamProvider.deinitFn,
+    };
+    return Provider{ .ptr = @ptrCast(state), .vtable = &vtable };
+}
+
+/// Concatenates every non-final text chunk the agent emits.
+const StreamTextCapture = struct {
+    text: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (chunk.is_final) return;
+        self.text.appendSlice(std.testing.allocator, chunk.delta) catch unreachable;
+    }
+};
+
 fn makeTurnAgent(
     allocator: std.mem.Allocator,
     provider: Provider,
@@ -14359,4 +14572,403 @@ test "Agent turn nudges on a lone closer after an unclosed fence" {
     defer allocator.free(response);
     try std.testing.expectEqual(@as(usize, 2), state.idx);
     try std.testing.expectEqualStrings("最终答案。", response);
+}
+
+// Regression: interim text written in the same response as a tool call was dropped; only the post-tool reply reached the user
+test "Agent turn keeps interim text from native tool-call round in final reply" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "调研结论：发现目标配置" } },
+        .{ .text = "已存入笔记" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("开始调研");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("调研结论：发现目标配置\n\n已存入笔记", response);
+
+    // Persistence: the stored reply must match the delivered visible text.
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expectEqualStrings("调研结论：发现目标配置\n\n已存入笔记", last_msg.content);
+}
+
+test "Agent turn deduplicates interim text repeated in the final reply" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "答案" } },
+        .{ .text = "答案" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("求答案");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("答案", response);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expectEqualStrings("答案", last_msg.content);
+}
+
+// Regression: a final [NO_REPLY] round was merged with the interim text, so
+// the channel received the interim prose plus the token and posted it instead
+// of staying silent.
+test "Agent turn returns only the silent token when the final round is NO_REPLY" {
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{}", .content = "正在查询数据库。" } },
+        .{ .text = "[NO_REPLY]" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查一下数据库");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("[NO_REPLY]", response);
+}
+
+// Regression: same turn on the streaming path returned the streamed interim
+// text plus the token. The preview may already show both (the channel clears
+// its draft), but the final reply must be the bare token so it is suppressed.
+test "Agent turn returns only the silent token when the streamed final round is NO_REPLY" {
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "正在查询数据库。", .tool_call = true },
+        .{ .text = "[NO_REPLY]" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("查一下数据库");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("[NO_REPLY]", response);
+    // The live preview already carried the interim text and the token.
+    try std.testing.expectEqualStrings("正在查询数据库。\n\n[NO_REPLY]", capture.text.items);
+}
+
+test "Agent turn preserves XML-path interim text without leaking tool-call markup" {
+    const allocator = std.testing.allocator;
+    const xml_response = "正在准备查询...\n<tool_call>\n{\"name\": \"probe\", \"arguments\": {\"value\": 1}}\n</tool_call>";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = xml_response },
+        .{ .text = "查询完成。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查数据");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", response);
+    try std.testing.expect(std.mem.indexOf(u8, response, "<tool_call>") == null);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expectEqualStrings("正在准备查询...\n\n查询完成。", last_msg.content);
+}
+
+const StopProbeTool = struct {
+    agent: ?*Agent = null,
+};
+
+fn stopProbeToolVTable() tools_mod.Tool.VTable {
+    return .{
+        .name = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "probe";
+            }
+        }.f,
+        .description = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "probe";
+            }
+        }.f,
+        .parameters_json = struct {
+            fn f(_: *anyopaque) []const u8 {
+                return "{}";
+            }
+        }.f,
+        .execute = struct {
+            fn f(ptr: *anyopaque, _: std.mem.Allocator, _: tools_mod.JsonObjectMap) anyerror!tools_mod.ToolResult {
+                const self: *StopProbeTool = @ptrCast(@alignCast(ptr));
+                self.agent.?.requestInterrupt();
+                return tools_mod.ToolResult.ok("ok");
+            }
+        }.f,
+    };
+}
+
+test "Agent /stop reply keeps the interim text the preview already showed" {
+    // Regression: a /stop after a tool-call round dropped the text of that
+    // round, so the reply was just "Interrupted by /stop..." while the preview
+    // still showed the interim text (not a prefix of the reply) and the content
+    // was lost from the reply and from history.
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "正在查询数据库。", .tool_call = true },
+        .{ .text = "不会被调用" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var tool_state = StopProbeTool{};
+    const vt = stopProbeToolVTable();
+    const tools = [_]Tool{.{ .ptr = @ptrCast(&tool_state), .vtable = &vt }};
+    const specs = try allocator.alloc(ToolSpec, 1);
+    specs[0] = .{ .name = "probe", .description = "probe", .parameters_json = "{}" };
+
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &tools, specs, noop.observer());
+    defer agent.deinit();
+    tool_state.agent = &agent;
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("查一下数据库");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "正在查询数据库。") != null);
+    try std.testing.expect(std.mem.indexOf(u8, response, "Interrupted by /stop") != null);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "正在查询数据库。") != null);
+}
+
+test "Agent XML-path reply keeps the streamed preview as a byte prefix" {
+    // Regression: on the XML path the shared parse trimmed the text around a
+    // closed call and joined the parts with "\n", so the reply was
+    // "A\nB\n\nC" while the preview showed "AB\n\nC": the preview was not a
+    // prefix of the reply.
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "A<tool_call>{\"name\":\"probe\",\"arguments\":{}}</tool_call>B", .tool_call = true },
+        .{ .text = "C" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    // The preview the user sees is the TagFilter output, as on every channel.
+    const streaming_mod = @import("../streaming.zig");
+    const Collector = struct {
+        text: std.ArrayListUnmanaged(u8) = .empty,
+        fn callback(ctx: *anyopaque, event: streaming_mod.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (event.stage == .final) return;
+            self.text.appendSlice(std.testing.allocator, event.text) catch {};
+        }
+    };
+    var capture = Collector{};
+    defer capture.text.deinit(allocator);
+    var filter = streaming_mod.TagFilter.init(.{ .callback = Collector.callback, .ctx = @ptrCast(&capture) });
+    var sink = filter.sink();
+    const Adapter = struct {
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            streaming_mod.forwardProviderChunk(@as(*streaming_mod.Sink, @ptrCast(@alignCast(ctx))).*, chunk);
+        }
+    };
+    agent.stream_callback = Adapter.onChunk;
+    agent.stream_ctx = @ptrCast(&sink);
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    sink.emitFinal();
+
+    try std.testing.expectEqualStrings("AB\n\nC", response);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+}
+
+test "Agent turn keeps the body of a closed non-call tool_call block" {
+    // Regression: a closed <tool_call> block whose body was prose (not a call)
+    // was consumed whole, so the reply and history lost the text the streaming
+    // preview had shown; a block-only reply vanished entirely.
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "A<tool_call>中文</tool_call>B", .tool_call = true },
+        .{ .text = "C" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+
+    try std.testing.expect(std.mem.indexOf(u8, response, "中文") != null);
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "中文") != null);
+}
+
+/// True when `text` carries any dispatcher tool-call marker (V1 of the interim
+/// markup fix); none may reach a user-visible surface.
+fn containsAnyToolCallMarker(text: []const u8) bool {
+    const markers = [_][]const u8{
+        "<tool_call>", "</tool_call>", "[/tool_call]",
+        "[tool_call]", "[TOOL_CALL]",  "[/TOOL_CALL]",
+    };
+    for (markers) |marker| {
+        if (std.mem.indexOf(u8, text, marker) != null) return true;
+    }
+    return false;
+}
+
+test "Agent turn hides an unclosed tool opener after a valid text tool call" {
+    // Regression: with a valid call in the same response, the shared parse
+    // released the trailing unclosed `<tool_call>` verbatim, so the marker
+    // reached the interim text, the final reply and the assistant history.
+    const allocator = std.testing.allocator;
+    const xml_response = "准备中<tool_call>\n{\"name\": \"probe\", \"arguments\": {\"value\": 1}}\n</tool_call>继续<tool_call>未闭合的散文";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = xml_response },
+        .{ .text = "查询完成。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查数据");
+    defer allocator.free(response);
+
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+    try std.testing.expectEqualStrings("准备中继续未闭合的散文\n\n查询完成。", response);
+    try std.testing.expect(!containsAnyToolCallMarker(response));
+    try std.testing.expect(std.mem.indexOf(u8, response, "未闭合的散文") != null);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last_msg.role == .assistant);
+    try std.testing.expect(!containsAnyToolCallMarker(last_msg.content));
+    try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "未闭合的散文") != null);
+}
+
+test "Agent turn hides a stray tool-call closer after a valid text tool call" {
+    // Regression: a stray `</tool_call>` in the prose following a valid call
+    // survived into the visible text and the history entry.
+    const allocator = std.testing.allocator;
+    const xml_response = "准备中<tool_call>\n{\"name\": \"probe\", \"arguments\": {\"value\": 1}}\n</tool_call>继续</tool_call>[/TOOL_CALL]";
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .text = xml_response },
+        .{ .text = "查询完成。" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    const response = try agent.turn("查数据");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("准备中继续\n\n查询完成。", response);
+    try std.testing.expect(!containsAnyToolCallMarker(response));
+    try std.testing.expect(std.mem.indexOf(u8, response, "继续") != null);
+
+    const last_msg = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(!containsAnyToolCallMarker(last_msg.content));
+
+    // The interim display path is separate from the final strip: the text
+    // `selectDisplayText` hands to the interim accumulator must be clean too.
+    const parsed = try dispatcher.parseToolCalls(allocator, xml_response);
+    defer {
+        allocator.free(parsed.text);
+        for (parsed.calls) |call| {
+            allocator.free(call.name);
+            allocator.free(call.arguments_json);
+        }
+        allocator.free(parsed.calls);
+    }
+    const display = Agent.selectDisplayText(xml_response, parsed.text, parsed.calls.len);
+    try std.testing.expect(!containsAnyToolCallMarker(display));
+}
+
+/// Runs a streaming turn and asserts the concatenated streamed chunks are a
+/// byte prefix of the reply and that both equal `expected`.
+fn expectStreamedReplyEqual(scripts: []const StreamTurnScript, expected: []const u8) !void {
+    const allocator = std.testing.allocator;
+    var state = ScriptedStreamProvider{ .scripts = scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    var capture = StreamTextCapture{};
+    defer capture.text.deinit(allocator);
+    agent.stream_callback = StreamTextCapture.onChunk;
+    agent.stream_ctx = @ptrCast(&capture);
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings(expected, capture.text.items);
+    try std.testing.expectEqualStrings(expected, response);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+}
+
+test "Agent turn streams the interim separator before the final round's text" {
+    // Regression: the separator was emitted after the provider had already
+    // streamed the next round, so the preview was "i1final" while the reply
+    // was "i1\n\nfinal" — not a prefix, so Slack posted the reply a second time.
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "i1", .tool_call = true },
+        .{ .text = "final" },
+    };
+    try expectStreamedReplyEqual(&scripts, "i1\n\nfinal");
+}
+
+test "Agent turn streams separators between two tool-call rounds" {
+    // Regression: the preview was "i1i2\n\nfinal" while the reply was
+    // "i1\n\ni2\n\nfinal" — not a prefix, so Slack posted the reply twice.
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "i1", .tool_call = true },
+        .{ .text = "i2", .tool_call = true },
+        .{ .text = "final" },
+    };
+    try expectStreamedReplyEqual(&scripts, "i1\n\ni2\n\nfinal");
+}
+
+test "Agent turn keeps a repeated interim in the streaming reply" {
+    // Regression: the dedupe suppressed the interim from the reply, giving
+    // "i1" while the preview was "i1i1"; not a prefix, so Slack posted twice.
+    // Streaming keeps the repeat because the user already saw it.
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "i1", .tool_call = true },
+        .{ .text = "i1" },
+    };
+    try expectStreamedReplyEqual(&scripts, "i1\n\ni1");
 }

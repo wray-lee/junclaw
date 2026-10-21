@@ -8806,6 +8806,48 @@ test "steer reactions preserve origin on failed and replaced messages" {
     }
 }
 
+test "post-turn follow-up streams the separator its reply joins with" {
+    // Regression: the combined reply is primary + "\n\n" + follow-up, but the
+    // follow-up turn's own stream went out with no separator, so the preview
+    // (primary followed by follow-up) was not a prefix of the reply.
+    var mock = MockProvider{ .response = "unused", .responses = &[_][]const u8{"follow-up answer"} };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+    const key = "followup:streamed-separator";
+    const session = try sm.getOrCreate(key);
+    session.turn_running.store(true, .release);
+    try testing.expect(try session.appendMidTurnIfRunning(testing.allocator, "steered while busy"));
+    session.turn_running.store(false, .release);
+
+    const StreamProbe = struct {
+        seen: [16]u8 = undefined,
+        len: usize = 0,
+        fn callback(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (chunk.is_final) return;
+            const n = @min(chunk.delta.len, self.seen.len - self.len);
+            @memcpy(self.seen[self.len..][0..n], chunk.delta[0..n]);
+            self.len += n;
+        }
+    };
+    var probe = StreamProbe{};
+    session.agent.stream_callback = StreamProbe.callback;
+    session.agent.stream_ctx = @ptrCast(&probe);
+    defer {
+        session.agent.stream_callback = null;
+        session.agent.stream_ctx = null;
+    }
+
+    var response: []const u8 = try testing.allocator.dupe(u8, "primary answer");
+    defer testing.allocator.free(response);
+    var completed_turns: u64 = 1;
+    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed_turns, null));
+
+    try testing.expectEqualStrings("\n\n", probe.seen[0..probe.len]);
+    try testing.expectEqualStrings("primary answer\n\nfollow-up answer", response);
+}
+
 test "steer failed follow up uses its originating reaction sink" {
     // Regression: a failed follow-up must clear the inserted message on its
     // original transport, even when the consuming turn came from another one.

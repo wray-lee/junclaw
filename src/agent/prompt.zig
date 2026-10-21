@@ -775,9 +775,11 @@ test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
 
 fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("## Channel Attachments\n\n");
-    try w.writeAll("- On marker-aware channels (for example Telegram), you can send real attachments by emitting markers in your final reply.\n");
+    try w.writeAll("- On marker-aware channels (for example Telegram and Slack), you can send real attachments by emitting markers in your final reply.\n");
     try w.writeAll("- File/document: `[FILE:/absolute/path/to/file.ext]` or `[DOCUMENT:/absolute/path/to/file.ext]`\n");
     try w.writeAll("- Image/video/audio/voice: `[IMAGE:/abs/path]`, `[VIDEO:/abs/path]`, `[AUDIO:/abs/path]`, `[VOICE:/abs/path]`\n");
+    try w.writeAll("- When the user asks for a file, report, document, or the full contents of a file, send it as an attachment with `[FILE:/absolute/path]` (or the matching `[DOCUMENT:...]`/`[IMAGE:...]` marker) instead of pasting the file body into the chat.\n");
+    try w.writeAll("- Attach the path you actually wrote; do not re-paste its contents unless the user explicitly asks to read the text inline.\n");
     try w.writeAll("- If user gives `~/...`, expand it to the absolute home path before sending.\n");
     try w.writeAll("- Do not claim attachment sending is unavailable when these markers are supported.\n\n");
 
@@ -1420,6 +1422,8 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Attachments") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "[FILE:/absolute/path/to/file.ext]") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "Do not claim attachment sending is unavailable") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "Telegram and Slack") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "instead of pasting the file body into the chat") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Choices") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<nc_choices>") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "One choices block must correspond to one concrete unanswered question.") != null);

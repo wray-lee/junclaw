@@ -33,6 +33,7 @@ const inbound_router = @import("inbound_router.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
 const provider_probe = @import("provider_probe.zig");
+const util = @import("util.zig");
 
 const signal = @import("channels/signal.zig");
 const weixin = @import("channels/weixin.zig");
@@ -130,23 +131,7 @@ fn setScheduleToolContext(
 /// A silent token must never reach any channel as visible text, in groups or DMs.
 /// Only token-only replies are suppressed; prose mentioning the token is delivered.
 pub fn shouldSuppressReply(reply: []const u8) bool {
-    var saw_token = false;
-    var words = std.mem.tokenizeAny(u8, reply, " \t\r\n");
-    while (words.next()) |word| {
-        const bare = stripEdgePunctuation(word);
-        if (bare.len == 0) continue; // Punctuation alone is neither content nor a token.
-        if (!std.ascii.eqlIgnoreCase(bare, "NO_REPLY")) return false;
-        saw_token = true;
-    }
-    return saw_token;
-}
-
-fn stripEdgePunctuation(word: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = word.len;
-    while (start < end and std.ascii.isPunctuation(word[start])) start += 1;
-    while (end > start and std.ascii.isPunctuation(word[end - 1])) end -= 1;
-    return word[start..end];
+    return util.isSilentTokenReply(reply);
 }
 
 fn logAgentProcessingError(
@@ -1182,6 +1167,18 @@ fn processTelegramMessage(
             return;
         };
         defer payload.deinit(allocator);
+        // Regression: the edit path cannot upload files, so a reply carrying
+        // attachment markers was stripped of them and the attachment was never
+        // sent. Deliver a normal message instead.
+        if (telegram.payloadRequiresNormalSend(payload.payload())) {
+            tg_ptr.sendAssistantMessageWithReply(sender, message_sender_id, is_group, reply, reply_to_id) catch |err| {
+                tg_ptr.setTaskReaction(sender, message_id, .failed);
+                log.warn("Send error: {}", .{err});
+                return;
+            };
+            tg_ptr.setTaskReaction(sender, message_id, .done);
+            return;
+        }
         const edit_message_id = std.fmt.allocPrint(allocator, "{d}", .{message_id.?}) catch {
             tg_ptr.setTaskReaction(sender, message_id, .failed);
             return;
