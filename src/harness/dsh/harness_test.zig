@@ -9,6 +9,7 @@ const mock_mod = @import("mock.zig");
 const sidecar_mod = @import("sidecar.zig");
 
 const Allocator = std.mem.Allocator;
+const DshEngine = harness_mod.DshEngine;
 const DshHarness = harness_mod.DshHarness;
 const MockDsh = mock_mod.MockDsh;
 
@@ -22,18 +23,26 @@ fn bootUrl(allocator: Allocator, mock: *MockDsh) ![]u8 {
     );
 }
 
-fn newHarness(
+fn newEngine(
     allocator: Allocator,
     boot_url: []const u8,
     session_file: ?[]const u8,
-) !DshHarness {
-    return DshHarness.init(allocator, .{
+) !*DshEngine {
+    const engine = try allocator.create(DshEngine);
+    engine.* = DshEngine.init(allocator, .{
         .sidecar = .{ .bin_js = "unused", .workspace = test_cwd, .dsh_home = "/tmp/dsh-home" },
         .boot_url = boot_url,
         .session_file = session_file,
         .turn_timeout_ms = 5_000,
         .cancel_timeout_ms = 5_000,
     });
+    return engine;
+}
+
+fn freeEngine(engine: *DshEngine) void {
+    const allocator = engine.allocator;
+    engine.deinit();
+    allocator.destroy(engine);
 }
 
 /// Absolute path inside a test tmp dir, so the harness can create the file.
@@ -53,8 +62,7 @@ fn keySessionFile(allocator: Allocator, base_file: []const u8, key: []const u8) 
 }
 
 /// Run one turn for `key`, the way the host sets `session_key` first.
-fn turnKey(h: *DshHarness, key: []const u8, message: []const u8) !port.TurnResult {
-    h.session_key = key;
+fn runOneTurn(h: *DshHarness, message: []const u8) !port.TurnResult {
     return h.harness().runTurn(.{ .user_message = message });
 }
 
@@ -183,14 +191,16 @@ test "dsh harness adopts a persisted session on the key's first turn" {
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
 
-    var h = try newHarness(allocator, boot_url, session_file);
+    const engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     // Adoption is lazy: no WS until the key's first turn.
     try std.testing.expectEqual(@as(u32, 0), mock.wsConnections());
 
     try setTurnFrames(mock, allocator, &.{"resumed"}, "completed");
-    const result = try turnKey(&h, "test-key", "hi");
+    const result = try runOneTurn(&h, "hi");
     defer allocator.free(result.reply);
     try std.testing.expectEqualStrings("resumed", result.reply);
     try std.testing.expectEqual(@as(u32, 0), mock.createCount());
@@ -208,7 +218,9 @@ test "dsh harness streams ordered deltas and completes" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     try setTurnFrames(mock, allocator, &.{ "alpha ", "beta ", "gamma" }, "completed");
@@ -235,7 +247,9 @@ test "dsh committed assistant/message is the turn reply" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     const committed = try mock_mod.committedMessageFrame(allocator, "final answer", false);
@@ -266,7 +280,9 @@ test "dsh delta and committed reply exactly once" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     const delta = try mock_mod.textDeltaFrame(allocator, 0, "alpha ");
@@ -299,7 +315,9 @@ test "dsh /stop keeps a committed partial with no deltas" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     // No terminal frame from the prompt: the turn stays in flight until /stop;
@@ -338,7 +356,9 @@ test "dsh turn/end kinds map to port end reasons" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     const cases = [_]struct { kind: []const u8, want: port.EndReason }{
@@ -368,7 +388,9 @@ test "dsh turn/end error carries the failure message" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     const frame = try errorEndFrame(allocator, "provider exploded");
@@ -390,7 +412,9 @@ test "dsh /stop cancels mid-stream and keeps partial text" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     // No terminal frame: the turn stays in flight until /stop lands.
@@ -431,7 +455,9 @@ test "dsh idle /stop acks without cancelling the next turn" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, session_file);
+    const engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     // Regression: an idle /stop armed the interrupt flag, so the next prompt
@@ -463,11 +489,13 @@ test "dsh /new starts a fresh dsh session for its key" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, session_file);
+    const engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     try setTurnFrames(mock, allocator, &.{"first"}, "completed");
-    const first = try turnKey(&h, "test-key", "one");
+    const first = try runOneTurn(&h, "one");
     defer allocator.free(first.reply);
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
 
@@ -480,7 +508,7 @@ test "dsh /new starts a fresh dsh session for its key" {
     try std.testing.expect(mock.wasClosed("mock-sess-1"));
 
     try setTurnFrames(mock, allocator, &.{"second"}, "completed");
-    const second = try turnKey(&h, "test-key", "two");
+    const second = try runOneTurn(&h, "two");
     defer allocator.free(second.reply);
     try std.testing.expectEqualStrings("second", second.reply);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
@@ -501,7 +529,9 @@ test "dsh second runTurn queues after the active turn" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
     defer h.deinit();
 
     try setTurnFrames(mock, allocator, &.{"answer"}, "completed");
@@ -560,13 +590,15 @@ test "dsh reuses the session mapping and resumes it after a restart" {
     defer allocator.free(boot_url);
 
     {
-        var h = try newHarness(allocator, boot_url, session_file);
+        const engine = try newEngine(allocator, boot_url, session_file);
+        defer freeEngine(engine);
+        var h = try DshHarness.init(engine, "test-key-a");
         defer h.deinit();
 
         var index: u32 = 0;
         while (index < 2) : (index += 1) {
             try setTurnFrames(mock, allocator, &.{"same"}, "completed");
-            const result = try turnKey(&h, "test-key-a", "hi");
+            const result = try runOneTurn(&h, "hi");
             defer allocator.free(result.reply);
             try std.testing.expectEqualStrings("same", result.reply);
         }
@@ -575,14 +607,16 @@ test "dsh reuses the session mapping and resumes it after a restart" {
         try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
     }
 
-    // Simulated restart: a new harness over the same mapping file connects to
+    // Simulated restart: a new engine over the same mapping file connects to
     // the persisted session instead of creating another one.
-    var restarted = try newHarness(allocator, boot_url, session_file);
+    const restarted_engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(restarted_engine);
+    var restarted = try DshHarness.init(restarted_engine, "test-key-a");
     defer restarted.deinit();
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
 
     try setTurnFrames(mock, allocator, &.{"resumed"}, "completed");
-    const result = try turnKey(&restarted, "test-key-a", "again");
+    const result = try runOneTurn(&restarted, "again");
     defer allocator.free(result.reply);
     try std.testing.expectEqualStrings("resumed", result.reply);
     // The resumed key opened its fresh WS only when its turn began.
@@ -595,7 +629,7 @@ test "dsh reuses the session mapping and resumes it after a restart" {
     try std.testing.expectEqual(@as(u32, 3), mock.promptCount());
 }
 
-test "dsh two keys run their own sessions on one sidecar" {
+test "dsh two keys run their own sessions on one engine" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const mock = try MockDsh.init(allocator);
@@ -603,17 +637,21 @@ test "dsh two keys run their own sessions on one sidecar" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
-    defer h.deinit();
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "test-key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "test-key-b");
+    defer hb.deinit();
 
     try setTurnFrames(mock, allocator, &.{"alpha"}, "completed");
-    const first = try turnKey(&h, "test-key-a", "hi");
+    const first = try runOneTurn(&ha, "hi");
     defer allocator.free(first.reply);
     const first_session = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(first_session);
 
     try setTurnFrames(mock, allocator, &.{"beta"}, "completed");
-    const second = try turnKey(&h, "test-key-b", "hi");
+    const second = try runOneTurn(&hb, "hi");
     defer allocator.free(second.reply);
     const second_session = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(second_session);
@@ -621,6 +659,8 @@ test "dsh two keys run their own sessions on one sidecar" {
     try std.testing.expectEqualStrings("alpha", first.reply);
     try std.testing.expectEqualStrings("beta", second.reply);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    // One process-wide engine: two keys share a single boot/connect.
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
     // Each prompt landed on the session the key created for itself.
     try std.testing.expectEqualStrings("mock-sess-1", first_session);
     try std.testing.expectEqualStrings("mock-sess-2", second_session);
@@ -634,19 +674,23 @@ test "dsh key switch reuses its session and leaves the other key open" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, null);
-    defer h.deinit();
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "test-key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "test-key-b");
+    defer hb.deinit();
 
     try setTurnFrames(mock, allocator, &.{"one"}, "completed");
-    const first = try turnKey(&h, "test-key-a", "hi");
+    const first = try runOneTurn(&ha, "hi");
     defer allocator.free(first.reply);
 
     try setTurnFrames(mock, allocator, &.{"two"}, "completed");
-    const second = try turnKey(&h, "test-key-b", "hi");
+    const second = try runOneTurn(&hb, "hi");
     defer allocator.free(second.reply);
 
     try setTurnFrames(mock, allocator, &.{"three"}, "completed");
-    const third = try turnKey(&h, "test-key-a", "hi");
+    const third = try runOneTurn(&ha, "hi");
     defer allocator.free(third.reply);
     const prompted = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(prompted);
@@ -676,21 +720,24 @@ test "dsh /new closes only its key's session" {
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
-    var h = try newHarness(allocator, boot_url, session_file);
-    defer h.deinit();
+    const engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "test-key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "test-key-b");
+    defer hb.deinit();
 
     try setTurnFrames(mock, allocator, &.{"one"}, "completed");
-    const first = try turnKey(&h, "test-key-a", "hi");
+    const first = try runOneTurn(&ha, "hi");
     defer allocator.free(first.reply);
 
     try setTurnFrames(mock, allocator, &.{"two"}, "completed");
-    const second = try turnKey(&h, "test-key-b", "hi");
+    const second = try runOneTurn(&hb, "hi");
     defer allocator.free(second.reply);
 
     // Regression: /new reset the single shared session, so another key's
     // session was closed and its next turn started from scratch.
-    h.session_key = "test-key-a";
-    const ack = try h.harness().handleLocalCommand("/new");
+    const ack = try ha.harness().handleLocalCommand("/new");
     try std.testing.expectEqualStrings("Session cleared.", ack.?);
     try std.testing.expectEqual(@as(u32, 1), mock.closeCount());
     try std.testing.expect(mock.wasClosed("mock-sess-1"));
@@ -706,7 +753,7 @@ test "dsh /new closes only its key's session" {
 
     // B keeps working on its original session.
     try setTurnFrames(mock, allocator, &.{"still mine"}, "completed");
-    const after = try turnKey(&h, "test-key-b", "hi");
+    const after = try runOneTurn(&hb, "hi");
     defer allocator.free(after.reply);
     try std.testing.expectEqualStrings("still mine", after.reply);
     const b_prompted = (try mock.lastPromptSession(allocator)).?;
@@ -715,11 +762,148 @@ test "dsh /new closes only its key's session" {
 
     // A's next turn runs on the replacement session.
     try setTurnFrames(mock, allocator, &.{"fresh"}, "completed");
-    const fresh = try turnKey(&h, "test-key-a", "hi");
+    const fresh = try runOneTurn(&ha, "hi");
     defer allocator.free(fresh.reply);
     try std.testing.expectEqualStrings("fresh", fresh.reply);
     try std.testing.expectEqual(@as(u32, 3), mock.createCount());
     const a_prompted = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(a_prompted);
     try std.testing.expectEqualStrings("mock-sess-3", a_prompted);
+}
+
+/// Two-thread start barrier for concurrency tests.
+const StartGate = struct {
+    mutex: std_compat.sync.Mutex = .{},
+    cond: std_compat.sync.Condition = .{},
+    ready: u8 = 0,
+    go: bool = false,
+
+    fn arrive(self: *StartGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.ready += 1;
+        self.cond.broadcast();
+        while (!self.go) self.cond.wait(&self.mutex);
+    }
+
+    fn releaseBoth(self: *StartGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (self.ready < 2) self.cond.wait(&self.mutex);
+        self.go = true;
+        self.cond.broadcast();
+    }
+};
+
+const BootThread = struct {
+    engine: *DshEngine,
+    start: *StartGate,
+    failure: ?anyerror = null,
+
+    fn main(self: *BootThread) void {
+        self.start.arrive();
+        self.engine.ensureBooted() catch |err| {
+            self.failure = err;
+        };
+    }
+};
+
+test "dsh engine concurrent first use boots once" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var gate = mock_mod.ConnectGate{};
+    mock.setConnectGate(&gate);
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+
+    var start = StartGate{};
+    var first = BootThread{ .engine = engine, .start = &start };
+    var second = BootThread{ .engine = engine, .start = &start };
+    const first_thread = try std.Thread.spawn(.{}, BootThread.main, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, BootThread.main, .{&second});
+
+    start.releaseBoth();
+    // First entrant parks inside the mock's /connect; the other waits on the
+    // engine's boot mutex, so no second connect may start.
+    gate.waitEntered();
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    gate.open();
+
+    first_thread.join();
+    second_thread.join();
+    try std.testing.expect(first.failure == null);
+    try std.testing.expect(second.failure == null);
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+}
+
+test "dsh engine retries a failed boot without leaking" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+
+    mock.failNextConnect();
+    try std.testing.expectError(error.OwnerConnectRejected, engine.ensureBooted());
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+
+    // A failed boot leaves no state behind; the next attempt succeeds.
+    try engine.ensureBooted();
+    try std.testing.expectEqual(@as(u32, 2), mock.connectCount());
+
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    try setTurnFrames(mock, allocator, &.{"after retry"}, "completed");
+    const result = try runOneTurn(&h, "hi");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("after retry", result.reply);
+}
+
+test "dsh concurrent turns keep their own session key" {
+    // Regression: 共享 DshHarness 时 session_key 被另一个会话覆盖
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+    mock.setEchoPrompts(true);
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "test-key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "test-key-b");
+    defer hb.deinit();
+
+    var first = TurnThread{ .harness = &ha, .input = .{ .user_message = "alpha" } };
+    var second = TurnThread{ .harness = &hb, .input = .{ .user_message = "beta" } };
+    const first_thread = try std.Thread.spawn(.{}, TurnThread.main, .{&first});
+    const second_thread = try std.Thread.spawn(.{}, TurnThread.main, .{&second});
+    first_thread.join();
+    second_thread.join();
+
+    try std.testing.expect(first.failure == null);
+    try std.testing.expect(second.failure == null);
+    const first_result = first.result.?;
+    defer allocator.free(first_result.reply);
+    const second_result = second.result.?;
+    defer allocator.free(second_result.reply);
+    // The old shared handle retargeted both turns at one key; each handle must
+    // answer with the prompt it owns.
+    try std.testing.expectEqualStrings("alpha", first_result.reply);
+    try std.testing.expectEqualStrings("beta", second_result.reply);
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
 }

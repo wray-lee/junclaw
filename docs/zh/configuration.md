@@ -216,8 +216,9 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 ### `agent.harness`
 
 - 选择新建会话使用的回合引擎，可选值为 `native`（默认）和 `dsh`。省略该键即保持 `native`。
-- `dsh` 需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。未设置 `NULLCLAW_DSH_BIN` 或 sidecar 启动失败时也会回退到 native（同样记录警告）。
-- 在 dsh 构建中，`NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。sidecar 使用 agent 的工作目录，profile 保存在 `<配置目录>/.dsh`，dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
+- `dsh` 需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。
+- 在 dsh 构建中，整个进程共用一个 dsh sidecar，并在第一个 dsh 回合惰性启动，启动过程不在会话表锁内。因此会话创建保持很快，所有 dsh 会话共用同一个 sidecar。
+- `NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。未设置或 sidecar 启动失败时，该回合返回错误（呈现给用户），下一个回合会重试启动。sidecar 使用配置的 agent 工作目录，profile 保存在 `<配置目录>/.dsh`，每个会话的 dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
 - P1 的 dsh 模式覆盖聊天回合、流式回复，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话。steer 注入、审批和用户提问尚未接入；junclaw 仍会为自己的通道历史保留一份对话记录。
 
 示例：

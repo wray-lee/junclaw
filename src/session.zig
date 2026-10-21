@@ -50,27 +50,49 @@ const build_options = @import("build_options");
 const dsh_enabled = build_options.enable_harness_dsh;
 const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
     pub const DshHarness = void;
+    pub const DshEngine = void;
 };
 
-/// A dsh engine plus the owned strings its `Options` borrows.
+/// Per-session dsh handle. The sidecar and the key→session table live in the
+/// process-wide `DshEngine`; this only owns the handle's key copy.
 const DshState = if (dsh_enabled) struct {
-    allocator: Allocator,
     harness: dsh_harness_mod.DshHarness,
-    bin_js: []u8,
-    dsh_home: []u8,
-    session_file: []u8,
 
     fn deinit(self: *@This()) void {
         self.harness.deinit();
-        self.allocator.free(self.bin_js);
-        self.allocator.free(self.dsh_home);
-        self.allocator.free(self.session_file);
     }
 } else struct {
     fn deinit(self: *@This()) void {
         _ = self;
     }
 };
+
+/// The process-wide dsh engine plus the option strings its `Options` borrow.
+/// Created lazily by the manager; the sidecar itself boots on the first turn.
+const DshEngineState = if (dsh_enabled) struct {
+    allocator: Allocator,
+    engine: *dsh_harness_mod.DshEngine,
+    dsh_home: []u8,
+    session_base: []u8,
+
+    fn deinit(self: *@This()) void {
+        self.engine.deinit();
+        self.allocator.destroy(self.engine);
+        self.allocator.free(self.dsh_home);
+        self.allocator.free(self.session_base);
+    }
+} else struct {
+    fn deinit(self: *@This()) void {
+        _ = self;
+    }
+};
+
+/// Dsh builds carry the lazily created engine; a default build compiles the
+/// slot to an empty struct, so the native path is unchanged.
+const DshEngineSlot = if (dsh_enabled) struct {
+    mutex: std_compat.sync.Mutex = .{},
+    state: ?DshEngineState = null,
+} else struct {};
 
 /// Test seam: point session-created dsh harnesses at an in-process mock
 /// instead of spawning a sidecar. Production never sets it.
@@ -85,49 +107,12 @@ fn warnDshIgnored() void {
     }
 }
 
-/// Start this session's dsh engine. `NULLCLAW_DSH_BIN` names dsh's
-/// `lib/bin.js`; the profile and the session mapping live next to config.json.
-/// Callers fall back to native on any error.
-fn startDshHarness(allocator: Allocator, config: *const Config, workspace: []const u8, session_key: []const u8) !DshState {
-    const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
-    const dsh_home = try std_compat.fs.path.join(allocator, &.{ config_dir, ".dsh" });
-    errdefer allocator.free(dsh_home);
-    try fs_compat.makePath(dsh_home);
-    const sessions_dir = try std_compat.fs.path.join(allocator, &.{ config_dir, "dsh-sessions" });
-    defer allocator.free(sessions_dir);
-    try fs_compat.makePath(sessions_dir);
-    const session_file = try std.fmt.allocPrint(allocator, "{s}/{x}.json", .{
-        sessions_dir,
-        std.hash.Wyhash.hash(0, session_key),
-    });
-    errdefer allocator.free(session_file);
-    const bin_js = if (dsh_test_boot_url != null)
-        // An injected boot URL means an external sidecar; no binary to spawn.
-        try allocator.dupe(u8, "unused")
-    else
-        std_compat.process.getEnvVarOwned(allocator, "NULLCLAW_DSH_BIN") catch |err| switch (err) {
-            error.EnvironmentVariableNotFound => return error.DshBinNotConfigured,
-            else => return err,
-        };
-    errdefer allocator.free(bin_js);
-
-    var state = DshState{
-        .allocator = allocator,
-        .harness = undefined,
-        .bin_js = bin_js,
-        .dsh_home = dsh_home,
-        .session_file = session_file,
-    };
-    state.harness = try dsh_harness_mod.DshHarness.init(allocator, .{
-        .sidecar = .{
-            .bin_js = state.bin_js,
-            .workspace = workspace,
-            .dsh_home = state.dsh_home,
-        },
-        .boot_url = dsh_test_boot_url,
-        .session_file = state.session_file,
-    });
-    return state;
+/// Build this session's lightweight dsh handle. The shared engine is created
+/// on first use, which only allocates and fills fields; the sidecar boots
+/// later, on the first dsh turn, outside the session-table lock.
+fn startDshHarness(manager: *SessionManager, session_key: []const u8) !DshState {
+    const engine = try manager.ensureDshEngine();
+    return .{ .harness = try dsh_harness_mod.DshHarness.init(engine, session_key) };
 }
 
 const log = std.log.scoped(.session);
@@ -503,13 +488,13 @@ pub const Session = struct {
         return &self.agent;
     }
 
-    /// The engine this session's turns run on: dsh when selected and started,
-    /// otherwise the native adapter. Refreshes the engine's session_key first
-    /// because a legacy key can be canonicalized after session creation.
+    /// The engine this session's turns run on: dsh when selected, otherwise
+    /// the native adapter. The dsh handle owns an immutable key copy; the
+    /// native adapter still refreshes its key because a legacy key can be
+    /// canonicalized after session creation.
     fn turnHarness(self: *Session) harness_port.Harness {
         if (comptime dsh_enabled) {
             if (self.dsh) |*d| {
-                d.harness.session_key = self.session_key;
                 return d.harness.harness();
             }
         }
@@ -815,6 +800,9 @@ pub const SessionManager = struct {
     vision_capable: ?bool = null,
 
     mutex: std_compat.sync.Mutex,
+    /// Process-wide dsh engine, created lazily under its own lock. Empty in a
+    /// default build (the field is compiled away).
+    dsh_engine: DshEngineSlot = .{},
     usage_log_mutex: std_compat.sync.Mutex,
     claim_state_io_mutex: std_compat.sync.Mutex,
     usage_ledger_state_initialized: bool,
@@ -894,6 +882,12 @@ pub const SessionManager = struct {
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.sessions.deinit(self.allocator);
+
+        // Every session released its key above; tear down the shared sidecar
+        // last.
+        if (comptime dsh_enabled) {
+            if (self.dsh_engine.state) |*state| state.deinit();
+        }
 
         var rt_it = self.agent_runtimes.iterator();
         while (rt_it.next()) |entry| {
@@ -1966,6 +1960,45 @@ pub const SessionManager = struct {
         }
     }
 
+    /// Lazily create the process-wide dsh engine. Allocation only: no spawn,
+    /// no network, so it is safe under the session-table lock.
+    fn ensureDshEngine(self: *SessionManager) !*dsh_harness_mod.DshEngine {
+        if (comptime dsh_enabled) {
+            self.dsh_engine.mutex.lock();
+            defer self.dsh_engine.mutex.unlock();
+            if (self.dsh_engine.state) |*state| return state.engine;
+
+            const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse ".";
+            const dsh_home = try std_compat.fs.path.join(self.allocator, &.{ config_dir, ".dsh" });
+            errdefer self.allocator.free(dsh_home);
+            const sessions_dir = try std_compat.fs.path.join(self.allocator, &.{ config_dir, "dsh-sessions" });
+            defer self.allocator.free(sessions_dir);
+            // Only the directory matters; each key derives its own file.
+            const session_base = try std.fmt.allocPrint(self.allocator, "{s}/session.json", .{sessions_dir});
+            errdefer self.allocator.free(session_base);
+
+            const engine = try self.allocator.create(dsh_harness_mod.DshEngine);
+            errdefer self.allocator.destroy(engine);
+            engine.* = dsh_harness_mod.DshEngine.init(self.allocator, .{
+                .sidecar = .{
+                    // Empty: resolved from NULLCLAW_DSH_BIN at boot.
+                    .bin_js = "",
+                    .workspace = self.config.workspace_dir,
+                    .dsh_home = dsh_home,
+                },
+                .boot_url = dsh_test_boot_url,
+                .session_file = session_base,
+            });
+            self.dsh_engine.state = .{
+                .allocator = self.allocator,
+                .engine = engine,
+                .dsh_home = dsh_home,
+                .session_base = session_base,
+            };
+            return engine;
+        } else unreachable;
+    }
+
     /// Find or create a session for the given key. Thread-safe.
     pub fn getOrCreate(self: *SessionManager, session_key: []const u8) !*Session {
         return self.getOrCreateForTurn(session_key, false);
@@ -2107,15 +2140,8 @@ pub const SessionManager = struct {
 
         if (comptime dsh_enabled) {
             if (selected_config.agent.harness == .dsh) {
-                session.dsh = startDshHarness(
-                    self.allocator,
-                    selected_config,
-                    session.agent.workspace_dir,
-                    owned_key,
-                ) catch |err| blk: {
-                    log.warn("agent.harness=\"dsh\" not started ({s}); using native", .{@errorName(err)});
-                    break :blk null;
-                };
+                // Attach the handle now; the sidecar boots on the first turn.
+                session.dsh = try startDshHarness(self, owned_key);
             }
         } else if (selected_config.agent.harness == .dsh) {
             warnDshIgnored();
@@ -6596,6 +6622,67 @@ test "host /new starts a fresh dsh session and rewrites the mapping" {
     const persisted = (try sidecar_mod.loadSessionId(testing.allocator, session_file)).?;
     defer testing.allocator.free(persisted);
     try testing.expectEqualStrings("mock-sess-2", persisted);
+}
+
+test "dsh boot does not block session creation under the manager lock" {
+    // Regression: the sidecar spawned synchronously inside getOrCreate's
+    // SessionManager.mutex hold, so a slow boot stalled every session.
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var gate = mock_mod.ConnectGate{};
+    dsh_mock.setConnectGate(&gate);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try dshSessionTestConfig(&tmp);
+    defer testing.allocator.free(setup.base);
+    defer testing.allocator.free(setup.config_path);
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &setup.cfg);
+    defer sm.deinit();
+
+    const slow_delta = try mock_mod.textDeltaFrame(testing.allocator, 0, "slow boot");
+    defer testing.allocator.free(slow_delta);
+    try dsh_mock.setTurnFrames(&.{ slow_delta, mock_mod.turn_completed_frame });
+
+    const dsh_key = "cli:main:dsh-slow-boot";
+    var turn = HostDshTurn{ .mgr = &sm, .session_key = dsh_key, .content = "hello" };
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        HostDshTurn.main,
+        .{&turn},
+    );
+
+    // The turn is parked inside the sidecar boot. Creating another session
+    // must still complete: boot is not under the session-table lock.
+    gate.waitEntered();
+    setup.cfg.agent.harness = .native;
+    const native_session = try sm.getOrCreate("cli:main:native-during-boot");
+    try testing.expect(native_session.dsh == null);
+    try testing.expectEqual(
+        @as(*anyopaque, @ptrCast(&native_session.harness)),
+        native_session.turnHarness().ptr,
+    );
+    setup.cfg.agent.harness = .dsh;
+
+    gate.open();
+    thread.join();
+    try testing.expect(turn.failure == null);
+    const reply = turn.reply.?;
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("slow boot", reply);
 }
 
 test "harness display trust uses the real session key for shared channels" {

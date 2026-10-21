@@ -62,6 +62,38 @@ const WsConn = struct {
     session: []u8,
 };
 
+/// Test gate that parks the mock's `/connect` handler (and with it the boot)
+/// until the test opens it. The condition is event-based; no wall-clock check.
+pub const ConnectGate = struct {
+    mutex: std_compat.sync.Mutex = .{},
+    cond: std_compat.sync.Condition = .{},
+    entered: bool = false,
+    opened: bool = false,
+
+    /// Called from the mock's serve thread.
+    pub fn enter(self: *ConnectGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.entered = true;
+        self.cond.broadcast();
+        while (!self.opened) self.cond.wait(&self.mutex);
+    }
+
+    /// Block until a `/connect` is parked in `enter`.
+    pub fn waitEntered(self: *ConnectGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        while (!self.entered) self.cond.wait(&self.mutex);
+    }
+
+    pub fn open(self: *ConnectGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.opened = true;
+        self.cond.broadcast();
+    }
+};
+
 pub const MockDsh = struct {
     allocator: Allocator,
     server: std_compat.net.Server,
@@ -80,8 +112,15 @@ pub const MockDsh = struct {
     create_count: u32 = 0,
     prompt_count: u32 = 0,
     cancel_count: u32 = 0,
+    connect_count: u32 = 0,
     ws_connections: u32 = 0,
     last_prompt_session: ?[]u8 = null,
+    /// Fail the next `/connect` once (boot-failure tests).
+    fail_connect_once: bool = false,
+    /// Park `/connect` while non-null (boot-blocking tests).
+    connect_gate: ?*ConnectGate = null,
+    /// Echo each prompt back as a delta plus a completed turn/end.
+    echo_prompts: bool = false,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -190,7 +229,7 @@ pub const MockDsh = struct {
         }
 
         if (std.mem.startsWith(u8, request.target, "/connect")) {
-            serveConnect(stream, request.target) catch return;
+            self.serveConnect(stream, request.target) catch return;
             return;
         }
 
@@ -201,7 +240,20 @@ pub const MockDsh = struct {
         self.serveRpc(stream, request.target["/api/".len..], request.body) catch {};
     }
 
-    fn serveConnect(stream: std_compat.net.Stream, target: []const u8) !void {
+    fn serveConnect(self: *MockDsh, stream: std_compat.net.Stream, target: []const u8) !void {
+        self.mutex.lock();
+        self.connect_count += 1;
+        const fail = self.fail_connect_once;
+        if (fail) self.fail_connect_once = false;
+        const gate = self.connect_gate;
+        self.mutex.unlock();
+
+        if (gate) |g| g.enter();
+        if (fail) {
+            try writeHttp(stream, "500 Internal Server Error", "", "");
+            return;
+        }
+
         const token = queryValue(target, "token") orelse "";
         if (!std.mem.eql(u8, token, test_token)) {
             try writeHttp(stream, "403 Forbidden", "", "");
@@ -244,7 +296,14 @@ pub const MockDsh = struct {
         if (is_prompt) {
             const session = requestSessionId(self.allocator, body) orelse return;
             defer self.allocator.free(session);
-            try self.sendTurnFrames(session);
+            self.mutex.lock();
+            const echo = self.echo_prompts;
+            self.mutex.unlock();
+            if (echo) {
+                try self.sendEchoFrames(session, body);
+            } else {
+                try self.sendTurnFrames(session);
+            }
         } else if (is_cancel) {
             const session = requestSessionId(self.allocator, body) orelse return;
             defer self.allocator.free(session);
@@ -302,6 +361,33 @@ pub const MockDsh = struct {
         return self.cancel_count;
     }
 
+    /// Number of `/connect` owner-cookie exchanges (= boots) started.
+    pub fn connectCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.connect_count;
+    }
+
+    pub fn failNextConnect(self: *MockDsh) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.fail_connect_once = true;
+    }
+
+    /// Park `/connect` in `gate` until it is opened.
+    pub fn setConnectGate(self: *MockDsh, gate: ?*ConnectGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.connect_gate = gate;
+    }
+
+    /// Echo each prompt text back as the turn reply (distinct per session).
+    pub fn setEchoPrompts(self: *MockDsh, enabled: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.echo_prompts = enabled;
+    }
+
     pub fn wsConnections(self: *MockDsh) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -348,6 +434,22 @@ pub const MockDsh = struct {
         defer self.mutex.unlock();
         const ws = self.wsForSessionLocked(session) orelse return;
         for (self.turn_frames.items) |frame| try writeTextFrame(ws, frame);
+    }
+
+    /// Reply with the prompt's own text, so concurrent sessions are
+    /// distinguishable without a per-session frame table.
+    fn sendEchoFrames(self: *MockDsh, session: []const u8, body: []const u8) !void {
+        const text = requestPromptText(self.allocator, body) orelse
+            try self.allocator.dupe(u8, "");
+        defer self.allocator.free(text);
+        const delta = try textDeltaFrame(self.allocator, 0, text);
+        defer self.allocator.free(delta);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const ws = self.wsForSessionLocked(session) orelse return;
+        try writeTextFrame(ws, delta);
+        try writeTextFrame(ws, turn_completed_frame);
     }
 
     /// A cancelled turn commits its delivered prefix before the terminal frame.
@@ -482,6 +584,27 @@ fn requestCursor(allocator: Allocator, body: []const u8) ?u64 {
         .integer => |value| if (value >= 0) @intCast(value) else null,
         else => null,
     };
+}
+
+/// First text part of a `session/prompt` request; caller frees.
+fn requestPromptText(allocator: Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    const root = asObject(parsed.value) orelse return null;
+    const payload = asObject(root.get("payload")) orelse return null;
+    const args = asObject(payload.get("args")) orelse return null;
+    const request = asObject(args.get("request")) orelse return null;
+    const content = switch (request.get("content") orelse return null) {
+        .array => |items| items,
+        else => return null,
+    };
+    if (content.items.len == 0) return null;
+    const part = asObject(content.items[0]) orelse return null;
+    const text = switch (part.get("text") orelse return null) {
+        .string => |value| value,
+        else => return null,
+    };
+    return allocator.dupe(u8, text) catch null;
 }
 
 fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
