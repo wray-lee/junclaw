@@ -32,6 +32,9 @@ pub const NativeHarness = struct {
     /// Session key used for the `agent_start` observer event's display-trust
     /// decision (see `runTurn`).
     session_key: []const u8 = "",
+    /// The session host records `agent_start`; direct CLI/subagent callers
+    /// never did, so they turn this off to stay behavior-identical.
+    emit_start_event: bool = true,
 
     pub fn init(agent: *Agent) Self {
         return .{ .agent = agent };
@@ -133,13 +136,15 @@ pub const NativeHarness = struct {
 
         // Kept from src/session.zig:2773-2780: the observer's agent_start event
         // with channel attribution must survive the install block moving here.
-        const start_event = observability.ObserverEvent{ .agent_start = .{
-            .provider = agent.provider.getName(),
-            .model = agent.model_name,
-            .channel = if (input.conversation_context) |ctx| ctx.channel else null,
-            .bot_account = if (input.conversation_context) |ctx| ctx.account_id else null,
-        } };
-        agent.observer.recordEvent(&start_event);
+        if (self.emit_start_event) {
+            const start_event = observability.ObserverEvent{ .agent_start = .{
+                .provider = agent.provider.getName(),
+                .model = agent.model_name,
+                .channel = if (input.conversation_context) |ctx| ctx.channel else null,
+                .bot_account = if (input.conversation_context) |ctx| ctx.account_id else null,
+            } };
+            agent.observer.recordEvent(&start_event);
+        }
 
         // Replaces src/session.zig:2786-2794: the drain is installed per turn
         // with this turn's context, exactly as the host did.

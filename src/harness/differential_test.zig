@@ -524,6 +524,245 @@ test "differential: a null sink installs no callbacks on either path" {
     try std.testing.expectEqual(direct_provider.call(0).message_count, ported_provider.call(0).message_count);
 }
 
+// ── CLI / subagent call-site parity ─────────────────────────────────
+// CLI and subagent turns now go through NativeHarness too. Neither ever sent
+// `agent_start`, and neither has session/conversation context, so these tests
+// reproduce their exact install shape and assert the ported call is identical.
+
+const CliSinkCtx = struct {
+    recorder: *StreamRecorder,
+    sink: streaming.Sink = undefined,
+    suppress_live: bool = false,
+    emitted_text: bool = false,
+
+    fn rawSink(self: *CliSinkCtx) streaming.Sink {
+        return .{ .callback = onEvent, .ctx = @ptrCast(self) };
+    }
+
+    fn onEvent(ctx_ptr: *anyopaque, event: streaming.Event) void {
+        const self: *CliSinkCtx = @ptrCast(@alignCast(ctx_ptr));
+        if (event.stage != .chunk or event.text.len == 0) return;
+        if (self.suppress_live) return;
+        self.emitted_text = true;
+        StreamRecorder.onEvent(@ptrCast(self.recorder), event);
+    }
+};
+
+/// Verbatim `src/agent/cli.zig` install: the callback exists only when the
+/// provider supports streaming, and it feeds `stream_ctx.sink`.
+fn cliDirectTurn(agent: *Agent, text: []const u8, supports_streaming: bool, stream_ctx: *CliSinkCtx) ![]const u8 {
+    stream_ctx.emitted_text = false;
+    if (supports_streaming) {
+        agent.stream_callback = cliChunkForwarder;
+        agent.stream_ctx = @ptrCast(stream_ctx);
+    }
+    defer {
+        agent.stream_callback = null;
+        agent.stream_ctx = null;
+    }
+    return agent.turn(text);
+}
+
+fn cliChunkForwarder(ctx_ptr: *anyopaque, chunk: @import("../providers/root.zig").StreamChunk) void {
+    const stream_ctx: *CliSinkCtx = @ptrCast(@alignCast(ctx_ptr));
+    streaming.forwardProviderChunk(stream_ctx.sink, chunk);
+}
+
+fn cliPortedTurn(agent: *Agent, text: []const u8, supports_streaming: bool, stream_ctx: *CliSinkCtx) ![]const u8 {
+    stream_ctx.emitted_text = false;
+    var adapter = NativeHarness.init(agent);
+    adapter.emit_start_event = false;
+    const result = try adapter.harness().runTurn(.{
+        .user_message = text,
+        .live_stream = supports_streaming,
+        .sink = if (supports_streaming) port.Sink{
+            .ctx = @ptrCast(stream_ctx),
+            .emit = cliPortEmit,
+        } else null,
+    });
+    return result.reply;
+}
+
+fn cliPortEmit(ctx_ptr: *anyopaque, event: port.Event) void {
+    const stream_ctx: *CliSinkCtx = @ptrCast(@alignCast(ctx_ptr));
+    switch (event) {
+        .delta => |chunk| streaming.forwardProviderChunk(stream_ctx.sink, chunk),
+        else => {},
+    }
+}
+
+const EventRecorder = struct {
+    agent_start: usize = 0,
+    total: usize = 0,
+
+    const vtable = observability.Observer.VTable{
+        .record_event = recordEvent,
+        .record_metric = recordMetric,
+        .flush = flush,
+        .name = name,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
+    };
+
+    fn observer(self: *EventRecorder) observability.Observer {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+        const self: *EventRecorder = @ptrCast(@alignCast(ptr));
+        self.total += 1;
+        switch (event.*) {
+            .agent_start => self.agent_start += 1,
+            else => {},
+        }
+    }
+
+    fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+    fn flush(_: *anyopaque) void {}
+    fn name(_: *anyopaque) []const u8 {
+        return "event-recorder";
+    }
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+};
+
+fn expectSameHistory(a: *const Agent, b: *const Agent) !void {
+    try std.testing.expectEqual(a.history.items.len, b.history.items.len);
+    for (a.history.items, b.history.items) |left, right| {
+        try std.testing.expectEqual(left.role, right.role);
+        try std.testing.expectEqualStrings(left.content, right.content);
+    }
+}
+
+fn cliSinkChain(recorder: *StreamRecorder, ctx: *CliSinkCtx, passthrough: bool, filter: *streaming.TagFilter, think: *streaming.ThinkPassthroughFilter) streaming.Sink {
+    ctx.recorder = recorder;
+    if (passthrough) {
+        think.* = streaming.ThinkPassthroughFilter.init(ctx.rawSink());
+        think.filter.orphan_think_closer = .suppress;
+        ctx.sink = think.sink();
+    } else {
+        filter.* = streaming.TagFilter.init(ctx.rawSink());
+        filter.orphan_think_closer = .suppress;
+        ctx.sink = filter.sink();
+    }
+    return ctx.sink;
+}
+
+fn runCliDiff(comptime supports_streaming: bool, comptime passthrough: bool, text: []const u8, script: []const scripted.Response) !void {
+    const cfg = testConfig();
+    const no_tools = [_]Tool{};
+
+    var direct_obs = EventRecorder{};
+    var direct_provider = scripted.ScriptedProvider{ .responses = script };
+    var direct_sm = initManager(&cfg, &direct_provider, &no_tools, null, direct_obs.observer());
+    defer direct_sm.deinit();
+    const direct_session = try direct_sm.getOrCreate("cli:direct");
+
+    var direct_recorder = StreamRecorder{};
+    var direct_ctx = CliSinkCtx{ .recorder = &direct_recorder };
+    var direct_filter = streaming.TagFilter{};
+    var direct_think = streaming.ThinkPassthroughFilter{};
+    _ = cliSinkChain(&direct_recorder, &direct_ctx, passthrough, &direct_filter, &direct_think);
+    const direct_reply = try cliDirectTurn(&direct_session.agent, text, supports_streaming, &direct_ctx);
+    defer std.testing.allocator.free(direct_reply);
+
+    var ported_obs = EventRecorder{};
+    var ported_provider = scripted.ScriptedProvider{ .responses = script };
+    var ported_sm = initManager(&cfg, &ported_provider, &no_tools, null, ported_obs.observer());
+    defer ported_sm.deinit();
+    const ported_session = try ported_sm.getOrCreate("cli:ported");
+
+    var ported_recorder = StreamRecorder{};
+    var ported_ctx = CliSinkCtx{ .recorder = &ported_recorder };
+    var ported_filter = streaming.TagFilter{};
+    var ported_think = streaming.ThinkPassthroughFilter{};
+    _ = cliSinkChain(&ported_recorder, &ported_ctx, passthrough, &ported_filter, &ported_think);
+    const ported_reply = try cliPortedTurn(&ported_session.agent, text, supports_streaming, &ported_ctx);
+    defer std.testing.allocator.free(ported_reply);
+
+    // Observable output: reply, stream event sequence, history, call count.
+    try std.testing.expectEqualStrings(direct_reply, ported_reply);
+    try direct_recorder.sameAs(&ported_recorder);
+    try std.testing.expectEqual(direct_ctx.emitted_text, ported_ctx.emitted_text);
+    try expectSameHistory(&direct_session.agent, &ported_session.agent);
+    try std.testing.expectEqual(direct_provider.call_count, ported_provider.call_count);
+    try std.testing.expectEqual(direct_provider.call(0).message_count, ported_provider.call(0).message_count);
+
+    // Neither path may emit `agent_start` (the direct callers never did).
+    try std.testing.expectEqual(@as(usize, 0), direct_obs.agent_start);
+    try std.testing.expectEqual(@as(usize, 0), ported_obs.agent_start);
+    try std.testing.expect(direct_obs.total > 0);
+    try std.testing.expect(ported_obs.total > 0);
+
+    if (!supports_streaming) {
+        try std.testing.expectEqual(@as(usize, 0), ported_recorder.count);
+        try std.testing.expect(!ported_ctx.emitted_text);
+        try std.testing.expect(ported_session.agent.stream_callback == null);
+    }
+}
+
+test "differential: CLI streaming turn matches direct agent.turn" {
+    const script = [_]scripted.Response{
+        .{ .text = "streamed answer", .chunks = &.{ "streamed ", "answer" } },
+    };
+    try runCliDiff(true, false, "hello", &script);
+}
+
+test "differential: CLI turn without streaming support installs no callback" {
+    const script = [_]scripted.Response{
+        .{ .text = "plain answer", .chunks = &.{ "plain ", "answer" } },
+    };
+    try runCliDiff(false, false, "hello", &script);
+}
+
+test "differential: CLI reasoning passthrough turn matches direct agent.turn" {
+    const script = [_]scripted.Response{
+        .{ .text = "answer", .chunks = &.{ "<think>plan</think>", "answer" } },
+    };
+    try runCliDiff(true, true, "hello", &script);
+}
+
+test "differential: subagent bare turn matches direct agent.turn" {
+    const script = [_]scripted.Response{
+        .{ .text = "subagent answer" },
+    };
+    const cfg = testConfig();
+    const no_tools = [_]Tool{};
+
+    var direct_obs = EventRecorder{};
+    var direct_provider = scripted.ScriptedProvider{ .responses = &script };
+    var direct_sm = initManager(&cfg, &direct_provider, &no_tools, null, direct_obs.observer());
+    defer direct_sm.deinit();
+    const direct_session = try direct_sm.getOrCreate("subagent:direct");
+    const direct_reply = try direct_session.agent.turn("do the task");
+    defer std.testing.allocator.free(direct_reply);
+
+    var ported_obs = EventRecorder{};
+    var ported_provider = scripted.ScriptedProvider{ .responses = &script };
+    var ported_sm = initManager(&cfg, &ported_provider, &no_tools, null, ported_obs.observer());
+    defer ported_sm.deinit();
+    const ported_session = try ported_sm.getOrCreate("subagent:ported");
+    var adapter = NativeHarness.init(&ported_session.agent);
+    adapter.emit_start_event = false;
+    const ported_result = try adapter.harness().runTurn(.{ .user_message = "do the task" });
+    defer std.testing.allocator.free(ported_result.reply);
+
+    try std.testing.expectEqualStrings(direct_reply, ported_result.reply);
+    try std.testing.expectEqualStrings("subagent answer", ported_result.reply);
+    try expectSameHistory(&direct_session.agent, &ported_session.agent);
+    try std.testing.expectEqual(direct_provider.call_count, ported_provider.call_count);
+    try std.testing.expectEqual(direct_provider.call(0).message_count, ported_provider.call(0).message_count);
+
+    // Bare turn: no agent_start, no callback left installed, blocking path used.
+    try std.testing.expectEqual(@as(usize, 0), direct_obs.agent_start);
+    try std.testing.expectEqual(@as(usize, 0), ported_obs.agent_start);
+    try std.testing.expect(ported_session.agent.stream_callback == null);
+    try std.testing.expect(ported_session.agent.progress_callback == null);
+    try std.testing.expect(ported_session.agent.drain_injection_cb == null);
+}
+
 // ── Test 2b: a progress-only sink (the channel_loop/daemon shape) ────
 
 test "differential: a progress-only sink installs progress but not the stream" {
