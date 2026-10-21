@@ -1492,7 +1492,11 @@ pub fn parseDispatcherXmlToolCalls(
         var end_tag_len = if (strict_end != null) strict_end_tag_len else fallback_first_end_tag_len;
 
         if (found_end) |end| {
-            const before = std.mem.trim(u8, remaining[0..info.start], " \t\r\n");
+            // Regression: the bytes around a block were trimmed and re-joined
+            // with "\n", so the delivered reply differed from the streamed
+            // preview ("A<tool_call>{call}</tool_call>B" -> "A\nB" vs "AB")
+            // and the preview stopped being a byte prefix. Keep them verbatim.
+            const before = remaining[0..info.start];
             if (before.len > 0) {
                 try text_parts.append(allocator, before);
             }
@@ -1532,7 +1536,7 @@ pub fn parseDispatcherXmlToolCalls(
                 // names the marker had its text dropped from the reply, while
                 // the streaming preview and the batch strip kept it. Release
                 // the body here too; the block is still consumed.
-                const inner = std.mem.trim(u8, after_open[0..selected_end], " \t\r\n");
+                const inner = after_open[0..selected_end];
                 if (inner.len > 0) try text_parts.append(allocator, inner);
             }
             // A block is only a block the *display* must hide when the
@@ -1561,7 +1565,7 @@ pub fn parseDispatcherXmlToolCalls(
                             allocator.free(call.name);
                             allocator.free(call.arguments_json);
                         }
-                        const before = std.mem.trim(u8, remaining[0..info.start], " \t\r\n");
+                        const before = remaining[0..info.start];
                         if (before.len > 0) try text_parts.append(allocator, before);
                         try calls.append(allocator, call);
                         recovered = true;
@@ -1577,7 +1581,7 @@ pub fn parseDispatcherXmlToolCalls(
                             allocator.free(call.name);
                             allocator.free(call.arguments_json);
                         }
-                        const before = std.mem.trim(u8, remaining[0..info.start], " \t\r\n");
+                        const before = remaining[0..info.start];
                         if (before.len > 0) try text_parts.append(allocator, before);
                         try calls.append(allocator, call);
                         recovered = true;
@@ -1591,10 +1595,9 @@ pub fn parseDispatcherXmlToolCalls(
             if (!recovered) {
                 // Release the prose on both sides of the opener as separate
                 // parts; the marker itself is dropped by the text filter below.
-                const before = std.mem.trim(u8, remaining[0..info.start], " \t\r\n");
+                const before = remaining[0..info.start];
                 if (before.len > 0) try text_parts.append(allocator, before);
-                const unresolved = std.mem.trim(u8, after_open, " \t\r\n");
-                if (unresolved.len > 0) try text_parts.append(allocator, unresolved);
+                if (after_open.len > 0) try text_parts.append(allocator, after_open);
             }
 
             // Only a block the dispatcher would *execute* swallows the rest
@@ -1610,9 +1613,8 @@ pub fn parseDispatcherXmlToolCalls(
         }
     }
 
-    const trailing = std.mem.trim(u8, remaining, " \t\r\n");
-    if (trailing.len > 0) {
-        try text_parts.append(allocator, trailing);
+    if (remaining.len > 0) {
+        try text_parts.append(allocator, remaining);
     }
 
     // The text the dispatcher shows must never carry dispatcher markers: a
@@ -1620,12 +1622,18 @@ pub fn parseDispatcherXmlToolCalls(
     // opener is released as prose. The join is freed in its own scope so a
     // later failure cannot free it twice.
     const text = blk: {
+        // No separator: the parts are contiguous slices of `response`, so the
+        // visible text is exactly the original bytes minus the blocks.
         const joined = if (text_parts.items.len == 0)
             try allocator.dupe(u8, "")
         else
-            try std.mem.join(allocator, "\n", text_parts.items);
+            try std.mem.join(allocator, "", text_parts.items);
         defer allocator.free(joined);
-        break :blk try stripDispatcherMarkerTokens(allocator, joined);
+        // Only the ends are trimmed (the draft presenters trim the live preview
+        // the same way); interior bytes stay verbatim so the reply keeps the
+        // preview's bytes.
+        const trimmed = std.mem.trim(u8, joined, " \t\r\n");
+        break :blk try stripDispatcherMarkerTokens(allocator, trimmed);
     };
     errdefer allocator.free(text);
 
@@ -3703,7 +3711,35 @@ test "parseDispatcherXmlToolCalls keeps the prose of an unclosed trailing opener
         a.free(parsed.blocks);
     }
     try std.testing.expectEqual(@as(usize, 1), parsed.calls.len);
-    try std.testing.expectEqualStrings("Q1\nQ2\nunclosed prose", parsed.text);
+    // Regression: parts were trimmed and re-joined with "\n", so the reply
+    // differed from the streamed preview. The visible text is now the original
+    // bytes minus the marker.
+    try std.testing.expectEqualStrings("Q1Q2unclosed prose", parsed.text);
+}
+
+test "parseDispatcherXmlToolCalls keeps the bytes around a call verbatim" {
+    // Regression: the text around a well-formed closed call was trimmed and
+    // re-joined with "\n", so `A<tool_call>{call}</tool_call>B` parsed to
+    // "A\nB" while the streamed preview showed "AB" - the preview stopped
+    // being a byte prefix of the reply. An inline mention gained a newline too.
+    const a = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "A<tool_call>{\"name\":\"probe\",\"arguments\":{}}</tool_call>B", "AB" },
+        .{ "Use <tool_call> to call a tool.", "Use  to call a tool." },
+    };
+    for (cases) |case| {
+        const parsed = try parseDispatcherXmlToolCalls(a, case[0]);
+        defer {
+            a.free(parsed.text);
+            for (parsed.calls) |call| {
+                a.free(call.name);
+                a.free(call.arguments_json);
+            }
+            a.free(parsed.calls);
+            a.free(parsed.blocks);
+        }
+        try std.testing.expectEqualStrings(case[1], parsed.text);
+    }
 }
 
 test "parseDispatcherXmlToolCalls keeps the body of a closed non-call block" {

@@ -14745,6 +14745,52 @@ test "Agent /stop reply keeps the interim text the preview already showed" {
     try std.testing.expect(std.mem.indexOf(u8, last_msg.content, "正在查询数据库。") != null);
 }
 
+test "Agent XML-path reply keeps the streamed preview as a byte prefix" {
+    // Regression: on the XML path the shared parse trimmed the text around a
+    // closed call and joined the parts with "\n", so the reply was
+    // "A\nB\n\nC" while the preview showed "AB\n\nC": the preview was not a
+    // prefix of the reply.
+    const allocator = std.testing.allocator;
+    const scripts = [_]StreamTurnScript{
+        .{ .text = "A<tool_call>{\"name\":\"probe\",\"arguments\":{}}</tool_call>B", .tool_call = true },
+        .{ .text = "C" },
+    };
+    var state = ScriptedStreamProvider{ .scripts = &scripts };
+    const provider = scriptedStreamProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    // The preview the user sees is the TagFilter output, as on every channel.
+    const streaming_mod = @import("../streaming.zig");
+    const Collector = struct {
+        text: std.ArrayListUnmanaged(u8) = .empty,
+        fn callback(ctx: *anyopaque, event: streaming_mod.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (event.stage == .final) return;
+            self.text.appendSlice(std.testing.allocator, event.text) catch {};
+        }
+    };
+    var capture = Collector{};
+    defer capture.text.deinit(allocator);
+    var filter = streaming_mod.TagFilter.init(.{ .callback = Collector.callback, .ctx = @ptrCast(&capture) });
+    var sink = filter.sink();
+    const Adapter = struct {
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            streaming_mod.forwardProviderChunk(@as(*streaming_mod.Sink, @ptrCast(@alignCast(ctx))).*, chunk);
+        }
+    };
+    agent.stream_callback = Adapter.onChunk;
+    agent.stream_ctx = @ptrCast(&sink);
+
+    const response = try agent.turn("继续");
+    defer allocator.free(response);
+    sink.emitFinal();
+
+    try std.testing.expectEqualStrings("AB\n\nC", response);
+    try std.testing.expect(std.mem.startsWith(u8, response, capture.text.items));
+}
+
 test "Agent turn keeps the body of a closed non-call tool_call block" {
     // Regression: a closed <tool_call> block whose body was prose (not a call)
     // was consumed whole, so the reply and history lost the text the streaming
@@ -14805,7 +14851,7 @@ test "Agent turn hides an unclosed tool opener after a valid text tool call" {
     defer allocator.free(response);
 
     try std.testing.expectEqual(@as(usize, 2), state.idx);
-    try std.testing.expectEqualStrings("准备中\n继续\n未闭合的散文\n\n查询完成。", response);
+    try std.testing.expectEqualStrings("准备中继续未闭合的散文\n\n查询完成。", response);
     try std.testing.expect(!containsAnyToolCallMarker(response));
     try std.testing.expect(std.mem.indexOf(u8, response, "未闭合的散文") != null);
 
@@ -14832,7 +14878,7 @@ test "Agent turn hides a stray tool-call closer after a valid text tool call" {
     const response = try agent.turn("查数据");
     defer allocator.free(response);
 
-    try std.testing.expectEqualStrings("准备中\n继续\n\n查询完成。", response);
+    try std.testing.expectEqualStrings("准备中继续\n\n查询完成。", response);
     try std.testing.expect(!containsAnyToolCallMarker(response));
     try std.testing.expect(std.mem.indexOf(u8, response, "继续") != null);
 
