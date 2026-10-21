@@ -1,9 +1,10 @@
 //! The dsh adapter: `Harness` implemented over the dsh web sidecar.
 //!
 //! P1 scope (see .scratch/dsh-sidecar-design.md §4): spawn one sidecar, capture
-//! the owner cookie, keep one WS stream per process, map junclaw session keys to
-//! dsh session ids, stream assistant text as `Event.delta`, answer `/stop` with
-//! `session/cancel` and `/new` with a fresh dsh session.
+//! the owner cookie, serve many junclaw session keys side by side on it (one dsh
+//! session and one WS stream per key), stream assistant text as `Event.delta`,
+//! answer `/stop` with `session/cancel` and `/new` with a fresh dsh session for
+//! that key only.
 //!
 //! P1 explicitly omits the P2 surface: approvals, user questions, steer
 //! injection and the approval/question UI. `approval/request` frames are
@@ -34,10 +35,10 @@ const stop_ack = "No active background task to stop.";
 /// Same text `Agent.handleSlashCommand("/new")` returns.
 const new_session_ack = "Session cleared.";
 
-/// `Harness` over one dsh web sidecar.
+/// `Harness` over one dsh web sidecar, shared by every junclaw session key.
 ///
 /// Options slices are borrowed for the harness lifetime (the same contract as
-/// `sidecar.Options`); `session_file` is read at init and rewritten on create.
+/// `sidecar.Options`); each key's mapping is read on that key's first turn.
 pub const DshHarness = struct {
     const Self = @This();
 
@@ -47,13 +48,37 @@ pub const DshHarness = struct {
         /// Use this launch URL instead of spawning a process (tests, or an
         /// externally managed sidecar). The owner-cookie exchange still runs.
         boot_url: ?[]const u8 = null,
-        /// Persist `{"sessionId":…}` here so a new process resumes the session.
-        /// Null disables cross-process resume.
+        /// Persist one mapping per key next to this path as
+        /// `{dir}/{Wyhash(key)}.json` (the layout `startDshHarness` uses), so a
+        /// new process resumes each key's session. Null disables resume.
         session_file: ?[]const u8 = null,
         /// Hang guard for one turn waiting on a terminal `turn/end`.
         turn_timeout_ms: u64 = 30_000,
         /// Hang guard for `/stop` waiting on dsh's aborted `turn/end`.
         cancel_timeout_ms: u64 = 10_000,
+    };
+
+    /// One junclaw key's dsh session. The client's WS lives as long as the
+    /// entry, so switching keys is a lookup, never a reconnect.
+    /// shortcut: one WS per dsh session instead of the design's single
+    /// multiplexed remote.mux stream, upgrade when the key count grows.
+    const Entry = struct {
+        key: []u8,
+        /// This key's persisted mapping path; null when resume is disabled.
+        session_file: ?[]u8 = null,
+        client: DshClient,
+        session_id: []u8,
+        /// dsh is single-flight per session: a second turn on this key waits
+        /// here and runs as the next queued prompt (P1: no steer injection).
+        turn_mutex: std_compat.sync.Mutex = .{},
+        interrupt_requested: std.atomic.Value(bool) = .init(false),
+
+        fn deinit(self: *Entry, allocator: Allocator) void {
+            self.client.deinit();
+            allocator.free(self.key);
+            if (self.session_file) |path| allocator.free(path);
+            allocator.free(self.session_id);
+        }
     };
 
     allocator: Allocator,
@@ -62,23 +87,16 @@ pub const DshHarness = struct {
     /// P1 has no auto-restart loop: a dead sidecar surfaces as an error from the
     /// next RPC. `sidecar.restart`/`backoffDelayMs` are ready for the P2 loop.
     sidecar: ?sidecar_mod.Sidecar = null,
-    client: DshClient,
-    client_live: bool = true,
-    connected: bool = false,
-    /// Owned copies: rebuilding the client after `/new` needs them.
+    /// Owned copies: each entry's client is built from them.
     base_url: []u8,
     cookie: []u8,
-    /// Current dsh session; null until created or loaded from `session_file`.
-    session_id: ?[]u8 = null,
-    /// junclaw key the current dsh session belongs to; null for a resumed id
-    /// adopted by the first turn.
-    current_key: ?[]u8 = null,
+    /// One live dsh session per junclaw key, all on this one sidecar.
+    entries: std.ArrayListUnmanaged(*Entry) = .empty,
+    /// Guards `entries`; entries live until deinit, so their pointers are
+    /// stable outside this lock.
+    entries_mutex: std_compat.sync.Mutex = .{},
     /// Host-set before a turn, exactly like NativeHarness.session_key.
     session_key: []const u8 = "",
-    /// dsh is single-flight per session: a second turn waits here and runs as
-    /// the next queued prompt (P1: no steer injection).
-    turn_mutex: std_compat.sync.Mutex = .{},
-    interrupt_requested: std.atomic.Value(bool) = .init(false),
 
     pub fn init(allocator: Allocator, opts: Options) !DshHarness {
         var spawned: ?sidecar_mod.Sidecar = null;
@@ -98,13 +116,10 @@ pub const DshHarness = struct {
         const endpoint = try client_mod.parseBootEndpoint(boot_url);
         base_url = try allocator.dupe(u8, endpoint.base_url);
 
-        const dsh_client = try DshClient.init(allocator, base_url.?, cookie.?);
-
-        var self = DshHarness{
+        const self = DshHarness{
             .allocator = allocator,
             .opts = opts,
             .sidecar = spawned,
-            .client = dsh_client,
             .base_url = base_url.?,
             .cookie = cookie.?,
         };
@@ -112,33 +127,21 @@ pub const DshHarness = struct {
         spawned = null;
         cookie = null;
         base_url = null;
-        errdefer self.deinit();
-
-        if (opts.session_file) |path| {
-            // A corrupt mapping falls back to a fresh session (design §2.2).
-            const persisted = sidecar_mod.loadSessionId(allocator, path) catch null;
-            if (persisted) |session_id| {
-                errdefer allocator.free(session_id);
-                try self.client.connect(session_id);
-                self.connected = true;
-                self.session_id = session_id;
-            }
-        }
         return self;
     }
 
-    /// Release the client, the sidecar process and every owned slice; does not
-    /// destroy `self` (the vtable deinit does that for host-owned instances).
+    /// Release every key's client, the sidecar process and all owned slices;
+    /// does not destroy `self` (the vtable deinit does that for host-owned
+    /// instances).
     pub fn deinit(self: *Self) void {
-        if (self.client_live) {
-            self.client.deinit();
-            self.client_live = false;
+        for (self.entries.items) |entry| {
+            entry.deinit(self.allocator);
+            self.allocator.destroy(entry);
         }
+        self.entries.deinit(self.allocator);
         if (self.sidecar) |*sidecar| sidecar.deinit();
         self.allocator.free(self.base_url);
         self.allocator.free(self.cookie);
-        if (self.session_id) |session_id| self.allocator.free(session_id);
-        if (self.current_key) |key| self.allocator.free(key);
     }
 
     pub fn harness(self: *Self) port.Harness {
@@ -149,64 +152,118 @@ pub const DshHarness = struct {
     /// checks this before pre-routing a local command: a pre-turn /stop must
     /// abort that command the way native's `Agent.turn` check does.
     pub fn interruptPending(self: *Self) bool {
-        return self.interrupt_requested.load(.acquire);
+        self.entries_mutex.lock();
+        defer self.entries_mutex.unlock();
+        const entry = self.findEntry(self.session_key) orelse return false;
+        return entry.interrupt_requested.load(.acquire);
     }
 
     // ── session mapping ─────────────────────────────────────────────────────
 
-    /// Junclaw key → dsh session id. The first turn after a restart adopts the
-    /// persisted id; later turns reuse it; a different key gets a fresh session
-    /// (P1 keeps one session per sidecar; multi-key routing is T4's selection).
-    fn ensureSession(self: *Self) !void {
-        if (self.session_id) |session_id| {
-            if (self.current_key) |key| {
-                if (std.mem.eql(u8, key, self.session_key)) {
-                    if (!self.connected) try self.reconnect(session_id);
-                    return;
-                }
-            } else {
-                if (!self.connected) try self.reconnect(session_id);
-                try self.setCurrentKey(self.session_key);
-                return;
+    /// Per-key mapping path: `{dir}/{Wyhash(key)}.json`, the file
+    /// `startDshHarness` names for its key. Caller frees; null disables resume.
+    fn sessionFilePath(self: *const Self, allocator: Allocator, key: []const u8) !?[]u8 {
+        const base = self.opts.session_file orelse return null;
+        const dir = std_compat.fs.path.dirname(base) orelse ".";
+        return try std.fmt.allocPrint(allocator, "{s}/{x}.json", .{
+            dir,
+            std.hash.Wyhash.hash(0, key),
+        });
+    }
+
+    /// Caller holds `entries_mutex`.
+    fn findEntry(self: *Self, key: []const u8) ?*Entry {
+        for (self.entries.items) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) return entry;
+        }
+        return null;
+    }
+
+    /// Get-or-create this key's entry: adopt the persisted id via
+    /// `session/follow`, else `session/create` and rewrite its mapping file.
+    /// Other keys' entries are never touched. Caller holds `entries_mutex`.
+    fn ensureEntry(self: *Self) !*Entry {
+        if (self.findEntry(self.session_key)) |entry| return entry;
+        return self.createEntry(true);
+    }
+
+    /// Build this key's entry. `adopt` resumes the persisted id instead of
+    /// creating a session. Caller holds `entries_mutex`.
+    fn createEntry(self: *Self, adopt: bool) !*Entry {
+        const key = self.session_key;
+
+        const mapping = try self.sessionFilePath(self.allocator, key);
+        errdefer if (mapping) |path| self.allocator.free(path);
+
+        var client = try DshClient.init(self.allocator, self.base_url, self.cookie);
+        errdefer client.deinit();
+
+        // A corrupt mapping falls back to a fresh session (design §2.2); an id
+        // dsh no longer knows surfaces as an error from this turn.
+        var persisted: ?[]u8 = null;
+        if (adopt) {
+            if (mapping) |path| {
+                persisted = sidecar_mod.loadSessionId(self.allocator, path) catch null;
             }
-            try self.startFreshSession();
+        }
+        defer if (persisted) |session_id| self.allocator.free(session_id);
+
+        var session_id: []u8 = undefined;
+        if (persisted) |id| {
+            try client.connect(id);
+            session_id = try self.allocator.dupe(u8, id);
+        } else {
+            session_id = try client.createSession(self.opts.sidecar.workspace);
+            errdefer self.allocator.free(session_id);
+            if (mapping) |path| try sidecar_mod.saveSessionId(path, session_id);
+            try client.connect(session_id);
+        }
+        errdefer self.allocator.free(session_id);
+
+        const entry_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(entry_key);
+        const entry = try self.allocator.create(Entry);
+        errdefer self.allocator.destroy(entry);
+        entry.* = .{
+            .key = entry_key,
+            .session_file = mapping,
+            .client = client,
+            .session_id = session_id,
+        };
+        try self.entries.append(self.allocator, entry);
+        return entry;
+    }
+
+    /// `/new`: close and replace only this key's session, rewriting this key's
+    /// mapping. Other keys keep their client and session untouched.
+    fn resetKeySession(self: *Self) !void {
+        self.entries_mutex.lock();
+        const maybe_entry = self.findEntry(self.session_key);
+        if (maybe_entry == null) {
+            defer self.entries_mutex.unlock();
+            _ = try self.createEntry(false);
             return;
         }
-        try self.startFreshSession();
-    }
+        const entry = maybe_entry.?;
+        self.entries_mutex.unlock();
+        // Serialize with this key's active turn before swapping its client.
+        entry.turn_mutex.lock();
+        defer entry.turn_mutex.unlock();
 
-    /// `/new` and key switches: close the old session, create and persist a new
-    /// one, then point the client's WS at it.
-    fn startFreshSession(self: *Self) !void {
-        if (self.session_id) |old| {
-            if (self.connected) self.client.closeSession(old) catch {};
-        }
-        const session_id = try self.client.createSession(self.opts.sidecar.workspace);
+        // Build the replacement before touching the old session, so a failed
+        // create/connect leaves the key on its current session.
+        var client = try DshClient.init(self.allocator, self.base_url, self.cookie);
+        errdefer client.deinit();
+        const session_id = try client.createSession(self.opts.sidecar.workspace);
         errdefer self.allocator.free(session_id);
-        if (self.opts.session_file) |path| try sidecar_mod.saveSessionId(path, session_id);
-        try self.reconnect(session_id);
-        try self.setCurrentKey(self.session_key);
-        if (self.session_id) |old| self.allocator.free(old);
-        self.session_id = session_id;
-    }
+        if (entry.session_file) |path| try sidecar_mod.saveSessionId(path, session_id);
+        try client.connect(session_id);
 
-    fn setCurrentKey(self: *Self, key: []const u8) !void {
-        if (self.current_key) |old| {
-            self.allocator.free(old);
-            self.current_key = null;
-        }
-        self.current_key = try self.allocator.dupe(u8, key);
-    }
-
-    /// One DshClient speaks one session, so a session swap is a reconnect.
-    fn reconnect(self: *Self, session_id: []const u8) !void {
-        self.client.deinit();
-        self.client_live = false;
-        self.connected = false;
-        self.client = try DshClient.init(self.allocator, self.base_url, self.cookie);
-        self.client_live = true;
-        try self.client.connect(session_id);
-        self.connected = true;
+        entry.client.closeSession(entry.session_id) catch {};
+        entry.client.deinit();
+        self.allocator.free(entry.session_id);
+        entry.client = client;
+        entry.session_id = session_id;
     }
 
     // ── vtable ──────────────────────────────────────────────────────────────
@@ -214,20 +271,27 @@ pub const DshHarness = struct {
     fn runTurn(ptr: *anyopaque, input: port.TurnInput) anyerror!port.TurnResult {
         const self: *Self = @ptrCast(@alignCast(ptr));
 
-        self.turn_mutex.lock();
-        defer self.turn_mutex.unlock();
+        self.entries_mutex.lock();
+        const entry = self.ensureEntry() catch |err| {
+            self.entries_mutex.unlock();
+            return err;
+        };
+        self.entries_mutex.unlock();
+        // Entries live until deinit, so the pointer stays valid while this
+        // key's turn runs and other keys' turns come and go.
+        entry.turn_mutex.lock();
+        defer entry.turn_mutex.unlock();
 
         // A stop that landed before the prompt still cancels this turn, so a
         // pre-turn requestInterrupt behaves like native's.
-        if (self.interrupt_requested.swap(false, .acquire)) {
+        if (entry.interrupt_requested.swap(false, .acquire)) {
             return .{ .reply = try self.allocator.dupe(u8, ""), .end_reason = .interrupted };
         }
 
-        try self.ensureSession();
-        const session_id = self.session_id.?;
+        const session_id = entry.session_id;
         const sink = input.sink;
 
-        try self.client.prompt(session_id, input.user_message);
+        try entry.client.prompt(session_id, input.user_message);
 
         var text: std.ArrayListUnmanaged(u8) = .empty;
         errdefer text.deinit(self.allocator);
@@ -235,11 +299,11 @@ pub const DshHarness = struct {
         const deadline = std_compat.time.milliTimestamp() +
             @as(i64, @intCast(self.opts.turn_timeout_ms));
         while (true) {
-            if (self.interrupt_requested.swap(false, .acquire)) {
+            if (entry.interrupt_requested.swap(false, .acquire)) {
                 // session/cancel is sent from this thread: the Shared event
                 // queue has exactly one consumer, and cancel() consumes it
                 // while waiting for the aborted turn/end.
-                var cancelled = self.client.cancel(session_id, self.opts.cancel_timeout_ms) catch |err| switch (err) {
+                var cancelled = entry.client.cancel(session_id, self.opts.cancel_timeout_ms) catch |err| switch (err) {
                     // The turn may have ended between the flag and the RPC; the
                     // partial text is still the best reply we have.
                     error.CancelTimeout => return .{
@@ -266,7 +330,7 @@ pub const DshHarness = struct {
             const remaining = deadline - std_compat.time.milliTimestamp();
             if (remaining <= 0) return error.TurnTimeout;
 
-            var event = self.client.nextEvent(@min(@as(u64, @intCast(remaining)), poll_slice_ms)) catch |err| switch (err) {
+            var event = entry.client.nextEvent(@min(@as(u64, @intCast(remaining)), poll_slice_ms)) catch |err| switch (err) {
                 error.Timeout => continue,
                 else => return err,
             };
@@ -325,12 +389,18 @@ pub const DshHarness = struct {
 
     fn requestInterrupt(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.interrupt_requested.store(true, .release);
+        self.entries_mutex.lock();
+        defer self.entries_mutex.unlock();
+        const entry = self.findEntry(self.session_key) orelse return;
+        entry.interrupt_requested.store(true, .release);
     }
 
     fn clearInterrupt(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
-        self.interrupt_requested.store(false, .release);
+        self.entries_mutex.lock();
+        defer self.entries_mutex.unlock();
+        const entry = self.findEntry(self.session_key) orelse return;
+        entry.interrupt_requested.store(false, .release);
     }
 
     fn activeToolName(ptr: *anyopaque, allocator: Allocator) anyerror!?[]u8 {
@@ -376,25 +446,25 @@ pub const DshHarness = struct {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const command = std.mem.trim(u8, content, " \t\r\n");
         if (std.mem.eql(u8, command, "/stop") or std.mem.eql(u8, command, "/abort")) {
-            // Do NOT wait on turn_mutex: an active turn owns it, and that
-            // turn's loop sends session/cancel and returns the partial text.
-            // An idle stop only acks, like native: arming it here would cancel
-            // the next prompt (tryLock succeeds only between turns).
-            if (self.turn_mutex.tryLock()) {
-                self.turn_mutex.unlock();
+            // Do NOT wait on the key's turn mutex: an active turn owns it, and
+            // that turn's loop sends session/cancel and returns the partial
+            // text. An idle stop only acks, like native: arming it here would
+            // cancel the next prompt (tryLock succeeds only between turns).
+            self.entries_mutex.lock();
+            defer self.entries_mutex.unlock();
+            const entry = self.findEntry(self.session_key) orelse return stop_ack;
+            if (entry.turn_mutex.tryLock()) {
+                entry.turn_mutex.unlock();
                 return stop_ack;
             }
-            self.interrupt_requested.store(true, .release);
+            entry.interrupt_requested.store(true, .release);
             return stop_ack;
         }
         if (std.mem.eql(u8, command, "/new") or
             std.mem.eql(u8, command, "/reset") or
             std.mem.eql(u8, command, "/clear"))
         {
-            // Between turns: serialize with runTurn before swapping the client.
-            self.turn_mutex.lock();
-            defer self.turn_mutex.unlock();
-            try self.startFreshSession();
+            try self.resetKeySession();
             return new_session_ack;
         }
         return null;

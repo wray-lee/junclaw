@@ -56,6 +56,12 @@ const follow_records = [_]struct { seq: u64, json: []const u8 }{
     .{ .seq = 3, .json = "{\"seq\":3,\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"reason\":{\"kind\":\"completed\"}}}}" },
 };
 
+/// One upgraded WS connection, bound to the dsh session its follow stream named.
+const WsConn = struct {
+    stream: std_compat.net.Stream,
+    session: []u8,
+};
+
 pub const MockDsh = struct {
     allocator: Allocator,
     server: std_compat.net.Server,
@@ -66,7 +72,10 @@ pub const MockDsh = struct {
     turn_frames: std.ArrayListUnmanaged([]u8) = .empty,
     /// Frames streamed by `session/cancel` before the aborted `turn/end`.
     cancel_frames: std.ArrayListUnmanaged([]u8) = .empty,
-    ws: ?std_compat.net.Stream = null,
+    /// Each harness client opens one WS; frames go to the session's latest one.
+    ws_conns: std.ArrayListUnmanaged(WsConn) = .empty,
+    /// Session ids the harness sent `session/close` for.
+    closed_sessions: std.ArrayListUnmanaged([]u8) = .empty,
     /// Harness-test observability; guarded by `mutex`.
     create_count: u32 = 0,
     prompt_count: u32 = 0,
@@ -94,7 +103,13 @@ pub const MockDsh = struct {
         } else |_| {}
         if (self.thread) |thread| thread.join();
         self.server.deinit();
-        if (self.ws) |stream| stream.close();
+        for (self.ws_conns.items) |conn| {
+            conn.stream.close();
+            self.allocator.free(conn.session);
+        }
+        self.ws_conns.deinit(self.allocator);
+        for (self.closed_sessions.items) |session| self.allocator.free(session);
+        self.closed_sessions.deinit(self.allocator);
         if (self.last_prompt_session) |session| self.allocator.free(session);
         clearFrames(self.allocator, &self.turn_frames);
         self.turn_frames.deinit(self.allocator);
@@ -159,8 +174,15 @@ pub const MockDsh = struct {
 
         if (std.mem.startsWith(u8, request.target, "/api/remote.mux")) {
             self.upgrade(stream, request.head) catch return;
+            // The harness sends its `session/follow` open as the first frame;
+            // bind this connection to that session for prompt/cancel routing.
+            const session = readFollowSession(self.allocator, stream) catch return;
             self.mutex.lock();
-            self.ws = stream;
+            self.ws_conns.append(self.allocator, .{ .stream = stream, .session = session }) catch {
+                self.mutex.unlock();
+                self.allocator.free(session);
+                return;
+            };
             self.ws_connections += 1;
             self.mutex.unlock();
             keep_open = true;
@@ -206,8 +228,10 @@ pub const MockDsh = struct {
 
         // Record before the reply: the client may return as soon as it reads it.
         const is_prompt = std.mem.eql(u8, method, "session/prompt");
+        const is_cancel = std.mem.eql(u8, method, "session/cancel");
         if (is_prompt) self.recordPrompt(body);
-        if (std.mem.eql(u8, method, "session/cancel")) self.recordCancel();
+        if (is_cancel) self.recordCancel();
+        if (std.mem.eql(u8, method, "session/close")) self.recordClose(body);
 
         const response = try std.fmt.allocPrint(
             self.allocator,
@@ -218,9 +242,13 @@ pub const MockDsh = struct {
 
         try writeHttp(stream, "200 OK", "Content-Type: application/json\r\n", response);
         if (is_prompt) {
-            try self.sendTurnFrames();
-        } else if (std.mem.eql(u8, method, "session/cancel")) {
-            try self.sendCancelFrames();
+            const session = requestSessionId(self.allocator, body) orelse return;
+            defer self.allocator.free(session);
+            try self.sendTurnFrames(session);
+        } else if (is_cancel) {
+            const session = requestSessionId(self.allocator, body) orelse return;
+            defer self.allocator.free(session);
+            try self.sendCancelFrames(session);
         }
     }
 
@@ -249,6 +277,13 @@ pub const MockDsh = struct {
         self.cancel_count += 1;
     }
 
+    fn recordClose(self: *MockDsh, body: []const u8) void {
+        const session = requestSessionId(self.allocator, body) orelse return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.closed_sessions.append(self.allocator, session) catch self.allocator.free(session);
+    }
+
     pub fn createCount(self: *MockDsh) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -273,6 +308,21 @@ pub const MockDsh = struct {
         return self.ws_connections;
     }
 
+    pub fn closeCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return @intCast(self.closed_sessions.items.len);
+    }
+
+    pub fn wasClosed(self: *MockDsh, session: []const u8) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.closed_sessions.items) |closed| {
+            if (std.mem.eql(u8, closed, session)) return true;
+        }
+        return false;
+    }
+
     /// Caller frees. Null before any prompt.
     pub fn lastPromptSession(self: *MockDsh, allocator: Allocator) !?[]u8 {
         self.mutex.lock();
@@ -280,18 +330,31 @@ pub const MockDsh = struct {
         return if (self.last_prompt_session) |session| try allocator.dupe(u8, session) else null;
     }
 
-    fn sendTurnFrames(self: *MockDsh) !void {
+    /// Newest connection bound to `session`: a resumed process opens a fresh
+    /// WS for an id that an earlier harness instance also used. Caller holds
+    /// `mutex`.
+    fn wsForSessionLocked(self: *MockDsh, session: []const u8) ?std_compat.net.Stream {
+        var index = self.ws_conns.items.len;
+        while (index > 0) {
+            index -= 1;
+            const conn = self.ws_conns.items[index];
+            if (std.mem.eql(u8, conn.session, session)) return conn.stream;
+        }
+        return null;
+    }
+
+    fn sendTurnFrames(self: *MockDsh, session: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ws = self.ws orelse return;
+        const ws = self.wsForSessionLocked(session) orelse return;
         for (self.turn_frames.items) |frame| try writeTextFrame(ws, frame);
     }
 
     /// A cancelled turn commits its delivered prefix before the terminal frame.
-    fn sendCancelFrames(self: *MockDsh) !void {
+    fn sendCancelFrames(self: *MockDsh, session: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ws = self.ws orelse return;
+        const ws = self.wsForSessionLocked(session) orelse return;
         for (self.cancel_frames.items) |frame| try writeTextFrame(ws, frame);
         try writeTextFrame(ws, turn_aborted_frame);
     }
@@ -457,6 +520,51 @@ fn writeHttp(
     );
     try stream.writeAll(text);
     try stream.writeAll(body);
+}
+
+/// Read the first client text frame (the harness's `session/follow` open) and
+/// return the session id it names. Client frames are masked (RFC 6455 §5.3).
+fn readFollowSession(allocator: Allocator, stream: std_compat.net.Stream) ![]u8 {
+    var header: [2]u8 = undefined;
+    try readExact(stream, &header);
+    if ((header[0] & 0x0f) != 0x01) return error.NotTextFrame;
+    const masked = (header[1] & 0x80) != 0;
+    var length: u64 = header[1] & 0x7f;
+    if (length == 126) {
+        var ext: [2]u8 = undefined;
+        try readExact(stream, &ext);
+        length = std.mem.readInt(u16, &ext, .big);
+    } else if (length == 127) {
+        var ext: [8]u8 = undefined;
+        try readExact(stream, &ext);
+        length = std.mem.readInt(u64, &ext, .big);
+    }
+    if (length > 64 * 1024) return error.MessageTooLarge;
+    var mask: [4]u8 = .{ 0, 0, 0, 0 };
+    if (masked) try readExact(stream, &mask);
+    const payload = try allocator.alloc(u8, @intCast(length));
+    defer allocator.free(payload);
+    try readExact(stream, payload);
+    if (masked) {
+        for (payload, 0..) |*byte, index| byte.* ^= mask[index % 4];
+    }
+
+    // Test-only frames come from `protocol.buildFollowOpen`; a plain search is
+    // enough for its flat `"sessionId":"<id>"` field.
+    const marker = "\"sessionId\":\"";
+    const start = (std.mem.indexOf(u8, payload, marker) orelse return error.NoSessionId) +
+        marker.len;
+    const end = std.mem.indexOfScalarPos(u8, payload, start, '"') orelse return error.NoSessionId;
+    return try allocator.dupe(u8, payload[start..end]);
+}
+
+fn readExact(stream: std_compat.net.Stream, buffer: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buffer.len) {
+        const n = try stream.read(buffer[offset..]);
+        if (n == 0) return error.ConnectionClosed;
+        offset += n;
+    }
 }
 
 /// Server-to-client frame: FIN + text, no mask (RFC 6455 §5.1).

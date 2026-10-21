@@ -43,6 +43,21 @@ fn tempSessionFile(allocator: Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     return std.fs.path.join(allocator, &.{ dir, "session.json" });
 }
 
+/// The per-key mapping path the harness derives (`{dir}/{Wyhash(key)}.json`).
+fn keySessionFile(allocator: Allocator, base_file: []const u8, key: []const u8) ![]u8 {
+    const dir = std_compat.fs.path.dirname(base_file) orelse ".";
+    return std.fmt.allocPrint(allocator, "{s}/{x}.json", .{
+        dir,
+        std.hash.Wyhash.hash(0, key),
+    });
+}
+
+/// Run one turn for `key`, the way the host sets `session_key` first.
+fn turnKey(h: *DshHarness, key: []const u8, message: []const u8) !port.TurnResult {
+    h.session_key = key;
+    return h.harness().runTurn(.{ .user_message = message });
+}
+
 fn endFrame(allocator: Allocator, kind: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
@@ -151,7 +166,7 @@ fn waitForPrompt(mock: *MockDsh, at_least: u32) void {
     }
 }
 
-test "dsh harness boots the sidecar contract and connects" {
+test "dsh harness adopts a persisted session on the key's first turn" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const mock = try MockDsh.init(allocator);
@@ -161,7 +176,9 @@ test "dsh harness boots the sidecar contract and connects" {
     defer tmp.cleanup();
     const session_file = try tempSessionFile(allocator, &tmp);
     defer allocator.free(session_file);
-    try sidecar_mod.saveSessionId(session_file, mock_mod.session_id);
+    const mapping = try keySessionFile(allocator, session_file, "test-key");
+    defer allocator.free(mapping);
+    try sidecar_mod.saveSessionId(mapping, mock_mod.session_id);
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
@@ -169,9 +186,18 @@ test "dsh harness boots the sidecar contract and connects" {
     var h = try newHarness(allocator, boot_url, session_file);
     defer h.deinit();
 
-    // The owner-cookie exchange happened and session/follow opened the WS.
-    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    // Adoption is lazy: no WS until the key's first turn.
+    try std.testing.expectEqual(@as(u32, 0), mock.wsConnections());
+
+    try setTurnFrames(mock, allocator, &.{"resumed"}, "completed");
+    const result = try turnKey(&h, "test-key", "hi");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("resumed", result.reply);
     try std.testing.expectEqual(@as(u32, 0), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    const prompted = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(prompted);
+    try std.testing.expectEqualStrings(mock_mod.session_id, prompted);
 }
 
 test "dsh harness streams ordered deltas and completes" {
@@ -422,7 +448,7 @@ test "dsh idle /stop acks without cancelling the next turn" {
     try std.testing.expectEqual(@as(u32, 0), mock.cancelCount());
 }
 
-test "dsh /new starts a fresh dsh session" {
+test "dsh /new starts a fresh dsh session for its key" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
     const mock = try MockDsh.init(allocator);
@@ -432,6 +458,8 @@ test "dsh /new starts a fresh dsh session" {
     defer tmp.cleanup();
     const session_file = try tempSessionFile(allocator, &tmp);
     defer allocator.free(session_file);
+    const mapping = try keySessionFile(allocator, session_file, "test-key");
+    defer allocator.free(mapping);
 
     const boot_url = try bootUrl(allocator, mock);
     defer allocator.free(boot_url);
@@ -439,28 +467,30 @@ test "dsh /new starts a fresh dsh session" {
     defer h.deinit();
 
     try setTurnFrames(mock, allocator, &.{"first"}, "completed");
-    const first = try h.harness().runTurn(.{ .user_message = "one" });
+    const first = try turnKey(&h, "test-key", "one");
     defer allocator.free(first.reply);
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
 
+    // /new closes this key's session and eagerly creates its replacement, the
+    // same single-key behavior the host already expects.
     const ack = try h.harness().handleLocalCommand("/new");
     try std.testing.expectEqualStrings("Session cleared.", ack.?);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
-    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
-
-    const persisted = (try sidecar_mod.loadSessionId(allocator, session_file)).?;
-    defer allocator.free(persisted);
-    try std.testing.expectEqualStrings("mock-sess-2", persisted);
+    try std.testing.expectEqual(@as(u32, 1), mock.closeCount());
+    try std.testing.expect(mock.wasClosed("mock-sess-1"));
 
     try setTurnFrames(mock, allocator, &.{"second"}, "completed");
-    const second = try h.harness().runTurn(.{ .user_message = "two" });
+    const second = try turnKey(&h, "test-key", "two");
     defer allocator.free(second.reply);
     try std.testing.expectEqualStrings("second", second.reply);
+    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
 
     const prompted = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(prompted);
     try std.testing.expectEqualStrings("mock-sess-2", prompted);
-    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    const persisted = (try sidecar_mod.loadSessionId(allocator, mapping)).?;
+    defer allocator.free(persisted);
+    try std.testing.expectEqualStrings("mock-sess-2", persisted);
 }
 
 test "dsh second runTurn queues after the active turn" {
@@ -533,10 +563,10 @@ test "dsh reuses the session mapping and resumes it after a restart" {
         var h = try newHarness(allocator, boot_url, session_file);
         defer h.deinit();
 
-        var turn: u32 = 0;
-        while (turn < 2) : (turn += 1) {
+        var index: u32 = 0;
+        while (index < 2) : (index += 1) {
             try setTurnFrames(mock, allocator, &.{"same"}, "completed");
-            const result = try h.harness().runTurn(.{ .user_message = "hi" });
+            const result = try turnKey(&h, "test-key-a", "hi");
             defer allocator.free(result.reply);
             try std.testing.expectEqualStrings("same", result.reply);
         }
@@ -549,17 +579,147 @@ test "dsh reuses the session mapping and resumes it after a restart" {
     // the persisted session instead of creating another one.
     var restarted = try newHarness(allocator, boot_url, session_file);
     defer restarted.deinit();
-    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
 
     try setTurnFrames(mock, allocator, &.{"resumed"}, "completed");
-    const result = try restarted.harness().runTurn(.{ .user_message = "again" });
+    const result = try turnKey(&restarted, "test-key-a", "again");
     defer allocator.free(result.reply);
     try std.testing.expectEqualStrings("resumed", result.reply);
+    // The resumed key opened its fresh WS only when its turn began.
+    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
 
     const prompted = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(prompted);
     try std.testing.expectEqualStrings(mock_mod.session_id, prompted);
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
     try std.testing.expectEqual(@as(u32, 3), mock.promptCount());
+}
+
+test "dsh two keys run their own sessions on one sidecar" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, null);
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"alpha"}, "completed");
+    const first = try turnKey(&h, "test-key-a", "hi");
+    defer allocator.free(first.reply);
+    const first_session = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(first_session);
+
+    try setTurnFrames(mock, allocator, &.{"beta"}, "completed");
+    const second = try turnKey(&h, "test-key-b", "hi");
+    defer allocator.free(second.reply);
+    const second_session = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(second_session);
+
+    try std.testing.expectEqualStrings("alpha", first.reply);
+    try std.testing.expectEqualStrings("beta", second.reply);
+    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    // Each prompt landed on the session the key created for itself.
+    try std.testing.expectEqualStrings("mock-sess-1", first_session);
+    try std.testing.expectEqualStrings("mock-sess-2", second_session);
+}
+
+test "dsh key switch reuses its session and leaves the other key open" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, null);
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"one"}, "completed");
+    const first = try turnKey(&h, "test-key-a", "hi");
+    defer allocator.free(first.reply);
+
+    try setTurnFrames(mock, allocator, &.{"two"}, "completed");
+    const second = try turnKey(&h, "test-key-b", "hi");
+    defer allocator.free(second.reply);
+
+    try setTurnFrames(mock, allocator, &.{"three"}, "completed");
+    const third = try turnKey(&h, "test-key-a", "hi");
+    defer allocator.free(third.reply);
+    const prompted = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(prompted);
+
+    // Regression: a key switch called startFreshSession, which closed the
+    // previous key's dsh session and created a new one for the new key.
+    try std.testing.expectEqualStrings("mock-sess-1", prompted);
+    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 0), mock.closeCount());
+    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
+}
+
+test "dsh /new closes only its key's session" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_file = try tempSessionFile(allocator, &tmp);
+    defer allocator.free(session_file);
+    const mapping_a = try keySessionFile(allocator, session_file, "test-key-a");
+    defer allocator.free(mapping_a);
+    const mapping_b = try keySessionFile(allocator, session_file, "test-key-b");
+    defer allocator.free(mapping_b);
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, session_file);
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"one"}, "completed");
+    const first = try turnKey(&h, "test-key-a", "hi");
+    defer allocator.free(first.reply);
+
+    try setTurnFrames(mock, allocator, &.{"two"}, "completed");
+    const second = try turnKey(&h, "test-key-b", "hi");
+    defer allocator.free(second.reply);
+
+    // Regression: /new reset the single shared session, so another key's
+    // session was closed and its next turn started from scratch.
+    h.session_key = "test-key-a";
+    const ack = try h.harness().handleLocalCommand("/new");
+    try std.testing.expectEqualStrings("Session cleared.", ack.?);
+    try std.testing.expectEqual(@as(u32, 1), mock.closeCount());
+    try std.testing.expect(mock.wasClosed("mock-sess-1"));
+    try std.testing.expect(!mock.wasClosed("mock-sess-2"));
+
+    // Only A's mapping moved to its replacement; B's still names its session.
+    const replaced = (try sidecar_mod.loadSessionId(allocator, mapping_a)).?;
+    defer allocator.free(replaced);
+    try std.testing.expectEqualStrings("mock-sess-3", replaced);
+    const kept = (try sidecar_mod.loadSessionId(allocator, mapping_b)).?;
+    defer allocator.free(kept);
+    try std.testing.expectEqualStrings("mock-sess-2", kept);
+
+    // B keeps working on its original session.
+    try setTurnFrames(mock, allocator, &.{"still mine"}, "completed");
+    const after = try turnKey(&h, "test-key-b", "hi");
+    defer allocator.free(after.reply);
+    try std.testing.expectEqualStrings("still mine", after.reply);
+    const b_prompted = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(b_prompted);
+    try std.testing.expectEqualStrings("mock-sess-2", b_prompted);
+
+    // A's next turn runs on the replacement session.
+    try setTurnFrames(mock, allocator, &.{"fresh"}, "completed");
+    const fresh = try turnKey(&h, "test-key-a", "hi");
+    defer allocator.free(fresh.reply);
+    try std.testing.expectEqualStrings("fresh", fresh.reply);
+    try std.testing.expectEqual(@as(u32, 3), mock.createCount());
+    const a_prompted = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(a_prompted);
+    try std.testing.expectEqualStrings("mock-sess-3", a_prompted);
 }
