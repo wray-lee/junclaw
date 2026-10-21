@@ -52,6 +52,17 @@ fn endFrame(allocator: Allocator, kind: []const u8) ![]u8 {
     );
 }
 
+/// The dsh error shape: `reason.error.message`.
+fn errorEndFrame(allocator: Allocator, message: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{{\"type\":\"event\"," ++
+            "\"event\":{{\"type\":\"turn/end\",\"data\":{{\"reason\":{{\"kind\":\"error\"," ++
+            "\"error\":{{\"message\":{f}}}}}}}}}}}}}",
+        .{std.json.fmt(message, .{})},
+    );
+}
+
 /// Script the frames streamed after the next prompt: text deltas in order,
 /// then a terminal `turn/end` when `end_kind` is non-null.
 fn setTurnFrames(
@@ -197,7 +208,7 @@ test "dsh turn/end kinds map to port end reasons" {
         .{ .kind = "interrupted", .want = .interrupted },
         .{ .kind = "aborted", .want = .interrupted },
         .{ .kind = "error", .want = .failed },
-        .{ .kind = "blocked", .want = .failed },
+        .{ .kind = "blocked", .want = .blocked },
         .{ .kind = "max-tokens", .want = .max_tokens },
         .{ .kind = "forked", .want = .completed },
     };
@@ -209,6 +220,28 @@ test "dsh turn/end kinds map to port end reasons" {
         try std.testing.expectEqual(case.want, result.end_reason);
         try std.testing.expectEqualStrings("x", result.reply);
     }
+}
+
+test "dsh turn/end error carries the failure message" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    var h = try newHarness(allocator, boot_url, null);
+    defer h.deinit();
+
+    const frame = try errorEndFrame(allocator, "provider exploded");
+    defer allocator.free(frame);
+    try mock.setTurnFrames(&.{frame});
+
+    const result = try h.harness().runTurn(.{ .user_message = "hi" });
+    defer allocator.free(result.reply);
+    defer if (result.@"error") |message| allocator.free(message);
+    try std.testing.expectEqual(port.EndReason.failed, result.end_reason);
+    try std.testing.expectEqualStrings("provider exploded", result.@"error".?);
 }
 
 test "dsh /stop cancels mid-stream and keeps partial text" {

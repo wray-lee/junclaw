@@ -190,6 +190,7 @@ fn freeServerEvent(allocator: Allocator, event: protocol.ServerEvent) void {
         .turn_end => |turn| {
             allocator.free(turn.kind);
             if (turn.reason_kind) |kind| allocator.free(kind);
+            if (turn.error_message) |message| allocator.free(message);
         },
         .approval_request => |request| {
             allocator.free(request.tool_name);

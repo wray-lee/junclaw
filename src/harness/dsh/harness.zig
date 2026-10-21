@@ -290,9 +290,17 @@ pub const DshHarness = struct {
                     } }),
                     .other => {},
                 },
-                .turn_end => |turn| return .{
-                    .reply = try text.toOwnedSlice(self.allocator),
-                    .end_reason = mapEndReason(turn.kind),
+                .turn_end => |turn| {
+                    const reply = try text.toOwnedSlice(self.allocator);
+                    errdefer self.allocator.free(reply);
+                    return .{
+                        .reply = reply,
+                        .end_reason = mapEndReason(turn.kind),
+                        .@"error" = if (turn.error_message) |message|
+                            try self.allocator.dupe(u8, message)
+                        else
+                            null,
+                    };
                 },
                 // P1 has no approval/question UI. The payload can carry command
                 // text, so it is dropped rather than logged.
@@ -402,7 +410,7 @@ pub const DshHarness = struct {
 /// dsh `turn/end` kind → port reason:
 ///   completed   → completed        interrupted → interrupted
 ///   aborted     → interrupted      error       → failed
-///   blocked     → failed           max-tokens  → max_tokens
+///   blocked     → blocked          max-tokens  → max_tokens
 ///   forked      → completed
 /// An unknown kind is reported as `.failed`: an end we do not understand must
 /// not look like a clean completion.
@@ -412,18 +420,19 @@ fn mapEndReason(kind: []const u8) port.EndReason {
     if (eq(u8, kind, "interrupted")) return .interrupted;
     if (eq(u8, kind, "aborted")) return .interrupted;
     if (eq(u8, kind, "error")) return .failed;
-    if (eq(u8, kind, "blocked")) return .failed;
+    if (eq(u8, kind, "blocked")) return .blocked;
     if (eq(u8, kind, "max-tokens")) return .max_tokens;
     if (eq(u8, kind, "forked")) return .completed;
     return .failed;
 }
 
+// Regression: dsh turn/end kind "blocked" mapped to .failed instead of port .blocked.
 test "dsh end reason table" {
     try std.testing.expectEqual(port.EndReason.completed, mapEndReason("completed"));
     try std.testing.expectEqual(port.EndReason.interrupted, mapEndReason("interrupted"));
     try std.testing.expectEqual(port.EndReason.interrupted, mapEndReason("aborted"));
     try std.testing.expectEqual(port.EndReason.failed, mapEndReason("error"));
-    try std.testing.expectEqual(port.EndReason.failed, mapEndReason("blocked"));
+    try std.testing.expectEqual(port.EndReason.blocked, mapEndReason("blocked"));
     try std.testing.expectEqual(port.EndReason.max_tokens, mapEndReason("max-tokens"));
     try std.testing.expectEqual(port.EndReason.completed, mapEndReason("forked"));
     try std.testing.expectEqual(port.EndReason.failed, mapEndReason("mystery"));

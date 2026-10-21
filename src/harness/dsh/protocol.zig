@@ -168,6 +168,8 @@ pub const ServerEvent = union(enum) {
     turn_end: struct {
         kind: []const u8,
         reason_kind: ?[]const u8,
+        /// dsh's failure text for `kind == "error"`; null for other ends.
+        error_message: ?[]const u8,
     },
     approval_request: struct {
         tool_name: []const u8,
@@ -431,7 +433,28 @@ fn parseTurnEnd(allocator: Allocator, raw: []const u8, event: ObjectMap) !Server
         try allocator.dupe(u8, nested_kind)
     else
         null;
-    return .{ .turn_end = .{ .kind = kind_copy, .reason_kind = reason_kind_copy } };
+    errdefer if (reason_kind_copy) |nested_kind| allocator.free(nested_kind);
+    // Current dsh: `reason.error.message`. Older logs keep it on `reason`, and
+    // some frames put it on `data`.
+    var error_message: ?[]const u8 = null;
+    if (std.mem.eql(u8, kind, "error")) {
+        if (reason_value) |value| {
+            const reason = asObject(value).?;
+            if (objectField(reason, "error")) |failure|
+                error_message = stringField(failure, "message");
+            if (error_message == null) error_message = stringField(reason, "message");
+        }
+        if (error_message == null) error_message = stringField(data, "message");
+    }
+    const error_message_copy: ?[]const u8 = if (error_message) |message|
+        try allocator.dupe(u8, message)
+    else
+        null;
+    return .{ .turn_end = .{
+        .kind = kind_copy,
+        .reason_kind = reason_kind_copy,
+        .error_message = error_message_copy,
+    } };
 }
 
 fn parseWaterfall(allocator: Allocator, raw: []const u8, object: ObjectMap) !ServerEvent {
@@ -681,6 +704,7 @@ fn freeServerEvent(allocator: Allocator, event: ServerEvent) void {
         .turn_end => |turn| {
             allocator.free(turn.kind);
             if (turn.reason_kind) |kind| allocator.free(kind);
+            if (turn.error_message) |message| allocator.free(message);
         },
         .approval_request => |request| {
             allocator.free(request.tool_name);
@@ -1000,6 +1024,36 @@ test "parseServerFrame: turn/end kind and nested abort reason" {
     const unknown = try parseServerFrame(allocator, missing_reason);
     defer freeServerEvent(allocator, unknown);
     try std.testing.expect(unknown == .unknown);
+}
+
+test "parseServerFrame: turn/end error keeps the failure message" {
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"turn\":3," ++
+        "\"reason\":{\"kind\":\"error\",\"error\":{\"message\":\"provider exploded\"," ++
+        "\"code\":\"UNKNOWN\"}}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .turn_end => |turn| {
+            try std.testing.expectEqualStrings("error", turn.kind);
+            try std.testing.expectEqualStrings("provider exploded", turn.error_message.?);
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
+test "parseServerFrame: turn/end error falls back to a direct message" {
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"event\",\"event\":{\"type\":\"turn/end\"," ++
+        "\"data\":{\"reason\":{\"kind\":\"error\",\"message\":\"old log shape\"}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .turn_end => |turn| try std.testing.expectEqualStrings("old log shape", turn.error_message.?),
+        else => return error.TestUnexpectedEvent,
+    }
 }
 
 test "parseServerFrame maps approval waterfalls" {

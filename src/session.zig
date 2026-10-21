@@ -2654,6 +2654,8 @@ pub const SessionManager = struct {
                 return err;
             };
         };
+        // Only `reply` is returned; the port hands failure text to the host.
+        defer if (turn_result.@"error") |message| self.allocator.free(message);
         // dsh reports interruption through the port; the host's /stop tail
         // (pending-injection discard and notices) reads the agent flag.
         session.agent.last_turn_interrupted = turn_result.end_reason == .interrupted;
