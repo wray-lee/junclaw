@@ -165,6 +165,10 @@ pub const DshEngine = struct {
         /// here and runs as the next queued prompt (P1: no steer injection).
         turn_mutex: std_compat.sync.Mutex = .{},
         interrupt_requested: std.atomic.Value(bool) = .init(false),
+        /// A `/new` swap failed; the next turn must report, never prompt the
+        /// old session. Cleared by the next successful reset. Guarded by
+        /// `turn_mutex`.
+        reset_failed: bool = false,
         refs: usize = 0,
         retired: bool = false,
 
@@ -621,7 +625,6 @@ pub const DshHarness = struct {
     }
 
     fn reset(ptr: *anyopaque) void {
-        // No local session state to clear: history and commands live in dsh.
         _ = ptr;
     }
 
@@ -690,8 +693,11 @@ pub const DshHarness = struct {
         defer entry.turn_mutex.unlock();
 
         // Build the replacement before touching the old session, so a failed
-        // create/follow leaves the key on its current session. The new follow
-        // stream opens on the same mux socket, never a second WebSocket.
+        // create/follow leaves the old session untouched. The key is then
+        // marked failed: the next turn reports instead of silently reusing it.
+        // The new follow stream opens on the same mux socket, never a second
+        // WebSocket.
+        errdefer entry.reset_failed = true;
         const client = entry.client;
         const session_id = try client.createSession(engine.opts.sidecar.workspace);
         errdefer allocator.free(session_id);
@@ -703,6 +709,7 @@ pub const DshHarness = struct {
         allocator.free(entry.session_id);
         entry.sub = sub;
         entry.session_id = session_id;
+        entry.reset_failed = false;
     }
 
     fn vtableDeinit(ptr: *anyopaque, allocator: Allocator) void {

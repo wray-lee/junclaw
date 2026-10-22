@@ -139,6 +139,9 @@ pub const MockDsh = struct {
     ws_gate: ?*ConnectGate = null,
     /// Echo each prompt back as a delta plus a completed turn/end.
     echo_prompts: bool = false,
+    /// When false, `session/cancel` acks but leaves the turn running (no
+    /// aborted `turn/end`), so the cancel-timeout fallback is reachable.
+    cancel_ends_turn: bool = true,
     /// Reply value for `session/modelCatalog`; null replies `{}`.
     model_catalog_json: ?[]u8 = null,
     /// Reply value for `session/projections`; null replies `{}`.
@@ -538,6 +541,13 @@ pub const MockDsh = struct {
         self.echo_prompts = enabled;
     }
 
+    /// Let `session/cancel` ack without ending the turn (cancel-timeout tests).
+    pub fn setCancelEndsTurn(self: *MockDsh, enabled: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_ends_turn = enabled;
+    }
+
     pub fn wsConnections(self: *MockDsh) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -636,7 +646,9 @@ pub const MockDsh = struct {
         for (self.cancel_frames.items) |frame| {
             try self.writeFrameForStreamLocked(conn, stream_id, frame);
         }
-        try self.writeFrameForStreamLocked(conn, stream_id, turn_aborted_frame);
+        if (self.cancel_ends_turn) {
+            try self.writeFrameForStreamLocked(conn, stream_id, turn_aborted_frame);
+        }
     }
 
     fn buildSnapshot(self: *MockDsh, body: []const u8) ![]u8 {
