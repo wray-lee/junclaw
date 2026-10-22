@@ -587,6 +587,7 @@ pub const Loop = struct {
         var accumulator = stream.Accumulator.init(self.allocator());
         defer accumulator.deinit();
 
+        var saw_chunk = false;
         var stream_error: ?anyerror = null;
         var aborted = false;
         var done = false;
@@ -608,8 +609,8 @@ pub const Loop = struct {
                 .assistant_stream = .{ .position = position, .attempt = 1, .event = event },
             });
             switch (event) {
+                .chunk, .record => saw_chunk = true,
                 .done => done = true,
-                else => {},
             }
             const keep = try accumulator.push(self.now(), event);
             if (!keep) done = true;
@@ -623,18 +624,23 @@ pub const Loop = struct {
             return .aborted;
         }
         if (stream_error) |err| {
-            // dsh agent.ts:462-511: a non-aborted provider failure settles
-            // assistant/attempt (never an interrupted message) and rethrows
-            // into turn/end {kind:"error"}.
-            const id = try std.fmt.allocPrint(
-                self.allocator(),
-                "assistant-{d}-{d}",
-                .{ position.turn, position.step },
-            );
-            const settlement = try accumulator.settle(id, self.config.provider, self.config.model);
-            _ = try self.emit(.{
-                .assistant_attempt = .{ .position = position, .settlement = settlement },
-            });
+            if (!saw_chunk) {
+                accumulator.interrupted = true;
+                try self.emitSettlement(position, &accumulator);
+            } else {
+                // dsh agent.ts:462-511: a non-aborted provider failure settles
+                // assistant/attempt (never an interrupted message) and
+                // rethrows into turn/end {kind:"error"}.
+                const id = try std.fmt.allocPrint(
+                    self.allocator(),
+                    "assistant-{d}-{d}",
+                    .{ position.turn, position.step },
+                );
+                const settlement = try accumulator.settle(id, self.config.provider, self.config.model);
+                _ = try self.emit(.{
+                    .assistant_attempt = .{ .position = position, .settlement = settlement },
+                });
+            }
             _ = try self.emit(.{ .step_end = position });
             return .{ .failure = .{
                 .message = "assistant stream failed",
