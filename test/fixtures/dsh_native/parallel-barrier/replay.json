@@ -1,0 +1,220 @@
+{
+  "calls": [
+    {
+      "index": 1,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_read_a",
+          "name": "read",
+          "args": [
+            ""
+          ]
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_read_a",
+          "args": [
+            "{\"file_path\":\"a.txt\",\"limit\":2}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_read_a",
+              "name": "read",
+              "arguments": "{\"file_path\":\"a.txt\",\"limit\":2}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 1,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 1,
+          "dt": [],
+          "id": "call_read_b",
+          "name": "read",
+          "args": [
+            ""
+          ]
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 1,
+          "dt": [],
+          "id": "call_read_b",
+          "args": [
+            "{\"file_path\":\"b.txt\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 1,
+            "block": {
+              "type": "tool-call",
+              "id": "call_read_b",
+              "name": "read",
+              "arguments": "{\"file_path\":\"b.txt\"}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 2,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 2,
+          "dt": [],
+          "id": "call_write_out",
+          "name": "write",
+          "args": [
+            ""
+          ]
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 2,
+          "dt": [],
+          "id": "call_write_out",
+          "args": [
+            "{\"file_path\":\"out.txt\",\"content\":\"alpha\\nbeta\\n\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 2,
+            "block": {
+              "type": "tool-call",
+              "id": "call_write_out",
+              "name": "write",
+              "arguments": "{\"file_path\":\"out.txt\",\"content\":\"alpha\\nbeta\\n\"}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 10,
+              "outputTokens": 20,
+              "totalTokens": 30
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "PARALLEL_BARRIER_DONE"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "PARALLEL_BARRIER_DONE"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 10,
+              "outputTokens": 3,
+              "totalTokens": 13
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

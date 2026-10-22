@@ -1,0 +1,734 @@
+{
+  "scenario": "parallel-barrier",
+  "purpose": "P1 consistency fixture for the dsh-native Zig harness: one assistant message issues two parallel reads and one exclusive write. The fixture pins the parallel pool (default 10), the exclusive barrier, model-order call/result commit, the exact read truncation footer, and the write confirmation rendering.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "recording": {
+      "method": "Recorded with dsh headless against a scripted Anthropic Messages SSE server. No real model, network, or credentials: DEEPSEEK_BASE_URL points at a loopback mock and DEEPSEEK_API_KEY is the neutral placeholder test-key.",
+      "image": "junclaw:full-dsh-test (dsh 0.2.1-rc.2, node v22.23.4)",
+      "command": "docker run --rm --entrypoint sh -v <dsh-record>:/work -e DSH_HOME=/tmp/dshhome -e DEEPSEEK_API_KEY=test-key -e DEEPSEEK_BASE_URL=http://localhost:18082 -e MOCK_MODE=parallel-barrier junclaw:full-dsh-test -c 'mkdir -p /tmp/ws-pb3 /tmp/dshhome; printf \"alpha\\nbeta\\ngamma\\ndelta\\n\" > /tmp/ws-pb3/a.txt; printf \"beta\\n\" > /tmp/ws-pb3/b.txt; cd /tmp/ws-pb3; node /work/mock-anthropic.mjs & sleep 0.5; /opt/dsh/node_modules/.bin/dsh --profile headless --patch /work/record.patch.yml \"Read a.txt with limit 2, read b.txt, write out.txt, then reply PARALLEL_BARRIER_DONE.\"'",
+      "result": "exit 0; stdout PARALLEL_BARRIER_DONE; one session.v4.jsonl with 25 physical rows (header + 24 events)",
+      "rawLog": "<dsh-record>/raw/parallel-barrier.raw.v4.jsonl (scratch artifact; not committed)",
+      "profilePatch": "<dsh-record>/record.patch.yml disables non-core tool plugins, keeps tool-fs read+write only, disables plan mode and the DeepSeek delivery log, and sets agent-default-model to provider deepseek-official/model fake.",
+      "normalizationScript": "<dsh-record>/generate-fixtures.mjs (scratch artifact; deterministic transform from the raw log to expected.v4.jsonl and replay.json)",
+      "workspaceNote": "The workspace lived on the container's Linux filesystem. Writing to the Windows bind mount failed with a chmod EPERM, so the final recording uses /tmp/ws-pb3; the cwd is tokenized as {{cwd}}."
+    },
+    "v4GroundTruth": [
+      {
+        "path": "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl",
+        "lines": "15-19",
+        "note": "Real dsh v4 parallel batch: one assistant message with two tool-call blocks, two tool/call events, then both tool/result events in model order. Pins the read envelope and meta."
+      },
+      {
+        "path": "/root/jsplug-proto/dsh/snapshots/web/changed-files-turn/session.v4.jsonl",
+        "lines": "17-33",
+        "note": "Real dsh v4 mixed batch: read (parallel) then bash (exclusive) in step 1; four exclusive mutations in step 2. Pins the barrier ordering and model-order commit."
+      },
+      {
+        "path": "/root/jsplug-proto/dsh/snapshots/session/bash-tool-turn/session.v4.jsonl",
+        "lines": "1-24",
+        "note": "Real dsh v4 single-tool turn used for the session-start and step/turn envelopes."
+      }
+    ],
+    "normalizer": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts",
+      "lines": "16-24, 27-35, 271-277, 384-408, 449, 603"
+    },
+    "replayHelper": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts",
+      "lines": "309-312, 386-400, 462-496",
+      "note": "deriveReplayScript rebuilds one model call per assistant/message from the compact stream; replay.json uses the same compact record shape."
+    },
+    "scheduler": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts",
+      "lines": "1-12, 56-104, 114-130, 134, 145-160, 198-220, 260-290",
+      "note": "Exclusive calls form a barrier; parallel calls use a bounded rolling pool; policy/results/context commit in model order; tool/call is appended at start and tool/result cites its seq."
+    },
+    "maxParallelDefault": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/constants.ts",
+      "lines": "6",
+      "note": "DEFAULT_MAX_PARALLEL_TOOL_CALLS = 10; the agent-loop config default is wired at index.ts:306 and :346."
+    },
+    "toolExecutionMode": {
+      "path": "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts",
+      "lines": "1307-1318",
+      "note": "A tool with no isConcurrencySafe classifier is exclusive; read declares isConcurrencySafe true at read.ts:136, write declares none."
+    },
+    "toolFsRead": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts",
+      "lines": "74, 78-84, 124-132, 136"
+    },
+    "toolFsReadRender": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts",
+      "lines": "152-170",
+      "note": "The line-window footer at :157-159 is the truncation marker in this fixture."
+    },
+    "toolFsWrite": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts",
+      "lines": "36-45, 68, 74-85, 103-108"
+    },
+    "toolFsSandbox": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts",
+      "lines": "61-70"
+    },
+    "deepseekTranslate": {
+      "path": "/root/jsplug-proto/dsh/packages/llm/llm-deepseek/src/translate.ts",
+      "lines": "159-161",
+      "note": "Usage totalTokens = input + output + cache; finish carries the provider replayState envelope."
+    },
+    "sessionTypes": {
+      "path": "/root/jsplug-proto/dsh/packages/core/session/src/types.ts",
+      "lines": "241-266, 289-331, 342-349, 362-403, 438-515"
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "expected": "expected.v4.jsonl",
+    "replay": "replay.json",
+    "manifest": "manifest.json"
+  },
+  "inputContract": {
+    "steps": [
+      "initialize",
+      "newSession(workspace)",
+      "prompt"
+    ],
+    "workspace": "newSession.workspace creates a.txt with four lines (alpha, beta, gamma, delta) and b.txt with one line (beta). The write creates out.txt with alpha+beta. This is fixture-driver setup, not a session event.",
+    "prompt": "Read a.txt with limit 2, read b.txt, write out.txt, then reply PARALLEL_BARRIER_DONE."
+  },
+  "dshToFixtureDifferences": [
+    {
+      "id": "recorded-v4-to-projected-fixture",
+      "change": "The recording is a real v4 log with the physical seq/time envelope and real UUID identities. The fixture drops the envelope, zeroes clocks, tokenizes identity/cwd, strips provider-only replayState and adapter-default header fields, and excludes the runtime-context user message.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:31-35",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:384-408",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:449",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:603",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:15-19"
+      ]
+    },
+    {
+      "id": "parallel-barrier-shape",
+      "change": "One assistant message has three tool-call blocks: read a.txt, read b.txt, write out.txt. The scheduler runs read a and read b in the parallel pool, logs both tool/call events, commits both results in model order, then starts the exclusive write after the pool drains. The write call/result pair follows. A final step returns text.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:56-104",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:198-220",
+        "/root/jsplug-proto/dsh/snapshots/web/changed-files-turn/session.v4.jsonl:17-33",
+        "expected.v4.jsonl:13-20"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "line": 1,
+      "type": "session",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/session/session-format/src/types.ts:16-26",
+        "/root/jsplug-proto/dsh/packages/session/session-persistence-jsonl/src/format.ts:83-98",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:1"
+      ],
+      "note": "version 4; id {{session:1}}; cwd {{cwd}}; createdAt 200 (fixture convention; zeroed before comparison)."
+    },
+    {
+      "line": 2,
+      "type": "permission/preset",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:416",
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:440-442",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:2"
+      ],
+      "note": "workspace-write."
+    },
+    {
+      "line": 3,
+      "type": "sandbox/mode",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:33",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:54",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:3"
+      ],
+      "note": "workspace-write."
+    },
+    {
+      "line": 4,
+      "type": "approval/policy",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/user-approval/src/index.ts:104",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:4"
+      ],
+      "note": "ask."
+    },
+    {
+      "line": 5,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-235",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:5"
+      ],
+      "note": "Queue the prompt as {{message:1}}."
+    },
+    {
+      "line": 6,
+      "type": "turn/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:289",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:307"
+      ],
+      "note": "turn 1."
+    },
+    {
+      "line": 7,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-235"
+      ],
+      "note": "Claim/remove the queued next-turn message."
+    },
+    {
+      "line": 8,
+      "type": "step/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 1."
+    },
+    {
+      "line": 9,
+      "type": "system/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:331",
+        "/root/jsplug-proto/dsh/packages/core/system-prompt/src/index.ts:453",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:74",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:68"
+      ],
+      "note": "System text is preserved verbatim from the recording: base identity, headless persona with model fake, read guidance, write guidance. id {{message:2}}; source kind system-prompt; surfaceOp append."
+    },
+    {
+      "line": 10,
+      "type": "user/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:310",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:10"
+      ],
+      "note": "The prompt text from input.json; id {{message:1}}; surfaceOp append."
+    },
+    {
+      "line": 11,
+      "type": "request/header",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:241-252",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:391-399",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:637-650",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-84",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:74-85",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:61-70"
+      ],
+      "note": "Initial header. config reduced to {{provider}}/{{model}}; tools is the exact recorded schema array (read then write), not the {{tools}} token."
+    },
+    {
+      "line": 12,
+      "type": "request/context",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:255-266",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:682"
+      ],
+      "note": "Reduced to provider fake/model fake."
+    },
+    {
+      "line": 13,
+      "type": "assistant/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-349",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:15",
+        "/root/jsplug-proto/dsh/packages/llm/llm-deepseek/src/translate.ts:159-161",
+        "replay.json:1"
+      ],
+      "note": "Step 1 assistant message with three tool-call blocks in model order: read a.txt (limit 2), read b.txt, write out.txt. usage input 10/output 20/total 30. stream is replay call 1. id {{message:3}}; surfaceOp append."
+    },
+    {
+      "line": 14,
+      "type": "tool/call",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:362",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:260-266",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:16"
+      ],
+      "note": "call_read_a, read, {\"file_path\":\"a.txt\",\"limit\":2}. Parallel pool; normalized seq 12."
+    },
+    {
+      "line": 15,
+      "type": "tool/call",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:362",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:260-266",
+        "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:17"
+      ],
+      "note": "call_read_b, read, {\"file_path\":\"b.txt\"}. Parallel pool; normalized seq 13. Both tool/call events are logged before either result."
+    },
+    {
+      "line": 16,
+      "type": "tool/result",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:376-387",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:145-160",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts:152-170",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:124-132",
+        "expected.v4.jsonl:16"
+      ],
+      "note": "Exact read rendering for a 4-line file with limit 2. The truncation marker is (Showing lines 1-2 of 4. Use offset=3 to continue.) at read-render.ts:157-159. meta has offset 1, two lines, totalLines 4. sourceEventSeqs [12]; id {{message:4}}; surfaceOp append."
+    },
+    {
+      "line": 17,
+      "type": "tool/result",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:376-387",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:145-160",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts:152-170",
+        "expected.v4.jsonl:17"
+      ],
+      "note": "Exact read rendering for b.txt: (End of file - total 1 lines). sourceEventSeqs [13]; id {{message:5}}; surfaceOp append. The two read results commit in model order."
+    },
+    {
+      "line": 18,
+      "type": "tool/call",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:362",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:198-220",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:1307-1318",
+        "/root/jsplug-proto/dsh/snapshots/web/changed-files-turn/session.v4.jsonl:19-22"
+      ],
+      "note": "call_write_out, write, {\"file_path\":\"out.txt\",\"content\":\"alpha\\nbeta\\n\"}. write has no isConcurrencySafe classifier, so it is exclusive: the scheduler starts it only after the read pool drained. There is no exclusive boolean in the event; the ordering is the barrier evidence. Normalized seq 16."
+    },
+    {
+      "line": 19,
+      "type": "tool/result",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:376-387",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:36-45",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:103-108",
+        "expected.v4.jsonl:19"
+      ],
+      "note": "Exact write confirmation: <path>{{cwd}}/out.txt</path>, <type>file</type>, <content>, Created file, </content>. meta operation create, path, diffs []. sourceEventSeqs [16]; id {{message:6}}; surfaceOp append."
+    },
+    {
+      "line": 20,
+      "type": "step/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 1. All three results are committed before the step closes."
+    },
+    {
+      "line": 21,
+      "type": "step/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 2: the tool results are on the surface, so the loop continues."
+    },
+    {
+      "line": 22,
+      "type": "assistant/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-349",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:476",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:534",
+        "replay.json:2"
+      ],
+      "note": "Step 2 assistant text PARALLEL_BARRIER_DONE. usage input 10/output 3/total 13. id {{message:7}}; surfaceOp append."
+    },
+    {
+      "line": 23,
+      "type": "step/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 2."
+    },
+    {
+      "line": 24,
+      "type": "turn/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387"
+      ],
+      "note": "reason completed."
+    }
+  ],
+  "normalization": {
+    "tokenSource": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:16-24",
+    "tokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 id",
+        "note": "Ordinal session identity; identity.ts:44-60."
+      },
+      {
+        "token": "{{message:N}}",
+        "used": true,
+        "where": "expected.v4.jsonl:5,9,10,13,16,17,19,22",
+        "note": "Ordinal message identity in first-appearance order; runtime-context ids are skipped because that event is excluded."
+      },
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1,16,17,19",
+        "note": "The recorded workspace path is replaced everywhere, including tool result text and meta."
+      },
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.provider",
+        "note": "Comparison mask; both sides are rewritten to the token."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.model",
+        "note": "Comparison mask; the recorded model was the literal fake."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1",
+        "note": "Single session in this fixture."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:5,10",
+        "note": "User prompt."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9",
+        "note": "System message."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl:13",
+        "note": "Step 1 assistant message."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl:16",
+        "note": "Read a.txt result."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl:17",
+        "note": "Read b.txt result."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl:19",
+        "note": "Write out.txt result."
+      },
+      {
+        "token": "{{message:7}}",
+        "used": true,
+        "where": "expected.v4.jsonl:22",
+        "note": "Step 2 assistant message."
+      }
+    ],
+    "comparisonMask": [
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11",
+        "note": "Applied to both expected and actual before comparison."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11",
+        "note": "Applied to both expected and actual before comparison."
+      }
+    ],
+    "volatileFields": [
+      {
+        "fields": "seq, time",
+        "handling": "Absent from expected; the comparator deletes them from actual. Evidence normalize.ts:31-35,449,603."
+      },
+      {
+        "fields": "session header createdAt",
+        "handling": "Expected uses 200; the comparator zeroes both sides. Evidence normalize.ts:384-408."
+      },
+      {
+        "fields": "assistant stream time, time0, dt",
+        "handling": "Expected uses 0/0/zeros; the comparator zeroes both sides. Evidence normalize.ts:398-408."
+      },
+      {
+        "fields": "session id, message ids, cwd",
+        "handling": "Ordinal tokens; identity relationships preserved by redactSessionSnapshotIds (identity.ts:44-60)."
+      },
+      {
+        "fields": "provider and model ids",
+        "handling": "{{provider}}/{{model}} mask in request/header; fake/fake in request/context and assistant source."
+      }
+    ],
+    "rules": [
+      {
+        "id": "physical-envelope",
+        "rule": "Drop seq/time from every event and zero createdAt and every assistant-stream clock. expected.v4.jsonl has no physical envelope.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:31-35",
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:384-408",
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:449",
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:603"
+        ],
+        "note": "No wall-clock assertion is possible: every time value in the fixture is 0."
+      },
+      {
+        "id": "identity-tokens",
+        "rule": "Replace the session id with {{session:1}}, each message id with {{message:N}} in first-appearance order, and the recorded cwd with {{cwd}}.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/identity.ts:44-60",
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:16-24",
+          "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:271-277"
+        ],
+        "note": "Excluded runtime-context ids do not consume an ordinal, so message ids are dense 1..7."
+      },
+      {
+        "id": "provider-model",
+        "rule": "Rewrite the recorded provider deepseek-official to fake in request/context and assistant source, and mask request/header config provider/model as {{provider}}/{{model}}. The model id was recorded as fake.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:241-266",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:476",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:534"
+        ],
+        "note": "Symmetric on both sides; the system prompt's literal fake model name is preserved."
+      },
+      {
+        "id": "system-prompt-preserved",
+        "rule": "Keep the recorded system message text verbatim; only its id and source are tokenized/normalized.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/system-prompt/src/index.ts:453",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:74",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:68",
+          "expected.v4.jsonl:9"
+        ],
+        "note": "The text is the ground truth for this recording: base identity, headless persona with model fake, read guidance, write guidance."
+      },
+      {
+        "id": "tool-schemas-preserved",
+        "rule": "Keep request/header.tools as the exact recorded schema array in registration order read, write. Do not replace it with the {{tools}} token and do not drop descriptions, parameters, required lists, or the write sandbox escalation fields.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-84",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:74-85",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:61-70",
+          "expected.v4.jsonl:11"
+        ],
+        "note": "This is the comparison focus: a schema drift changes the request header line."
+      },
+      {
+        "id": "parallel-pool",
+        "rule": "The first two calls in the assistant message are read and both classify as parallel (read.isConcurrencySafe true). The scheduler runs them in one rolling pool bounded by maxParallelToolCalls=10. This fixture uses two, so no call waits for pool capacity; both tool/call events are appended before either result.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/constants.ts:6",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:198-220",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:56-104",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:136",
+          "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:15-19",
+          "expected.v4.jsonl:13-17"
+        ],
+        "note": "Pool default 10 is cited at constants.ts:6 and wired at agent-loop/src/index.ts:306,346."
+      },
+      {
+        "id": "exclusive-barrier",
+        "rule": "The third call, write, has no isConcurrencySafe classifier and therefore classifies as exclusive. The scheduler does not start it until the read pool drains; its tool/call is logged after both read results, and it runs alone. dsh persists no exclusive boolean: the barrier is proven by this event order.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:1307-1318",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:56-104",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:198-220",
+          "/root/jsplug-proto/dsh/snapshots/web/changed-files-turn/session.v4.jsonl:17-33",
+          "expected.v4.jsonl:14-19"
+        ],
+        "note": "The write schema itself is in request/header.tools; only its scheduling class is implicit."
+      },
+      {
+        "id": "model-order-commit",
+        "rule": "tool/result events commit in model order: read a, read b, write. An earlier call's slower completion cannot reorder results; the next barrier waits for all started calls.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:114-130",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:145-160",
+          "/root/jsplug-proto/dsh/snapshots/web/changed-files-turn/session.v4.jsonl:25-33",
+          "expected.v4.jsonl:16-19"
+        ],
+        "note": "tool/call order is 12,13,16; tool/result order is 12,13,16."
+      },
+      {
+        "id": "read-window-truncation",
+        "rule": "The a.txt read passes limit 2 over a 4-line file. Keep the exact footer (Showing lines 1-2 of 4. Use offset=3 to continue.) and the two numbered lines in the model-facing text.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts:152-170",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts:157-159",
+          "expected.v4.jsonl:16"
+        ],
+        "note": "This is the required truncation marker; it must not be normalized away."
+      },
+      {
+        "id": "write-result-rendering",
+        "rule": "Keep the exact write confirmation envelope and the Created file body for a create operation.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:36-45",
+          "expected.v4.jsonl:19"
+        ],
+        "note": "The write tool does not echo file content back."
+      },
+      {
+        "id": "tool-result-meta-preserved",
+        "rule": "Keep tool/result meta verbatim except for the cwd token: read offset/lines/totalLines and write operation/path/diffs.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:124-132",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:103-108",
+          "expected.v4.jsonl:16-19"
+        ],
+        "note": "meta is persisted presentation data, not model-facing content; it is still compared."
+      },
+      {
+        "id": "usage-preserved",
+        "rule": "Keep assistant/message.data.usage and the stream usage chunk exactly as replayed. totalTokens is input + output + cache.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-349",
+          "/root/jsplug-proto/dsh/packages/llm/llm-deepseek/src/translate.ts:159-161",
+          "replay.json:1",
+          "expected.v4.jsonl:13"
+        ],
+        "note": "call 1 usage 10/20/30; call 2 usage 10/3/13."
+      },
+      {
+        "id": "replay-state-stripped",
+        "rule": "Remove the provider-specific replayState envelope from assistant source and from the terminal finish chunk. replay.json carries only portable stream records.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/llm/llm/src/types.ts:481",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:476",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:534",
+          "/root/jsplug-proto/dsh/packages/llm/llm-deepseek/src/translate.ts:161"
+        ],
+        "note": "replayState names the DeepSeek Messages adapter; the native harness has no such adapter."
+      },
+      {
+        "id": "header-config-reduced",
+        "rule": "Reduce request/header.header.config to provider and model. Drop adapterDefaults, maxTokens, and reasoningEffort, which the DeepSeek adapter materialized rather than the caller proposing them.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:241-252",
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:391-399",
+          "expected.v4.jsonl:11"
+        ],
+        "note": "The tool schemas inside the same header are untouched."
+      },
+      {
+        "id": "request-context-reduced",
+        "rule": "Reduce request/context to provider fake and model fake. Drop the recorded contextWindow adapter metadata.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:255-266",
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:403",
+          "expected.v4.jsonl:12"
+        ],
+        "note": "The native harness has no provider context-window advertisement in this fixture."
+      },
+      {
+        "id": "runtime-context-excluded",
+        "rule": "Exclude the recorded runtime-context user/message from expected.v4.jsonl. It is SDK-composed context, not part of the parallel/barrier contract; the plain-turn fixture excludes the same event.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/system-prompt/src/index.ts:317",
+          "/root/jsplug-proto/dsh/snapshots/session/parallel-tool-calls/session.v4.jsonl:11",
+          "expected.v4.jsonl:1-24"
+        ],
+        "note": "All excluded raw events are listed in excludedV4Events."
+      },
+      {
+        "id": "source-event-seqs-renumbered",
+        "rule": "After excluding the runtime-context event, renumber tool/result.sourceEventSeqs to the zero-based index of the referenced tool/call in the normalized event list. parallel-barrier: read a [12], read b [13], write [16].",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:438-515",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:134",
+          "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:260-290",
+          "expected.v4.jsonl:16",
+          "expected.v4.jsonl:17",
+          "expected.v4.jsonl:19"
+        ],
+        "note": "The catalog validation in validation.commands restores dense seqs and accepts these references."
+      },
+      {
+        "id": "surface-op-preserved",
+        "rule": "Keep surfaceOp append on system/message, user/message, assistant/message, and tool/result. Keep it absent on log-only events.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:438-515",
+          "expected.v4.jsonl:9-10",
+          "expected.v4.jsonl:13",
+          "expected.v4.jsonl:16-19",
+          "expected.v4.jsonl:22"
+        ],
+        "note": "No replace op occurs in this turn."
+      },
+      {
+        "id": "replay-derived-from-stream",
+        "rule": "replay.json calls[1..N].stream is the corresponding assistant/message.data.stream with time/time0/dt zeroed and replayState stripped. Calls are numbered 1..N and each stream is non-empty.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts:309-312",
+          "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts:462-496",
+          "replay.json:1-20"
+        ],
+        "note": "The Zig ReplayProvider returns the stream verbatim; the driver writes it into assistant/message.data.stream."
+      }
+    ],
+    "notUsedFromSourceLog": [
+      "recorded session UUID",
+      "recorded message UUIDs",
+      "recorded createdAt epoch",
+      "recorded seq/time envelope",
+      "recorded provider replayState"
+    ]
+  },
+  "replay": {
+    "file": "replay.json",
+    "calls": 2,
+    "call1": "tool-call stream: read a.txt limit 2, read b.txt, write out.txt; finish reason tool-calls",
+    "call2": "text stream: PARALLEL_BARRIER_DONE; finish reason stop",
+    "usage": "call1 input 10/output 20/total 30; call2 input 10/output 3/total 13",
+    "provider": "ReplayProvider returns each stream verbatim, including block-start, compact chunks, block-end, usage, and finish."
+  },
+  "excludedV4Events": [
+    {
+      "type": "user/message",
+      "sourceKind": "runtime-context",
+      "rawLine": 11,
+      "reason": "SDK-composed runtime context; excluded like plain-turn. It is the only excluded event in this recording."
+    }
+  ],
+  "openIssues": [
+    "The recording used the published dsh 0.2.1-rc.2 install in junclaw:full-dsh-test, not a source build. The source tree at /root/jsplug-proto/dsh is the same version and supplies every cited line.",
+    "dsh does not persist an exclusive flag on tool/call. The fixture proves the barrier through event ordering: the exclusive write's tool/call appears only after both parallel results commit.",
+    "The fixture pins the default maxParallelToolCalls=10 and uses two parallel calls, so it does not exercise queueing at the pool bound. Add 11 parallel calls in a future fixture if bound behavior needs coverage.",
+    "The write tool schema includes sandbox_permissions/justification because the recording composes the sandbox tool suite. The native harness must expose the same fields under the default workspace-write preset.",
+    "The write result meta diffs is empty for a create; an update would carry a diff. This fixture covers create only."
+  ],
+  "validation": {
+    "groundTruth": "The raw recording is a valid v4 artifact under dsh's own session format catalog: 25 rows, 24 events, all types in known-event-types.ts.",
+    "commands": [
+      "node validate-session.mjs raw/parallel-barrier.raw.v4.jsonl -> version 4, rows 25, events 24",
+      "node validate-session.mjs out/parallel-barrier/expected.v4.jsonl --tokens -> version 4, rows 24, events 23 (tokens materialized, dense seq/time restored)",
+      "node validate-replay.mjs out/parallel-barrier/replay.json -> call 1 three tool-call blocks (read, read, write), call 2 text/stop",
+      "bun -e 'JSON.parse(...)' self-check: every JSONL line parses; event type sequence matches expected; sourceEventSeqs [12],[13],[16] point at the three tool/call rows"
+    ]
+  }
+}

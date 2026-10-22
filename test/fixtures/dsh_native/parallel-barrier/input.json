@@ -1,0 +1,18 @@
+{
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession",
+      "workspace": {
+        "a.txt": "alpha\nbeta\ngamma\ndelta\n",
+        "b.txt": "beta\n"
+      }
+    },
+    {
+      "op": "prompt",
+      "text": "Read a.txt with limit 2, read b.txt, write out.txt, then reply PARALLEL_BARRIER_DONE."
+    }
+  ]
+}
