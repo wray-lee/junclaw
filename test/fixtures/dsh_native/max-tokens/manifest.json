@@ -1,0 +1,515 @@
+{
+  "scenario": "max-tokens",
+  "purpose": "P1 consistency fixture for the dsh-native Zig harness: the assistant finishes with max_tokens. The message is committed with usage, the partial tool-call block is not executed, step returns max-tokens, and turn/end reason is max-tokens. Pins design B11.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "groundTruthV4": {
+      "path": "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl",
+      "lines": "5-17",
+      "note": "Real SDK snapshot. First turn: prompt, assistant message with text and a truncated tool-call block in the stream, usage, finish(max-tokens), step/end, turn/end max-tokens. The source continues with a second turn at 18-25; this fixture stops after the first turn."
+    },
+    "design": {
+      "path": "/mnt/f/Projects/junclaw/.scratch/dsh-zig-rewrite-design.md",
+      "lines": "131-143, 181-185, 641",
+      "note": "B7 end reasons, B11 max-tokens, P1 exit criteria."
+    },
+    "loop": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts",
+      "lines": "338-343, 529-550",
+      "note": "max-tokens is sticky; finish max-tokens returns step reason max-tokens."
+    },
+    "llmTypes": {
+      "path": "/root/jsplug-proto/dsh/packages/llm/llm/src/types.ts",
+      "lines": "156-165",
+      "note": "Finish reason union includes max-tokens."
+    },
+    "sessionTypes": {
+      "path": "/root/jsplug-proto/dsh/packages/core/session/src/types.ts",
+      "lines": "202-233, 289-302, 342-356",
+      "note": "assistant/message usage/interrupted fields and turn end reasons."
+    },
+    "assistantStream": {
+      "path": "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts",
+      "lines": "18-49, 202-230",
+      "note": "Packed stream record types; usage/finish are raw chunks."
+    },
+    "normalizer": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts",
+      "lines": "16-24, 27-35, 384-408, 449, 603"
+    },
+    "replayHelper": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts",
+      "lines": "309-312, 386-400, 462-496"
+    },
+    "toolSchemaRead": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts",
+      "lines": "78-95",
+      "note": "The truncated tool-call names read; the schema is pinned behind {{tools}}."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "expected": "expected.v4.jsonl",
+    "replay": "replay.json",
+    "manifest": "manifest.json"
+  },
+  "scenarioInput": {
+    "steps": [
+      {
+        "op": "initialize"
+      },
+      {
+        "op": "newSession"
+      },
+      {
+        "op": "prompt",
+        "text": "Read notes.txt, then continue until the output limit."
+      }
+    ],
+    "whenSemantics": "No asynchronous op; the single replay call finishes max-tokens."
+  },
+  "rules": [
+    {
+      "id": "max-tokens-finish",
+      "rule": "When the provider finish is max-tokens, the assistant/message is committed, the tool call is not executed, step returns max-tokens, and turn/end reason is max-tokens.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-550",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/types.ts:156-165",
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:15-17"
+      ],
+      "expectedLines": [
+        13,
+        15
+      ]
+    },
+    {
+      "id": "usage-accounting",
+      "rule": "The usage chunk is folded into assistant/message.data.usage and kept in the stream. inputTokens/outputTokens are semantic values, not volatile fields.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:539-547",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:18-49",
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:15"
+      ],
+      "expectedLines": [
+        13
+      ]
+    },
+    {
+      "id": "partial-tool-call-not-executed",
+      "rule": "The stream opens a tool-call block and emits a truncated tool-call-chunks run but no block-end. The block is not in message.content and no tool/call event is emitted.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:15",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:547-550"
+      ],
+      "expectedLines": [
+        13
+      ]
+    },
+    {
+      "id": "turn-end-max-tokens",
+      "rule": "step/end precedes turn/end; turn/end reason is max-tokens. max-tokens is sticky across later steps.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:338-343",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:547",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:215",
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:16-17"
+      ],
+      "expectedLines": [
+        14,
+        15
+      ]
+    },
+    {
+      "id": "no-second-turn",
+      "rule": "The source snapshot continues with a second turn (18-25). This fixture stops after the first turn to pin B11 only.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:18-25"
+      ],
+      "expectedLines": []
+    }
+  ],
+  "events": [
+    {
+      "line": 1,
+      "type": "session",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/session/session-format/src/types.ts:16-26",
+        "/root/jsplug-proto/dsh/packages/session/session-persistence-jsonl/src/format.ts:83-98"
+      ],
+      "note": "v4 session header; id/cwd are tokens; createdAt 200 is normalized to 0 for comparison."
+    },
+    {
+      "line": 2,
+      "type": "permission/preset",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:416",
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:440-442"
+      ],
+      "note": "Session-start metadata from the workspace-write preset; data.preset only."
+    },
+    {
+      "line": 3,
+      "type": "sandbox/mode",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:33",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:54"
+      ],
+      "note": "Session-start metadata; data.mode only."
+    },
+    {
+      "line": 4,
+      "type": "approval/policy",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/user-approval/src/index.ts:104"
+      ],
+      "note": "Session-start metadata; data.policy only."
+    },
+    {
+      "line": 5,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Insert the prompt as {{message:1}} into next-turn at start 0: 'Read notes.txt, then continue until the output limit.'."
+    },
+    {
+      "line": 6,
+      "type": "turn/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:289",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:307"
+      ],
+      "note": "turn 1."
+    },
+    {
+      "line": 7,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:109-113",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Claim/remove the queued next-turn prompt (removedCount 1)."
+    },
+    {
+      "line": 8,
+      "type": "step/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 1."
+    },
+    {
+      "line": 9,
+      "type": "system/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:331",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:423"
+      ],
+      "note": "System prompt {{system}} appended to the surface."
+    },
+    {
+      "line": 10,
+      "type": "user/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:310",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:424-436"
+      ],
+      "note": "Prompt message {{message:1}} appended to the surface."
+    },
+    {
+      "line": 11,
+      "type": "request/header",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:391-403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:637-650"
+      ],
+      "note": "First header for this session; config provider/model are comparison masks, tools is the whole-array {{tools}} token."
+    },
+    {
+      "line": 12,
+      "type": "request/context",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:398-403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:682"
+      ],
+      "note": "Route context for the fake replay route."
+    },
+    {
+      "line": 13,
+      "type": "assistant/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-356",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-547"
+      ],
+      "note": "Assistant message {{message:3}}: content is the completed text block only; usage inputTokens 12/outputTokens 4; stream has text block, a partial tool-call block without block-end, usage, finish(max-tokens)."
+    },
+    {
+      "line": 14,
+      "type": "step/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 1 closes with max-tokens."
+    },
+    {
+      "line": 15,
+      "type": "turn/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:369-372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387"
+      ],
+      "note": "reason max-tokens."
+    }
+  ],
+  "normalization": {
+    "tokenSource": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:16-24",
+    "tokens": [
+      {
+        "token": "{{sessionId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{session:1}}."
+      },
+      {
+        "token": "{{messageId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{message:N}}."
+      },
+      {
+        "token": "{{usedTokens}}",
+        "used": false,
+        "where": null,
+        "note": "No usage_update event in this fixture."
+      },
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1",
+        "note": "Materialized to /dsh-snapshot-cwd for fixture validation; also used in the read result envelope and meta."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9 system text",
+        "note": "System prompt text token."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header tools",
+        "note": "The dsh normalizer replaces the whole tool-schema array with this token. The read schema text is pinned by toolSchemaRead, not dropped."
+      },
+      {
+        "token": "{{eventTime}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{eventOmittedBytes}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{sourceSessionFormatVersion}}",
+        "used": false,
+        "where": null,
+        "note": "No delivery marker in this fixture."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 id",
+        "note": "Ordinal session identity; see identity.ts:44-60."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:5 and :10",
+        "note": "Prompt user message."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9",
+        "note": "System message."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl:13",
+        "note": "Assistant max-tokens message."
+      }
+    ],
+    "comparisonMask": [
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.provider",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.model",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      }
+    ],
+    "notUsedFromV4SourceLog": [
+      "{{rpc:1}}",
+      "{{rpc:2}}",
+      "{{clientTimeZone}}",
+      "{{sourceRoot}}",
+      "{{webUrl}}",
+      "{{id:1}}"
+    ],
+    "volatileFields": [
+      {
+        "fields": "seq, time, seq0, time0",
+        "handling": "Absent from committed fixture; deleted by normalize.ts:27-35 (omitFixtureEnvelope) and :449/:603 before comparison."
+      },
+      {
+        "fields": "session header createdAt",
+        "handling": "Fixture keeps 200; normalize.ts:387-388 sets it to 0 on both sides before comparison."
+      },
+      {
+        "fields": "assistant stream time/time0/dt",
+        "handling": "Fixture uses 0/0/[]; normalize.ts:398-408 zeroes time/time0 and maps dt to zeros on both sides."
+      },
+      {
+        "fields": "session id and message ids",
+        "handling": "Ordinal tokens {{session:N}} / {{message:N}}; identity relationships preserved by redactSessionSnapshotIds (identity.ts:44-60)."
+      },
+      {
+        "fields": "cwd",
+        "handling": "{{cwd}} token; projected to /dsh-snapshot-cwd for v4 header validation by llm-replay/src/index.ts:386-400."
+      },
+      {
+        "fields": "config.provider, config.model",
+        "handling": "Masked to {{provider}}/{{model}} on both sides per the task convention (see providerModelConvention)."
+      },
+      {
+        "fields": "assistant/message usage",
+        "handling": "Kept: inputTokens/outputTokens are the usage accounting this fixture pins. They are authored neutral values, not provider-measured counts."
+      },
+      {
+        "fields": "message.source.replayState, finish.replayState",
+        "handling": "Excluded: SDK/provider-specific replay state, not part of the core v4 harness (see excludedV4Events)."
+      }
+    ],
+    "sourceEventSeqConvention": "The committed JSONL omits seq. Event seq is the 0-based index after the session header: expected line N has seq N-2. No event carries sourceEventSeqs in this fixture."
+  },
+  "providerModelConvention": {
+    "rule": "Before comparison, replace request/header.data.header.config.provider with {{provider}} and .model with {{model}} on both expected and actual.",
+    "reason": "The fixture is a fake replay route. request/context and assistant/message.source keep the literal fake/fake route identity; only the header config is masked.",
+    "appliedAt": [
+      "expected.v4.jsonl:11"
+    ]
+  },
+  "replay": {
+    "file": "replay.json",
+    "shape": "calls[i].index is the 1-based model-call number; calls[i].stream is an AssistantStreamRecord[] identical in shape to assistant/attempt.data.stream.",
+    "callCount": 1,
+    "packedRecordTypes": [
+      "text-chunks",
+      "tool-call-chunks",
+      "chunk"
+    ],
+    "expansion": "Call 1 expands to a text block, an open tool-call block (no block-end), usage, finish(max-tokens).",
+    "finish": "The call carries an explicit finish(max-tokens) chunk; the last record is finish. usage is the raw chunk before it."
+  },
+  "excludedV4Events": [
+    {
+      "v4LogLine": 11,
+      "type": "user/message",
+      "source": "runtime-context",
+      "reason": "P3 runtime-context plugin event; not part of the max-tokens loop.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:11"
+      ]
+    },
+    {
+      "v4LogLine": 14,
+      "type": "session/title",
+      "source": "fallback titler",
+      "reason": "Session title is out of scope (design section 0.2).",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:14"
+      ]
+    },
+    {
+      "v4LogLine": 15,
+      "type": "assistant/message.source.replayState, finish.replayState",
+      "source": "pi-ai SDK adapter",
+      "reason": "Provider-specific replay state is not part of the core v4 harness; the fixture keeps the model-facing message/stream only.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:15"
+      ]
+    },
+    {
+      "v4LogLine": "18-25",
+      "type": "second turn",
+      "source": "max-tokens-continue scenario",
+      "reason": "The source continues with a second turn; this fixture stops after the first turn to pin B11 only.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/max-tokens-continue/session.v4.jsonl:18-25"
+      ]
+    }
+  ],
+  "openIssues": [
+    "usage values 12/4 are authored neutral numbers, not provider-measured token counts. They are semantic for the fixture but must not be used as real accounting evidence.",
+    "The Zig harness must fold the usage chunk into assistant/message.data.usage and keep the usage chunk in the recorded stream; P0 does not interpret streams yet.",
+    "The truncated tool-call block must remain open (no block-end) and must not appear in message.content or produce tool/call events. A stream assembler that materializes partial tool calls would break this fixture.",
+    "No jq binary is installed in WSL; the JSONL check uses Python 3.14 plus a Node 24 stdin sentinel (node.exe)."
+  ],
+  "validation": {
+    "commands": [
+      "python3 -I /mnt/c/Users/Wray/AppData/Local/Temp/check_dsh_fixtures.py",
+      "python3 -I /mnt/c/Users/Wray/AppData/Local/Temp/check_dsh_manifests.py",
+      "docker run --rm --entrypoint node -v /home/wray/dsh-zig/test/fixtures/dsh_native:/fixtures:ro -v /mnt/c/Users/Wray/AppData/Local/Temp/dsh_validate_fixtures.js:/validate.js:ro junclaw:full-dsh-test /validate.js /fixtures/<scenario>/expected.v4.jsonl /fixtures/<scenario>/replay.json",
+      "cat test/fixtures/dsh_native/<scenario>/expected.v4.jsonl | /mnt/c/Tools/nodejs/node.exe -e <JSON.parse each line>",
+      "git status --short -- test/fixtures/dsh_native"
+    ],
+    "results": [
+      "catalog: HEADER_OK version=4 events=14",
+      "catalog TYPES: permission/preset sandbox/mode approval/policy agent/inbox/spliced turn/start agent/inbox/spliced step/start system/message user/message request/header request/context assistant/message step/end turn/end",
+      "replay call 1: chunks=7 finish={\"kind\":\"max-tokens\"} usage={\"inputTokens\":12,\"outputTokens\":4}; blocks=[{\"type\":\"text\",\"text\":\"Starting the read now.\"}]; CONTENT_MATCH true USAGE_MATCH true FINISH_MATCH true",
+      "self-check: max-tokens: OK lines=15 events=14 calls=1; all fixture self-checks passed",
+      "node sentinel: max-tokens: node-json-ok lines=15",
+      "worktree: only test/fixtures/dsh_native/{steer,abort,max-tokens} are added by this task"
+    ],
+    "notes": "The dsh catalog validator materializes {{cwd}} to /dsh-snapshot-cwd and adds the omitted physical seq/time envelope (seq=index, time=0) before restore, matching normalize.ts:27-35. No jq binary is installed in WSL; the Node 24 stdin sentinel covers the JSON.parse requirement and Python covers the event-sequence invariants."
+  },
+  "toolSchema": {
+    "name": "read",
+    "description": "Read a UTF-8 text file and return line-numbered content.",
+    "parameters": {
+      "file_path": {
+        "type": "string",
+        "required": true,
+        "description": "Path to read, resolved by the filesystem backend."
+      },
+      "offset": {
+        "type": "number",
+        "description": "1-based first line to return. Defaults to 1."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Maximum number of lines to return. Defaults to ${caps.limit}."
+      }
+    },
+    "evidence": [
+      "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-95"
+    ],
+    "note": "Literal read tool schema behind the {{tools}} whole-array token. The expected request/header keeps dsh's committed {{tools}} form; this object records the schema text so it is not silently dropped. A P1 comparator that needs literal schema text must resolve {{tools}} to this schema (plus the runtime tool set)."
+  }
+}

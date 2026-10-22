@@ -1,0 +1,25 @@
+{
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession",
+      "workspace": {
+        "notes.txt": "steer target\n"
+      }
+    },
+    {
+      "op": "prompt",
+      "text": "Read notes.txt, then wait for my steer."
+    },
+    {
+      "op": "steer",
+      "text": "Now reply with DONE.",
+      "when": {
+        "kind": "tool-result",
+        "callId": "call_steer_read"
+      }
+    }
+  ]
+}

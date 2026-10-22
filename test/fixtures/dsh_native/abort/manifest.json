@@ -1,0 +1,637 @@
+{
+  "scenario": "abort",
+  "purpose": "P1 consistency fixture for the dsh-native Zig harness: the user aborts while the first of two tool calls is running. The started call is drained and still writes tool/result (AbortError/ABORTED); the unstarted call receives a synthetic tool/call + tool/result (AbortError/ABORTED_BEFORE_DISPATCH); the turn ends aborted/user. Pins design B10/B22/B23 and repair.ts recovery codes.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "groundTruthV4": {
+      "path": "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl",
+      "lines": "15-23",
+      "note": "Authored ACP recording of exactly this scenario: assistant message with call_wait/call_skipped, tool/call + tool/result ABORTED for the started call, synthetic tool/call + tool/result ABORTED_BEFORE_DISPATCH for the skipped call, step/end, turn/end aborted/user. The fixture uses read instead of bash so no job/registered or job/settled events are needed."
+    },
+    "midStreamAbortVariant": {
+      "path": "/root/jsplug-proto/dsh/snapshots/acp/cancel/session.v4.jsonl",
+      "lines": "15-17",
+      "note": "Variant where abort lands mid-stream: assistant/message interrupted:true with the partial stream, then step/end, then turn/end aborted/user. This fixture covers the tool-abort variant instead."
+    },
+    "schedulerFailureVariant": {
+      "path": "/root/jsplug-proto/dsh/snapshots/sdk/tool-scheduler-recovery/session.v4.jsonl",
+      "lines": "16-23",
+      "note": "Variant where the scheduler fails: repair.ts writes ToolOutcomeUnknownError/TOOL_OUTCOME_UNKNOWN for a started call and ToolNotStartedError/TOOL_NOT_STARTED for an unstarted call, then the turn ends error. Not part of this fixture's expected log; pinned for the P1 implementation."
+    },
+    "design": {
+      "path": "/mnt/f/Projects/junclaw/.scratch/dsh-zig-rewrite-design.md",
+      "lines": "131-143, 170-179, 266-284, 641",
+      "note": "B7 end reasons, B10 cancel, B22 scheduling, B23 abort/recovery results, P1 exit criteria."
+    },
+    "loop": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts",
+      "lines": "154-181, 369-372, 452-486",
+      "note": "cancel(), aborted turn end, interrupted assistant settlement."
+    },
+    "toolCalls": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts",
+      "lines": "119-242, 250-289",
+      "note": "Abort drain, synthetic skipped call/result, model-order commit."
+    },
+    "repair": {
+      "path": "/root/jsplug-proto/dsh/packages/core/session/src/repair.ts",
+      "lines": "160-198",
+      "note": "Conservative recovery results for crash repair: ToolOutcomeUnknownError / ToolNotStartedError."
+    },
+    "toolRuntime": {
+      "path": "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts",
+      "lines": "484-490, 1970-1992",
+      "note": "TOOL_ABORTED='ABORTED', TOOL_ABORTED_BEFORE_DISPATCH='ABORTED_BEFORE_DISPATCH', and the canonical result texts."
+    },
+    "sessionTypes": {
+      "path": "/root/jsplug-proto/dsh/packages/core/session/src/types.ts",
+      "lines": "202-233, 289-302, 342-356, 376-386",
+      "note": "v4 event vocabulary, tool/result error shape and end reasons."
+    },
+    "assistantStream": {
+      "path": "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts",
+      "lines": "18-49, 202-230"
+    },
+    "normalizer": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts",
+      "lines": "16-24, 27-35, 384-408, 416-420, 449, 603"
+    },
+    "replayHelper": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts",
+      "lines": "309-312, 386-400, 462-496"
+    },
+    "toolSchemaRead": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts",
+      "lines": "78-95",
+      "note": "read tool schema pinned behind the {{tools}} token."
+    },
+    "schedulerConfig": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/constants.ts",
+      "lines": "1-6",
+      "note": "DEFAULT_MAX_PARALLEL_TOOL_CALLS=10. The scenario sets maxParallelToolCalls=1 so call_second cannot start before call_first settles; this makes the started/unstarted split deterministic. The config schema is agent-loop/src/index.ts:345-346."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "expected": "expected.v4.jsonl",
+    "replay": "replay.json",
+    "manifest": "manifest.json"
+  },
+  "scenarioInput": {
+    "steps": [
+      {
+        "op": "initialize"
+      },
+      {
+        "op": "newSession",
+        "workspace": {
+          "notes.txt": "abort target\n"
+        },
+        "config": {
+          "maxParallelToolCalls": 1
+        }
+      },
+      {
+        "op": "prompt",
+        "text": "Read notes.txt, then read skipped.txt."
+      },
+      {
+        "op": "abort",
+        "cause": "user",
+        "when": {
+          "kind": "tool-started",
+          "callId": "call_first"
+        }
+      }
+    ],
+    "whenSemantics": "when.kind=tool-started/callId means: after the named tool call has been dispatched and its body started, while the step is still running, apply the abort. maxParallelToolCalls=1 keeps call_second unstarted until call_first settles, so the started/unstarted split is deterministic."
+  },
+  "rules": [
+    {
+      "id": "abort-drains-started",
+      "rule": "Abort stops replenishment and drains started calls. The started call still commits a tool/result after the abort, with error AbortError/ABORTED and the canonical text 'Error: tool call aborted'.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:150-160",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:238-242",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:1970-1980",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:15-19"
+      ],
+      "expectedLines": [
+        14,
+        15
+      ]
+    },
+    {
+      "id": "abort-synthetic-unstarted",
+      "rule": "Every model call that was not started receives an ordered synthetic tool/call followed by a tool/result with error AbortError/ABORTED_BEFORE_DISPATCH and text 'Error: tool call aborted before dispatch'. The serialized code is ABORTED_BEFORE_DISPATCH; the exported constant is TOOL_ABORTED_BEFORE_DISPATCH. The scenario sets maxParallelToolCalls=1 so call_second cannot start before call_first settles.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:250-261",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:484-490",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:1983-1992",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:20-21",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/constants.ts:6",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/index.ts:345-346"
+      ],
+      "expectedLines": [
+        16,
+        17
+      ]
+    },
+    {
+      "id": "abort-no-synthetic-user-message",
+      "rule": "dsh 0.2.1-rc.2 does not append a synthetic abort user message. The cancellation cause is recorded only in turn/end.data.reason. Both the tool-abort and mid-stream abort snapshots end without a user/message after the abort.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:19-23",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel/session.v4.jsonl:15-17",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:369-372",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:202-205"
+      ],
+      "expectedLines": [
+        18,
+        19
+      ]
+    },
+    {
+      "id": "abort-turn-end",
+      "rule": "step/end precedes turn/end; turn/end reason is aborted with reason.kind=user.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:369-372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298-302"
+      ],
+      "expectedLines": [
+        18,
+        19
+      ]
+    },
+    {
+      "id": "scheduler-failure-variant",
+      "rule": "A scheduler internal failure drains started calls and repair writes ToolOutcomeUnknownError/TOOL_OUTCOME_UNKNOWN for started and ToolNotStartedError/TOOL_NOT_STARTED for unstarted; the turn ends error, not aborted. This fixture does not include that variant.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/repair.ts:160-198",
+        "/root/jsplug-proto/dsh/snapshots/sdk/tool-scheduler-recovery/session.v4.jsonl:19-23"
+      ],
+      "expectedLines": []
+    },
+    {
+      "id": "assistant-not-interrupted",
+      "rule": "The assistant message committed before the abort, so it carries no interrupted flag. interrupted:true applies only when abort lands mid-stream.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:465-486",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:15",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel/session.v4.jsonl:15"
+      ],
+      "expectedLines": [
+        13
+      ]
+    },
+    {
+      "id": "tool-result-rendering",
+      "rule": "The canonical abort result texts are kept verbatim; they are not normalized to placeholders.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:1970-1992",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:19-21"
+      ],
+      "expectedLines": [
+        15,
+        17
+      ]
+    }
+  ],
+  "events": [
+    {
+      "line": 1,
+      "type": "session",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/session/session-format/src/types.ts:16-26",
+        "/root/jsplug-proto/dsh/packages/session/session-persistence-jsonl/src/format.ts:83-98"
+      ],
+      "note": "v4 session header; id/cwd are tokens; createdAt 200 is normalized to 0 for comparison."
+    },
+    {
+      "line": 2,
+      "type": "permission/preset",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:416",
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:440-442"
+      ],
+      "note": "Session-start metadata from the workspace-write preset; data.preset only."
+    },
+    {
+      "line": 3,
+      "type": "sandbox/mode",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:33",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:54"
+      ],
+      "note": "Session-start metadata; data.mode only."
+    },
+    {
+      "line": 4,
+      "type": "approval/policy",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/user-approval/src/index.ts:104"
+      ],
+      "note": "Session-start metadata; data.policy only."
+    },
+    {
+      "line": 5,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Insert the prompt as {{message:1}} into next-turn at start 0: 'Read notes.txt, then read skipped.txt.'."
+    },
+    {
+      "line": 6,
+      "type": "turn/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:289",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:307"
+      ],
+      "note": "turn 1."
+    },
+    {
+      "line": 7,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:109-113",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Claim/remove the queued next-turn prompt (removedCount 1)."
+    },
+    {
+      "line": 8,
+      "type": "step/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 1."
+    },
+    {
+      "line": 9,
+      "type": "system/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:331",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:423"
+      ],
+      "note": "System prompt {{system}} appended to the surface."
+    },
+    {
+      "line": 10,
+      "type": "user/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:310",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:424-436"
+      ],
+      "note": "Prompt message {{message:1}} appended to the surface."
+    },
+    {
+      "line": 11,
+      "type": "request/header",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:391-403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:637-650"
+      ],
+      "note": "First header for this session; config provider/model are comparison masks, tools is the whole-array {{tools}} token."
+    },
+    {
+      "line": 12,
+      "type": "request/context",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:398-403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:682"
+      ],
+      "note": "Route context for the fake replay route."
+    },
+    {
+      "line": 13,
+      "type": "assistant/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-356",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-547"
+      ],
+      "note": "Assistant tool-call message {{message:3}} with call_first and call_second; stream ends finish(tool-calls)."
+    },
+    {
+      "line": 14,
+      "type": "tool/call",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:360-372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:263-268"
+      ],
+      "note": "call_first read(notes.txt) starts; this is the abort trigger point."
+    },
+    {
+      "line": 15,
+      "type": "tool/result",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:376-386",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:238-242",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:1970-1992"
+      ],
+      "note": "Started call drained after abort: {{message:4}} error AbortError/ABORTED, text 'Error: tool call aborted'; sourceEventSeqs [12] cites the tool/call at seq 12 (line 14)."
+    },
+    {
+      "line": 16,
+      "type": "tool/call",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:250-261",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:484-490"
+      ],
+      "note": "Synthetic tool/call for call_second (never dispatched)."
+    },
+    {
+      "line": 17,
+      "type": "tool/result",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:250-261",
+        "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts:484-490"
+      ],
+      "note": "Synthetic result {{message:5}} error AbortError/ABORTED_BEFORE_DISPATCH, text 'Error: tool call aborted before dispatch'; sourceEventSeqs [14] cites the synthetic tool/call at seq 14 (line 16)."
+    },
+    {
+      "line": 18,
+      "type": "step/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 1 closes after all tool results are committed."
+    },
+    {
+      "line": 19,
+      "type": "turn/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:369-372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387"
+      ],
+      "note": "reason aborted, reason.kind user. No synthetic user message follows (see rules)."
+    }
+  ],
+  "normalization": {
+    "tokenSource": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:16-24",
+    "tokens": [
+      {
+        "token": "{{sessionId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{session:1}}."
+      },
+      {
+        "token": "{{messageId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{message:N}}."
+      },
+      {
+        "token": "{{usedTokens}}",
+        "used": false,
+        "where": null,
+        "note": "No usage_update event in this fixture."
+      },
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1",
+        "note": "Materialized to /dsh-snapshot-cwd for fixture validation; also used in the read result envelope and meta."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9 system text",
+        "note": "System prompt text token."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header tools",
+        "note": "The dsh normalizer replaces the whole tool-schema array with this token. The read schema text is pinned by toolSchemaRead, not dropped."
+      },
+      {
+        "token": "{{eventTime}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{eventOmittedBytes}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{sourceSessionFormatVersion}}",
+        "used": false,
+        "where": null,
+        "note": "No delivery marker in this fixture."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 id",
+        "note": "Ordinal session identity; see identity.ts:44-60."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:5 and :10",
+        "note": "Prompt user message."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9",
+        "note": "System message."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl:13",
+        "note": "Assistant tool-call message."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl:15",
+        "note": "Started-call abort result."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl:17",
+        "note": "Unstarted-call synthetic abort result."
+      }
+    ],
+    "comparisonMask": [
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.provider",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.model",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      }
+    ],
+    "notUsedFromV4SourceLog": [
+      "{{rpc:1}}",
+      "{{rpc:2}}",
+      "{{clientTimeZone}}",
+      "{{sourceRoot}}",
+      "{{webUrl}}",
+      "{{id:1}}"
+    ],
+    "volatileFields": [
+      {
+        "fields": "seq, time, seq0, time0",
+        "handling": "Absent from committed fixture; deleted by normalize.ts:27-35 (omitFixtureEnvelope) and :449/:603 before comparison."
+      },
+      {
+        "fields": "session header createdAt",
+        "handling": "Fixture keeps 200; normalize.ts:387-388 sets it to 0 on both sides before comparison."
+      },
+      {
+        "fields": "assistant stream time/time0/dt",
+        "handling": "Fixture uses 0/0/[]; normalize.ts:398-408 zeroes time/time0 and maps dt to zeros on both sides."
+      },
+      {
+        "fields": "session id and message ids",
+        "handling": "Ordinal tokens {{session:N}} / {{message:N}}; identity relationships preserved by redactSessionSnapshotIds (identity.ts:44-60)."
+      },
+      {
+        "fields": "cwd",
+        "handling": "{{cwd}} token; projected to /dsh-snapshot-cwd for v4 header validation by llm-replay/src/index.ts:386-400."
+      },
+      {
+        "fields": "config.provider, config.model",
+        "handling": "Masked to {{provider}}/{{model}} on both sides per the task convention (see providerModelConvention)."
+      },
+      {
+        "fields": "job/registered, job/settled startedAt/finishedAt",
+        "handling": "Not present: this fixture uses read, so there are no bash job events. normalize.ts:416-420 zeroes those clocks when a source log has them."
+      },
+      {
+        "fields": "assistant/message usage",
+        "handling": "Absent: the replay stream has no usage chunk. usage is optional (session/src/types.ts:342-350)."
+      }
+    ],
+    "sourceEventSeqConvention": "The committed JSONL omits seq. Event seq is the 0-based index after the session header: expected line N has seq N-2. tool/result.sourceEventSeqs [12] cites the started-call tool/call at line 14; [14] cites the synthetic skipped-call tool/call at line 16."
+  },
+  "providerModelConvention": {
+    "rule": "Before comparison, replace request/header.data.header.config.provider with {{provider}} and .model with {{model}} on both expected and actual.",
+    "reason": "The fixture is a fake replay route. request/context and assistant/message.source keep the literal fake/fake route identity; only the header config is masked.",
+    "appliedAt": [
+      "expected.v4.jsonl:11"
+    ]
+  },
+  "replay": {
+    "file": "replay.json",
+    "shape": "calls[i].index is the 1-based model-call number; calls[i].stream is an AssistantStreamRecord[] identical in shape to assistant/attempt.data.stream.",
+    "callCount": 1,
+    "packedRecordTypes": [
+      "tool-call-chunks",
+      "chunk"
+    ],
+    "expansion": "Call 1 expands to two block-start/tool-call-delta/block-end groups and finish(tool-calls).",
+    "finish": "The call carries an explicit finish(tool-calls) chunk; the last record is finish."
+  },
+  "excludedV4Events": [
+    {
+      "v4LogLine": 11,
+      "type": "user/message",
+      "source": "runtime-context",
+      "reason": "P3 runtime-context plugin event; not part of the abort loop.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:11"
+      ]
+    },
+    {
+      "v4LogLine": 14,
+      "type": "session/title",
+      "source": "fallback titler",
+      "reason": "Session title is out of scope (design section 0.2).",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:14"
+      ]
+    },
+    {
+      "v4LogLine": "17-18",
+      "type": "job/registered, job/settled",
+      "source": "bash job runtime",
+      "reason": "The source scenario uses bash, which registers a job. This fixture uses read so the core scheduler/abort semantics are isolated; job clocks would also be normalized to 0 (normalize.ts:416-420).",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/session.v4.jsonl:17-18"
+      ]
+    },
+    {
+      "v4LogLine": "stdout.expected.jsonl, workspace.expected",
+      "type": "ACP stdout/workspace",
+      "source": "ACP scenario harness",
+      "reason": "Transport/workspace assertions are not session-log events.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/stdout.expected.jsonl",
+        "/root/jsplug-proto/dsh/snapshots/acp/cancel-tool-calls/workspace.expected"
+      ]
+    }
+  ],
+  "openIssues": [
+    "The task prose says a synthetic abort user message follows the tool results; dsh 0.2.1-rc.2 does not emit one (snapshots and agent.ts:369-372). This fixture follows the recorded ground truth. If the P1 harness intentionally adds one, it is a divergence that must be resolved before comparison.",
+    "The task prose names TOOL_ABORTED_BEFORE_DISPATCH; the serialized error code is ABORTED_BEFORE_DISPATCH and the exported constant is TOOL_ABORTED_BEFORE_DISPATCH (tools/src/index.ts:487). The fixture uses the serialized code.",
+    "The P1 driver must implement abort.when.kind=tool-call; the P0 InputFile parser only knows op/text.",
+    "The Zig harness must emit sourceEventSeqs on tool/result, including the synthetic skipped call, and must not drop synthetic results after abort.",
+    "Scheduler-failure recovery (ToolOutcomeUnknownError/ToolNotStartedError, turn/end error) is documented here but not part of this fixture; it needs its own fixture if P1 implements repair.",
+    "No jq binary is installed in WSL; the JSONL check uses Python 3.14 plus a Node 24 stdin sentinel (node.exe)."
+  ],
+  "validation": {
+    "commands": [
+      "python3 -I /mnt/c/Users/Wray/AppData/Local/Temp/check_dsh_fixtures.py",
+      "python3 -I /mnt/c/Users/Wray/AppData/Local/Temp/check_dsh_manifests.py",
+      "docker run --rm --entrypoint node -v /home/wray/dsh-zig/test/fixtures/dsh_native:/fixtures:ro -v /mnt/c/Users/Wray/AppData/Local/Temp/dsh_validate_fixtures.js:/validate.js:ro junclaw:full-dsh-test /validate.js /fixtures/<scenario>/expected.v4.jsonl /fixtures/<scenario>/replay.json",
+      "cat test/fixtures/dsh_native/<scenario>/expected.v4.jsonl | /mnt/c/Tools/nodejs/node.exe -e <JSON.parse each line>",
+      "git status --short -- test/fixtures/dsh_native"
+    ],
+    "results": [
+      "catalog: HEADER_OK version=4 events=18",
+      "catalog TYPES: permission/preset sandbox/mode approval/policy agent/inbox/spliced turn/start agent/inbox/spliced step/start system/message user/message request/header request/context assistant/message tool/call tool/result tool/call tool/result step/end turn/end",
+      "replay call 1: chunks=7 finish={\"kind\":\"tool-calls\"} usage=undefined; blocks=[{\"type\":\"tool-call\",\"id\":\"call_first\",\"name\":\"read\",\"arguments\":\"{\\\"file_path\\\": \\\"notes.txt\\\"}\"},{\"type\":\"tool-call\",\"id\":\"call_second\",\"name\":\"read\",\"arguments\":\"{\\\"file_path\\\": \\\"skipped.txt\\\"}\"}]; CONTENT_MATCH true USAGE_MATCH true FINISH_MATCH true",
+      "self-check: abort: OK lines=19 events=18 calls=1; all fixture self-checks passed",
+      "node sentinel: abort: node-json-ok lines=19",
+      "worktree: only test/fixtures/dsh_native/{steer,abort,max-tokens} are added by this task"
+    ],
+    "notes": "The dsh catalog validator materializes {{cwd}} to /dsh-snapshot-cwd and adds the omitted physical seq/time envelope (seq=index, time=0) before restore, matching normalize.ts:27-35. No jq binary is installed in WSL; the Node 24 stdin sentinel covers the JSON.parse requirement and Python covers the event-sequence invariants."
+  },
+  "toolSchema": {
+    "name": "read",
+    "description": "Read a UTF-8 text file and return line-numbered content.",
+    "parameters": {
+      "file_path": {
+        "type": "string",
+        "required": true,
+        "description": "Path to read, resolved by the filesystem backend."
+      },
+      "offset": {
+        "type": "number",
+        "description": "1-based first line to return. Defaults to 1."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Maximum number of lines to return. Defaults to ${caps.limit}."
+      }
+    },
+    "evidence": [
+      "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-95"
+    ],
+    "note": "Literal read tool schema behind the {{tools}} whole-array token. The expected request/header keeps dsh's committed {{tools}} form; this object records the schema text so it is not silently dropped. A P1 comparator that needs literal schema text must resolve {{tools}} to this schema (plus the runtime tool set)."
+  }
+}

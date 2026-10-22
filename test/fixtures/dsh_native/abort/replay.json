@@ -1,0 +1,87 @@
+{
+  "calls": [
+    {
+      "index": 1,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_first",
+          "name": "read",
+          "args": [
+            "{\"file_path\": \"notes.txt\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_first",
+              "name": "read",
+              "arguments": "{\"file_path\": \"notes.txt\"}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 1,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 1,
+          "dt": [],
+          "id": "call_second",
+          "name": "read",
+          "args": [
+            "{\"file_path\": \"skipped.txt\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 1,
+            "block": {
+              "type": "tool-call",
+              "id": "call_second",
+              "name": "read",
+              "arguments": "{\"file_path\": \"skipped.txt\"}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

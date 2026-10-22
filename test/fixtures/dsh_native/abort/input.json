@@ -1,0 +1,28 @@
+{
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession",
+      "workspace": {
+        "notes.txt": "abort target\n"
+      },
+      "config": {
+        "maxParallelToolCalls": 1
+      }
+    },
+    {
+      "op": "prompt",
+      "text": "Read notes.txt, then read skipped.txt."
+    },
+    {
+      "op": "abort",
+      "cause": "user",
+      "when": {
+        "kind": "tool-started",
+        "callId": "call_first"
+      }
+    }
+  ]
+}

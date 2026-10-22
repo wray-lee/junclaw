@@ -1,0 +1,655 @@
+{
+  "scenario": "steer",
+  "purpose": "P1 consistency fixture for the dsh-native Zig harness: a steer message arrives while step 1 is running, is spliced into next-step, and is claimed at the step boundary. Step 2 starts with the steer user/message and the turn completes. Pins design B9 and the Z4 branch where the steer batch immediately starts a new step.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "groundTruthV4": {
+      "path": "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl",
+      "lines": "5-28",
+      "note": "Live web recording. Core loop order is used as-is: prompt splice (5-7), step 1 (8-22), steer splice (16-18), step 2 claim/start/user/assistant/end (23-28). The web client first queues the interjection to next-turn and then requeues it to next-step (16-18); this fixture models the final next-step insert directly."
+    },
+    "design": {
+      "path": "/mnt/f/Projects/junclaw/.scratch/dsh-zig-rewrite-design.md",
+      "lines": "131-143, 158-167, 641",
+      "note": "B7 end reasons, B9 steer semantics, P1 exit criteria."
+    },
+    "loop": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts",
+      "lines": "154-181, 267-288, 298-398, 400-560",
+      "note": "Inbox API, preStep claim, turn loop, step loop."
+    },
+    "inbox": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts",
+      "lines": "109-113, 118-132, 167-240",
+      "note": "claim('next-step'), append/steer, splice event construction."
+    },
+    "toolCalls": {
+      "path": "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts",
+      "lines": "156-180, 263-289",
+      "note": "Tool call/result append and model-order commit."
+    },
+    "sessionTypes": {
+      "path": "/root/jsplug-proto/dsh/packages/core/session/src/types.ts",
+      "lines": "202-233, 289-302, 310, 331, 342-356, 376-386, 391-403",
+      "note": "v4 event vocabulary and end reasons."
+    },
+    "assistantStream": {
+      "path": "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts",
+      "lines": "18-49, 202-230",
+      "note": "Packed stream record types and expansion."
+    },
+    "normalizer": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts",
+      "lines": "16-24, 27-35, 384-408, 449, 603"
+    },
+    "replayHelper": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts",
+      "lines": "309-312, 386-400, 462-496"
+    },
+    "toolSchemaRead": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts",
+      "lines": "78-95",
+      "note": "read tool name/description/parameters. expected request/header uses the dsh whole-array {{tools}} token; this source pins the schema text that the token stands for."
+    },
+    "toolRenderRead": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts",
+      "lines": "153-170",
+      "note": "Read result envelope: <path>, <type>, numbered lines, EOF footer."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "expected": "expected.v4.jsonl",
+    "replay": "replay.json",
+    "manifest": "manifest.json"
+  },
+  "scenarioInput": {
+    "steps": [
+      {
+        "op": "initialize"
+      },
+      {
+        "op": "newSession",
+        "workspace": {
+          "notes.txt": "steer target\n"
+        }
+      },
+      {
+        "op": "prompt",
+        "text": "Read notes.txt, then wait for my steer."
+      },
+      {
+        "op": "steer",
+        "text": "Now reply with DONE.",
+        "when": {
+          "kind": "tool-result",
+          "callId": "call_steer_read"
+        }
+      }
+    ],
+    "whenSemantics": "when.kind=tool-call/tool-result with callId means: after the named session event is appended, while the step is still running, apply the op. The steer fixture waits for the read tool/result so the splice lands after the tool result; the abort fixture waits for the first tool/call so the abort lands while that tool is running."
+  },
+  "rules": [
+    {
+      "id": "steer-targets-next-step",
+      "rule": "steer() appends the message to next-step, not next-turn; the splice event carries target next-step and the message object that later appears as user/message.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:122",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:154-181",
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:18"
+      ],
+      "expectedLines": [
+        16
+      ]
+    },
+    {
+      "id": "steer-claimed-at-step-boundary",
+      "rule": "At the step boundary preStep claim('next-step') removes the pending steer (removedCount 1) before step/start; step 2 starts only after step/end step 1.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:109-113",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:267-288",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331",
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:22-24"
+      ],
+      "expectedLines": [
+        17,
+        18,
+        19
+      ]
+    },
+    {
+      "id": "steer-user-message-provenance",
+      "rule": "The claimed message is appended as user/message with the same id and content as the next-step splice. dsh does not emit sourceEventSeqs on this user/message; provenance is the shared message id {{message:5}} on the splice and the user/message.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:424-436",
+        "/root/jsplug-proto/dsh/packages/core/session/src/surface.ts:303-311",
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:23-25"
+      ],
+      "expectedLines": [
+        16,
+        20
+      ]
+    },
+    {
+      "id": "steer-starts-next-step",
+      "rule": "A non-empty steer batch always enters a new step: the loop breaks only when turnEnds is set AND decision.messages is empty. This fixture covers the 'immediately starts a new step' branch; the 'directly ends turn' branch cannot occur for a non-empty steer.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:318-326",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "expectedLines": [
+        17,
+        19,
+        20
+      ]
+    },
+    {
+      "id": "tool-result-rendering",
+      "rule": "The read tool result envelope and meta are kept verbatim; only {{cwd}} is tokenized. The result text is not normalized to a placeholder.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts:153-170",
+        "/root/jsplug-proto/dsh/snapshots/session/fs-read/session.v4.jsonl:17",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-95"
+      ],
+      "expectedLines": [
+        15
+      ]
+    },
+    {
+      "id": "turn-completes",
+      "rule": "Step 2's assistant finishes with stop; the turn ends completed.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:547",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:202-233"
+      ],
+      "expectedLines": [
+        21,
+        23
+      ]
+    }
+  ],
+  "events": [
+    {
+      "line": 1,
+      "type": "session",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/session/session-format/src/types.ts:16-26",
+        "/root/jsplug-proto/dsh/packages/session/session-persistence-jsonl/src/format.ts:83-98"
+      ],
+      "note": "v4 session header; id/cwd are tokens; createdAt 200 is normalized to 0 for comparison."
+    },
+    {
+      "line": 2,
+      "type": "permission/preset",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:416",
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:440-442"
+      ],
+      "note": "Session-start metadata from the workspace-write preset; data.preset only."
+    },
+    {
+      "line": 3,
+      "type": "sandbox/mode",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:33",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:54"
+      ],
+      "note": "Session-start metadata; data.mode only."
+    },
+    {
+      "line": 4,
+      "type": "approval/policy",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/user-approval/src/index.ts:104"
+      ],
+      "note": "Session-start metadata; data.policy only."
+    },
+    {
+      "line": 5,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Insert the prompt as {{message:1}} into next-turn at start 0: 'Read notes.txt, then wait for my steer.'."
+    },
+    {
+      "line": 6,
+      "type": "turn/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:289",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:307"
+      ],
+      "note": "turn 1."
+    },
+    {
+      "line": 7,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:109-113",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Claim/remove the queued next-turn prompt (removedCount 1)."
+    },
+    {
+      "line": 8,
+      "type": "step/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 1."
+    },
+    {
+      "line": 9,
+      "type": "system/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:331",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:423"
+      ],
+      "note": "System prompt {{system}} appended to the surface."
+    },
+    {
+      "line": 10,
+      "type": "user/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:310",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:424-436"
+      ],
+      "note": "Prompt message {{message:1}} appended to the surface."
+    },
+    {
+      "line": 11,
+      "type": "request/header",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:391-403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:637-650"
+      ],
+      "note": "First header for this session; config provider/model are comparison masks, tools is the whole-array {{tools}} token."
+    },
+    {
+      "line": 12,
+      "type": "request/context",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:398-403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:682"
+      ],
+      "note": "Route context for the fake replay route."
+    },
+    {
+      "line": 13,
+      "type": "assistant/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-356",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-547"
+      ],
+      "note": "Assistant tool-call message {{message:3}}; stream is block-start/tool-call-chunks/block-end/finish(tool-calls)."
+    },
+    {
+      "line": 14,
+      "type": "tool/call",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:360-372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:263-268"
+      ],
+      "note": "read(notes.txt) call call_steer_read, arguments exactly as the model produced them."
+    },
+    {
+      "line": 15,
+      "type": "tool/result",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:376-386",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/tool-calls.ts:269-289",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read-render.ts:153-170"
+      ],
+      "note": "Successful read result {{message:4}} with the OpenCode-style envelope and meta; sourceEventSeqs [12] cites the tool/call at seq 12 (line 14)."
+    },
+    {
+      "line": 16,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:122",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Steer arrives during step 1: target next-step, start 0, inserted {{message:5}} 'Now reply with DONE.'."
+    },
+    {
+      "line": 17,
+      "type": "step/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 1 closes."
+    },
+    {
+      "line": 18,
+      "type": "agent/inbox/spliced",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:109-113",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-240"
+      ],
+      "note": "Step 2 preStep claims the steer: target next-step, removedCount 1."
+    },
+    {
+      "line": 19,
+      "type": "step/start",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 2; starts only after the steer claim."
+    },
+    {
+      "line": 20,
+      "type": "user/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:310",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:424-436"
+      ],
+      "note": "Steer message {{message:5}} appended; same id/content as the splice at line 16."
+    },
+    {
+      "line": 21,
+      "type": "assistant/message",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-356",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-547"
+      ],
+      "note": "Assistant reply DONE {{message:6}}; finish(stop). No new request/header or request/context because the route and surface generation did not change."
+    },
+    {
+      "line": 22,
+      "type": "step/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 2 closes."
+    },
+    {
+      "line": 23,
+      "type": "turn/end",
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:369-372",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387"
+      ],
+      "note": "reason completed."
+    }
+  ],
+  "normalization": {
+    "tokenSource": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:16-24",
+    "tokens": [
+      {
+        "token": "{{sessionId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{session:1}}."
+      },
+      {
+        "token": "{{messageId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{message:N}}."
+      },
+      {
+        "token": "{{usedTokens}}",
+        "used": false,
+        "where": null,
+        "note": "No usage_update event in this fixture."
+      },
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 and :15",
+        "note": "Materialized to /dsh-snapshot-cwd for fixture validation; also used in the read result envelope and meta."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9 system text",
+        "note": "System prompt text token."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header tools",
+        "note": "The dsh normalizer replaces the whole tool-schema array with this token. The read schema text is pinned by toolSchemaRead, not dropped; a P1 comparator that needs literal schema text must resolve the token from the registry."
+      },
+      {
+        "token": "{{eventTime}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{eventOmittedBytes}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{sourceSessionFormatVersion}}",
+        "used": false,
+        "where": null,
+        "note": "No delivery marker in this fixture."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 id",
+        "note": "Ordinal session identity; see identity.ts:44-60."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:5 and :10",
+        "note": "Prompt user message."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9",
+        "note": "System message."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl:13",
+        "note": "Assistant tool-call message."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl:15",
+        "note": "Tool result message."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl:16 and :20",
+        "note": "Steer message; same ordinal on the next-step splice and the user/message."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl:21",
+        "note": "Assistant reply message."
+      }
+    ],
+    "comparisonMask": [
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.provider",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.model",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      }
+    ],
+    "notUsedFromV4SourceLog": [
+      "{{rpc:1}}",
+      "{{rpc:2}}",
+      "{{clientTimeZone}}",
+      "{{sourceRoot}}",
+      "{{webUrl}}",
+      "{{id:1}}"
+    ],
+    "volatileFields": [
+      {
+        "fields": "seq, time, seq0, time0",
+        "handling": "Absent from committed fixture; deleted by normalize.ts:27-35 (omitFixtureEnvelope) and :449/:603 before comparison."
+      },
+      {
+        "fields": "session header createdAt",
+        "handling": "Fixture keeps 200; normalize.ts:387-388 sets it to 0 on both sides before comparison."
+      },
+      {
+        "fields": "assistant stream time/time0/dt",
+        "handling": "Fixture uses 0/0/[]; normalize.ts:398-408 zeroes time/time0 and maps dt to zeros on both sides."
+      },
+      {
+        "fields": "session id and message ids",
+        "handling": "Ordinal tokens {{session:N}} / {{message:N}}; identity relationships preserved by redactSessionSnapshotIds (identity.ts:44-60)."
+      },
+      {
+        "fields": "cwd",
+        "handling": "{{cwd}} token; projected to /dsh-snapshot-cwd for v4 header validation by llm-replay/src/index.ts:386-400."
+      },
+      {
+        "fields": "config.provider, config.model",
+        "handling": "Masked to {{provider}}/{{model}} on both sides per the task convention (see providerModelConvention)."
+      },
+      {
+        "fields": "tool/result meta",
+        "handling": "Kept verbatim; only {{cwd}} inside meta.path is tokenized."
+      }
+    ],
+    "sourceEventSeqConvention": "The committed JSONL omits seq. Event seq is the 0-based index after the session header: expected line N has seq N-2. tool/result.sourceEventSeqs [12] cites the tool/call at line 14."
+  },
+  "providerModelConvention": {
+    "rule": "Before comparison, replace request/header.data.header.config.provider with {{provider}} and .model with {{model}} on both expected and actual.",
+    "reason": "The fixture is a fake replay route. request/context and assistant/message.source keep the literal fake/fake route identity; only the header config is masked.",
+    "appliedAt": [
+      "expected.v4.jsonl:11"
+    ]
+  },
+  "replay": {
+    "file": "replay.json",
+    "shape": "calls[i].index is the 1-based model-call number; calls[i].stream is an AssistantStreamRecord[] identical in shape to assistant/attempt.data.stream.",
+    "callCount": 2,
+    "packedRecordTypes": [
+      "tool-call-chunks",
+      "text-chunks",
+      "chunk"
+    ],
+    "expansion": "Call 1 expands to block-start/tool-call-delta/block-end/finish(tool-calls); call 2 expands to text-delta/finish(stop).",
+    "finish": "Both calls carry an explicit finish chunk; the last record of each stream is finish."
+  },
+  "excludedV4Events": [
+    {
+      "v4LogLine": 11,
+      "type": "user/message",
+      "source": "runtime-context",
+      "reason": "P3 runtime-context plugin event; not part of the steer loop.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:11"
+      ]
+    },
+    {
+      "v4LogLine": 12,
+      "type": "user/message",
+      "source": "time-context",
+      "reason": "Time-context plugin event; out of scope for P1.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:12"
+      ]
+    },
+    {
+      "v4LogLine": 15,
+      "type": "session/title",
+      "source": "fallback titler",
+      "reason": "Session title is out of scope (design section 0.2).",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:15"
+      ]
+    },
+    {
+      "v4LogLine": "16-18",
+      "type": "agent/inbox/spliced",
+      "source": "web client requeue",
+      "reason": "The web client first inserts the interjection into next-turn, cancels it, then inserts it into next-step. This fixture models the final next-step insert directly; the canceled next-turn pair is a client transport detail, not loop behavior.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:16-18"
+      ]
+    },
+    {
+      "v4LogLine": "20-21",
+      "type": "tool/call, tool/result",
+      "source": "ask_user_question",
+      "reason": "The source scenario asks a question; this fixture substitutes a read tool call to create the step boundary without approval/question events.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/web/steering/session.v4.jsonl:20-21"
+      ]
+    }
+  ],
+  "openIssues": [
+    "The P1 driver must implement newSession.workspace and steer.when.kind=tool-result; the P0 InputFile parser only knows op/text.",
+    "The Zig harness must emit sourceEventSeqs on tool/result and preserve the read result envelope/meta; P0 only folds append events.",
+    "dsh does not put sourceEventSeqs on the steer user/message. Provenance is the shared {{message:5}} ordinal; adding sourceEventSeqs would be a deliberate extension, not dsh parity.",
+    "The {{tools}} token stands for the full read schema; the schema text is pinned by toolSchemaRead. If the P1 comparator needs literal schema text, it must resolve the token from the tool registry.",
+    "No jq binary is installed in WSL; the JSONL check uses Python 3.14 plus a Node 24 stdin sentinel (node.exe)."
+  ],
+  "validation": {
+    "commands": [
+      "python3 -I /mnt/c/Users/Wray/AppData/Local/Temp/check_dsh_fixtures.py",
+      "python3 -I /mnt/c/Users/Wray/AppData/Local/Temp/check_dsh_manifests.py",
+      "docker run --rm --entrypoint node -v /home/wray/dsh-zig/test/fixtures/dsh_native:/fixtures:ro -v /mnt/c/Users/Wray/AppData/Local/Temp/dsh_validate_fixtures.js:/validate.js:ro junclaw:full-dsh-test /validate.js /fixtures/<scenario>/expected.v4.jsonl /fixtures/<scenario>/replay.json",
+      "cat test/fixtures/dsh_native/<scenario>/expected.v4.jsonl | /mnt/c/Tools/nodejs/node.exe -e <JSON.parse each line>",
+      "git status --short -- test/fixtures/dsh_native"
+    ],
+    "results": [
+      "catalog: HEADER_OK version=4 events=22",
+      "catalog TYPES: permission/preset sandbox/mode approval/policy agent/inbox/spliced turn/start agent/inbox/spliced step/start system/message user/message request/header request/context assistant/message tool/call tool/result agent/inbox/spliced step/end agent/inbox/spliced step/start user/message assistant/message step/end turn/end",
+      "replay call 1: chunks=4 finish={\"kind\":\"tool-calls\"} usage=undefined; blocks=[{\"type\":\"tool-call\",\"id\":\"call_steer_read\",\"name\":\"read\",\"arguments\":\"{\\\"file_path\\\": \\\"notes.txt\\\"}\"}]; CONTENT_MATCH true USAGE_MATCH true FINISH_MATCH true",
+      "replay call 2: chunks=2 finish={\"kind\":\"stop\"} usage=undefined; blocks=[{\"type\":\"text\",\"text\":\"DONE\"}]; CONTENT_MATCH true USAGE_MATCH true FINISH_MATCH true",
+      "self-check: steer: OK lines=23 events=22 calls=2; all fixture self-checks passed",
+      "node sentinel: steer: node-json-ok lines=23",
+      "worktree: only test/fixtures/dsh_native/{steer,abort,max-tokens} are added by this task"
+    ],
+    "notes": "The dsh catalog validator materializes {{cwd}} to /dsh-snapshot-cwd and adds the omitted physical seq/time envelope (seq=index, time=0) before restore, matching normalize.ts:27-35. No jq binary is installed in WSL; the Node 24 stdin sentinel covers the JSON.parse requirement and Python covers the event-sequence invariants."
+  },
+  "toolSchema": {
+    "name": "read",
+    "description": "Read a UTF-8 text file and return line-numbered content.",
+    "parameters": {
+      "file_path": {
+        "type": "string",
+        "required": true,
+        "description": "Path to read, resolved by the filesystem backend."
+      },
+      "offset": {
+        "type": "number",
+        "description": "1-based first line to return. Defaults to 1."
+      },
+      "limit": {
+        "type": "number",
+        "description": "Maximum number of lines to return. Defaults to ${caps.limit}."
+      }
+    },
+    "evidence": [
+      "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-95"
+    ],
+    "note": "Literal read tool schema behind the {{tools}} whole-array token. The expected request/header keeps dsh's committed {{tools}} form; this object records the schema text so it is not silently dropped. A P1 comparator that needs literal schema text must resolve {{tools}} to this schema (plus the runtime tool set)."
+  }
+}
