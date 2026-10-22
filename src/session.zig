@@ -14,6 +14,7 @@ const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
 const fs_compat = @import("fs_compat.zig");
 const agent_routing = @import("agent_routing.zig");
+const model_refs = @import("model_refs.zig");
 const agent_mod = @import("agent/root.zig");
 const turn_persistence = @import("agent/turn_persistence.zig");
 const session_reset = @import("session_reset.zig");
@@ -74,12 +75,20 @@ const DshEngineState = if (dsh_enabled) struct {
     engine: *dsh_harness_mod.DshEngine,
     dsh_home: []u8,
     session_base: []u8,
+    /// Owned strings backing `engine.opts.sidecar.profile` (null when the
+    /// config has no usable default model, so the profile is left alone).
+    profile_base_url: ?[]u8 = null,
+    profile_model: ?[]u8 = null,
+    profile_models: ?[][]const u8 = null,
 
     fn deinit(self: *@This()) void {
         self.engine.deinit();
         self.allocator.destroy(self.engine);
         self.allocator.free(self.dsh_home);
         self.allocator.free(self.session_base);
+        if (self.profile_base_url) |value| self.allocator.free(value);
+        if (self.profile_model) |value| self.allocator.free(value);
+        if (self.profile_models) |value| self.allocator.free(value);
     }
 } else struct {
     fn deinit(self: *@This()) void {
@@ -1977,9 +1986,7 @@ pub const SessionManager = struct {
             const session_base = try std.fmt.allocPrint(self.allocator, "{s}/session.json", .{sessions_dir});
             errdefer self.allocator.free(session_base);
 
-            const engine = try self.allocator.create(dsh_harness_mod.DshEngine);
-            errdefer self.allocator.destroy(engine);
-            engine.* = dsh_harness_mod.DshEngine.init(self.allocator, .{
+            var opts = dsh_harness_mod.DshEngine.Options{
                 .sidecar = .{
                     // Empty: resolved from NULLCLAW_DSH_BIN at boot.
                     .bin_js = "",
@@ -1988,12 +1995,54 @@ pub const SessionManager = struct {
                 },
                 .boot_url = dsh_test_boot_url,
                 .session_file = session_base,
-            });
+            };
+
+            var profile_base_url: ?[]u8 = null;
+            errdefer if (profile_base_url) |value| self.allocator.free(value);
+            var profile_model: ?[]u8 = null;
+            errdefer if (profile_model) |value| self.allocator.free(value);
+            var profile_models: ?[][]const u8 = null;
+            errdefer if (profile_models) |value| self.allocator.free(value);
+
+            // Current junclaw provider config -> the dsh route. The route id
+            // and credential env name are constants; only these values move.
+            if (self.config.default_model) |model_ref| {
+                const provider = self.config.default_provider;
+                const model = if (model_refs.matchExplicitProviderPrefix(model_ref, provider)) |ref|
+                    ref.model
+                else
+                    model_ref;
+                const base_url = if (std.mem.startsWith(u8, provider, "custom:"))
+                    provider["custom:".len..]
+                else
+                    self.config.getProviderBaseUrl(provider) orelse
+                        providers.factory.compatibleProviderUrl(provider) orelse "";
+                if (model.len > 0 and base_url.len > 0) {
+                    profile_base_url = try self.allocator.dupe(u8, base_url);
+                    profile_model = try self.allocator.dupe(u8, model);
+                    const models = try self.allocator.alloc([]const u8, 1);
+                    models[0] = profile_model.?;
+                    profile_models = models;
+                    opts.sidecar.profile = .{
+                        .base_url = profile_base_url.?,
+                        .models = profile_models.?,
+                        .default_model = profile_model.?,
+                        .api_key = self.config.defaultProviderKey(),
+                    };
+                }
+            }
+
+            const engine = try self.allocator.create(dsh_harness_mod.DshEngine);
+            errdefer self.allocator.destroy(engine);
+            engine.* = dsh_harness_mod.DshEngine.init(self.allocator, opts);
             self.dsh_engine.state = .{
                 .allocator = self.allocator,
                 .engine = engine,
                 .dsh_home = dsh_home,
                 .session_base = session_base,
+                .profile_base_url = profile_base_url,
+                .profile_model = profile_model,
+                .profile_models = profile_models,
             };
             return engine;
         } else unreachable;

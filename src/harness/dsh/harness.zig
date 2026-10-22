@@ -27,6 +27,7 @@ const agent_mod = @import("../../agent/root.zig");
 const port = @import("../port.zig");
 const client_mod = @import("client.zig");
 const sidecar_mod = @import("sidecar.zig");
+const profile_mod = @import("profile.zig");
 
 const Allocator = std.mem.Allocator;
 const DshClient = client_mod.DshClient;
@@ -40,6 +41,82 @@ const poll_slice_ms: u64 = 50;
 const stop_ack = "No active background task to stop.";
 /// Same text `Agent.handleSlashCommand("/new")` returns.
 const new_session_ack = "Session cleared.";
+
+const ModelSelection = struct { provider: []const u8 = "", model: []const u8 = "" };
+
+/// The model a resumed session recorded, or null when it never selected one
+/// (fresh sessions fall back to `agent-default-model`).
+fn sessionSelection(allocator: Allocator, client: *DshClient, session_id: []const u8) !?ModelSelection {
+    const args = try std.json.Stringify.valueAlloc(allocator, .{
+        .request = .{ .sessionId = session_id },
+    }, .{});
+    defer allocator.free(args);
+    var reply = try client.call("session/projections", args);
+    defer client.freeReply(&reply);
+    if (!reply.ok) return null;
+
+    const Reply = struct {
+        values: ?Values = null,
+        const Values = struct {
+            modelSelection: ?Selection = null,
+            const Selection = struct {
+                lastUsed: ?ModelSelection = null,
+                next: ?ModelSelection = null,
+            };
+        };
+    };
+    const parsed = std.json.parseFromSlice(Reply, allocator, reply.value_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return null;
+    defer parsed.deinit();
+    const values = parsed.value.values orelse return null;
+    const selection = values.modelSelection orelse return null;
+    return selection.next orelse selection.lastUsed;
+}
+
+/// True when the host catalog still advertises this provider/model. A failed
+/// catalog read counts as "present" so a transport hiccup never rewrites a
+/// user's deliberate selection.
+fn catalogContains(allocator: Allocator, client: *DshClient, selection: ModelSelection) bool {
+    var reply = client.call("session/modelCatalog", "{}") catch return true;
+    defer client.freeReply(&reply);
+    if (!reply.ok) return true;
+
+    const Catalog = struct {
+        groups: []const Group = &.{},
+        const Group = struct {
+            id: []const u8 = "",
+            models: []const Model = &.{},
+        };
+        const Model = struct { id: []const u8 = "" };
+    };
+    const parsed = std.json.parseFromSlice(Catalog, allocator, reply.value_json, .{
+        .ignore_unknown_fields = true,
+    }) catch return true;
+    defer parsed.deinit();
+    for (parsed.value.groups) |group| {
+        if (!std.mem.eql(u8, group.id, selection.provider)) continue;
+        for (group.models) |model| {
+            if (std.mem.eql(u8, model.id, selection.model)) return true;
+        }
+    }
+    return false;
+}
+
+/// Point a resumed session at the current junclaw default when its recorded
+/// model is no longer offered. Best effort: an older dsh without these RPCs
+/// leaves the session alone.
+fn ensureSessionModel(
+    allocator: Allocator,
+    client: *DshClient,
+    session_id: []const u8,
+    route: profile_mod.Route,
+) !void {
+    const selection = try sessionSelection(allocator, client, session_id) orelse return;
+    if (selection.provider.len == 0 or selection.model.len == 0) return;
+    if (catalogContains(allocator, client, selection)) return;
+    try client.selectModel(session_id, profile_mod.route_id, route.default_model);
+}
 
 /// Process-wide dsh state: the sidecar (or an injected boot URL), its
 /// credentials, and one dsh session per junclaw key.
@@ -141,6 +218,12 @@ pub const DshEngine = struct {
         if (self.booted) return;
 
         try fs_compat.makePath(self.opts.sidecar.dsh_home);
+        // Rewrite the junclaw route in the web profile before spawning: dsh
+        // composes the profile once at boot. Idempotent, atomic, and limited
+        // to `providers.junclaw` plus the default selection.
+        if (self.opts.sidecar.profile) |route| {
+            try profile_mod.write(self.allocator, self.opts.sidecar.dsh_home, route);
+        }
         if (self.opts.session_file) |base| {
             const dir = std_compat.fs.path.dirname(base) orelse ".";
             try fs_compat.makePath(dir);
@@ -301,6 +384,12 @@ pub const DshEngine = struct {
         var session_id: []u8 = undefined;
         if (persisted) |id| {
             try client.connect(id);
+            // A resumed session keeps the model it recorded. When that model
+            // left the catalog (provider or model renamed), switch it to the
+            // current default before prompting instead of failing the turn.
+            if (self.opts.sidecar.profile) |route| {
+                ensureSessionModel(self.allocator, &client, id, route) catch {};
+            }
             session_id = try self.allocator.dupe(u8, id);
         } else {
             session_id = try client.createSession(self.opts.sidecar.workspace);

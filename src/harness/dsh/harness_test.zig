@@ -3,10 +3,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const std_compat = @import("compat");
+const fs_compat = @import("../../fs_compat.zig");
 const port = @import("../port.zig");
 const harness_mod = @import("harness.zig");
 const mock_mod = @import("mock.zig");
 const sidecar_mod = @import("sidecar.zig");
+const profile_mod = @import("profile.zig");
 
 const Allocator = std.mem.Allocator;
 const DshEngine = harness_mod.DshEngine;
@@ -906,4 +908,199 @@ test "dsh concurrent turns keep their own session key" {
     try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
     try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+}
+
+/// Engine whose boot rewrites a junclaw-owned profile route.
+fn newProfileEngine(
+    allocator: Allocator,
+    boot_url: []const u8,
+    session_file: ?[]const u8,
+    dsh_home: []const u8,
+    route: profile_mod.Route,
+) !*DshEngine {
+    const engine = try allocator.create(DshEngine);
+    engine.* = DshEngine.init(allocator, .{
+        .sidecar = .{
+            .bin_js = "unused",
+            .workspace = test_cwd,
+            .dsh_home = dsh_home,
+            .profile = route,
+        },
+        .boot_url = boot_url,
+        .session_file = session_file,
+        .turn_timeout_ms = 5_000,
+        .cancel_timeout_ms = 5_000,
+    });
+    return engine;
+}
+
+fn readProfilePatch(allocator: Allocator, dsh_home: []const u8) ![]u8 {
+    const path = try profile_mod.patchPath(allocator, dsh_home);
+    defer allocator.free(path);
+    return fs_compat.readFileAlloc(std_compat.fs.cwd(), allocator, path, 1 << 20);
+}
+
+fn seedProfilePatch(allocator: Allocator, dsh_home: []const u8, contents: []const u8) !void {
+    const path = try profile_mod.patchPath(allocator, dsh_home);
+    defer allocator.free(path);
+    try fs_compat.makePath(std.fs.path.dirname(path).?);
+    const file = try fs_compat.createPath(path, .{});
+    defer file.close();
+    try file.writeAll(contents);
+}
+
+fn countOwnedRoute(text: []const u8) usize {
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        if (std.mem.eql(u8, std.mem.trim(u8, line, " "), profile_mod.route_id ++ ":")) count += 1;
+    }
+    return count;
+}
+
+const seeded_profile_patch =
+    \\- id: llm-pi-ai
+    \\  config:
+    \\    providers:
+    \\      user-route:
+    \\        api: openai-completions
+    \\        baseURL: https://user.example.com/v1
+    \\        apiKeyEnv: USER_KEY
+    \\        models:
+    \\          - id: user-model
+    \\            name: User Model
+    \\- id: agent-default-model
+    \\  config:
+    \\    provider: user-route
+    \\    model: user-model
+    \\    reasoningEffort: high
+    \\- id: some-plugin
+    \\  config:
+    \\    answer: 42
+    \\
+;
+
+test "dsh boot rewrites only the junclaw route and follows model changes" {
+    // Regression: 修复前 boot 不写 profile，dsh 没有 junclaw 路由/默认模型。
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh" });
+    defer allocator.free(dsh_home);
+    try seedProfilePatch(allocator, dsh_home, seeded_profile_patch);
+
+    {
+        const engine = try newProfileEngine(allocator, boot_url, null, dsh_home, .{
+            .base_url = "https://api.example.com/v1",
+            .models = &.{"model-a"},
+            .default_model = "model-a",
+            .api_key = "test-key",
+        });
+        defer freeEngine(engine);
+        try engine.ensureBooted();
+    }
+
+    const first = try readProfilePatch(allocator, dsh_home);
+    defer allocator.free(first);
+    try std.testing.expectEqual(@as(usize, 1), countOwnedRoute(first));
+    try std.testing.expect(std.mem.indexOf(u8, first, "      junclaw:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "          - id: model-a\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "    provider: junclaw\n    model: model-a\n") != null);
+    // The user's route, entry and key survive the rewrite.
+    try std.testing.expect(std.mem.indexOf(u8, first, "user-route:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "baseURL: https://user.example.com/v1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "apiKeyEnv: USER_KEY\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "reasoningEffort: high\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "    answer: 42\n") != null);
+
+    const second_route: profile_mod.Route = .{
+        .base_url = "https://api.example.com/v1",
+        .models = &.{ "model-b", "model-c" },
+        .default_model = "model-c",
+        .api_key = "test-key",
+    };
+    {
+        const engine = try newProfileEngine(allocator, boot_url, null, dsh_home, second_route);
+        defer freeEngine(engine);
+        try engine.ensureBooted();
+    }
+
+    const second = try readProfilePatch(allocator, dsh_home);
+    defer allocator.free(second);
+    // Same permanent route key; catalog and default moved with the config.
+    try std.testing.expectEqual(@as(usize, 1), countOwnedRoute(second));
+    try std.testing.expect(std.mem.indexOf(u8, second, "- id: model-a\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "          - id: model-b\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "          - id: model-c\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "    provider: junclaw\n    model: model-c\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "baseURL: https://user.example.com/v1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, second, "apiKeyEnv: USER_KEY\n") != null);
+
+    // Idempotent: rewriting the same config leaves the bytes untouched.
+    try profile_mod.write(allocator, dsh_home, second_route);
+    const third = try readProfilePatch(allocator, dsh_home);
+    defer allocator.free(third);
+    try std.testing.expectEqualStrings(second, third);
+}
+
+test "dsh resumed session switches an unavailable model to the current default" {
+    // Regression: 修复前恢复旧会话直接 prompt，记录模型已下架时整轮报错。
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh" });
+    defer allocator.free(dsh_home);
+    const session_file = try tempSessionFile(allocator, &tmp);
+    defer allocator.free(session_file);
+    const mapping = try keySessionFile(allocator, session_file, "test-key");
+    defer allocator.free(mapping);
+    try sidecar_mod.saveSessionId(mapping, mock_mod.session_id);
+
+    // The session last ran on model-a; the host now only offers model-b.
+    try mock.setModelCatalog(
+        \\{"default":{"provider":"junclaw","model":"model-b"},"routableProviders":["junclaw"],
+        \\"groups":[{"id":"junclaw","name":"junclaw","models":[{"id":"model-b","name":"model-b"}]}],"failures":[]}
+    );
+    try mock.setProjection(
+        \\{"kind":"sequenced","asOfSeq":3,"values":{"modelSelection":
+        \\{"lastUsed":{"provider":"junclaw","model":"model-a"},"next":null}}}
+    );
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newProfileEngine(allocator, boot_url, session_file, dsh_home, .{
+        .base_url = "https://api.example.com/v1",
+        .models = &.{"model-b"},
+        .default_model = "model-b",
+        .api_key = "test-key",
+    });
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"answered on model-b"}, "completed");
+    const result = try runOneTurn(&h, "hi");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("answered on model-b", result.reply);
+
+    try std.testing.expectEqual(@as(usize, 1), mock.selectModelCount());
+    const select_body = (try mock.lastSelectModel(allocator)).?;
+    defer allocator.free(select_body);
+    try std.testing.expect(std.mem.indexOf(u8, select_body, "\"sessionId\":\"" ++ mock_mod.session_id ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, select_body, "\"provider\":\"junclaw\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, select_body, "\"model\":\"model-b\"") != null);
 }

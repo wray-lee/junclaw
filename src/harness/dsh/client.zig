@@ -500,6 +500,24 @@ pub const DshClient = struct {
         return self.allocator.dupe(u8, session_id);
     }
 
+    /// Select the Session-local model; dsh persists it as the default in the
+    /// background. Requires the session to be resumed (WS `session/follow`).
+    pub fn selectModel(
+        self: *DshClient,
+        session_id: []const u8,
+        provider: []const u8,
+        model: []const u8,
+    ) !void {
+        const args = try std.json.Stringify.valueAlloc(self.allocator, .{
+            .request = .{ .sessionId = session_id, .provider = provider, .model = model },
+        }, .{});
+        defer self.allocator.free(args);
+
+        var reply = try self.call("session/selectModel", args);
+        defer self.freeReply(&reply);
+        if (!reply.ok) return error.RpcFailed;
+    }
+
     pub fn prompt(self: *DshClient, session_id: []const u8, text: []const u8) !void {
         return self.sendPrompt(session_id, text, "queue");
     }

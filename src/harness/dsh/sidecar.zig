@@ -11,6 +11,7 @@ const std_compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const protocol = @import("protocol.zig");
 const client = @import("client.zig");
+const profile_mod = @import("profile.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,6 +28,9 @@ pub const Options = struct {
     dsh_home: []const u8,
     /// Extra environment entries; these override the defaults below.
     env: []const EnvVar = &.{},
+    /// junclaw-owned dsh route; rewritten into the web profile before each
+    /// boot and its key injected under the fixed `api_key_env` name.
+    profile: ?profile_mod.Route = null,
     /// Upper bound on reading the launch URL from stdout.
     boot_timeout_ms: u64 = 60_000,
 };
@@ -68,6 +72,11 @@ pub fn buildEnvMap(allocator: Allocator, opts: Options) !std_compat.process.EnvM
     try env.put("DSH_HOME", opts.dsh_home);
     try env.put("DSH_TELEMETRY_MODE", "DISABLED");
     try env.put("MOCK_API_KEY", "test-key");
+    if (opts.profile) |profile| {
+        if (profile.api_key) |key| {
+            if (key.len > 0) try env.put(profile_mod.api_key_env, key);
+        }
+    }
     for (opts.env) |entry| try env.put(entry.key, entry.value);
     return env;
 }
@@ -242,7 +251,7 @@ pub const Sidecar = struct {
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
         try argv.append(arena, self.opts.node_exe);
         try argv.append(arena, self.opts.bin_js);
-        for ([_][]const u8{ "--profile", "web", "--no-open", "--host", "127.0.0.1", "--port", "0" }) |argument| {
+        for ([_][]const u8{ "--profile", profile_mod.profile_name, "--no-open", "--host", "127.0.0.1", "--port", "0" }) |argument| {
             try argv.append(arena, argument);
         }
         self.argv = try argv.toOwnedSlice(arena);

@@ -121,6 +121,12 @@ pub const MockDsh = struct {
     connect_gate: ?*ConnectGate = null,
     /// Echo each prompt back as a delta plus a completed turn/end.
     echo_prompts: bool = false,
+    /// Reply value for `session/modelCatalog`; null replies `{}`.
+    model_catalog_json: ?[]u8 = null,
+    /// Reply value for `session/projections`; null replies `{}`.
+    projection_json: ?[]u8 = null,
+    /// `session/selectModel` request bodies, in arrival order.
+    select_model_requests: std.ArrayListUnmanaged([]u8) = .empty,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -150,6 +156,10 @@ pub const MockDsh = struct {
         for (self.closed_sessions.items) |session| self.allocator.free(session);
         self.closed_sessions.deinit(self.allocator);
         if (self.last_prompt_session) |session| self.allocator.free(session);
+        if (self.model_catalog_json) |json| self.allocator.free(json);
+        if (self.projection_json) |json| self.allocator.free(json);
+        for (self.select_model_requests.items) |request| self.allocator.free(request);
+        self.select_model_requests.deinit(self.allocator);
         clearFrames(self.allocator, &self.turn_frames);
         self.turn_frames.deinit(self.allocator);
         clearFrames(self.allocator, &self.cancel_frames);
@@ -163,6 +173,45 @@ pub const MockDsh = struct {
 
     pub fn baseUrl(self: *const MockDsh, allocator: Allocator) ![]u8 {
         return std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{self.port()});
+    }
+
+    /// Replace the `session/modelCatalog` reply value.
+    pub fn setModelCatalog(self: *MockDsh, json: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, json);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.model_catalog_json) |old| self.allocator.free(old);
+        self.model_catalog_json = copy;
+    }
+
+    /// Replace the `session/projections` reply value.
+    pub fn setProjection(self: *MockDsh, json: []const u8) !void {
+        const copy = try self.allocator.dupe(u8, json);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.projection_json) |old| self.allocator.free(old);
+        self.projection_json = copy;
+    }
+
+    pub fn selectModelCount(self: *MockDsh) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.select_model_requests.items.len;
+    }
+
+    /// Copy of the last `session/selectModel` request body; caller frees.
+    pub fn lastSelectModel(self: *MockDsh, allocator: Allocator) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.select_model_requests.items.len == 0) return null;
+        return try allocator.dupe(u8, self.select_model_requests.items[self.select_model_requests.items.len - 1]);
+    }
+
+    fn recordSelectModel(self: *MockDsh, body: []const u8) void {
+        const copy = self.allocator.dupe(u8, body) catch return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.select_model_requests.append(self.allocator, copy) catch self.allocator.free(copy);
     }
 
     /// Replace the frames streamed after the next `session/prompt` reply.
@@ -273,6 +322,25 @@ pub const MockDsh = struct {
             value = try self.nextSessionValue();
         } else if (std.mem.eql(u8, method, "session/follow")) {
             value = try self.buildSnapshot(body);
+        } else if (std.mem.eql(u8, method, "session/modelCatalog")) {
+            self.mutex.lock();
+            const json = self.model_catalog_json orelse "{}";
+            value = self.allocator.dupe(u8, json) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            self.mutex.unlock();
+        } else if (std.mem.eql(u8, method, "session/projections")) {
+            self.mutex.lock();
+            const json = self.projection_json orelse "{}";
+            value = self.allocator.dupe(u8, json) catch |err| {
+                self.mutex.unlock();
+                return err;
+            };
+            self.mutex.unlock();
+        } else if (std.mem.eql(u8, method, "session/selectModel")) {
+            self.recordSelectModel(body);
+            value = try self.allocator.dupe(u8, "{}");
         } else {
             value = try self.allocator.dupe(u8, "{}");
         }
