@@ -9,6 +9,8 @@ pub const types = @import("types.zig");
 pub const json = @import("json.zig");
 pub const session_log = @import("session_log.zig");
 pub const session_store = @import("session_store.zig");
+pub const surface = @import("surface.zig");
+pub const replay_provider = @import("replay_provider.zig");
 
 /// Session format generation written and read by this build.
 pub const SESSION_FORMAT_VERSION: u32 = types.SESSION_FORMAT_VERSION;
@@ -19,4 +21,7 @@ test {
     _ = @import("json.zig");
     _ = @import("session_log.zig");
     _ = @import("session_store.zig");
+    _ = @import("surface.zig");
+    _ = @import("replay_provider.zig");
+    _ = @import("plain_turn_test.zig");
 }

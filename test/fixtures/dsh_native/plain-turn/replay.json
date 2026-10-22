@@ -1,0 +1,11 @@
+{
+  "calls": [
+    {
+      "index": 1,
+      "stream": [
+        { "type": "text-chunks", "time0": 0, "index": 0, "dt": [], "texts": ["hi"] },
+        { "type": "chunk", "time": 0, "chunk": { "type": "finish", "reason": { "kind": "stop" } } }
+      ]
+    }
+  ]
+}

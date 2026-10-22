@@ -1,0 +1,604 @@
+{
+  "scenario": "plain-turn",
+  "purpose": "P0 consistency fixture for the dsh-native Zig harness: drive initialize/newSession/prompt(plain), replay one model call, compare the normalized v4 session log.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "v3FixtureDir": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/fixtures/suite/plain-turn",
+    "input": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/fixtures/suite/plain-turn/input.json",
+      "lines": "1",
+      "content": "steps: initialize, newSession, prompt plain"
+    },
+    "v3Session": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/fixtures/suite/plain-turn/session.v3.jsonl",
+      "lines": "1-6",
+      "note": "Committed, already-tokenized v3 projection. It is a scripted fake-ACP log, not a real dsh turn: 6 lines, stops at assistant/attempt, has no user/message, inbox splice, request/context, step/end or turn/end."
+    },
+    "v3Behavior": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/fixtures/suite/plain-turn/behavior.json",
+      "lines": "8-13",
+      "note": "Raw scripted parent log (seq/time present, SYS PROMPT, tool schema t1). The committed session.v3.jsonl is its normalized projection."
+    },
+    "v4GroundTruth": {
+      "path": "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl",
+      "lines": "1-25",
+      "note": "Real, normalized v4 plain-text turn. Used for v4 envelope, event order and field shapes. Its provider is deepseek-official and it includes SDK-only plugins (runtime context, title, delivery, feedback); those are excluded below."
+    },
+    "normalizer": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts",
+      "lines": "16-24, 27-35, 384-408, 449, 603"
+    },
+    "replayHelper": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts",
+      "lines": "309-312, 386-400, 462-496"
+    },
+    "scenarioConfig": {
+      "path": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/suite.spec.ts",
+      "lines": "102-115",
+      "note": "plain-turn scenario: hasModelTurn, recorded, headerClass main, DSH_PERMISSION_MODE=never, workspace seeded with seed.txt."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "expected": "expected.v4.jsonl",
+    "replay": "replay.json",
+    "manifest": "manifest.json"
+  },
+  "v3ToV4Differences": [
+    {
+      "id": "header-version",
+      "change": "Session header version 3 -> 4; same required/optional field set.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/migration.ts:15-22",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/validation.ts:19-30",
+        "/root/jsplug-proto/dsh/packages/session/session-format/src/types.ts:16-26",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:1"
+      ]
+    },
+    {
+      "id": "fixture-envelope",
+      "change": "Committed fixtures omit the physical seq/time envelope; createdAt and stream clocks are zeroed before comparison.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:31-35",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:384-408",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:449",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:603"
+      ]
+    },
+    {
+      "id": "system-message-source",
+      "change": "system/message source {kind:plugin, plugin:@deepseek-ai/dsh-system-prompt} becomes {kind:system-prompt}; v4 rejects kind:plugin.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/sources.ts:44",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/sources.ts:60",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/sources.ts:99",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/message-sources.ts:7-12",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/message.ts:279-285",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:9"
+      ]
+    },
+    {
+      "id": "assistant-attempt-to-message",
+      "change": "The scripted v3 assistant/attempt becomes a successful v4 assistant/message with message content, source, id and surfaceOp append. assistant/attempt remains a v4 event, but only for attempts that commit no surface message.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-356",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-547",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/message.ts:258-272",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:16"
+      ]
+    },
+    {
+      "id": "assistant-stream-finish",
+      "change": "The completed assistant/message stream gains a terminal raw finish chunk after the packed text-chunks row. The v3 attempt stream has only text-chunks; the real v4 assistant/message records the finish chunk, and llm-replay refuses a recorded call without a finish chunk.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:20-27",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:44",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:202-230",
+        "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts:462-496",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:16"
+      ]
+    },
+    {
+      "id": "session-start-metadata",
+      "change": "Real v4 sessions start with permission/preset, sandbox/mode and approval/policy before the first turn. These are runtime plugin events, not format-migration events; the v3 scripted log omits them.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:416",
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:440-442",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:33",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:54",
+        "/root/jsplug-proto/dsh/packages/interaction/user-approval/src/index.ts:104",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:2-4"
+      ]
+    },
+    {
+      "id": "inbox-splice",
+      "change": "The prompt is inserted into next-turn before turn/start and removed after turn/start. The v3 scripted log has neither event.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-235",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:5",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:7"
+      ]
+    },
+    {
+      "id": "prompt-user-message",
+      "change": "The claimed prompt is appended as a user/message on the surface before request/header. The v3 scripted log omits it.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:303-310",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:430-439",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/message.ts:246-255",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:10"
+      ]
+    },
+    {
+      "id": "request-context",
+      "change": "A real v4 first request also appends request/context with the resolved route metadata after request/header. The v3 scripted log omits it.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:254-264",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:677-683",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:13"
+      ]
+    },
+    {
+      "id": "turn-completion",
+      "change": "The completed turn closes with step/end and turn/end reason completed after assistant/message. The v3 scripted log stops at assistant/attempt.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298-302",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:202-233",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:17",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:25"
+      ]
+    },
+    {
+      "id": "message-identity-renumbering",
+      "change": "v3 assigned {{message:1}} to the system message because it had no user message. The complete turn allocates {{message:1}} to the prompt at inbox insert, {{message:2}} to the system message, {{message:3}} to the assistant message, matching the real v4 log order (user, system, runtime context, assistant).",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:5",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:9",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:16",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/identity.ts:44-60"
+      ]
+    },
+    {
+      "id": "request-header-tools-token",
+      "change": "The v3 request/header tool schema is kept as the {{tools}} token; the concrete schema sidecar (tool-schemas.1.expected.json) is not part of this fixture.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/fixtures/suite/plain-turn/session.v3.jsonl:5",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/fixtures/suite/plain-turn/tool-schemas.1.expected.json",
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:12",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:629"
+      ]
+    }
+  ],
+  "events": [
+    {
+      "line": 1,
+      "type": "session",
+      "v3FixtureLine": 1,
+      "v4LogLine": 1,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/session/session-format/src/types.ts:16-26",
+        "/root/jsplug-proto/dsh/packages/session/session-persistence-jsonl/src/format.ts:83-98",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/validation.ts:19-30"
+      ],
+      "note": "version 4; id/cwd are tokens; createdAt 200 is kept from the v3 fixture and normalized to 0 for comparison."
+    },
+    {
+      "line": 2,
+      "type": "permission/preset",
+      "v3FixtureLine": null,
+      "v4LogLine": 2,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:416",
+        "/root/jsplug-proto/dsh/packages/interaction/permission-presets/src/index.ts:440-442"
+      ],
+      "note": "Session-start metadata from the default permission preset; data.preset only."
+    },
+    {
+      "line": 3,
+      "type": "sandbox/mode",
+      "v3FixtureLine": null,
+      "v4LogLine": 3,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:33",
+        "/root/jsplug-proto/dsh/packages/sandbox/sandbox-policy/src/session-mode.ts:54"
+      ],
+      "note": "Session-start metadata; data.mode only."
+    },
+    {
+      "line": 4,
+      "type": "approval/policy",
+      "v3FixtureLine": null,
+      "v4LogLine": 4,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/interaction/user-approval/src/index.ts:104"
+      ],
+      "note": "Session-start metadata; data.policy only."
+    },
+    {
+      "line": 5,
+      "type": "agent/inbox/spliced",
+      "v3FixtureLine": null,
+      "v4LogLine": 5,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-235"
+      ],
+      "note": "Insert the prompt as {{message:1}} into next-turn at start 0."
+    },
+    {
+      "line": 6,
+      "type": "turn/start",
+      "v3FixtureLine": 2,
+      "v4LogLine": 6,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:289",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:307"
+      ],
+      "note": "turn 1."
+    },
+    {
+      "line": 7,
+      "type": "agent/inbox/spliced",
+      "v3FixtureLine": null,
+      "v4LogLine": 7,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/agent/src/types.ts:96-102",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/inbox.ts:227-235"
+      ],
+      "note": "Claim/remove the one queued next-turn message: removedCount 1, inserted empty."
+    },
+    {
+      "line": 8,
+      "type": "step/start",
+      "v3FixtureLine": 3,
+      "v4LogLine": 8,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:300",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:331"
+      ],
+      "note": "turn 1, step 1."
+    },
+    {
+      "line": 9,
+      "type": "system/message",
+      "v3FixtureLine": 4,
+      "v4LogLine": 9,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:331",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/message.ts:279-285",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/sources.ts:60",
+        "/root/jsplug-proto/dsh/packages/session/session-format-v3-to-v4/src/message-sources.ts:7-12"
+      ],
+      "note": "role system; content text {{system}}; source kind system-prompt (v3 plugin source rewritten); id {{message:2}}; surfaceOp append."
+    },
+    {
+      "line": 10,
+      "type": "user/message",
+      "v3FixtureLine": null,
+      "v4LogLine": 10,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:303-310",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/message.ts:246-255",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:430-439"
+      ],
+      "note": "The claimed prompt: content text plain; source kind user; role user; id {{message:1}}; surfaceOp append."
+    },
+    {
+      "line": 11,
+      "type": "request/header",
+      "v3FixtureLine": 5,
+      "v4LogLine": 12,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:241-252",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:266-274",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:637-641"
+      ],
+      "note": "config.provider/model masked to {{provider}}/{{model}} by the task convention; tools {{tools}}; reason initial."
+    },
+    {
+      "line": 12,
+      "type": "request/context",
+      "v3FixtureLine": null,
+      "v4LogLine": 13,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:254-264",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:403",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:677-683"
+      ],
+      "note": "Resolved route metadata; provider/model fake/fake (the replay route identity). Not masked by the task convention; see openIssues."
+    },
+    {
+      "line": 13,
+      "type": "assistant/message",
+      "v3FixtureLine": 6,
+      "v4LogLine": 16,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:342-350",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:529-547",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/message.ts:258-272",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:20-27",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:44",
+        "/root/jsplug-proto/dsh/packages/llm/llm/src/assistant-stream.ts:202-230",
+        "/root/jsplug-proto/dsh/packages/test-support/llm-replay/src/index.ts:462-496"
+      ],
+      "note": "role assistant; content text hi assembled from the v3 text-chunks; source kind model provider/model fake/fake; id {{message:3}}; stream = v3 packed text-chunks plus a terminal finish chunk; usage absent because the replay stream reports none; surfaceOp append."
+    },
+    {
+      "line": 14,
+      "type": "step/end",
+      "v3FixtureLine": null,
+      "v4LogLine": 17,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:302",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:358"
+      ],
+      "note": "turn 1, step 1."
+    },
+    {
+      "line": 15,
+      "type": "turn/end",
+      "v3FixtureLine": null,
+      "v4LogLine": 25,
+      "sources": [
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:298",
+        "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:202-233",
+        "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:387"
+      ],
+      "note": "turn 1, reason completed."
+    }
+  ],
+  "normalization": {
+    "tokenSource": "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/src/normalize.ts:16-24",
+    "tokens": [
+      {
+        "token": "{{sessionId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{session:N}}."
+      },
+      {
+        "token": "{{messageId}}",
+        "used": false,
+        "where": null,
+        "note": "Legacy singular normalizer token; this fixture uses ordinal {{message:N}}."
+      },
+      {
+        "token": "{{usedTokens}}",
+        "used": false,
+        "where": null,
+        "note": "No usage_update event in this fixture."
+      },
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 cwd",
+        "note": "Materialized to /dsh-snapshot-cwd for fixture validation."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9 system text",
+        "note": "System prompt text token."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header tools",
+        "note": "Whole tool-schema array token."
+      },
+      {
+        "token": "{{eventTime}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{eventOmittedBytes}}",
+        "used": false,
+        "where": null,
+        "note": "No event-read output in this fixture."
+      },
+      {
+        "token": "{{sourceSessionFormatVersion}}",
+        "used": false,
+        "where": null,
+        "note": "No delivery marker in this fixture."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:1 id",
+        "note": "Ordinal session identity; see identity.ts:44-60."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl:5 and :10",
+        "note": "Prompt user message."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl:9",
+        "note": "System message."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl:13",
+        "note": "Assistant message."
+      }
+    ],
+    "comparisonMask": [
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.provider",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl:11 request/header config.model",
+        "note": "Task convention; applied to both expected and actual before comparison."
+      }
+    ],
+    "notUsedFromV4SourceLog": [
+      "{{command:1}}",
+      "{{id:1}}",
+      "{{id:2}}",
+      "{{id:3}}"
+    ],
+    "volatileFields": [
+      {
+        "fields": "seq, time, seq0, time0",
+        "handling": "Absent from committed fixture; deleted by normalize.ts:31-35 (omitFixtureEnvelope) and :449/:603 before comparison."
+      },
+      {
+        "fields": "session header createdAt",
+        "handling": "Fixture keeps 200 from the v3 source; normalize.ts:387-388 sets it to 0 on both sides before comparison."
+      },
+      {
+        "fields": "assistant stream time/time0/dt",
+        "handling": "Fixture uses 0/0/[]; normalize.ts:398-408 zeroes time/time0 and maps dt to zeros on both sides."
+      },
+      {
+        "fields": "session id and message ids",
+        "handling": "Ordinal tokens {{session:N}} / {{message:N}}; identity relationships preserved by redactSessionSnapshotIds (identity.ts:44-60)."
+      },
+      {
+        "fields": "cwd",
+        "handling": "{{cwd}} token; projected to /dsh-snapshot-cwd for v4 header validation by llm-replay/src/index.ts:386-400."
+      },
+      {
+        "fields": "config.provider, config.model",
+        "handling": "Masked to {{provider}}/{{model}} on both sides per the task convention (see providerModelConvention)."
+      },
+      {
+        "fields": "assistant/message usage",
+        "handling": "Absent: the replay stream has no usage chunk; usage is optional (core/session/src/types.ts:342-350)."
+      }
+    ]
+  },
+  "providerModelConvention": {
+    "rule": "Before comparison, replace request/header.data.header.config.provider with {{provider}} and .model with {{model}} on both expected and actual.",
+    "reason": "Design section 5 decision 5 writes the fixed runtime identity provider junclaw plus a junclaw model name; the fixture source is the fake provider. No other field is masked.",
+    "appliedAt": [
+      "expected.v4.jsonl:11"
+    ],
+    "notMasked": [
+      {
+        "path": "request/context.data.provider and .model",
+        "fixtureValue": "fake / fake",
+        "risk": "The native harness derives these from the same request config, so under decision 5 it will write junclaw here too. The task convention does not mask this event."
+      },
+      {
+        "path": "assistant/message.data.message.source.provider and .model",
+        "fixtureValue": "fake / fake",
+        "risk": "Built from request.provider/request.model at agent-loop/src/agent.ts:529-536; under decision 5 it will be junclaw. The task convention does not mask this field."
+      }
+    ],
+    "recommendation": "Either extend the same {{provider}}/{{model}} mask to these two provider-identity locations, or make the P0 replay route report fake/fake. Decide before wiring the Zig comparison."
+  },
+  "replay": {
+    "file": "replay.json",
+    "shape": "calls[i].index is the 1-based model-call number; calls[i].stream is an AssistantStreamRecord[] identical in shape to assistant/attempt.data.stream.",
+    "callCount": 1,
+    "packedRecordTypes": [
+      "text-chunks",
+      "chunk"
+    ],
+    "expansion": "expandAssistantStream (assistant-stream.ts:202-230) turns the text-chunks row into one text-delta(index 0, text hi) and the raw chunk row into finish(stop).",
+    "finish": "The script carries an explicit finish chunk. The v3 attempt stream has none; a real v4 completed message records one (v4 log line 16), and llm-replay rejects a recorded call whose last chunk is not finish (llm-replay/src/index.ts:462-496). The dsh assembler would default to stop at EOF (assembler.ts:186-189), but the explicit chunk removes ambiguity."
+  },
+  "excludedV4Events": [
+    {
+      "v4LogLine": 11,
+      "type": "user/message",
+      "source": "runtime-context",
+      "reason": "P3 runtime-context plugin event; not present in the plain-turn source artifact; its workspace-write/ask text conflicts with the suite scenario DSH_PERMISSION_MODE=never.",
+      "evidence": [
+        "/root/jsplug-proto/dsh/snapshots/sdk/text-turn/session.v4.jsonl:11",
+        "/root/jsplug-proto/dsh/packages/test-support/session-snapshot/tests/suite.spec.ts:105"
+      ]
+    },
+    {
+      "v4LogLine": 14,
+      "type": "session/title",
+      "source": "fallback titler",
+      "reason": "Session title is explicitly out of scope (design section 0.2, not translated)."
+    },
+    {
+      "v4LogLine": 15,
+      "type": "session-log-deepseek/delivery-accepted",
+      "reason": "deepseek-provider delivery marker; not part of the core harness."
+    },
+    {
+      "v4LogLine": 18,
+      "type": "command/run",
+      "reason": "Feedback command injected by the SDK snapshot feedback-producer.mjs."
+    },
+    {
+      "v4LogLine": 19,
+      "type": "feedback/record",
+      "reason": "Feedback test plugin; not part of the core harness."
+    },
+    {
+      "v4LogLine": 20,
+      "type": "command/done",
+      "reason": "Feedback command completion; not part of the core harness."
+    },
+    {
+      "v4LogLine": 21,
+      "type": "feedback/record",
+      "reason": "Feedback test plugin; not part of the core harness."
+    },
+    {
+      "v4LogLine": 22,
+      "type": "feedback/message-put",
+      "reason": "Feedback test plugin; not part of the core harness."
+    },
+    {
+      "v4LogLine": 23,
+      "type": "feedback/message-put",
+      "reason": "Feedback test plugin; not part of the core harness."
+    },
+    {
+      "v4LogLine": 24,
+      "type": "feedback/message-delete",
+      "reason": "Feedback test plugin; not part of the core harness."
+    }
+  ],
+  "openIssues": [
+    "request/context.provider/model and assistant/message.source.provider/model are provider-route identity. The task convention masks only request/header config.provider/model, so under design decision 5 (fixed provider junclaw) these two locations will not match the fixture fake/fake unless the comparison is extended or the replay route reports fake/fake.",
+    "The v3 source is a scripted fake-ACP log, not a real dsh turn: it stops at assistant/attempt and has no user/message, inbox splice, request/context, step/end or turn/end. The complete v4 sequence is reconstructed from the real v4 log; every added event is listed in v3ToV4Differences. If the P0 harness does not yet emit inbox/request-context events, compare the implemented subset or split the fixture.",
+    "The request/header tools token {{tools}} comes from the v3 scripted fixture (tool t1). P0 is a no-tool turn; if the native harness advertises no tools, expected line 11 must drop the tools field (agent.ts:629 omits it when tools.length is 0).",
+    "The v4 ground-truth assistant stream also carries block-start/block-end and usage chunks from the deepseek provider. This fixture intentionally uses the delta-only replay stream (text-chunks + finish); the dsh assembler supports delta-only protocols (assembler.ts:33-35), but the expected stream is not byte-identical to the deepseek stream.",
+    "createdAt 200 is copied from the v3 fixture for readability. The comparison normalizer zeroes it (normalize.ts:387-388); a raw byte comparison without normalization would fail."
+  ],
+  "validation": {
+    "commands": [
+      "python3 -I (json.loads each file/line)",
+      "docker run --entrypoint node junclaw:full-dsh-test: parse expected.v4.jsonl with @deepseek-ai/dsh-session-format-catalog (recovery strict, validation current)",
+      "docker run --entrypoint node junclaw:full-dsh-test: expand replay.json with @deepseek-ai/dsh-llm expandAssistantStream",
+      "docker run --entrypoint node junclaw:full-dsh-test: assemble expected assistant/message stream with @deepseek-ai/dsh-llm BlockAssembler",
+      "grep -nE UUID/IP/email over all four files",
+      "git status --short in ~/dsh-zig"
+    ],
+    "results": [
+      "input.json: JSON OK; replay.json: JSON OK; manifest.json: JSON OK; expected.v4.jsonl: 15 JSONL records OK",
+      "HEADER_OK version=4 events=14; TYPES permission/preset sandbox/mode approval/policy agent/inbox/spliced turn/start agent/inbox/spliced step/start system/message user/message request/header request/context assistant/message step/end turn/end",
+      "CALL 1 chunks=2 text-delta(0,\"hi\") finish(stop)",
+      "BLOCKS [{\"type\":\"text\",\"text\":\"hi\"}]; FINISH {\"kind\":\"stop\"}; CONTENT_MATCH true",
+      "NO_CREDENTIAL_PATTERNS",
+      "git status at final check: ?? test/ (this task) plus concurrent changes under src/ from another process (M src/root.zig, ?? src/dsh_native_test_root.zig, ?? src/harness/dsh_native/); this task made no src edits"
+    ]
+  }
+}
