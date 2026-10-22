@@ -2059,3 +2059,69 @@ test "dsh crash recovery keeps a large payload leak-free" {
     try std.testing.expectEqual(big.len, second.reply.len);
     try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
 }
+
+const HarnessReapCtl = struct { calls: u32 = 0, last_exclude: ?i32 = null };
+
+fn countHarnessReap(ctx: ?*anyopaque, _: *const sidecar_mod.Options, exclude_pid: ?i32) void {
+    const ctl: *HarnessReapCtl = @ptrCast(@alignCast(ctx.?));
+    ctl.calls += 1;
+    ctl.last_exclude = exclude_pid;
+}
+
+test "dsh writer-held prompt reaps leftovers and retries the same session" {
+    // Regression: an orphaned sidecar holding session.lock made dsh answer
+    // session/writer-held; the harness folded it into error.RpcFailed and the
+    // turn failed without clearing the leftover writer.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ctl = HarnessReapCtl{};
+    engine.opts.sidecar.reap = countHarnessReap;
+    engine.opts.sidecar.reap_ctx = &ctl;
+
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setPromptWriterHeld(1);
+    try setTurnFrames(mock, allocator, &.{"resumed after reap"}, "completed");
+
+    const result = try runOneTurn(&h, "hi");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("resumed after reap", result.reply);
+    try std.testing.expectEqual(@as(u32, 1), ctl.calls);
+    try std.testing.expectEqual(@as(?i32, null), ctl.last_exclude);
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+}
+
+test "persistent writer-held returns SessionWriterHeld after one reap" {
+    // The turn must fail with the real cause, not retry forever and not fall
+    // back to a fresh session (which would drop the conversation history).
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ctl = HarnessReapCtl{};
+    engine.opts.sidecar.reap = countHarnessReap;
+    engine.opts.sidecar.reap_ctx = &ctl;
+
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setPromptWriterHeld(std.math.maxInt(u32));
+    try setTurnFrames(mock, allocator, &.{"unreachable"}, "completed");
+
+    try std.testing.expectError(error.SessionWriterHeld, runOneTurn(&h, "hi"));
+    try std.testing.expectEqual(@as(u32, 1), ctl.calls);
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+}

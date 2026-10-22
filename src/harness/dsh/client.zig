@@ -310,6 +310,9 @@ pub const Subscription = struct {
     stream_id: []u8,
     queue: std.ArrayListUnmanaged(Event) = .empty,
     tool_calls: protocol.ToolCallAccumulator = .{},
+    /// Call ids whose half-streamed state `drain` dropped. A late `tool-call`
+    /// completion for one belongs to the dead turn, not to the next turn.
+    stale_calls: std.ArrayListUnmanaged([]u8) = .empty,
     mutex: std_compat.sync.Mutex = .{},
     lost: std.atomic.Value(bool) = .init(false),
 
@@ -321,15 +324,39 @@ pub const Subscription = struct {
 
     /// Consumes `event`: frees it when no event is emitted or on error.
     fn pushEvent(self: *Subscription, event: protocol.ServerEvent) !void {
+        // The accumulator and `drain` share this lock: a drain must never
+        // interleave with a fold, or half a tool call survives it.
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.dropStaleToolCall(event)) return;
+
         // Deltas fold into their pending call and produce no event.
         const emitted = (try self.tool_calls.absorb(self.allocator, event)) orelse return;
         errdefer freeServerEvent(self.allocator, emitted);
         const session_id = try self.allocator.dupe(u8, self.session_id);
         errdefer self.allocator.free(session_id);
-
-        self.mutex.lock();
-        defer self.mutex.unlock();
         try self.queue.append(self.allocator, .{ .session_id = session_id, .event = emitted });
+    }
+
+    /// True when `event` is a late tool-call frame for a call whose deltas
+    /// `drain` dropped. A full call clears its tombstone; a stray delta keeps
+    /// it so the eventual completion is still swallowed.
+    fn dropStaleToolCall(self: *Subscription, event: protocol.ServerEvent) bool {
+        const call = switch (event) {
+            .assistant_chunk => |chunk| switch (chunk) {
+                .tool_call => |tool| tool,
+                else => return false,
+            },
+            else => return false,
+        };
+        for (self.stale_calls.items, 0..) |stale_id, index| {
+            if (!std.mem.eql(u8, stale_id, call.call_id)) continue;
+            if (!call.is_delta) self.allocator.free(self.stale_calls.swapRemove(index));
+            freeServerEvent(self.allocator, event);
+            return true;
+        }
+        return false;
     }
 
     /// Drop every queued event. A cancel that timed out leaves the old turn
@@ -339,6 +366,16 @@ pub const Subscription = struct {
         defer self.mutex.unlock();
         for (self.queue.items) |*event| freeEvent(self.allocator, event);
         self.queue.clearRetainingCapacity();
+
+        // A turn stopped mid tool-call leaves argument fragments pending.
+        // Free them and tombstone the ids so the completion cannot surface as
+        // the next turn's `.tool_call` progress.
+        for (self.tool_calls.pending.items) |call| {
+            const call_id = self.allocator.dupe(u8, call.call_id) catch continue;
+            self.stale_calls.append(self.allocator, call_id) catch self.allocator.free(call_id);
+        }
+        self.tool_calls.deinit(self.allocator);
+        self.tool_calls = .{};
     }
 
     /// Test seam: frames arrive here asynchronously from the mux reader.
@@ -373,6 +410,8 @@ pub const Subscription = struct {
         }
         self.queue.deinit(self.allocator);
         self.tool_calls.deinit(self.allocator);
+        for (self.stale_calls.items) |call_id| self.allocator.free(call_id);
+        self.stale_calls.deinit(self.allocator);
         self.allocator.free(self.session_id);
         self.allocator.free(self.stream_id);
     }
@@ -763,6 +802,11 @@ fn isSessionNotAttached(reply: protocol.RpcReply) bool {
     return std.mem.indexOf(u8, error_json, "\"code\":\"session/not-found\"") != null;
 }
 
+fn isSessionWriterHeld(reply: protocol.RpcReply) bool {
+    const error_json = reply.error_json orelse return false;
+    return std.mem.indexOf(u8, error_json, "\"code\":\"session/writer-held\"") != null;
+}
+
 pub const DshClient = struct {
     allocator: Allocator,
     base_url: []u8,
@@ -956,7 +1000,13 @@ pub const DshClient = struct {
 
         var reply = try self.call("session/prompt", args);
         defer self.freeReply(&reply);
-        if (!reply.ok) return error.RpcFailed;
+        if (!reply.ok) {
+            // dsh maps SessionAlreadyOwnedError to session/writer-held. Keep it
+            // distinct so the harness can clear the leftover writer and retry
+            // instead of reporting an opaque RPC failure.
+            if (isSessionWriterHeld(reply)) return error.SessionWriterHeld;
+            return error.RpcFailed;
+        }
     }
 
     /// Cancel the active turn and return the terminal `turn/end` plus any
@@ -1153,4 +1203,64 @@ test "cancel result surfaces the aborted turn/end and partial text" {
     try std.testing.expectEqualStrings("aborted", result.kind);
     try std.testing.expectEqualStrings("user", result.reason_kind.?);
     try std.testing.expectEqualStrings("partial answer", result.partial_text);
+}
+
+test "drain drops a half-streamed tool call and its late completion" {
+    // Regression: drain() cleared only the event queue. A turn cancelled mid
+    // tool-call kept its pending arguments forever, and the late full
+    // `tool-call` surfaced as the next turn's `.tool_call` progress.
+    const allocator = std.testing.allocator;
+    var shared = Subscription{
+        .allocator = allocator,
+        .session_id = try allocator.dupe(u8, "session-test"),
+        .stream_id = try allocator.dupe(u8, "follow"),
+    };
+    defer shared.deinitContents();
+
+    try shared.pushFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\",\"callId\":\"call-1\"," ++
+            "\"name\":\"read\",\"argumentsDelta\":\"{\\\"path\\\":\"}}",
+    );
+    try shared.pushFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\",\"callId\":\"call-1\"," ++
+            "\"name\":\"read\",\"argumentsDelta\":\"\\\"example.com\\\"}\"}}",
+    );
+    try std.testing.expectEqual(@as(usize, 0), shared.queuedCount());
+
+    shared.drain();
+    try std.testing.expectEqual(@as(usize, 0), shared.tool_calls.pending.items.len);
+
+    // The dead turn's completion arrives late: swallowed, not emitted.
+    try shared.pushFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call\",\"callId\":\"call-1\"," ++
+            "\"name\":\"read\",\"arguments\":{\"path\":\"example.com\"}}}",
+    );
+    try std.testing.expectEqual(@as(usize, 0), shared.queuedCount());
+
+    // A fresh call still surfaces normally.
+    try shared.pushFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call\",\"callId\":\"call-2\"," ++
+            "\"name\":\"read\",\"arguments\":{\"path\":\"example.com\"}}}",
+    );
+    try std.testing.expectEqual(@as(usize, 1), shared.queuedCount());
+    var event = try shared.nextEvent(0);
+    defer freeEvent(allocator, &event);
+    switch (event.event) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .tool_call => |call| try std.testing.expectEqualStrings("call-2", call.call_id),
+            else => return error.TestUnexpectedChunk,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
+test "writer-held RPC error is distinct from a generic RPC failure" {
+    const held = protocol.RpcReply{
+        .ok = false,
+        .value_json = "null",
+        .error_json = "{\"code\":\"session/writer-held\",\"message\":\"session is owned by another writer\"}",
+    };
+    try std.testing.expect(isSessionWriterHeld(held));
+    try std.testing.expect(!isSessionNotAttached(held));
+    try std.testing.expect(!isSessionWriterHeld(.{ .ok = true, .value_json = "null", .error_json = null }));
 }

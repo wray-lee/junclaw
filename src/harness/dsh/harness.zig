@@ -309,6 +309,18 @@ pub const DshEngine = struct {
         return self.opts.boot_url == null and (self.sidecar != null or self.spawn_override != null);
     }
 
+    /// Kill dsh processes left behind by a killed gateway. They keep the
+    /// session writer lock, so the live sidecar answers session/writer-held.
+    /// Externally managed sidecars (tests, injected `boot_url`) are only swept
+    /// when a test seam replaces the real /proc scan.
+    fn reapOrphanSidecars(self: *Self) void {
+        if (!self.selfManaged() and self.opts.sidecar.reap == null) return;
+        self.recovery_mutex.lock();
+        defer self.recovery_mutex.unlock();
+        const exclude_pid = if (self.sidecar) |*sidecar| sidecar.pid() else null;
+        sidecar_mod.reapOrphans(self.allocator, self.opts.sidecar, exclude_pid);
+    }
+
     /// Restart the sidecar and install a fresh client. Caller holds
     /// `recovery_mutex`. The previous client is released, but any key still
     /// bound to it holds a reference until its turn re-attaches.
@@ -696,8 +708,19 @@ pub const DshHarness = struct {
         const prompt_request_id = try client_mod.newRequestId(allocator);
         defer allocator.free(prompt_request_id);
         var prompt_retried = false;
+        var writer_retried = false;
         while (true) {
             entry.client.promptWithRequestId(session_id, input.user_message, prompt_request_id) catch |err| {
+                // A sidecar orphaned by a SIGKILLed gateway still owns the
+                // session writer. Clear it once and retry the same session; if
+                // it persists, report it instead of dropping history or
+                // silently starting a fresh session.
+                if (err == error.SessionWriterHeld and !writer_retried) {
+                    writer_retried = true;
+                    std.log.warn("dsh session {s} is writer-held; reaping leftover sidecars", .{session_id});
+                    engine.reapOrphanSidecars();
+                    continue;
+                }
                 if (!client_mod.isConnectionError(err) or prompt_retried or !engine.selfManaged()) return err;
                 prompt_retried = true;
                 try engine.recover(entry, entry.client);

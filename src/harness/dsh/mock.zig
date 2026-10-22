@@ -164,6 +164,9 @@ pub const MockDsh = struct {
     /// Drop every prompt reply until cleared: a sidecar that boots and
     /// handshakes but dies on its first RPC.
     drop_prompt_replies: bool = false,
+    /// Answer this many `session/prompt` calls with `session/writer-held`,
+    /// like dsh does when another process still owns the session.
+    prompt_writer_held: u32 = 0,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -474,6 +477,23 @@ pub const MockDsh = struct {
             }
         }
 
+        if (is_prompt) {
+            self.mutex.lock();
+            const held = self.prompt_writer_held > 0;
+            if (held) self.prompt_writer_held -= 1;
+            self.mutex.unlock();
+            if (held) {
+                try writeHttp(
+                    stream,
+                    "200 OK",
+                    "Content-Type: application/json\r\n",
+                    "{\"result\":{\"ok\":false,\"error\":{\"code\":\"session/writer-held\"," ++
+                        "\"message\":\"session is owned by another writer\"}}}",
+                );
+                return;
+            }
+        }
+
         if (is_prompt and self.takeDropPromptReply()) {
             // Crash after admitting the prompt but before replying: close the
             // mux too, because a restarted process would have lost it.
@@ -645,6 +665,13 @@ pub const MockDsh = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.cancel_not_found = enabled;
+    }
+
+    /// Answer the next `count` prompts with `session/writer-held`.
+    pub fn setPromptWriterHeld(self: *MockDsh, count: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.prompt_writer_held = count;
     }
 
     pub fn wsConnections(self: *MockDsh) u32 {
