@@ -785,6 +785,59 @@ const AgentRuntime = struct {
     }
 };
 
+/// Endpoint and wire protocol for the dsh route derived from junclaw's
+/// provider config. Null when dsh cannot speak the provider's protocol
+/// (Gemini/Vertex native APIs, Azure api-key auth, Ollama's native API, CLI
+/// providers); the profile is then left alone.
+const DshRouteEndpoint = struct {
+    base_url: []const u8,
+    api: []const u8,
+};
+
+fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoint {
+    const kind = providers.classifyProvider(provider);
+    switch (kind) {
+        .anthropic_provider => {
+            const base_url = if (std.mem.startsWith(u8, provider, "anthropic-custom:") and
+                config_types.ProviderEntry.isValidBaseUrl(provider["anthropic-custom:".len..]))
+                provider["anthropic-custom:".len..]
+            else
+                config.getProviderBaseUrl(provider) orelse
+                    providers.factory.defaultProviderUrl(provider) orelse return null;
+            return .{ .base_url = base_url, .api = "anthropic-messages" };
+        },
+        // These clients always talk to their fixed endpoint; config base_url
+        // and api_mode are ignored by createProvider.
+        .openai_provider, .openrouter_provider => return .{
+            .base_url = providers.factory.defaultProviderUrl(provider) orelse return null,
+            .api = "openai-completions",
+        },
+        .compatible_provider, .unknown => {
+            const base_url = config.getProviderBaseUrl(provider) orelse blk: {
+                if (std.mem.startsWith(u8, provider, "custom:") and
+                    config_types.ProviderEntry.isValidBaseUrl(provider["custom:".len..]))
+                {
+                    break :blk provider["custom:".len..];
+                }
+                if (kind == .compatible_provider) {
+                    if (providers.compatibleProviderUrl(provider)) |url| break :blk url;
+                }
+                // Mirrors createProvider: no URL and an unknown name both
+                // fall back to the OpenRouter client.
+                return .{ .base_url = "https://openrouter.ai/api/v1", .api = "openai-completions" };
+            };
+            return .{
+                .base_url = base_url,
+                .api = switch (config.getProviderApiMode(provider)) {
+                    .responses => "openai-responses",
+                    else => "openai-completions",
+                },
+            };
+        },
+        else => return null,
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // SessionManager
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2012,23 +2065,21 @@ pub const SessionManager = struct {
                     ref.model
                 else
                     model_ref;
-                const base_url = if (std.mem.startsWith(u8, provider, "custom:"))
-                    provider["custom:".len..]
-                else
-                    self.config.getProviderBaseUrl(provider) orelse
-                        providers.factory.compatibleProviderUrl(provider) orelse "";
-                if (model.len > 0 and base_url.len > 0) {
-                    profile_base_url = try self.allocator.dupe(u8, base_url);
-                    profile_model = try self.allocator.dupe(u8, model);
-                    const models = try self.allocator.alloc([]const u8, 1);
-                    models[0] = profile_model.?;
-                    profile_models = models;
-                    opts.sidecar.profile = .{
-                        .base_url = profile_base_url.?,
-                        .models = profile_models.?,
-                        .default_model = profile_model.?,
-                        .api_key = self.config.defaultProviderKey(),
-                    };
+                if (model.len > 0) {
+                    if (dshRouteEndpoint(self.config, provider)) |endpoint| {
+                        profile_base_url = try self.allocator.dupe(u8, endpoint.base_url);
+                        profile_model = try self.allocator.dupe(u8, model);
+                        const models = try self.allocator.alloc([]const u8, 1);
+                        models[0] = profile_model.?;
+                        profile_models = models;
+                        opts.sidecar.profile = .{
+                            .base_url = profile_base_url.?,
+                            .api = endpoint.api,
+                            .models = profile_models.?,
+                            .default_model = profile_model.?,
+                            .api_key = self.config.defaultProviderKey(),
+                        };
+                    }
                 }
             }
 
@@ -6484,6 +6535,47 @@ test "agent.harness=dsh is ignored in a default build" {
     const session = try sm.getOrCreate("cli:main:local");
     try testing.expect(session.dsh == null);
     try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), session.turnHarness().ptr);
+}
+
+test "dsh route maps providers to dsh endpoints and protocols" {
+    const cfg = testConfig();
+
+    const anthropic = dshRouteEndpoint(&cfg, "anthropic").?;
+    try testing.expectEqualStrings("https://api.anthropic.com", anthropic.base_url);
+    try testing.expectEqualStrings("anthropic-messages", anthropic.api);
+
+    const openai = dshRouteEndpoint(&cfg, "openai").?;
+    try testing.expectEqualStrings("https://api.openai.com/v1", openai.base_url);
+    try testing.expectEqualStrings("openai-completions", openai.api);
+
+    const openrouter = dshRouteEndpoint(&cfg, "openrouter").?;
+    try testing.expectEqualStrings("https://openrouter.ai/api/v1", openrouter.base_url);
+    try testing.expectEqualStrings("openai-completions", openrouter.api);
+
+    const custom = dshRouteEndpoint(&cfg, "custom:https://api.example.com/v1").?;
+    try testing.expectEqualStrings("https://api.example.com/v1", custom.base_url);
+    try testing.expectEqualStrings("openai-completions", custom.api);
+
+    const anthropic_custom = dshRouteEndpoint(&cfg, "anthropic-custom:https://api.example.com").?;
+    try testing.expectEqualStrings("https://api.example.com", anthropic_custom.base_url);
+    try testing.expectEqualStrings("anthropic-messages", anthropic_custom.api);
+
+    // No dsh protocol for these clients.
+    try testing.expect(dshRouteEndpoint(&cfg, "gemini") == null);
+    try testing.expect(dshRouteEndpoint(&cfg, "vertex") == null);
+    try testing.expect(dshRouteEndpoint(&cfg, "ollama") == null);
+
+    var provider_list = [_]config_types.ProviderEntry{.{
+        .name = "proxy",
+        .api_key = "test-key",
+        .base_url = "https://api.example.com/v1",
+        .api_mode = .responses,
+    }};
+    var proxy_cfg = testConfig();
+    proxy_cfg.providers = &provider_list;
+    const proxy = dshRouteEndpoint(&proxy_cfg, "proxy").?;
+    try testing.expectEqualStrings("https://api.example.com/v1", proxy.base_url);
+    try testing.expectEqualStrings("openai-responses", proxy.api);
 }
 
 test "agent.harness=dsh selects the dsh engine in a dsh build" {

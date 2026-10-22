@@ -29,8 +29,11 @@ pub const context_window: u32 = 32_768;
 pub const max_tokens: u32 = 4_096;
 
 pub const Route = struct {
-    /// OpenAI-compatible endpoint, no `/chat/completions` suffix.
+    /// Endpoint the route speaks, without a request-path suffix.
     base_url: []const u8,
+    /// pi-ai wire protocol: `openai-completions`, `openai-responses`, or
+    /// `anthropic-messages`.
+    api: []const u8 = "openai-completions",
     /// Model ids advertised on the junclaw route.
     models: []const []const u8,
     /// Model `agent-default-model` points at.
@@ -86,6 +89,10 @@ pub fn render(allocator: Allocator, existing: []const u8, route: Route) ![]u8 {
 
     const llm = findEntry(lines, "llm-pi-ai");
     const agent = findEntry(lines, "agent-default-model");
+    // The dsh template ships an empty top-level array (`[]`); appending a
+    // block entry after it is invalid YAML. Drop the placeholder once we are
+    // about to add entries, but leave a document we do not modify untouched.
+    const append_entries = llm == null or agent == null;
 
     var out: std.ArrayListUnmanaged(u8) = .empty;
     errdefer out.deinit(allocator);
@@ -100,6 +107,10 @@ pub fn render(allocator: Allocator, existing: []const u8, route: Route) ![]u8 {
         if (agent != null and i == agent.?.start) {
             try renderAgentEntry(&out, allocator, lines, agent.?.start, agent.?.end, route);
             i = agent.?.end;
+            continue;
+        }
+        if (append_entries and indentOf(lines[i]) == 0 and std.mem.eql(u8, trimmed(lines[i]), "[]")) {
+            i += 1;
             continue;
         }
         try out.appendSlice(allocator, lines[i]);
@@ -366,7 +377,9 @@ fn renderLlmEntry(
 fn appendRoute(out: *std.ArrayListUnmanaged(u8), allocator: Allocator, indent: usize, route: Route) !void {
     try appendIndented(out, allocator, indent, route_id ++ ":\n");
     const child = indent + 2;
-    try appendIndented(out, allocator, child, "api: openai-completions\n");
+    try appendIndented(out, allocator, child, "api: ");
+    try out.appendSlice(allocator, route.api);
+    try out.append(allocator, '\n');
     try appendIndented(out, allocator, child, "baseURL: ");
     try appendScalar(out, allocator, route.base_url);
     try out.append(allocator, '\n');
@@ -535,6 +548,7 @@ test "profile render creates the owned entries and is idempotent" {
     defer allocator.free(first);
     try std.testing.expect(std.mem.indexOf(u8, first, "- id: llm-pi-ai\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "      junclaw:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "        api: openai-completions\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "        baseURL: https://api.example.com/v1\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "        apiKeyEnv: JUNCLAW_DSH_API_KEY\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "          - id: model-a\n") != null);
@@ -558,6 +572,37 @@ test "profile render creates the owned entries and is idempotent" {
     try std.testing.expect(std.mem.indexOf(u8, changed, "model-a") == null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "model-c") != null);
     try std.testing.expect(std.mem.indexOf(u8, changed, "model: model-c\n") != null);
+}
+
+test "profile render replaces the dsh template's empty array" {
+    const allocator = std.testing.allocator;
+    // The template dsh installs for a new profile.
+    const template =
+        \\# Your patch layer for this dsh profile, applied after every bundle layer:
+        \\# a top-level YAML array of loader patch entries.
+        \\[]
+        \\
+    ;
+    const route: Route = .{
+        .base_url = "https://api.example.com/v1",
+        .api = "anthropic-messages",
+        .models = &.{"model-a"},
+        .default_model = "model-a",
+    };
+
+    const rendered = try render(allocator, template, route);
+    defer allocator.free(rendered);
+
+    // Regression: appending "- id:" after the template's "[]" produced YAML
+    // that dsh rejected with "Unexpected token".
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\n[]\n") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "- id: llm-pi-ai\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "        api: anthropic-messages\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "- id: agent-default-model\n") != null);
+
+    const second = try render(allocator, rendered, route);
+    defer allocator.free(second);
+    try std.testing.expectEqualStrings(rendered, second);
 }
 
 test "profile render preserves user routes, entries and keys" {

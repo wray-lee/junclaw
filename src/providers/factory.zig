@@ -309,6 +309,16 @@ pub fn compatibleProviderUrl(name: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Base URL a core provider's dedicated client uses when the config has no
+/// `base_url` override. Null for providers without a fixed HTTP endpoint.
+pub fn defaultProviderUrl(name: []const u8) ?[]const u8 {
+    const canonical = provider_names.canonicalProviderName(name);
+    if (std.mem.eql(u8, canonical, "anthropic")) return "https://api.anthropic.com";
+    if (std.mem.eql(u8, canonical, "openai")) return "https://api.openai.com/v1";
+    if (std.mem.eql(u8, canonical, "openrouter")) return "https://openrouter.ai/api/v1";
+    return null;
+}
+
 /// Get the display name for an OpenAI-compatible provider.
 pub fn compatibleProviderDisplayName(name: []const u8) []const u8 {
     if (findCompatProvider(name)) |p| return p.display;
@@ -652,6 +662,15 @@ test "compatibleProviderUrl returns correct URLs" {
     try std.testing.expectEqualStrings("https://api.deepseek.com", compatibleProviderUrl("deepseek").?);
     try std.testing.expectEqualStrings("https://api.poe.com/v1", compatibleProviderUrl("poe").?);
     try std.testing.expect(compatibleProviderUrl("nonexistent") == null);
+}
+
+test "defaultProviderUrl covers core HTTP providers" {
+    try std.testing.expectEqualStrings("https://api.anthropic.com", defaultProviderUrl("anthropic").?);
+    try std.testing.expectEqualStrings("https://api.openai.com/v1", defaultProviderUrl("openai").?);
+    try std.testing.expectEqualStrings("https://openrouter.ai/api/v1", defaultProviderUrl("openrouter").?);
+    try std.testing.expect(defaultProviderUrl("gemini") == null);
+    try std.testing.expect(defaultProviderUrl("ollama") == null);
+    try std.testing.expect(defaultProviderUrl("custom:https://api.example.com/v1") == null);
 }
 
 test "compatibleProviderUrl fixed URLs" {
