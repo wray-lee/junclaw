@@ -1,0 +1,18 @@
+- id: llm-pi-ai
+  config:
+    providers:
+      mock:
+        api: openai-completions
+        baseURL: http://127.0.0.1:18081/v1
+        apiKeyEnv: MOCK_API_KEY
+        models:
+          - id: mock-model
+            name: Mock Model
+            contextWindow: 32768
+            maxTokens: 4096
+            input: [text]
+
+- id: agent-default-model
+  config:
+    provider: mock
+    model: mock-model
