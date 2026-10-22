@@ -158,6 +158,9 @@ pub const MockDsh = struct {
     /// Drop the next prompt reply (after recording it) and close the mux, as a
     /// crash between admission and response would.
     drop_prompt_reply_once: bool = false,
+    /// Drop every prompt reply until cleared: a sidecar that boots and
+    /// handshakes but dies on its first RPC.
+    drop_prompt_replies: bool = false,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -535,10 +538,18 @@ pub const MockDsh = struct {
         self.drop_prompt_reply_once = true;
     }
 
+    /// Drop every prompt reply from now on; used to prove a crash streak is
+    /// counted even when each restart boots and handshakes successfully.
+    pub fn dropAllPromptReplies(self: *MockDsh) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.drop_prompt_replies = true;
+    }
+
     fn takeDropPromptReply(self: *MockDsh) bool {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const drop = self.drop_prompt_reply_once;
+        const drop = self.drop_prompt_reply_once or self.drop_prompt_replies;
         self.drop_prompt_reply_once = false;
         return drop;
     }

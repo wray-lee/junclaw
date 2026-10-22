@@ -200,11 +200,10 @@ pub const DshEngine = struct {
     spawn_ctx: ?*anyopaque = null,
     /// Serializes restarts, so one crash never rebuilds two WebSockets.
     recovery_mutex: std_compat.sync.Mutex = .{},
-    /// Consecutive failed restarts; a successful rebuild resets it.
+    /// Consecutive crashes without a completed turn; a terminal `turn/end`
+    /// resets it. A boot and handshake alone do not: dsh can die on its first
+    /// RPC right after answering the upgrade.
     restart_attempts: u32 = 0,
-    /// Bumped on every successful client rebuild. A turn that captured the old
-    /// value knows someone else already recovered and only re-attaches.
-    generation: std.atomic.Value(u64) = .init(0),
     /// One live dsh session per junclaw key, all on this one sidecar.
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     /// Guards `entries` and each entry's `refs`/`retired`.
@@ -340,19 +339,37 @@ pub const DshEngine = struct {
         self.client = client;
         self.entries_mutex.unlock();
         if (old) |value| value.release();
+    }
 
-        _ = self.generation.fetchAdd(1, .release);
+    /// A client the failed call actually used, retained so the pointer cannot
+    /// be freed and reused while recovery compares it. Caller releases.
+    fn currentClient(self: *Self) ?*DshClient {
+        self.entries_mutex.lock();
+        defer self.entries_mutex.unlock();
+        const client = self.client orelse return null;
+        client.retain();
+        return client;
+    }
+
+    /// A terminal turn proves the sidecar is healthy again; only now clear the
+    /// crash streak.
+    fn noteTurnCompleted(self: *Self) void {
+        self.recovery_mutex.lock();
+        defer self.recovery_mutex.unlock();
         self.restart_attempts = 0;
     }
 
     /// Recover from a connection-level error: restart a self-managed sidecar
     /// (unless another turn already did) and re-attach every live session.
-    /// `observed_generation` is read before the failing call.
-    fn recover(self: *Self, entry: ?*Entry, observed_generation: u64) !void {
+    /// `observed_client` is the client the failing call used. Comparing the
+    /// client, not a generation counter, matters: a turn can still hold the old
+    /// client after another turn has already restarted, and a bare counter
+    /// would then restart a second time and kill the fresh sidecar.
+    fn recover(self: *Self, entry: ?*Entry, observed_client: *DshClient) !void {
         self.recovery_mutex.lock();
         defer self.recovery_mutex.unlock();
 
-        if (self.generation.load(.acquire) == observed_generation) {
+        if (self.client == observed_client) {
             if (!self.selfManaged()) return error.SidecarNotManaged;
             try self.restartSidecarLocked();
         }
@@ -637,11 +654,12 @@ pub const DshHarness = struct {
         try engine.ensureBooted();
         // A crash while creating this key's session surfaces here; restart and
         // retry the acquire once.
+        const acquire_client = engine.currentClient() orelse return error.SidecarNotStarted;
+        defer acquire_client.release();
         const entry = blk: {
             const acquired = engine.acquireEntry(self.session_key, self.session_file, true) catch |err| {
                 if (!engine.selfManaged() or !client_mod.isConnectionError(err)) return err;
-                const observed = engine.generation.load(.acquire);
-                try engine.recover(null, observed);
+                try engine.recover(null, acquire_client);
                 break :blk (try engine.acquireEntry(self.session_key, self.session_file, true)).entry;
             };
             break :blk acquired.entry;
@@ -675,11 +693,10 @@ pub const DshHarness = struct {
         defer allocator.free(prompt_request_id);
         var prompt_retried = false;
         while (true) {
-            const observed = engine.generation.load(.acquire);
             entry.client.promptWithRequestId(session_id, input.user_message, prompt_request_id) catch |err| {
                 if (!client_mod.isConnectionError(err) or prompt_retried or !engine.selfManaged()) return err;
                 prompt_retried = true;
-                try engine.recover(entry, observed);
+                try engine.recover(entry, entry.client);
                 continue;
             };
             break;
@@ -727,7 +744,6 @@ pub const DshHarness = struct {
                 };
             }
 
-            const observed = engine.generation.load(.acquire);
             var event = entry.sub.nextEvent(@min(@as(u64, @intCast(remaining)), poll_slice_ms)) catch |err| switch (err) {
                 error.Timeout => continue,
                 else => {
@@ -735,7 +751,7 @@ pub const DshHarness = struct {
                     // The sidecar died mid-turn: restart and re-attach so the
                     // session continues, then keep the text the user already
                     // saw (retrying the prompt would duplicate it).
-                    try engine.recover(entry, observed);
+                    try engine.recover(entry, entry.client);
                     if (text.items.len == 0) return err;
                     return .{ .reply = try text.toOwnedSlice(allocator), .end_reason = .failed };
                 },
@@ -774,6 +790,7 @@ pub const DshHarness = struct {
                     }
                 },
                 .turn_end => |turn| {
+                    engine.noteTurnCompleted();
                     const reply = try text.toOwnedSlice(allocator);
                     errdefer allocator.free(reply);
                     return .{
@@ -906,10 +923,17 @@ pub const DshHarness = struct {
     /// mapping. Other keys keep their client and session untouched.
     fn resetKeySession(self: *Self) !void {
         const engine = self.engine;
-        const allocator = engine.allocator;
 
         try engine.ensureBooted();
-        const acquired = try engine.acquireEntry(self.session_key, self.session_file, false);
+        const acquired = blk: {
+            const acquire_client = engine.currentClient() orelse return error.SidecarNotStarted;
+            defer acquire_client.release();
+            break :blk engine.acquireEntry(self.session_key, self.session_file, false) catch |err| {
+                if (!engine.selfManaged() or !client_mod.isConnectionError(err)) return err;
+                try engine.recover(null, acquire_client);
+                break :blk try engine.acquireEntry(self.session_key, self.session_file, false);
+            };
+        };
         const entry = acquired.entry;
         defer engine.releaseEntry(entry);
         // A key that had no session gets its first one; there is nothing to
@@ -920,11 +944,23 @@ pub const DshHarness = struct {
         entry.turn_mutex.lock();
         defer entry.turn_mutex.unlock();
 
-        // Build the replacement before touching the old session, so a failed
-        // create/follow leaves the old session untouched. The key is then
-        // marked failed: the next turn reports instead of silently reusing it.
-        // The new follow stream opens on the same mux socket, never a second
-        // WebSocket.
+        // An idle key's sidecar may have died since its last turn. Recover and
+        // retry once; otherwise `/new` fails and `reset_failed` reports
+        // SessionResetFailed forever with nobody left to recover.
+        self.swapSession(entry) catch |err| {
+            if (!engine.selfManaged() or !client_mod.isConnectionError(err)) return err;
+            try engine.recover(entry, entry.client);
+            try self.swapSession(entry);
+        };
+    }
+
+    /// Build the replacement before touching the old session, so a failed
+    /// create/follow leaves the old session untouched. The key is then marked
+    /// failed: the next turn reports instead of silently reusing it. The new
+    /// follow stream opens on the same mux socket, never a second WebSocket.
+    fn swapSession(self: *Self, entry: *DshEngine.Entry) !void {
+        const engine = self.engine;
+        const allocator = engine.allocator;
         errdefer entry.reset_failed = true;
         const client = entry.client;
         const session_id = try client.createSession(engine.opts.sidecar.workspace);
