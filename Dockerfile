@@ -99,10 +99,6 @@ CMD ["gateway", "--port", "3000", "--host", "::"]
 FROM release-base AS release-root
 USER 0:0
 
-# Safe default image (used when no --target is provided)
-FROM release-base AS release
-USER 65534:65534
-
 # ── Full dsh image (optional, additive) ──────────────────────
 # The targets above are unchanged. This target adds the dsh sidecar harness:
 #   docker build --target full-dsh -t junclaw:full-dsh .
@@ -158,3 +154,8 @@ EXPOSE 3000
 USER 65534:65534
 ENTRYPOINT ["nullclaw"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
+
+# Safe default image (used when no --target is provided)
+FROM release-base AS release
+USER 65534:65534
+
