@@ -490,6 +490,9 @@ pub const DshHarness = struct {
         entry.turn_mutex.lock();
         defer entry.turn_mutex.unlock();
 
+        // A failed `/new` must never fall back to the old dsh session.
+        if (entry.reset_failed) return error.SessionResetFailed;
+
         // A stop that landed before the prompt still cancels this turn, so a
         // pre-turn requestInterrupt behaves like native's.
         if (entry.interrupt_requested.swap(false, .acquire)) {
@@ -511,24 +514,13 @@ pub const DshHarness = struct {
                 // session/cancel is sent from this thread: the subscription's
                 // event queue has exactly one consumer, and cancelOn() drains
                 // it while waiting for the aborted turn/end.
-                var cancelled = entry.client.cancelOn(entry.sub, session_id, engine.opts.cancel_timeout_ms) catch |err| switch (err) {
+                var cancelled = (try self.cancelAndDrain(entry, session_id, &text, sink)) orelse return .{
                     // The turn may have ended between the flag and the RPC; the
                     // partial text is still the best reply we have.
-                    error.CancelTimeout => return .{
-                        .reply = try text.toOwnedSlice(allocator),
-                        .end_reason = .interrupted,
-                    },
-                    else => return err,
+                    .reply = try text.toOwnedSlice(allocator),
+                    .end_reason = .interrupted,
                 };
                 defer client_mod.freeCancelResult(allocator, &cancelled);
-                if (cancelled.partial_text.len > 0) {
-                    // A committed prefix replaces the deltas it finalizes.
-                    if (cancelled.committed) text.clearRetainingCapacity();
-                    try text.appendSlice(allocator, cancelled.partial_text);
-                    if (!cancelled.committed) {
-                        if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta(cancelled.partial_text) });
-                    }
-                }
                 return .{
                     .reply = try text.toOwnedSlice(allocator),
                     .end_reason = mapEndReason(cancelled.kind),
@@ -536,7 +528,23 @@ pub const DshHarness = struct {
             }
 
             const remaining = deadline - std_compat.time.milliTimestamp();
-            if (remaining <= 0) return error.TurnTimeout;
+            if (remaining <= 0) {
+                // Cancel and drain the expired turn before reporting, so its
+                // frames cannot land in the next turn. A /stop armed while the
+                // cancel drained belonged to this turn, which is now over.
+                var cancelled = try self.cancelAndDrain(entry, session_id, &text, sink);
+                _ = entry.interrupt_requested.swap(false, .acquire);
+                if (cancelled) |*result| {
+                    client_mod.freeCancelResult(allocator, result);
+                    return error.TurnTimeout;
+                }
+                // dsh never sent the aborted turn/end; return what the user
+                // already saw rather than an error that drops it.
+                return .{
+                    .reply = try text.toOwnedSlice(allocator),
+                    .end_reason = .failed,
+                };
+            }
 
             var event = entry.sub.nextEvent(@min(@as(u64, @intCast(remaining)), poll_slice_ms)) catch |err| switch (err) {
                 error.Timeout => continue,
@@ -595,6 +603,33 @@ pub const DshHarness = struct {
         }
     }
 
+    /// Send `session/cancel` and drain this subscription up to the aborted
+    /// `turn/end`, folding any text streamed meanwhile into `text`. Returns
+    /// null when dsh acked but never ended the turn (`CancelTimeout`).
+    fn cancelAndDrain(
+        self: *Self,
+        entry: *DshEngine.Entry,
+        session_id: []const u8,
+        text: *std.ArrayListUnmanaged(u8),
+        sink: ?port.Sink,
+    ) !?client_mod.CancelResult {
+        const allocator = self.engine.allocator;
+        var cancelled = entry.client.cancelOn(entry.sub, session_id, self.engine.opts.cancel_timeout_ms) catch |err| switch (err) {
+            error.CancelTimeout => return null,
+            else => return err,
+        };
+        errdefer client_mod.freeCancelResult(allocator, &cancelled);
+        if (cancelled.partial_text.len > 0) {
+            // A committed prefix replaces the deltas it finalizes.
+            if (cancelled.committed) text.clearRetainingCapacity();
+            try text.appendSlice(allocator, cancelled.partial_text);
+            if (!cancelled.committed) {
+                if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta(cancelled.partial_text) });
+            }
+        }
+        return cancelled;
+    }
+
     fn requestInterrupt(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         const entry = self.engine.acquireExisting(self.session_key) orelse return;
@@ -625,7 +660,10 @@ pub const DshHarness = struct {
     }
 
     fn reset(ptr: *anyopaque) void {
-        _ = ptr;
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        // This hook cannot report; resetKeySession() records the failure and
+        // the next turn reports error.SessionResetFailed.
+        self.resetKeySession() catch {};
     }
 
     fn invalidatePrompt(ptr: *anyopaque) void {

@@ -1273,6 +1273,47 @@ test "dsh turn timeout without a cancel ack returns partial text" {
     try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
 }
 
+test "dsh turn timeout consumes a stop armed during the cancel drain" {
+    // Regression: a /stop armed while the timeout cancel drained stayed set
+    // and cancelled the next prompt instead of ending with the timed-out turn.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    engine.opts.turn_timeout_ms = 5;
+    engine.opts.cancel_timeout_ms = 5_000;
+    try mock.setTurnFrames(&.{});
+    var gate = mock_mod.ConnectGate{};
+    mock.setRpcGate(&gate, "session/cancel");
+
+    var turn = TurnThread{ .harness = &h, .input = .{ .user_message = "one" } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+    gate.waitEntered();
+    // The turn still holds its mutex, so this stop targets the timed-out turn.
+    h.harness().requestInterrupt();
+    gate.open();
+    thread.join();
+
+    try std.testing.expectEqual(error.TurnTimeout, turn.failure.?);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+
+    // The stop was consumed by the timed-out turn; it must not cancel this
+    // prompt pre-emptively.
+    try setTurnFrames(mock, allocator, &.{"second"}, "completed");
+    const result = try runOneTurn(&h, "two");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("second", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+}
+
 test "dsh port reset starts a fresh dsh session for its key" {
     // Regression: reset() was a no-op, so /new through the port hook kept
     // prompting the old dsh session.
