@@ -520,16 +520,17 @@ pub const Loop = struct {
                 .aborted => return self.abortTurn(true),
                 .failure => |failure| return self.endTurn(.{ .failure = failure }),
                 .end => |maybe_reason| {
-                    if (maybe_reason) |reason| {
-                        const sticky = if (self.turn_ends) |turn_end|
-                            switch (turn_end) {
-                                .max_tokens => true,
-                                else => false,
-                            }
-                        else
-                            false;
-                        if (!sticky) self.turn_ends = reason;
-                    }
+                    // dsh agent.ts:343 assigns the step ending unconditionally:
+                    // a null (tool calls still pending) clears an earlier
+                    // completed, and only max-tokens stays sticky.
+                    const sticky = if (self.turn_ends) |turn_end|
+                        switch (turn_end) {
+                            .max_tokens => true,
+                            else => false,
+                        }
+                    else
+                        false;
+                    if (!sticky) self.turn_ends = maybe_reason;
                 },
             }
 
@@ -586,7 +587,6 @@ pub const Loop = struct {
         var accumulator = stream.Accumulator.init(self.allocator());
         defer accumulator.deinit();
 
-        var saw_chunk = false;
         var stream_error: ?anyerror = null;
         var aborted = false;
         var done = false;
@@ -608,8 +608,8 @@ pub const Loop = struct {
                 .assistant_stream = .{ .position = position, .attempt = 1, .event = event },
             });
             switch (event) {
-                .chunk, .record => saw_chunk = true,
                 .done => done = true,
+                else => {},
             }
             const keep = try accumulator.push(self.now(), event);
             if (!keep) done = true;
@@ -623,18 +623,23 @@ pub const Loop = struct {
             return .aborted;
         }
         if (stream_error) |err| {
-            accumulator.interrupted = true;
-            try self.emitSettlement(position, &accumulator);
+            // dsh agent.ts:462-511: a non-aborted provider failure settles
+            // assistant/attempt (never an interrupted message) and rethrows
+            // into turn/end {kind:"error"}.
+            const id = try std.fmt.allocPrint(
+                self.allocator(),
+                "assistant-{d}-{d}",
+                .{ position.turn, position.step },
+            );
+            const settlement = try accumulator.settle(id, self.config.provider, self.config.model);
+            _ = try self.emit(.{
+                .assistant_attempt = .{ .position = position, .settlement = settlement },
+            });
             _ = try self.emit(.{ .step_end = position });
-            if (!saw_chunk) {
-                return .{ .failure = .{
-                    .message = "assistant stream failed",
-                    .code = @errorName(err),
-                } };
-            }
-            // Stream broke after content: settle the visible prefix and let
-            // the next step drain whatever the host queued (Z5).
-            return .{ .end = .completed };
+            return .{ .failure = .{
+                .message = "assistant stream failed",
+                .code = @errorName(err),
+            } };
         }
 
         const id = try std.fmt.allocPrint(
@@ -1270,6 +1275,79 @@ test "tool turn schedules the batch and results land in model order" {
     try testing.expect(isTag(reasonOf(outcome), .completed));
 }
 
+test "tool-continue step clears the completed turn ending" {
+    // Regression: turn_ends stayed completed after a tool-continue step, so the turn closed before the model saw tool results.
+    var h = Harness.init(std.testing.allocator);
+    defer h.deinit();
+    var loop = try newLoop(&h, testConfig());
+    h.loop = &loop;
+    defer loop.deinit();
+
+    h.on_event = struct {
+        fn hook(harness: *Harness, attempt: usize, index: usize) void {
+            if (attempt != 0 or index != 0) return;
+            steerText(harness, harness.loop.?, "m-steer", "continue") catch @panic("steer failed");
+        }
+    }.hook;
+
+    const calls = [_]types.ToolCall{
+        .{ .id = "call-1", .name = "tool-a", .arguments = "{}" },
+    };
+    const first = &[_]stream.Event{
+        .{ .chunk = .{ .text_delta = .{ .index = 0, .text = "first" } } },
+        .{ .done = .{ .finish = .stop } },
+    };
+    const second = &[_]stream.Event{
+        .{ .done = .{ .finish = .tool_calls, .tool_calls = &calls } },
+    };
+    const third = &[_]stream.Event{
+        .{ .chunk = .{ .text_delta = .{ .index = 0, .text = "after tools" } } },
+        .{ .done = .{ .finish = .stop } },
+    };
+    try h.script(&.{
+        Harness.attempt(first),
+        Harness.attempt(second),
+        Harness.attempt(third),
+    });
+    try steerText(&h, &loop, "m1", "start");
+
+    const outcome = try loop.runTurn();
+    try h.expectKinds(&.{
+        .turn_start,
+        .step_start,
+        .system_message,
+        .user_message,
+        .request_start,
+        .assistant_stream,
+        .assistant_stream,
+        .assistant_message,
+        .step_end,
+        .step_start,
+        .user_message,
+        .request_start,
+        .assistant_stream,
+        .assistant_message,
+        .tool_call,
+        .tool_result,
+        .step_end,
+        .step_start,
+        .request_start,
+        .assistant_stream,
+        .assistant_stream,
+        .assistant_message,
+        .step_end,
+        .turn_end,
+    });
+    try testing.expectEqual(@as(usize, 3), h.count(.step_start));
+    try testing.expectEqual(@as(usize, 1), h.count(.turn_end));
+    try testing.expectEqual(@as(usize, 3), h.requests.items.len);
+    // The tool result precedes the third request, so the model sees it.
+    try testing.expectEqual(@as(u64, 3), h.records.items[18].step);
+    try testing.expectEqual(@as(u64, 2), h.find(.tool_result).?.step);
+    try testing.expectEqualStrings("ok", h.find(.tool_result).?.text);
+    try testing.expect(isTag(reasonOf(outcome), .completed));
+}
+
 test "steer and inject arriving mid-stream join the next step only" {
     var h = Harness.init(std.testing.allocator);
     defer h.deinit();
@@ -1468,7 +1546,9 @@ test "max-tokens is sticky and skips tool calls" {
     try testing.expect(isTag(reasonOf(outcome), .max_tokens));
 }
 
-test "stream break settles the prefix and the next step drains input (Z5)" {
+test "stream break settles an attempt and ends the turn with an error" {
+    // Regression: a non-abort stream break settled an interrupted assistant
+    // message and reported the turn completed.
     var h = Harness.init(std.testing.allocator);
     defer h.deinit();
     var loop = try newLoop(&h, testConfig());
@@ -1503,21 +1583,17 @@ test "stream break settles the prefix and the next step drains input (Z5)" {
         .user_message,
         .request_start,
         .assistant_stream,
-        .assistant_message,
-        .step_end,
-        .step_start,
-        .user_message,
-        .request_start,
-        .assistant_stream,
-        .assistant_stream,
-        .assistant_message,
+        .assistant_attempt,
         .step_end,
         .turn_end,
     });
-    try testing.expect(h.records.items[6].interrupted);
-    try testing.expectEqualStrings("partial", h.records.items[6].text);
-    try testing.expect(std.mem.indexOf(u8, h.records.items[9].text, "resume") != null);
-    try testing.expect(isTag(reasonOf(outcome), .completed));
+    try testing.expect(!h.find(.assistant_attempt).?.interrupted);
+    try testing.expectEqual(@as(usize, 0), h.count(.assistant_message));
+    try testing.expectEqual(@as(usize, 1), h.requests.items.len);
+    const reason = reasonOf(outcome);
+    try testing.expect(isTag(reason, .failure));
+    try testing.expectEqualStrings("assistant stream failed", reason.failure.message);
+    try testing.expectEqualStrings("StreamBroken", reason.failure.code);
 }
 
 test "abort before the request boundary writes no partial assistant message" {
