@@ -102,3 +102,59 @@ USER 0:0
 # Safe default image (used when no --target is provided)
 FROM release-base AS release
 USER 65534:65534
+
+# ── Full dsh image (optional, additive) ──────────────────────
+# The targets above are unchanged. This target adds the dsh sidecar harness:
+#   docker build --target full-dsh -t junclaw:full-dsh .
+# linux/amd64 is the supported platform; the ARM64 runtime has not been tested.
+FROM builder AS full-dsh-builder
+ARG TARGETARCH
+ARG VERSION=dev
+RUN --mount=type=cache,target=/root/.cache/zig \
+    --mount=type=cache,target=/app/.zig-cache \
+    set -eu; \
+    arch="${TARGETARCH:-}"; \
+    if [ -z "${arch}" ]; then \
+      case "$(uname -m)" in \
+        x86_64) arch="amd64" ;; \
+        aarch64|arm64) arch="arm64" ;; \
+        *) echo "Unsupported host arch: $(uname -m)" >&2; exit 1 ;; \
+      esac; \
+    fi; \
+    case "${arch}" in \
+      amd64) zig_target="x86_64-linux-musl" ;; \
+      arm64) zig_target="aarch64-linux-musl" ;; \
+      *) echo "Unsupported TARGETARCH: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    zig build -Dtarget="${zig_target}" -Doptimize=ReleaseSmall -Dversion="${VERSION}" -Dharness_dsh=true
+
+# dsh is installed from the committed lock file, so every package version and
+# integrity hash is pinned (0.2.1-rc.2). Native addons ship prebuilt for
+# linux-x64; no compiler is needed in this stage.
+FROM node:22-slim AS full-dsh-deps
+WORKDIR /opt/dsh
+COPY docker/dsh/package.json docker/dsh/package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
+
+FROM node:22-slim AS full-dsh
+LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
+
+COPY --from=full-dsh-builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
+COPY --from=full-dsh-deps /opt/dsh /opt/dsh
+COPY --from=config /nullclaw-data /nullclaw-data
+RUN mkdir -p /nullclaw-data/.dsh && chown -R 65534:65534 /nullclaw-data
+
+# The dsh harness is opt-in: agent.harness still defaults to native.
+ENV NULLCLAW_DSH_BIN=/opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js
+ENV DSH_HOME=/nullclaw-data/.dsh
+ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+ENV NULLCLAW_HOME=/nullclaw-data
+ENV HOME=/nullclaw-data
+ENV SHELL=/bin/sh
+ENV NULLCLAW_GATEWAY_PORT=3000
+
+WORKDIR /nullclaw-data
+EXPOSE 3000
+USER 65534:65534
+ENTRYPOINT ["nullclaw"]
+CMD ["gateway", "--port", "3000", "--host", "::"]
