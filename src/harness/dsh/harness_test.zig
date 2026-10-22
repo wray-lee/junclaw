@@ -1485,18 +1485,50 @@ test "dsh sidecar crash restarts and resumes the same session" {
     defer allocator.free(second.reply);
     try std.testing.expectEqualStrings("after", second.reply);
 
-    // One restart, one resume, and the prompt landed on the same dsh session.
+    // One restart; re-attach is `session/follow` (session/resume is not a
+    // Remote method and the mock 404s it), and the prompt landed on the same
+    // dsh session.
     try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
-    try std.testing.expectEqual(@as(u32, 1), mock.resumeCount());
-    const resumed = (try mock.lastResumeSession(allocator)).?;
-    defer allocator.free(resumed);
-    try std.testing.expectEqualStrings(session, resumed);
     const prompted = (try mock.lastPromptSession(allocator)).?;
     defer allocator.free(prompted);
     try std.testing.expectEqualStrings(session, prompted);
     try std.testing.expectEqual(@as(u32, 1), mock.createCount());
     // A successful recovery resets the consecutive-failure count.
     try std.testing.expectEqual(@as(u32, 0), engine.restart_attempts);
+}
+
+test "dsh prompt retry after a crash reuses the requestId" {
+    // Regression: every retry minted a fresh requestId, so dsh inserted the
+    // same user message twice instead of returning the original acceptance.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setEchoPrompts(true);
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    // The sidecar admits the prompt, then dies before answering: the client
+    // sees a connection error and resends after the restart.
+    mock.dropNextPromptReply();
+    const retried = try runOneTurn(&h, "retry-me");
+    defer allocator.free(retried.reply);
+    try std.testing.expectEqualStrings("retry-me", retried.reply);
+
+    // Index 0 is the first turn; the dropped prompt and its retry follow.
+    try std.testing.expectEqual(@as(u32, 3), mock.promptCount());
+    const dropped_id = (try mock.promptRequestIdAt(allocator, 1)).?;
+    defer allocator.free(dropped_id);
+    const retry_id = (try mock.promptRequestIdAt(allocator, 2)).?;
+    defer allocator.free(retry_id);
+    try std.testing.expectEqualStrings(dropped_id, retry_id);
 }
 
 test "dsh sidecar restart attempts grow on failure and reset on success" {
@@ -1611,9 +1643,8 @@ test "dsh crash mid-turn keeps partial text and reattaches every key" {
     try std.testing.expectEqualStrings("partial", slow.reply);
     try std.testing.expectEqual(port.EndReason.failed, slow.end_reason);
 
-    // One restart resumed both live sessions.
+    // One restart re-attached both live sessions over `session/follow`.
     try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
-    try std.testing.expectEqual(@as(u32, 2), mock.resumeCount());
 
     // The other key continues on its original session without a restart.
     mock.setEchoPrompts(true);
@@ -1636,7 +1667,6 @@ test "dsh crash mid-turn keeps partial text and reattaches every key" {
     // answer a concurrent second WebSocket with 409.
     try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
     try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
-    try std.testing.expectEqual(@as(u32, 2), mock.resumeCount());
 }
 
 test "dsh two in-flight turns share one restart" {
@@ -1689,7 +1719,6 @@ test "dsh two in-flight turns share one restart" {
         try std.testing.expectEqual(port.EndReason.failed, turn.result.?.end_reason);
     }
     try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
-    try std.testing.expectEqual(@as(u32, 2), mock.resumeCount());
     try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
     try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
@@ -1749,5 +1778,4 @@ test "dsh crash recovery keeps a large payload leak-free" {
     defer allocator.free(second.reply);
     try std.testing.expectEqual(big.len, second.reply.len);
     try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
-    try std.testing.expectEqual(@as(u32, 1), mock.resumeCount());
 }

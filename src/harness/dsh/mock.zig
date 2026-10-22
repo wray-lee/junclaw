@@ -151,11 +151,13 @@ pub const MockDsh = struct {
     /// Simulated process death: every new connection is reset and the mux is
     /// shut down until `revive`. Deterministic (no timing).
     dead: bool = false,
-    /// `session/resume` calls and the last resumed session id.
-    resume_count: u32 = 0,
-    last_resume_session: ?[]u8 = null,
     /// Times the "process" came back after `kill`.
     revive_count: u32 = 0,
+    /// `request.requestId` of every `session/prompt`, in arrival order.
+    prompt_request_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Drop the next prompt reply (after recording it) and close the mux, as a
+    /// crash between admission and response would.
+    drop_prompt_reply_once: bool = false,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -186,7 +188,8 @@ pub const MockDsh = struct {
         for (self.closed_sessions.items) |session| self.allocator.free(session);
         self.closed_sessions.deinit(self.allocator);
         if (self.last_prompt_session) |session| self.allocator.free(session);
-        if (self.last_resume_session) |session| self.allocator.free(session);
+        for (self.prompt_request_ids.items) |id| self.allocator.free(id);
+        self.prompt_request_ids.deinit(self.allocator);
         if (self.model_catalog_json) |json| self.allocator.free(json);
         if (self.projection_json) |json| self.allocator.free(json);
         for (self.select_model_requests.items) |request| self.allocator.free(request);
@@ -427,11 +430,18 @@ pub const MockDsh = struct {
         } else if (std.mem.eql(u8, method, "session/selectModel")) {
             self.recordSelectModel(body);
             value = try self.allocator.dupe(u8, "{}");
-        } else if (std.mem.eql(u8, method, "session/resume")) {
-            self.recordResume(body);
+        } else if (std.mem.eql(u8, method, "session/prompt") or
+            std.mem.eql(u8, method, "session/cancel") or
+            std.mem.eql(u8, method, "session/close"))
+        {
             value = try self.allocator.dupe(u8, "{}");
         } else {
-            value = try self.allocator.dupe(u8, "{}");
+            // The dsh gateway only routes typert-registered Remote endpoints;
+            // anything else (e.g. `session/resume`, which exists only in the
+            // stdio SDK) is a 404. Keep the mock honest so a call to one
+            // cannot pass on a blanket `ok:true`.
+            try writeHttp(stream, "404 Not Found", "Content-Type: text/plain\r\n", "unknown endpoint");
+            return;
         }
         defer self.allocator.free(value);
 
@@ -441,6 +451,19 @@ pub const MockDsh = struct {
         if (is_prompt) self.recordPrompt(body);
         if (is_cancel) self.recordCancel();
         if (std.mem.eql(u8, method, "session/close")) self.recordClose(body);
+
+        if (is_prompt and self.takeDropPromptReply()) {
+            // Crash after admitting the prompt but before replying: close the
+            // mux too, because a restarted process would have lost it.
+            self.mutex.lock();
+            if (self.ws) |conn| {
+                conn.open = false;
+                conn.stream.shutdown(.both) catch {};
+            }
+            self.follow_cond.broadcast();
+            self.mutex.unlock();
+            return;
+        }
 
         const response = try std.fmt.allocPrint(
             self.allocator,
@@ -480,11 +503,15 @@ pub const MockDsh = struct {
 
     fn recordPrompt(self: *MockDsh, body: []const u8) void {
         const session = requestSessionId(self.allocator, body) orelse return;
+        const request_id = requestString(self.allocator, body, "requestId");
         self.mutex.lock();
         defer self.mutex.unlock();
         self.prompt_count += 1;
         if (self.last_prompt_session) |old| self.allocator.free(old);
         self.last_prompt_session = session;
+        if (request_id) |id| {
+            self.prompt_request_ids.append(self.allocator, id) catch self.allocator.free(id);
+        }
     }
 
     fn recordCancel(self: *MockDsh) void {
@@ -500,16 +527,20 @@ pub const MockDsh = struct {
         self.closed_sessions.append(self.allocator, session) catch self.allocator.free(session);
     }
 
-    /// `session/resume` takes a bare `{sessionId}` args object.
-    fn recordResume(self: *MockDsh, body: []const u8) void {
-        const session = argSessionId(self.allocator, body);
+    /// Answer the next prompt with a dropped connection instead of a reply,
+    /// after recording it (crash-between-admission-and-response).
+    pub fn dropNextPromptReply(self: *MockDsh) void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        self.resume_count += 1;
-        if (session) |id| {
-            if (self.last_resume_session) |old| self.allocator.free(old);
-            self.last_resume_session = id;
-        }
+        self.drop_prompt_reply_once = true;
+    }
+
+    fn takeDropPromptReply(self: *MockDsh) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const drop = self.drop_prompt_reply_once;
+        self.drop_prompt_reply_once = false;
+        return drop;
     }
 
     pub fn createCount(self: *MockDsh) u32 {
@@ -619,18 +650,12 @@ pub const MockDsh = struct {
         return self.revive_count;
     }
 
-    /// Number of `session/resume` RPCs the harness sent.
-    pub fn resumeCount(self: *MockDsh) u32 {
+    /// Copy of the request id of the `index`-th `session/prompt`; caller frees.
+    pub fn promptRequestIdAt(self: *MockDsh, allocator: Allocator, index: usize) !?[]u8 {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return self.resume_count;
-    }
-
-    /// Copy of the last `session/resume` session id; caller frees.
-    pub fn lastResumeSession(self: *MockDsh, allocator: Allocator) !?[]u8 {
-        self.mutex.lock();
-        defer self.mutex.unlock();
-        return if (self.last_resume_session) |session| try allocator.dupe(u8, session) else null;
+        if (index >= self.prompt_request_ids.items.len) return null;
+        return try allocator.dupe(u8, self.prompt_request_ids.items[index]);
     }
 
     pub fn closeCount(self: *MockDsh) u32 {
@@ -869,31 +894,23 @@ fn requestPromptText(allocator: Allocator, body: []const u8) ?[]u8 {
     return allocator.dupe(u8, text) catch null;
 }
 
-fn argSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
-    defer parsed.deinit();
-    const root = asObject(parsed.value) orelse return null;
-    const payload = asObject(root.get("payload")) orelse return null;
-    const args = asObject(payload.get("args")) orelse return null;
-    const session = switch (args.get("sessionId") orelse return null) {
-        .string => |text| text,
-        else => return null,
-    };
-    return allocator.dupe(u8, session) catch null;
-}
-
-fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
+/// String field of `payload.args.request`; caller frees.
+fn requestString(allocator: Allocator, body: []const u8, field: []const u8) ?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
     const root = asObject(parsed.value) orelse return null;
     const payload = asObject(root.get("payload")) orelse return null;
     const args = asObject(payload.get("args")) orelse return null;
     const request = asObject(args.get("request")) orelse return null;
-    const session = switch (request.get("sessionId") orelse return null) {
-        .string => |text| text,
+    const text = switch (request.get(field) orelse return null) {
+        .string => |value| value,
         else => return null,
     };
-    return allocator.dupe(u8, session) catch null;
+    return allocator.dupe(u8, text) catch null;
+}
+
+fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
+    return requestString(allocator, body, "sessionId");
 }
 
 fn asObject(value: ?std.json.Value) ?std.json.ObjectMap {

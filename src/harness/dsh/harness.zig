@@ -404,8 +404,12 @@ pub const DshEngine = struct {
 
     /// Point `entry` at `client` and follow its session there. The old client
     /// is released once no turn is bound to it.
+    ///
+    /// `session/follow` reads durable history, so it attaches a session the
+    /// fresh sidecar has not loaded yet; the next prompt resumes it (dsh
+    /// session-controller README). There is no `session/resume` Remote method:
+    /// calling one 404s at the gateway and used to wedge every key.
     fn reattachEntry(entry: *Entry, client: *DshClient) !void {
-        try client.resumeSession(entry.session_id);
         const sub = try client.subscribe(entry.session_id);
         client.retain();
         const old = entry.client;
@@ -664,10 +668,15 @@ pub const DshHarness = struct {
 
         // A dead sidecar surfaces here before any text is streamed, so the
         // prompt is safe to retry once after a restart (no duplicate output).
+        // One id across attempts: dsh returns the original acceptance for a
+        // retry whose requestId is already queued or logged, so the user
+        // message is not inserted twice.
+        const prompt_request_id = try client_mod.newRequestId(allocator);
+        defer allocator.free(prompt_request_id);
         var prompt_retried = false;
         while (true) {
             const observed = engine.generation.load(.acquire);
-            entry.client.prompt(session_id, input.user_message) catch |err| {
+            entry.client.promptWithRequestId(session_id, input.user_message, prompt_request_id) catch |err| {
                 if (!client_mod.isConnectionError(err) or prompt_retried or !engine.selfManaged()) return err;
                 prompt_retried = true;
                 try engine.recover(entry, observed);

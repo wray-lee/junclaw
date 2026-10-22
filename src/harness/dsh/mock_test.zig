@@ -86,6 +86,23 @@ test "mock dsh exchanges the boot token for an owner cookie" {
     try std.testing.expectEqualStrings(mock_mod.session_id, session);
 }
 
+test "mock dsh answers unrouted methods with 404 like the gateway" {
+    // Regression: every unknown method answered ok:true, so a call to a method
+    // the real gateway does not route (session/resume exists only in the stdio
+    // SDK) stayed green here and 404ed in production.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var client = try newClient(allocator, mock);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.UnexpectedStatus,
+        client.call("session/resume", "{\"sessionId\":\"mock-sess-1\"}"),
+    );
+}
+
 /// Send a WebSocket upgrade by hand so a 409 rejection does not go through the
 /// client's handshake logging (the test runner fails a test on any err log).
 fn rawMuxUpgrade(allocator: Allocator, mock: *MockDsh) ![]u8 {

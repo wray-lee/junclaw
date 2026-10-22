@@ -251,8 +251,11 @@ pub const Sidecar = struct {
         const arena = self.arena.allocator();
 
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-        try argv.append(arena, self.opts.node_exe);
-        try argv.append(arena, self.opts.bin_js);
+        // The argv must outlive the caller's strings: `ensureBooted` frees its
+        // NULLCLAW_DSH_BIN copy when the spawn block ends, while restart()
+        // reuses argv. Keep owned copies in the sidecar arena.
+        try argv.append(arena, try arena.dupe(u8, self.opts.node_exe));
+        try argv.append(arena, try arena.dupe(u8, self.opts.bin_js));
         for ([_][]const u8{ "--profile", profile_mod.profile_name, "--no-open", "--host", "127.0.0.1", "--port", "0" }) |argument| {
             try argv.append(arena, argument);
         }
@@ -400,6 +403,32 @@ test "failed boot keeps the restart attempt and reaps the child" {
     try std.testing.expect(self.stdout_thread == null);
     try std.testing.expect(self.stderr_thread == null);
     try std.testing.expect(self.stdout_ctx == null);
+}
+
+test "spawn argv owns copies of node_exe and bin_js" {
+    // Regression: argv held slices into the caller's strings. `ensureBooted`
+    // frees its NULLCLAW_DSH_BIN copy when the spawn block ends, so restart()
+    // ran `node` with a dangling module path ("Cannot find module
+    // '/nullclaw-data/workspace/@…'") for every reused argv.
+    const allocator = std.testing.allocator;
+    const node_src = try allocator.dupe(u8, "node-test");
+    defer allocator.free(node_src);
+    const bin_src = try allocator.dupe(u8, "/opt/dsh/lib/bin.js");
+    defer allocator.free(bin_src);
+
+    var sidecar = Sidecar{
+        .allocator = allocator,
+        .opts = .{ .node_exe = node_src, .bin_js = bin_src, .workspace = "/tmp", .dsh_home = "/tmp" },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer sidecar.deinit();
+    try sidecar.initSpawnArgs();
+
+    // Stand in for the caller mutating its copies after start() returned.
+    @memset(node_src, 'X');
+    @memset(bin_src, 'X');
+    try std.testing.expectEqualStrings("node-test", sidecar.argv[0]);
+    try std.testing.expectEqualStrings("/opt/dsh/lib/bin.js", sidecar.argv[1]);
 }
 
 test "sidecar environment sets required defaults and honors overrides" {

@@ -230,7 +230,7 @@ fn parsePort(base_url: []const u8) !u16 {
     return std.fmt.parseInt(u16, authority[colon + 1 ..], 10) catch error.InvalidBaseUrl;
 }
 
-fn newRequestId(allocator: Allocator) ![]u8 {
+pub fn newRequestId(allocator: Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
     std_compat.crypto.random.bytes(&bytes);
     const hex = std.fmt.bytesToHex(bytes, .lower);
@@ -891,27 +891,35 @@ pub const DshClient = struct {
     }
 
     pub fn prompt(self: *DshClient, session_id: []const u8, text: []const u8) !void {
-        return self.sendPrompt(session_id, text, "queue");
+        return self.sendPrompt(session_id, text, "queue", null);
     }
 
-    /// Re-attach a persisted session after the sidecar restarted, so its next
-    /// prompt continues the same conversation. dsh replies with `{}`.
-    pub fn resumeSession(self: *DshClient, session_id: []const u8) !void {
-        const args = try std.json.Stringify.valueAlloc(self.allocator, .{ .sessionId = session_id }, .{});
-        defer self.allocator.free(args);
-        var reply = try self.call("session/resume", args);
-        defer self.freeReply(&reply);
-        if (!reply.ok) return error.RpcFailed;
+    /// Resend with a caller-owned id. dsh dedupes prompts by `requestId`
+    /// ("retries whose requestId is already queued or logged return the
+    /// original acceptance"), so a retry after a crash must reuse the id.
+    pub fn promptWithRequestId(
+        self: *DshClient,
+        session_id: []const u8,
+        text: []const u8,
+        request_id: []const u8,
+    ) !void {
+        return self.sendPrompt(session_id, text, "queue", request_id);
     }
 
     pub fn steer(self: *DshClient, session_id: []const u8, text: []const u8) !void {
-        return self.sendPrompt(session_id, text, "steer");
+        return self.sendPrompt(session_id, text, "steer", null);
     }
 
-    fn sendPrompt(self: *DshClient, session_id: []const u8, text: []const u8, mode: []const u8) !void {
+    fn sendPrompt(
+        self: *DshClient,
+        session_id: []const u8,
+        text: []const u8,
+        mode: []const u8,
+        explicit_id: ?[]const u8,
+    ) !void {
         const TextPart = struct { type: []const u8, text: []const u8 };
-        const request_id = try newRequestId(self.allocator);
-        defer self.allocator.free(request_id);
+        const request_id = explicit_id orelse try newRequestId(self.allocator);
+        defer if (explicit_id == null) self.allocator.free(request_id);
 
         const args = try std.json.Stringify.valueAlloc(self.allocator, .{
             .request = .{
