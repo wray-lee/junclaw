@@ -158,8 +158,8 @@ docker build --target full-dsh -t junclaw:full-dsh .
 
 **体积与内存（linux/amd64 实测）：**
 
-- 镜像：未压缩 1.4 GB（1,441,200,646 字节），压缩后 250 MB（261,122,565 字节）（`docker save | gzip`）
-- RSS：空闲约 3 MB（gateway 运行、dsh 未启动）；一轮对话时容器峰值约 287 MB，dsh sidecar 的 VmRSS 峰值约 315 MB（早期探针在较短轮次下测得 202-244 MB）
+- 镜像：未压缩 1.4 GB（1,441,200,646 字节），压缩后 250 MB（约 261 MB）（`docker save | gzip`）
+- RSS：空闲约 2-3 MB（gateway 运行、dsh 未启动）；一轮对话时容器峰值约 288 MB，dsh sidecar 的 VmRSS 峰值约 320 MB（早期探针在较短轮次下测得 202-244 MB）
 
 建议每容器至少 512 MB 内存，1 GB 更稳。
 

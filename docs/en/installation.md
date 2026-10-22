@@ -162,8 +162,8 @@ docker build --target full-dsh -t junclaw:full-dsh .
 
 **Size and memory (measured on linux/amd64):**
 
-- Image: 1.4 GB (1,441,200,646 bytes) uncompressed, 250 MB (261,122,565 bytes) compressed (`docker save | gzip`)
-- RSS: about 3 MB idle (gateway running, dsh not started); about 287 MB for the container at peak during a turn, with the dsh sidecar peaking at about 315 MB VmRSS (an earlier probe measured 202-244 MB for shorter turns)
+- Image: 1.4 GB (1,441,200,646 bytes) uncompressed, 250 MB (about 261 MB) compressed (`docker save | gzip`)
+- RSS: about 2-3 MB idle (gateway running, dsh not started); about 288 MB for the container at peak during a turn, with the dsh sidecar peaking at about 320 MB VmRSS (an earlier probe measured 202-244 MB for shorter turns)
 
 Plan for at least 512 MB of memory per container; 1 GB is safer.
 
