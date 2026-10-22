@@ -111,4 +111,5 @@ test {
     // Zig does not collect tests from nested module files on its own.
     _ = @import("harness/contract_test.zig");
     _ = @import("harness/differential_test.zig");
+    _ = @import("harness/dsh_native/root.zig");
 }
