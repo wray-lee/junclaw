@@ -289,7 +289,6 @@ fn start(
     hooks: Hooks,
 ) ?anyerror {
     if (hooks.on_dispatch) |hook| hook(hooks.context, index, state.call);
-    state.started = true;
     state.thread = std.Thread.spawn(.{}, worker, .{
         state,
         arena,
@@ -302,6 +301,9 @@ fn start(
         state.observed = true; // never counted as in flight
         return err;
     };
+    // Only a live worker counts as started; a spawn failure stays
+    // TOOL_NOT_STARTED (the tool body never ran).
+    state.started = true;
     return null;
 }
 
@@ -1430,6 +1432,9 @@ test "concludesTurn marks the batch for early turn close" {
     }
 
     hook.expectWaiting();
+    // One handshake is enough: a second onWait means a worker is still
+    // running, and the gates below are what let it finish.
+    hook.rendezvous.store(false, .release);
     hook.release();
     for (&test_calls) |*test_call| test_call.gate.set();
 
@@ -1495,6 +1500,9 @@ test "large worker results are freed by Batch.deinit without leaks" {
     }
 
     hook.expectWaiting();
+    // One handshake is enough: a second onWait means a worker is still
+    // running, and the gates below are what let it finish.
+    hook.rendezvous.store(false, .release);
     hook.release();
     for (&test_calls) |*test_call| test_call.gate.set();
 
