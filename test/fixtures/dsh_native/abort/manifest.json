@@ -609,7 +609,8 @@
       "node sentinel: abort: node-json-ok lines=19",
       "worktree: only test/fixtures/dsh_native/{steer,abort,max-tokens} are added by this task"
     ],
-    "notes": "The dsh catalog validator materializes {{cwd}} to /dsh-snapshot-cwd and adds the omitted physical seq/time envelope (seq=index, time=0) before restore, matching normalize.ts:27-35. No jq binary is installed in WSL; the Node 24 stdin sentinel covers the JSON.parse requirement and Python covers the event-sequence invariants."
+    "notes": "The dsh catalog validator materializes {{cwd}} to /dsh-snapshot-cwd and adds the omitted physical seq/time envelope (seq=index, time=0) before restore, matching normalize.ts:27-35. No jq binary is installed in WSL; the Node 24 stdin sentinel covers the JSON.parse requirement and Python covers the event-sequence invariants.",
+    "catalogCommand": "docker run --rm --entrypoint node -v /home/wray/dsh-zig/test/fixtures/dsh_native:/fixtures:ro -v /mnt/c/Users/Wray/AppData/Local/Temp/dsh_validate_fixtures.js:/validate.js:ro junclaw:full-dsh-test /validate.js /fixtures/abort/expected.v4.jsonl /fixtures/abort/replay.json"
   },
   "toolSchema": {
     "name": "read",
