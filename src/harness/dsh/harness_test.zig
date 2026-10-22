@@ -661,11 +661,54 @@ test "dsh two keys run their own sessions on one engine" {
     try std.testing.expectEqualStrings("alpha", first.reply);
     try std.testing.expectEqualStrings("beta", second.reply);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
-    // One process-wide engine: two keys share a single boot/connect.
+    // One process-wide engine: two keys share a single boot/connect and the
+    // one WebSocket dsh admits for this API token.
     try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
     // Each prompt landed on the session the key created for itself.
     try std.testing.expectEqualStrings("mock-sess-1", first_session);
     try std.testing.expectEqualStrings("mock-sess-2", second_session);
+}
+
+test "dsh three keys stream over one admitted WebSocket" {
+    // Regression: dsh admits one WS per authenticated peer (rpc-host.ts
+    // admitConnection answers 409 to a second socket). The old per-key client
+    // opened a second WS, got 409 Conflict, and that key's turn failed with
+    // WsHandshakeFailed and an empty reply.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "test-key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "test-key-b");
+    defer hb.deinit();
+    var hc = try DshHarness.init(engine, "test-key-c");
+    defer hc.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"alpha"}, "completed");
+    const first = try runOneTurn(&ha, "hi");
+    defer allocator.free(first.reply);
+    try setTurnFrames(mock, allocator, &.{"beta"}, "completed");
+    const second = try runOneTurn(&hb, "hi");
+    defer allocator.free(second.reply);
+    try setTurnFrames(mock, allocator, &.{"gamma"}, "completed");
+    const third = try runOneTurn(&hc, "hi");
+    defer allocator.free(third.reply);
+
+    try std.testing.expectEqualStrings("alpha", first.reply);
+    try std.testing.expectEqualStrings("beta", second.reply);
+    try std.testing.expectEqualStrings("gamma", third.reply);
+    try std.testing.expectEqual(@as(u32, 3), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
 
 test "dsh key switch reuses its session and leaves the other key open" {
@@ -702,7 +745,9 @@ test "dsh key switch reuses its session and leaves the other key open" {
     try std.testing.expectEqualStrings("mock-sess-1", prompted);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
     try std.testing.expectEqual(@as(u32, 0), mock.closeCount());
-    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
+    // Both keys follow over the one admitted mux socket.
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
 
 test "dsh /new closes only its key's session" {
@@ -908,6 +953,10 @@ test "dsh concurrent turns keep their own session key" {
     try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
     try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    // Concurrent first turns must still open exactly one mux socket: the
+    // 409-on-second-socket mock would fail one of the turns otherwise.
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
 
 /// Engine whose boot rewrites a junclaw-owned profile route.

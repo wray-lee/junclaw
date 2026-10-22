@@ -13,6 +13,8 @@ const Allocator = std.mem.Allocator;
 
 pub const WS_HOST = "127.0.0.1";
 pub const WS_PATH = "/api/remote.mux";
+/// Client stream id for the process-wide `$events` waterfall stream.
+const events_stream_id = "events";
 
 // ---------------------------------------------------------------------------
 // Boot URL helpers
@@ -300,36 +302,37 @@ pub fn freeCancelResult(allocator: Allocator, result: *CancelResult) void {
     allocator.free(result.partial_text);
 }
 
-/// State shared with the reader thread. Heap-allocated so moving `DshClient`
-/// after `connect` does not invalidate the thread's pointer.
-const Shared = struct {
+/// One `session/follow` stream's event queue. The mux reader routes frames
+/// here by stream id, so one WebSocket serves every session in the process.
+pub const Subscription = struct {
     allocator: Allocator,
     session_id: []u8,
-    ws: ?websocket.WsClient = null,
+    stream_id: []u8,
     queue: std.ArrayListUnmanaged(Event) = .empty,
     tool_calls: protocol.ToolCallAccumulator = .{},
     mutex: std_compat.sync.Mutex = .{},
-    lost: bool = false,
+    lost: std.atomic.Value(bool) = .init(false),
 
-    fn enqueueFrame(self: *Shared, frame_json: []const u8) !void {
-        const parsed = protocol.parseServerFrame(self.allocator, frame_json) catch return;
+    /// Parse one frame addressed to this stream and queue its event.
+    fn pushFrame(self: *Subscription, frame_json: []const u8) !void {
+        const event = protocol.parseServerFrame(self.allocator, frame_json) catch return;
+        try self.pushEvent(event);
+    }
+
+    /// Consumes `event`: frees it when no event is emitted or on error.
+    fn pushEvent(self: *Subscription, event: protocol.ServerEvent) !void {
         // Deltas fold into their pending call and produce no event.
-        const event = (try self.tool_calls.absorb(self.allocator, parsed)) orelse return;
-        const session_id = self.allocator.dupe(u8, self.session_id) catch |err| {
-            freeServerEvent(self.allocator, event);
-            return err;
-        };
-        errdefer {
-            self.allocator.free(session_id);
-            freeServerEvent(self.allocator, event);
-        }
+        const emitted = (try self.tool_calls.absorb(self.allocator, event)) orelse return;
+        errdefer freeServerEvent(self.allocator, emitted);
+        const session_id = try self.allocator.dupe(u8, self.session_id);
+        errdefer self.allocator.free(session_id);
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.queue.append(self.allocator, .{ .session_id = session_id, .event = event });
+        try self.queue.append(self.allocator, .{ .session_id = session_id, .event = emitted });
     }
 
-    fn nextEvent(self: *Shared, timeout_ms: u64) !Event {
+    pub fn nextEvent(self: *Subscription, timeout_ms: u64) !Event {
         const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
         while (true) {
             self.mutex.lock();
@@ -338,7 +341,7 @@ const Shared = struct {
                 self.mutex.unlock();
                 return event;
             }
-            const lost = self.lost;
+            const lost = self.lost.load(.acquire);
             self.mutex.unlock();
 
             if (lost) return error.ConnectionLost;
@@ -347,13 +350,7 @@ const Shared = struct {
         }
     }
 
-    fn markLost(self: *Shared) void {
-        self.mutex.lock();
-        self.lost = true;
-        self.mutex.unlock();
-    }
-
-    fn deinitContents(self: *Shared) void {
+    fn deinitContents(self: *Subscription) void {
         while (self.queue.items.len > 0) {
             var event = self.queue.orderedRemove(0);
             freeEvent(self.allocator, &event);
@@ -361,12 +358,18 @@ const Shared = struct {
         self.queue.deinit(self.allocator);
         self.tool_calls.deinit(self.allocator);
         self.allocator.free(self.session_id);
+        self.allocator.free(self.stream_id);
+    }
+
+    fn deinit(self: *Subscription) void {
+        self.deinitContents();
+        self.allocator.destroy(self);
     }
 };
 
 /// Wait for the aborted `turn/end`, keeping assistant text seen on the way.
-fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
-    const allocator = shared.allocator;
+fn waitForTurnEnd(sub: *Subscription, timeout_ms: u64) !CancelResult {
+    const allocator = sub.allocator;
     var text: std.ArrayListUnmanaged(u8) = .empty;
     errdefer text.deinit(allocator);
     // A cancelled turn commits its delivered prefix before `turn/end`; that
@@ -378,7 +381,7 @@ fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
     while (true) {
         const remaining = deadline - std_compat.time.milliTimestamp();
         if (remaining <= 0) return error.CancelTimeout;
-        var event = shared.nextEvent(@intCast(remaining)) catch |err| switch (err) {
+        var event = sub.nextEvent(@intCast(remaining)) catch |err| switch (err) {
             error.Timeout => return error.CancelTimeout,
             else => return err,
         };
@@ -428,19 +431,190 @@ fn waitForTurnEnd(shared: *Shared, timeout_ms: u64) !CancelResult {
     }
 }
 
-fn readerMain(shared: *Shared) void {
+/// The process-wide `/api/remote.mux` socket. dsh admits one socket per
+/// authenticated peer (`rpc-host.ts` `admitConnection` answers 409 to a second
+/// one), so every session follows over this single socket.
+const Mux = struct {
+    allocator: Allocator,
+    ws: websocket.WsClient,
+    reader: ?std.Thread = null,
+    /// Set when the socket closes; every subscription surfaces ConnectionLost.
+    lost: std.atomic.Value(bool) = .init(false),
+    /// Serializes client frames on the one socket.
+    write_mutex: std_compat.sync.Mutex = .{},
+    /// Guards the routing table and `next_stream`.
+    mutex: std_compat.sync.Mutex = .{},
+    subs: std.ArrayListUnmanaged(*Subscription) = .empty,
+    next_stream: u32 = 1,
+
+    fn connect(allocator: Allocator, port: u16, cookie: []const u8, handshake_timeout_ms: u64) !*Mux {
+        const mux = try allocator.create(Mux);
+        errdefer allocator.destroy(mux);
+
+        const header = try cookieHeader(allocator, cookie);
+        defer allocator.free(header);
+        // dsh signs the owner cookie for the Host authority, so the handshake
+        // Host header must carry the port (unlike the bare connectTcp host).
+        const handshake_host = try std.fmt.allocPrint(allocator, "{s}:{d}", .{ WS_HOST, port });
+        defer allocator.free(handshake_host);
+        const stream = try websocket.WsClient.connectTcp(allocator, WS_HOST, port);
+        mux.* = .{
+            .allocator = allocator,
+            .ws = try connectHandshakeBounded(
+                allocator,
+                stream,
+                handshake_host,
+                WS_PATH,
+                &.{header},
+                handshake_timeout_ms,
+            ),
+        };
+        errdefer mux.ws.deinit();
+
+        const events = try protocol.buildEventsOpen(allocator, events_stream_id);
+        defer allocator.free(events);
+        try mux.ws.writeText(events);
+
+        mux.reader = try std.Thread.spawn(.{}, readerMain, .{mux});
+        return mux;
+    }
+
+    /// Open one `session/follow` stream on the shared socket.
+    fn subscribe(self: *Mux, session_id: []const u8) !*Subscription {
+        if (self.lost.load(.acquire)) return error.ConnectionLost;
+
+        const sub = try self.allocator.create(Subscription);
+        var owned = false;
+        errdefer if (!owned) self.allocator.destroy(sub);
+        const sid = try self.allocator.dupe(u8, session_id);
+        errdefer if (!owned) self.allocator.free(sid);
+
+        self.mutex.lock();
+        const seq = self.next_stream;
+        self.next_stream += 1;
+        self.mutex.unlock();
+        const stream_id = try std.fmt.allocPrint(self.allocator, "follow-{d}", .{seq});
+        errdefer if (!owned) self.allocator.free(stream_id);
+        sub.* = .{ .allocator = self.allocator, .session_id = sid, .stream_id = stream_id };
+
+        const frame = try protocol.buildFollowOpen(self.allocator, stream_id, session_id);
+        defer self.allocator.free(frame);
+
+        // Register before writing the open: dsh may answer with a snapshot at
+        // once, and the reader must have somewhere to put it.
+        self.mutex.lock();
+        self.subs.append(self.allocator, sub) catch |err| {
+            self.mutex.unlock();
+            return err;
+        };
+        owned = true;
+        self.mutex.unlock();
+
+        self.write_mutex.lock();
+        defer self.write_mutex.unlock();
+        if (self.lost.load(.acquire)) {
+            self.remove(sub);
+            return error.ConnectionLost;
+        }
+        self.ws.writeText(frame) catch |err| {
+            self.remove(sub);
+            return err;
+        };
+        return sub;
+    }
+
+    /// Stop the server-side follow stream, then drop its queue.
+    fn unsubscribe(self: *Mux, sub: *Subscription) void {
+        if (!self.lost.load(.acquire)) {
+            const frame: ?[]u8 = std.json.Stringify.valueAlloc(self.allocator, .{
+                .type = "cancel",
+                .streamId = sub.stream_id,
+            }, .{}) catch null;
+            if (frame) |text| {
+                defer self.allocator.free(text);
+                self.write_mutex.lock();
+                defer self.write_mutex.unlock();
+                self.ws.writeText(text) catch {};
+            }
+        }
+        self.remove(sub);
+    }
+
+    fn remove(self: *Mux, sub: *Subscription) void {
+        self.mutex.lock();
+        for (self.subs.items, 0..) |item, index| {
+            if (item == sub) {
+                _ = self.subs.swapRemove(index);
+                break;
+            }
+        }
+        self.mutex.unlock();
+        sub.deinit();
+    }
+
+    fn enqueueFrame(self: *Mux, frame_json: []const u8) void {
+        const routed = protocol.parseRoutedServerFrame(self.allocator, frame_json) catch return;
+        defer if (routed.stream_id) |id| self.allocator.free(id);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const stream_id = routed.stream_id orelse {
+            freeServerEvent(self.allocator, routed.event);
+            return;
+        };
+        if (std.mem.eql(u8, stream_id, events_stream_id)) {
+            // `$events` is process-wide, not tied to one follow stream, so
+            // every session queue gets a copy (P1 drops approvals).
+            freeServerEvent(self.allocator, routed.event);
+            for (self.subs.items) |sub| sub.pushFrame(frame_json) catch {};
+            return;
+        }
+        const sub = self.findSubLocked(stream_id) orelse {
+            freeServerEvent(self.allocator, routed.event);
+            return;
+        };
+        sub.pushEvent(routed.event) catch {};
+    }
+
+    fn findSubLocked(self: *Mux, stream_id: []const u8) ?*Subscription {
+        for (self.subs.items) |sub| {
+            if (std.mem.eql(u8, sub.stream_id, stream_id)) return sub;
+        }
+        return null;
+    }
+
+    fn markLost(self: *Mux) void {
+        self.lost.store(true, .release);
+        self.mutex.lock();
+        for (self.subs.items) |sub| sub.lost.store(true, .release);
+        self.mutex.unlock();
+    }
+
+    fn deinit(self: *Mux) void {
+        self.ws.writeClose();
+        self.ws.stream.shutdown(.both) catch {};
+        if (self.reader) |thread| thread.join();
+        self.reader = null;
+        self.ws.deinit();
+        for (self.subs.items) |sub| sub.deinit();
+        self.subs.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+};
+
+fn readerMain(mux: *Mux) void {
     while (true) {
-        const maybe_text = shared.ws.?.readTextMessage() catch {
-            shared.markLost();
+        const maybe_text = mux.ws.readTextMessage() catch {
+            mux.markLost();
             return;
         };
         const text = maybe_text orelse {
-            shared.markLost();
+            mux.markLost();
             return;
         };
         {
-            defer shared.allocator.free(text);
-            shared.enqueueFrame(text) catch {};
+            defer mux.allocator.free(text);
+            mux.enqueueFrame(text);
         }
     }
 }
@@ -551,8 +725,10 @@ pub const DshClient = struct {
     rpc_timeout_ms: u64 = 30_000,
     /// Deadline for the WebSocket upgrade handshake.
     handshake_timeout_ms: u64 = 10_000,
-    shared: ?*Shared = null,
-    reader: ?std.Thread = null,
+    /// The process-wide mux, opened once and shared by every session.
+    mux: ?*Mux = null,
+    /// Single-session binding used by the client API and its tests.
+    sub: ?*Subscription = null,
 
     pub fn init(allocator: Allocator, base_url: []const u8, cookie: []const u8) !DshClient {
         const base_copy = try allocator.dupe(u8, base_url);
@@ -566,61 +742,41 @@ pub const DshClient = struct {
     }
 
     pub fn deinit(self: *DshClient) void {
-        if (self.shared) |shared| {
-            if (shared.ws) |*ws| {
-                ws.writeClose();
-                ws.stream.shutdown(.both) catch {};
-            }
-            if (self.reader) |thread| thread.join();
-            self.reader = null;
-            if (shared.ws) |*ws| ws.deinit();
-            shared.deinitContents();
-            self.allocator.destroy(shared);
-            self.shared = null;
-        }
+        if (self.sub) |sub| self.unsubscribe(sub);
+        self.sub = null;
+        if (self.mux) |mux| mux.deinit();
+        self.mux = null;
         self.allocator.free(self.base_url);
         self.allocator.free(self.cookie);
     }
 
-    /// Open the WebSocket, subscribe to `$events` and `session/follow`, and
-    /// start the single reader thread. One session per client (P0).
-    pub fn connect(self: *DshClient, session_id: []const u8) !void {
-        if (self.shared != null) return error.AlreadyConnected;
-
-        const shared = try self.allocator.create(Shared);
-        errdefer self.allocator.destroy(shared);
-        shared.* = .{ .allocator = self.allocator, .session_id = try self.allocator.dupe(u8, session_id) };
-        errdefer self.allocator.free(shared.session_id);
-
-        const header = try cookieHeader(self.allocator, self.cookie);
-        defer self.allocator.free(header);
-        const headers = [_][]const u8{header};
-        // dsh signs the owner cookie for the Host authority, so the handshake
-        // Host header must carry the port (unlike the bare connectTcp host).
-        const handshake_host = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ WS_HOST, self.port });
-        defer self.allocator.free(handshake_host);
-        const stream = try websocket.WsClient.connectTcp(self.allocator, WS_HOST, self.port);
-        shared.ws = try connectHandshakeBounded(
+    /// Open the shared mux once. The engine calls this at boot, before any
+    /// session exists; one socket serves the whole process.
+    pub fn connectMux(self: *DshClient) !void {
+        if (self.mux != null) return;
+        self.mux = try Mux.connect(
             self.allocator,
-            stream,
-            handshake_host,
-            WS_PATH,
-            &headers,
+            self.port,
+            self.cookie,
             self.handshake_timeout_ms,
         );
-        errdefer shared.ws.?.deinit();
+    }
 
-        const follow = try protocol.buildFollowOpen(self.allocator, "follow", session_id);
-        defer self.allocator.free(follow);
-        try shared.ws.?.writeText(follow);
+    /// Single-session convenience: open the mux and follow `session_id`.
+    pub fn connect(self: *DshClient, session_id: []const u8) !void {
+        if (self.sub != null) return error.AlreadyConnected;
+        try self.connectMux();
+        self.sub = try self.mux.?.subscribe(session_id);
+    }
 
-        const events = try protocol.buildEventsOpen(self.allocator, "events");
-        defer self.allocator.free(events);
-        try shared.ws.?.writeText(events);
+    /// Follow one more session on the shared socket.
+    pub fn subscribe(self: *DshClient, session_id: []const u8) !*Subscription {
+        const mux = self.mux orelse return error.NotConnected;
+        return mux.subscribe(session_id);
+    }
 
-        const reader = try std.Thread.spawn(.{}, readerMain, .{shared});
-        self.shared = shared;
-        self.reader = reader;
+    pub fn unsubscribe(self: *DshClient, sub: *Subscription) void {
+        if (self.mux) |mux| mux.unsubscribe(sub);
     }
 
     /// POST one RPC and parse the `{result:{ok,value}}` envelope.
@@ -723,7 +879,13 @@ pub const DshClient = struct {
     /// Cancel the active turn and return the terminal `turn/end` plus any
     /// assistant text emitted before it (queued deltas are otherwise dropped).
     pub fn cancel(self: *DshClient, session_id: []const u8, timeout_ms: u64) !CancelResult {
-        const shared = self.shared orelse return error.NotConnected;
+        const sub = self.sub orelse return error.NotConnected;
+        return self.cancelOn(sub, session_id, timeout_ms);
+    }
+
+    /// Cancel and drain the given stream's queue (the engine owns one
+    /// subscription per session).
+    pub fn cancelOn(self: *DshClient, sub: *Subscription, session_id: []const u8, timeout_ms: u64) !CancelResult {
         const args = try std.json.Stringify.valueAlloc(self.allocator, .{ .request = .{ .sessionId = session_id } }, .{});
         defer self.allocator.free(args);
 
@@ -731,7 +893,7 @@ pub const DshClient = struct {
         defer self.freeReply(&reply);
         if (!reply.ok) return error.RpcFailed;
 
-        return waitForTurnEnd(shared, timeout_ms);
+        return waitForTurnEnd(sub, timeout_ms);
     }
 
     pub fn closeSession(self: *DshClient, session_id: []const u8) !void {
@@ -746,8 +908,8 @@ pub const DshClient = struct {
     /// Pop the next event, waiting at most `timeout_ms`.
     /// Returns `error.ConnectionLost` when the WebSocket reader stopped.
     pub fn nextEvent(self: *DshClient, timeout_ms: u64) !Event {
-        const shared = self.shared orelse return error.NotConnected;
-        return shared.nextEvent(timeout_ms);
+        const sub = self.sub orelse return error.NotConnected;
+        return sub.nextEvent(timeout_ms);
     }
 };
 
@@ -808,16 +970,17 @@ test "DshClient keeps the boot base URL and port" {
 }
 
 test "event queue routes parsed frames and tags the session" {
-    var shared = Shared{
+    var shared = Subscription{
         .allocator = std.testing.allocator,
         .session_id = try std.testing.allocator.dupe(u8, "session-test"),
+        .stream_id = try std.testing.allocator.dupe(u8, "follow"),
     };
     defer shared.deinitContents();
 
-    try shared.enqueueFrame(
+    try shared.pushFrame(
         "{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"reason\":{\"kind\":\"aborted\",\"reason\":{\"kind\":\"user\"}}}}}}",
     );
-    try shared.enqueueFrame(
+    try shared.pushFrame(
         "{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{\"type\":\"assistant-stream\",\"data\":{\"type\":\"text-delta\",\"index\":0,\"text\":\"slow-12 \"}}}",
     );
 
@@ -849,17 +1012,18 @@ test "event queue routes parsed frames and tags the session" {
 test "streamed tool call frames enqueue one tool_call event" {
     // Regression: tool-call after tool-call-delta produced two identical tool_call events.
     const allocator = std.testing.allocator;
-    var shared = Shared{
+    var shared = Subscription{
         .allocator = allocator,
         .session_id = try allocator.dupe(u8, "session-test"),
+        .stream_id = try allocator.dupe(u8, "follow"),
     };
     defer shared.deinitContents();
 
-    try shared.enqueueFrame(
+    try shared.pushFrame(
         "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\",\"callId\":\"call-1\"," ++
             "\"name\":\"read\",\"argumentsDelta\":\"{\\\"path\\\":\\\"example.com\\\"}\"}}",
     );
-    try shared.enqueueFrame(
+    try shared.pushFrame(
         "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call\",\"callId\":\"call-1\"," ++
             "\"name\":\"read\",\"arguments\":{\"path\":\"example.com\"}}}",
     );
@@ -882,16 +1046,17 @@ test "streamed tool call frames enqueue one tool_call event" {
 test "cancel result surfaces the aborted turn/end and partial text" {
     // Regression: cancel() returned without exposing turn/end aborted.
     const allocator = std.testing.allocator;
-    var shared = Shared{
+    var shared = Subscription{
         .allocator = allocator,
         .session_id = try allocator.dupe(u8, "session-test"),
+        .stream_id = try allocator.dupe(u8, "follow"),
     };
     defer shared.deinitContents();
 
-    try shared.enqueueFrame(
+    try shared.pushFrame(
         "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"text-delta\",\"index\":0,\"text\":\"partial answer\"}}",
     );
-    try shared.enqueueFrame(
+    try shared.pushFrame(
         "{\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"reason\":{\"kind\":\"aborted\",\"reason\":{\"kind\":\"user\"}}}}}",
     );
 
