@@ -1,18 +1,18 @@
 {
   "scenario": "parallel-barrier",
-  "purpose": "P1 consistency fixture for the dsh-native Zig harness: one assistant message issues two parallel reads and one exclusive write. The fixture pins the parallel pool (default 10), the exclusive barrier, model-order call/result commit, the exact read truncation footer, and the write confirmation rendering.",
+  "purpose": "P1 consistency fixture for the dsh-native Zig harness: one assistant message issues two parallel reads and one exclusive write. The fixture pins the parallel pool (default 10), the exclusive barrier, model-order call/result commit, the exact read truncation footer, and the write confirmation rendering. The request header pins all six core tool schemas (bash, edit, glob, grep, read, write) exactly as the committed P1 generated target (src/harness/dsh_native/generated/tool_schemas.zig), with the stock recording's sandbox escalation fields projected away as documented below.",
   "dshVersion": "0.2.1-rc.2",
   "formatVersion": 4,
   "sourceArtifacts": {
     "recording": {
       "method": "Recorded with dsh headless against a scripted Anthropic Messages SSE server. No real model, network, or credentials: DEEPSEEK_BASE_URL points at a loopback mock and DEEPSEEK_API_KEY is the neutral placeholder test-key.",
       "image": "junclaw:full-dsh-test (dsh 0.2.1-rc.2, node v22.23.4)",
-      "command": "docker run --rm --entrypoint sh -v <dsh-record>:/work -e DSH_HOME=/tmp/dshhome -e DEEPSEEK_API_KEY=test-key -e DEEPSEEK_BASE_URL=http://localhost:18082 -e MOCK_MODE=parallel-barrier junclaw:full-dsh-test -c 'mkdir -p /tmp/ws-pb3 /tmp/dshhome; printf \"alpha\\nbeta\\ngamma\\ndelta\\n\" > /tmp/ws-pb3/a.txt; printf \"beta\\n\" > /tmp/ws-pb3/b.txt; cd /tmp/ws-pb3; node /work/mock-anthropic.mjs & sleep 0.5; /opt/dsh/node_modules/.bin/dsh --profile headless --patch /work/record.patch.yml \"Read a.txt with limit 2, read b.txt, write out.txt, then reply PARALLEL_BARRIER_DONE.\"'",
-      "result": "exit 0; stdout PARALLEL_BARRIER_DONE; one session.v4.jsonl with 25 physical rows (header + 24 events)",
-      "rawLog": "<dsh-record>/raw/parallel-barrier.raw.v4.jsonl (scratch artifact; not committed)",
-      "profilePatch": "<dsh-record>/record.patch.yml disables non-core tool plugins, keeps tool-fs read+write only, disables plan mode and the DeepSeek delivery log, and sets agent-default-model to provider deepseek-official/model fake.",
+      "command": "docker run --rm --entrypoint sh -v <dsh-record>:/work -e DEEPSEEK_API_KEY=test-key -e DEEPSEEK_BASE_URL=http://127.0.0.1:18082 junclaw:full-dsh-test -c 'mkdir -p /tmp/ws6p /tmp/dshhome6p; printf \"alpha\\nbeta\\ngamma\\ndelta\\n\" > /tmp/ws6p/a.txt; printf \"beta\\n\" > /tmp/ws6p/b.txt; cd /tmp/ws6p; DSH_HOME=/tmp/dshhome6p MOCK_MODE=parallel-barrier MOCK_LOG=/work/mock-six-parallel.log node /work/mock-anthropic.mjs & sleep 0.5; DSH_HOME=/tmp/dshhome6p timeout 60 /opt/dsh/node_modules/.bin/dsh --profile headless --patch /work/record-six.patch.yml \"Read a.txt with limit 2, read b.txt, write out.txt, then reply PARALLEL_BARRIER_DONE.\"'",
+      "result": "exit 0; stdout PARALLEL_BARRIER_DONE; one session.v4.jsonl with 25 physical rows (header + 24 events); no activation warnings.",
+      "rawLog": "<dsh-record>/raw6/parallel-barrier.raw.v4.jsonl (scratch artifact; not committed)",
+      "profilePatch": "<dsh-record>/record-six.patch.yml enables tool-fs read/write/edit, tool-bash, and tool-fs-search (glob/grep); disables unrelated tool plugins, plan mode, the DeepSeek delivery log, and fs-observation-policy; and sets agent-default-model to provider deepseek-official/model fake. The stock headless fs-sandbox and bash-sandbox providers stay mounted, so the recording advertises sandbox_permissions/justification on bash/edit/write; the fixture then projects only those six optional properties away to the P1 no-sandbox composition.",
       "normalizationScript": "<dsh-record>/generate-fixtures.mjs (scratch artifact; deterministic transform from the raw log to expected.v4.jsonl and replay.json)",
-      "workspaceNote": "The workspace lived on the container's Linux filesystem. Writing to the Windows bind mount failed with a chmod EPERM, so the final recording uses /tmp/ws-pb3; the cwd is tokenized as {{cwd}}."
+      "workspaceNote": "The workspace lived on the container's Linux filesystem. Writing to the Windows bind mount failed with a chmod EPERM, so the recording uses /tmp/ws6p; the cwd is tokenized as {{cwd}}."
     },
     "v4GroundTruth": [
       {
@@ -53,7 +53,7 @@
     "toolExecutionMode": {
       "path": "/root/jsplug-proto/dsh/packages/core/tools/src/index.ts",
       "lines": "1307-1318",
-      "note": "A tool with no isConcurrencySafe classifier is exclusive; read declares isConcurrencySafe true at read.ts:136, write declares none."
+      "note": "A tool with no isConcurrencySafe classifier is exclusive; read declares isConcurrencySafe true at read.ts:136; write, edit, bash, grep, and glob declare none, so each is an exclusive barrier."
     },
     "toolFsRead": {
       "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts",
@@ -70,7 +70,8 @@
     },
     "toolFsSandbox": {
       "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts",
-      "lines": "61-70"
+      "lines": "43-50, 59-72",
+      "note": "Escalation advertisement is gated on ctx.fs.sandboxMode; schemaFields() defines the two parameter specs."
     },
     "deepseekTranslate": {
       "path": "/root/jsplug-proto/dsh/packages/llm/llm-deepseek/src/translate.ts",
@@ -80,6 +81,41 @@
     "sessionTypes": {
       "path": "/root/jsplug-proto/dsh/packages/core/session/src/types.ts",
       "lines": "241-266, 289-331, 342-349, 362-403, 438-515"
+    },
+    "toolFsEdit": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/edit.ts",
+      "lines": "76-98",
+      "note": "Guidance at :82; schema at :86-98; sandbox escalation fields spread at :97."
+    },
+    "toolFsSearchGlob": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/glob.ts",
+      "lines": "296-322",
+      "note": "Guidance at :302; schema at :307-322."
+    },
+    "toolFsSearchGrep": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/grep.ts",
+      "lines": "274-296",
+      "note": "Guidance at :280-281; schema at :285-296."
+    },
+    "toolBash": {
+      "path": "/root/jsplug-proto/dsh/packages/shell/tool-bash/src/index.ts",
+      "lines": "90-99, 251-255, 368-405",
+      "note": "Description at :90-99; guidance at :254; schema at :368-405; sandbox escalation fields spread at :391-404 when the mounted executor reports a sandboxMode."
+    },
+    "fsSandboxProvider": {
+      "path": "/root/jsplug-proto/dsh/packages/fs/fs-sandbox/src/index.ts",
+      "lines": "55-67",
+      "note": "Explains the recording's extra write/edit escalation fields: the stock headless fs provider reports the deployment default via sandboxMode. The fixture projects those fields away to the P1 target."
+    },
+    "bashSandboxProvider": {
+      "path": "/root/jsplug-proto/dsh/packages/shell/bash-sandbox/src/index.ts",
+      "lines": "68-78",
+      "note": "Explains the recording's extra bash escalation fields: the stock headless bash executor reports the deployment default via sandboxMode. The fixture projects those fields away to the P1 target."
+    },
+    "p1GeneratedSchemas": {
+      "path": "src/harness/dsh_native/generated/tool_schemas.zig",
+      "lines": "5-39",
+      "note": "P1 model-visible schema target, generated from dsh source with no confining fs/shell backend. The fixture tools equal these six objects (name, description, parameters, required) byte-for-byte after the declared escalation projection."
     }
   },
   "files": {
@@ -203,10 +239,15 @@
       "sources": [
         "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:331",
         "/root/jsplug-proto/dsh/packages/core/system-prompt/src/index.ts:453",
+        "/root/jsplug-proto/dsh/packages/bundle/headless/cordis.patch.yml:11-12",
         "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:74",
-        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:68"
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:68-70",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/edit.ts:82",
+        "/root/jsplug-proto/dsh/packages/shell/tool-bash/src/index.ts:254",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/glob.ts:302",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/grep.ts:280-281"
       ],
-      "note": "System text is preserved verbatim from the recording: base identity, headless persona with model fake, read guidance, write guidance. id {{message:2}}; source kind system-prompt; surfaceOp append."
+      "note": "System text is preserved verbatim from the recording: base identity, the headless persona with model fake, then bash, read, write, edit, glob, and grep guidance in section order. id {{message:2}}; source kind system-prompt; surfaceOp append."
     },
     {
       "line": 10,
@@ -225,10 +266,17 @@
         "/root/jsplug-proto/dsh/packages/core/session/src/types.ts:391-399",
         "/root/jsplug-proto/dsh/packages/core/agent-loop/src/agent.ts:637-650",
         "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-84",
-        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:74-85",
-        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:61-70"
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:74-84",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/edit.ts:86-98",
+        "/root/jsplug-proto/dsh/packages/shell/tool-bash/src/index.ts:368-405",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/glob.ts:307-322",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/grep.ts:285-296",
+        "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:43-50, 59-72",
+        "/root/jsplug-proto/dsh/packages/fs/fs-sandbox/src/index.ts:55-67",
+        "/root/jsplug-proto/dsh/packages/shell/bash-sandbox/src/index.ts:68-78",
+        "src/harness/dsh_native/generated/tool_schemas.zig:5-39"
       ],
-      "note": "Initial header. config reduced to {{provider}}/{{model}}; tools is the exact recorded schema array (read then write), not the {{tools}} token."
+      "note": "Initial header. config is reduced to {{provider}}/{{model}}; tools is the six literal P1 schemas in alphabetical registration order bash, edit, glob, grep, read, write, not the {{tools}} token. The recording's stock sandbox escalation fields are projected away; every other schema byte is verbatim."
     },
     {
       "line": 12,
@@ -521,22 +569,36 @@
         "rule": "Keep the recorded system message text verbatim; only its id and source are tokenized/normalized.",
         "evidence": [
           "/root/jsplug-proto/dsh/packages/core/system-prompt/src/index.ts:453",
+          "/root/jsplug-proto/dsh/packages/bundle/headless/cordis.patch.yml:11-12",
           "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:74",
-          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:68",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:68-70",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/edit.ts:82",
+          "/root/jsplug-proto/dsh/packages/shell/tool-bash/src/index.ts:254",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/glob.ts:302",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/grep.ts:280-281",
           "expected.v4.jsonl:9"
         ],
-        "note": "The text is the ground truth for this recording: base identity, headless persona with model fake, read guidance, write guidance."
+        "note": "The text is the ground truth for this recording: base identity, the headless persona \"You are a coding agent powered by the fake model.\", then bash, read, write, edit, glob, and grep guidance in section order."
       },
       {
         "id": "tool-schemas-preserved",
-        "rule": "Keep request/header.tools as the exact recorded schema array in registration order read, write. Do not replace it with the {{tools}} token and do not drop descriptions, parameters, required lists, or the write sandbox escalation fields.",
+        "rule": "Keep request/header.tools as the six literal schemas in alphabetical registration order bash, edit, glob, grep, read, write. Do not replace the array with the {{tools}} token and do not drop names, descriptions, parameters, or required lists. Every retained byte equals the committed P1 target src/harness/dsh_native/generated/tool_schemas.zig.",
         "evidence": [
+          "src/harness/dsh_native/generated/tool_schemas.zig:5-9 (read)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:11-15 (write)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:17-21 (edit)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:23-27 (bash)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:29-33 (grep)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:35-39 (glob)",
           "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/read.ts:78-84",
-          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:74-85",
-          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:61-70",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/write.ts:74-84",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/edit.ts:86-98",
+          "/root/jsplug-proto/dsh/packages/shell/tool-bash/src/index.ts:368-405",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/glob.ts:307-322",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs-search/src/grep.ts:285-296",
           "expected.v4.jsonl:11"
         ],
-        "note": "This is the comparison focus: a schema drift changes the request header line."
+        "note": "This is the comparison focus: a schema drift changes the request header line. The six full schemas are literal; only the separately declared escalation projection is not present."
       },
       {
         "id": "parallel-pool",
@@ -689,6 +751,24 @@
           "replay.json:1-20"
         ],
         "note": "The Zig ReplayProvider returns the stream verbatim; the driver writes it into assistant/message.data.stream."
+      },
+      {
+        "id": "sandbox-escalation-projected",
+        "rule": "The stock headless recording mounts fs-sandbox and bash-sandbox, so dsh adds sandbox_permissions and justification to bash, edit, and write. The P1 native composition has no confining backend and its generated schemas omit exactly those properties. Remove exactly those two properties from those three tools; do not remove, reorder, or rewrite any other key. This is a declared composition projection, not a schema-text tokenization: all six schemas remain literal and are compared.",
+        "evidence": [
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:43-50",
+          "/root/jsplug-proto/dsh/packages/fs/tool-fs/src/sandbox.ts:59-72",
+          "/root/jsplug-proto/dsh/packages/fs/fs-sandbox/src/index.ts:55-67",
+          "/root/jsplug-proto/dsh/packages/shell/bash-sandbox/src/index.ts:68-78",
+          "src/harness/dsh_native/generated/tool_schemas.zig:5-9 (read)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:11-15 (write)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:17-21 (edit)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:23-27 (bash)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:29-33 (grep)",
+          "src/harness/dsh_native/generated/tool_schemas.zig:35-39 (glob)",
+          "expected.v4.jsonl:11"
+        ],
+        "note": "Escalation is advertised only when ctx.fs.sandboxMode / ctx.shell.sandboxMode is defined (sandbox.ts:44-46; tool-bash/src/index.ts:207-209). The stock headless providers define it; the P1 generated target does not. The removed keys are exactly sandbox_permissions and justification on bash/edit/write, verified by the fixture self-check; every retained schema object deep-equals the generated target."
       }
     ],
     "notUsedFromSourceLog": [
@@ -719,16 +799,18 @@
     "The recording used the published dsh 0.2.1-rc.2 install in junclaw:full-dsh-test, not a source build. The source tree at /root/jsplug-proto/dsh is the same version and supplies every cited line.",
     "dsh does not persist an exclusive flag on tool/call. The fixture proves the barrier through event ordering: the exclusive write's tool/call appears only after both parallel results commit.",
     "The fixture pins the default maxParallelToolCalls=10 and uses two parallel calls, so it does not exercise queueing at the pool bound. Add 11 parallel calls in a future fixture if bound behavior needs coverage.",
-    "The write tool schema includes sandbox_permissions/justification because the recording composes the sandbox tool suite. The native harness must expose the same fields under the default workspace-write preset.",
-    "The write result meta diffs is empty for a create; an update would carry a diff. This fixture covers create only."
+    "The write result meta diffs is empty for a create; an update would carry a diff. This fixture covers create only.",
+    "The recorded system prompt includes the headless profile persona (\"You are a coding agent powered by the fake model.\") and all six tool guidance sections. A native harness that uses the base bundle's empty persona default must add the headless persona to match this fixture.",
+    "The recording's stock headless composition advertises sandbox_permissions/justification on bash, edit, and write. The fixture projects those six optional properties away to match the committed P1 generated schemas (no confining backend). When P2 lands approval/sandbox, it must add the fields to both the harness and this fixture; until then they are the only declared schema difference."
   ],
   "validation": {
-    "groundTruth": "The raw recording is a valid v4 artifact under dsh's own session format catalog: 25 rows, 24 events, all types in known-event-types.ts.",
+    "groundTruth": "The raw recording is a valid v4 artifact under dsh's own session format catalog: 25 rows, 24 events, all types in known-event-types.ts. The expected header tools are the six P1 generated schemas; only the recording's six optional sandbox escalation properties are projected away.",
     "commands": [
-      "node validate-session.mjs raw/parallel-barrier.raw.v4.jsonl -> version 4, rows 25, events 24",
-      "node validate-session.mjs out/parallel-barrier/expected.v4.jsonl --tokens -> version 4, rows 24, events 23 (tokens materialized, dense seq/time restored)",
-      "node validate-replay.mjs out/parallel-barrier/replay.json -> call 1 three tool-call blocks (read, read, write), call 2 text/stop",
-      "bun -e 'JSON.parse(...)' self-check: every JSONL line parses; event type sequence matches expected; sourceEventSeqs [12],[13],[16] point at the three tool/call rows"
+      "node validate-session.mjs raw6/parallel-barrier.raw.v4.jsonl -> version 4, rows 25, events 24",
+      "node validate-session.mjs out6n/parallel-barrier/expected.v4.jsonl --tokens -> version 4, rows 24, events 23 (tokens materialized, dense seq/time restored)",
+      "node validate-replay.mjs out6n/parallel-barrier/replay.json -> call 1 three tool-call blocks read/read/write, call 2 text/stop",
+      "bun selfcheck-fixtures.mjs out6n raw6 -> parallel-barrier expectedLines 24, replayCalls 2, toolCalls [call_read_a, call_read_b, call_write_out], sourceEventSeqs [12], [13], [16], forbiddenLiterals false, nonzeroClocks false",
+      "bun compare-p1-schemas.mjs <repo>/src/harness/dsh_native/generated/tool_schemas.zig out6n -> match for bash, edit, glob, grep, read, write in both scenarios"
     ]
   }
 }
