@@ -85,6 +85,10 @@ fn oneLine(buffer: []u8, text: []const u8) []const u8 {
 
 fn printEvent(session_id: []const u8, event: protocol.ServerEvent) void {
     switch (event) {
+        .committed => |message| {
+            var text_buf: [128]u8 = undefined;
+            emit("EVENT session={s} committed text=\"{s}\"\n", .{ session_id, oneLine(&text_buf, message) });
+        },
         .assistant_chunk => |chunk| switch (chunk) {
             .text_delta => |delta| {
                 var text_buf: [128]u8 = undefined;
