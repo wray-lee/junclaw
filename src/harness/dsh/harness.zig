@@ -675,6 +675,10 @@ pub const DshHarness = struct {
         // turn waited for the key's turn mutex; re-attach before prompting.
         try engine.ensureAttached(entry);
 
+        // A cancel that timed out left the old turn streaming into this
+        // subscription; its frames must never be read as this turn's reply.
+        entry.sub.drain();
+
         // A stop that landed before the prompt still cancels this turn, so a
         // pre-turn requestInterrupt behaves like native's.
         if (entry.interrupt_requested.swap(false, .acquire)) {
@@ -812,7 +816,8 @@ pub const DshHarness = struct {
 
     /// Send `session/cancel` and drain this subscription up to the aborted
     /// `turn/end`, folding any text streamed meanwhile into `text`. Returns
-    /// null when dsh acked but never ended the turn (`CancelTimeout`).
+    /// null when there is no live turn to drain: dsh acked but never ended it
+    /// (`CancelTimeout`), or the turn ended before the RPC (`TurnAlreadyEnded`).
     fn cancelAndDrain(
         self: *Self,
         entry: *DshEngine.Entry,
@@ -822,7 +827,7 @@ pub const DshHarness = struct {
     ) !?client_mod.CancelResult {
         const allocator = self.engine.allocator;
         var cancelled = entry.client.cancelOn(entry.sub, session_id, self.engine.opts.cancel_timeout_ms) catch |err| switch (err) {
-            error.CancelTimeout => return null,
+            error.CancelTimeout, error.TurnAlreadyEnded => return null,
             else => return err,
         };
         errdefer client_mod.freeCancelResult(allocator, &cancelled);

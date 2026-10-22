@@ -222,6 +222,14 @@ fn waitForPrompt(mock: *MockDsh, at_least: u32) void {
     }
 }
 
+/// Hang guard, never asserted: waits until the subscription has queued frames.
+fn waitForQueued(sub: *client_mod.Subscription, at_least: usize) void {
+    const deadline = std_compat.time.milliTimestamp() + 5_000;
+    while (sub.queuedCount() < at_least and std_compat.time.milliTimestamp() < deadline) {
+        std_compat.thread.sleep(std.time.ns_per_ms);
+    }
+}
+
 test "dsh harness adopts a persisted session on the key's first turn" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -392,6 +400,57 @@ test "dsh /stop keeps a committed partial with no deltas" {
     defer allocator.free(result.reply);
 
     try std.testing.expectEqualStrings("partial answer", result.reply);
+    try std.testing.expectEqual(port.EndReason.interrupted, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+}
+
+test "dsh /stop racing a finished turn keeps the streamed reply" {
+    // Regression: when the turn ended between the /stop flag and the RPC, dsh
+    // answered session/not-found; cancelOn turned that into error.RpcFailed and
+    // runTurn's errdefer dropped the reply the user had already seen.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    // The turn streams one delta and completes; the sink holds the turn thread
+    // after the delta, so /stop lands while the terminal frame is already out.
+    const delta = try mock_mod.textDeltaFrame(allocator, 0, "partial");
+    defer allocator.free(delta);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ delta, end });
+    // By the time the cancel RPC arrives the agent is detached.
+    mock.setCancelNotFound(true);
+
+    var sink = RecordingSink{
+        .block_after = 0,
+        .released = std.atomic.Value(bool).init(false),
+    };
+    var turn = TurnThread{ .harness = &h, .input = .{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+
+    waitForSink(&sink, 1);
+    const ack = try h.harness().handleLocalCommand("/stop");
+    try std.testing.expectEqualStrings("No active background task to stop.", ack.?);
+    sink.released.store(true, .release);
+
+    thread.join();
+    try std.testing.expect(turn.failure == null);
+    const result = turn.result.?;
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("partial", result.reply);
     try std.testing.expectEqual(port.EndReason.interrupted, result.end_reason);
     try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
 }
@@ -1316,6 +1375,61 @@ test "dsh turn timeout without a cancel ack returns partial text" {
     defer allocator.free(result.reply);
     try std.testing.expectEqualStrings("partial", result.reply);
     try std.testing.expectEqual(port.EndReason.failed, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+}
+
+test "dsh cancel timeout drops the old turn's frames before the next prompt" {
+    // Regression: a cancel that acked but never ended the turn left the old
+    // turn's delta/committed/turn_end in the per-session queue; the next turn
+    // consumed them as its own reply instead of the new turn's frames.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    // The turn stays in flight; the cancel acks and gives up at once, then the
+    // still-running turn's frames arrive in the persistent subscription queue.
+    engine.opts.cancel_timeout_ms = 0;
+    mock.setCancelEndsTurn(false);
+    try mock.setTurnFrames(&.{});
+    const stale_delta = try mock_mod.textDeltaFrame(allocator, 0, "stale ");
+    defer allocator.free(stale_delta);
+    const stale_committed = try mock_mod.committedMessageFrame(allocator, "stale answer", true);
+    defer allocator.free(stale_committed);
+    const stale_end = try endFrame(allocator, "completed");
+    defer allocator.free(stale_end);
+    try mock.setCancelFrames(&.{ stale_delta, stale_committed, stale_end });
+
+    var turn = TurnThread{ .harness = &h, .input = .{ .user_message = "one" } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+    waitForPrompt(mock, 1);
+    const ack = try h.harness().handleLocalCommand("/stop");
+    try std.testing.expectEqualStrings("No active background task to stop.", ack.?);
+    thread.join();
+    try std.testing.expect(turn.failure == null);
+    const first = turn.result.?;
+    defer allocator.free(first.reply);
+    try std.testing.expectEqual(port.EndReason.interrupted, first.end_reason);
+
+    // The old turn's frames land after runTurn returned; the next turn must
+    // ignore them and answer only from its own frames.
+    const entry = engine.acquireExisting("test-key").?;
+    defer engine.releaseEntry(entry);
+    waitForQueued(entry.sub, 3);
+    try std.testing.expect(entry.sub.queuedCount() >= 3);
+
+    try setTurnFrames(mock, allocator, &.{"second"}, "completed");
+    const result = try runOneTurn(&h, "two");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("second", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
     try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
 }
 

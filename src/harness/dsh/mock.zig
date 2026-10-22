@@ -142,6 +142,9 @@ pub const MockDsh = struct {
     /// When false, `session/cancel` acks but leaves the turn running (no
     /// aborted `turn/end`), so the cancel-timeout fallback is reachable.
     cancel_ends_turn: bool = true,
+    /// When true, `session/cancel` answers `session/not-found`, like dsh does
+    /// once the turn ended and its agent detached (/stop race tests).
+    cancel_not_found: bool = false,
     /// Reply value for `session/modelCatalog`; null replies `{}`.
     model_catalog_json: ?[]u8 = null,
     /// Reply value for `session/projections`; null replies `{}`.
@@ -455,6 +458,22 @@ pub const MockDsh = struct {
         if (is_cancel) self.recordCancel();
         if (std.mem.eql(u8, method, "session/close")) self.recordClose(body);
 
+        if (is_cancel) {
+            self.mutex.lock();
+            const not_found = self.cancel_not_found;
+            self.mutex.unlock();
+            if (not_found) {
+                try writeHttp(
+                    stream,
+                    "200 OK",
+                    "Content-Type: application/json\r\n",
+                    "{\"result\":{\"ok\":false,\"error\":{\"code\":\"session/not-found\"," ++
+                        "\"message\":\"session not attached\"}}}",
+                );
+                return;
+            }
+        }
+
         if (is_prompt and self.takeDropPromptReply()) {
             // Crash after admitting the prompt but before replying: close the
             // mux too, because a restarted process would have lost it.
@@ -619,6 +638,13 @@ pub const MockDsh = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.cancel_ends_turn = enabled;
+    }
+
+    /// Answer `session/cancel` with `session/not-found` (turn already ended).
+    pub fn setCancelNotFound(self: *MockDsh, enabled: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_not_found = enabled;
     }
 
     pub fn wsConnections(self: *MockDsh) u32 {

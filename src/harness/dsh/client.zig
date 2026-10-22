@@ -332,6 +332,22 @@ pub const Subscription = struct {
         try self.queue.append(self.allocator, .{ .session_id = session_id, .event = emitted });
     }
 
+    /// Drop every queued event. A cancel that timed out leaves the old turn
+    /// streaming into this subscription; the next turn must start clean.
+    pub fn drain(self: *Subscription) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (self.queue.items) |*event| freeEvent(self.allocator, event);
+        self.queue.clearRetainingCapacity();
+    }
+
+    /// Test seam: frames arrive here asynchronously from the mux reader.
+    pub fn queuedCount(self: *Subscription) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.queue.items.len;
+    }
+
     pub fn nextEvent(self: *Subscription, timeout_ms: u64) !Event {
         const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
         while (true) {
@@ -740,6 +756,13 @@ pub fn isConnectionError(err: anyerror) bool {
     };
 }
 
+/// dsh answers `session/cancel` with `session/not-found` once the turn has
+/// ended and its agent detached; that race means there is nothing to cancel.
+fn isSessionNotAttached(reply: protocol.RpcReply) bool {
+    const error_json = reply.error_json orelse return false;
+    return std.mem.indexOf(u8, error_json, "\"code\":\"session/not-found\"") != null;
+}
+
 pub const DshClient = struct {
     allocator: Allocator,
     base_url: []u8,
@@ -951,7 +974,12 @@ pub const DshClient = struct {
 
         var reply = try self.call("session/cancel", args);
         defer self.freeReply(&reply);
-        if (!reply.ok) return error.RpcFailed;
+        if (!reply.ok) {
+            // The turn finished before this RPC arrived, so dsh detached its
+            // agent and answers session/not-found; nothing is left to cancel.
+            if (isSessionNotAttached(reply)) return error.TurnAlreadyEnded;
+            return error.RpcFailed;
+        }
 
         return waitForTurnEnd(sub, timeout_ms);
     }
