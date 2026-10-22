@@ -354,15 +354,9 @@ pub const Loop = struct {
     }
 
     fn emit(self: *Loop, event: Event) anyerror!u64 {
-        if (isSurfaceEvent(event)) self.surface_generation +%= 1;
+        // dsh bumps `contentGeneration` only for replace/project surface
+        // operations, not for appends (session/src/surface.ts:572-578).
         return self.host.emit(self.host.context, event);
-    }
-
-    fn isSurfaceEvent(event: Event) bool {
-        return switch (event) {
-            .system_message, .user_message, .assistant_message, .tool_result => true,
-            else => false,
-        };
     }
 
     fn now(self: *Loop) i64 {
@@ -614,7 +608,7 @@ pub const Loop = struct {
                 .assistant_stream = .{ .position = position, .attempt = 1, .event = event },
             });
             switch (event) {
-                .chunk => saw_chunk = true,
+                .chunk, .record => saw_chunk = true,
                 .done => done = true,
             }
             const keep = try accumulator.push(self.now(), event);
@@ -993,7 +987,7 @@ fn emitEvent(context: *anyopaque, event: Event) anyerror!u64 {
                     .text_delta => |delta| record.text = try h.dup(delta.text),
                     else => {},
                 },
-                .done => {},
+                .done, .record => {},
             }
         },
         .assistant_message => |payload| {

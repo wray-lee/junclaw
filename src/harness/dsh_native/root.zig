@@ -47,5 +47,7 @@ test {
     _ = @import("tools/builtins.zig");
     _ = @import("tools/bash.zig");
     _ = @import("generated/root.zig");
+    _ = @import("fixture_compare.zig");
     _ = @import("plain_turn_test.zig");
+    _ = @import("fixture_replay_test.zig");
 }

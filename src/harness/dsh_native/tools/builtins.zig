@@ -134,12 +134,6 @@ fn globHandler(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror
 // ---------------------------------------------------------------------------
 // Result and argument helpers
 
-fn successText(allocator: Allocator, text: []const u8) !registry.ToolResult {
-    const blocks = try allocator.alloc(types.ContentBlock, 1);
-    blocks[0] = .{ .text = text };
-    return .{ .success = .{ .content = blocks } };
-}
-
 fn failure(allocator: Allocator, name: []const u8, code: []const u8, text: []const u8) !registry.ToolResult {
     const blocks = try allocator.alloc(types.ContentBlock, 1);
     blocks[0] = .{ .text = text };
@@ -302,6 +296,7 @@ fn runRead(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     var output_bytes: usize = 0;
     var truncated_by_bytes = false;
     var last_number: usize = @intCast(offset - 1);
+    var selected_lines = std.json.Array.init(allocator);
 
     var line_start: usize = 0;
     while (line_start < data.len) {
@@ -320,6 +315,7 @@ fn runRead(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
                 output_bytes += bytes;
                 if (selected > 0) try body.append(allocator, '\n');
                 try body.appendSlice(allocator, try std.fmt.allocPrint(allocator, "{d}: {s}", .{ total_lines, text }));
+                try selected_lines.append(try lineMetaValue(allocator, total_lines, text));
                 selected += 1;
                 last_number = total_lines;
             }
@@ -343,7 +339,33 @@ fn runRead(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     if (body.items.len > 0) try body.appendSlice(allocator, "\n\n");
     try body.appendSlice(allocator, footer);
 
-    return successText(allocator, try std.fmt.allocPrint(allocator, render.read.envelope, .{ absolute, body.items }));
+    var meta: std.json.ObjectMap = .empty;
+    try meta.put(allocator, "path", .{ .string = absolute });
+    try meta.put(allocator, "offset", .{ .integer = @intCast(offset) });
+    try meta.put(allocator, "lines", .{ .array = selected_lines });
+    try meta.put(allocator, "totalLines", .{ .integer = @intCast(total_lines) });
+    return successTextWithMeta(
+        allocator,
+        try std.fmt.allocPrint(allocator, render.read.envelope, .{ absolute, body.items }),
+        .{ .object = meta },
+    );
+}
+
+fn lineMetaValue(allocator: Allocator, number: usize, text: []const u8) !Value {
+    var object: std.json.ObjectMap = .empty;
+    try object.put(allocator, "number", .{ .integer = @intCast(number) });
+    try object.put(allocator, "text", .{ .string = text });
+    return .{ .object = object };
+}
+
+fn successText(allocator: Allocator, text: []const u8) !registry.ToolResult {
+    return successTextWithMeta(allocator, text, null);
+}
+
+fn successTextWithMeta(allocator: Allocator, text: []const u8, meta: ?Value) !registry.ToolResult {
+    const blocks = try allocator.alloc(types.ContentBlock, 1);
+    blocks[0] = .{ .text = text };
+    return .{ .success = .{ .content = blocks, .meta = meta } };
 }
 
 /// Truncate to `max_chars` Unicode scalar values, appending dsh's suffix.
@@ -397,7 +419,16 @@ fn runWrite(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRe
     file.sync() catch |err| return fsFailureFor(allocator, "write", absolute, err);
 
     const verb = if (existed) render.write.updated_verb else render.write.created_verb;
-    return successText(allocator, try std.fmt.allocPrint(allocator, render.write.output_envelope, .{ absolute, verb }));
+    var meta: std.json.ObjectMap = .empty;
+    try meta.put(allocator, "operation", .{ .string = if (existed) "update" else "create" });
+    try meta.put(allocator, "path", .{ .string = absolute });
+    // shortcut: update diffs are always empty until edit/write hunk rendering lands.
+    try meta.put(allocator, "diffs", .{ .array = std.json.Array.init(allocator) });
+    return successTextWithMeta(
+        allocator,
+        try std.fmt.allocPrint(allocator, render.write.output_envelope, .{ absolute, verb }),
+        .{ .object = meta },
+    );
 }
 
 // ---------------------------------------------------------------------------

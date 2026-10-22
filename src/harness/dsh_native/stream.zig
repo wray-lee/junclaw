@@ -56,12 +56,14 @@ pub const ProviderUsage = struct {
     total_tokens: ?u64 = null,
 };
 
-/// prompt/completion/total -> inputTokens/outputTokens/totalTokens, null -> 0.
+/// prompt/completion/total -> inputTokens/outputTokens/totalTokens; absent
+/// keys stay null so the durable record can omit them like dsh.
 pub fn normalizeUsage(input: ProviderUsage) types.Usage {
     return .{
         .input_tokens = input.prompt_tokens orelse 0,
         .output_tokens = input.completion_tokens orelse 0,
-        .total_tokens = input.total_tokens orelse 0,
+        // Missing total/cache/reasoning keys stay absent in the log.
+        .total_tokens = input.total_tokens,
     };
 }
 
@@ -112,6 +114,9 @@ pub const Done = struct {
 pub const Event = union(enum) {
     chunk: Chunk,
     done: Done,
+    /// Pre-packed durable record from a recording (fixture replay). It is
+    /// appended to the assistant stream verbatim and folded into content.
+    record: StreamRecord,
 };
 
 /// Compact stream records embedded in assistant/message.
@@ -220,8 +225,58 @@ pub const Accumulator = struct {
         switch (event) {
             .chunk => |chunk| try self.pushChunk(time_ms, chunk),
             .done => |done| try self.pushDone(time_ms, done),
+            .record => |record| try self.pushRecord(record),
         }
         return true;
+    }
+
+    fn pushRecord(self: *Accumulator, record: StreamRecord) !void {
+        const allocator = self.arena.allocator();
+        switch (record) {
+            .text_chunks, .reasoning_chunks => {
+                const run = switch (record) {
+                    .text_chunks => |value| value,
+                    .reasoning_chunks => |value| value,
+                    else => unreachable,
+                };
+                const block_type: BlockType = switch (record) {
+                    .text_chunks => .text,
+                    else => .reasoning,
+                };
+                const partial = try self.ensure(run.index, block_type);
+                if (partial.closed == null) {
+                    for (run.texts) |text| try partial.texts.append(allocator, try allocator.dupe(u8, text));
+                }
+                var mutable = MutableTextRun{ .index = run.index, .time0 = run.time0, .last_time = run.time0 };
+                for (run.texts) |text| try mutable.texts.append(allocator, try allocator.dupe(u8, text));
+                try mutable.dt.appendSlice(allocator, run.dt);
+                switch (record) {
+                    .text_chunks => try self.records.append(allocator, .{ .text_chunks = mutable }),
+                    else => try self.records.append(allocator, .{ .reasoning_chunks = mutable }),
+                }
+            },
+            .tool_call_chunks => |run| {
+                const partial = try self.ensure(run.index, .tool_call);
+                if (partial.closed == null) {
+                    partial.tool_id = try allocator.dupe(u8, run.id);
+                    if (run.name) |name| {
+                        if (name.len > 0) partial.tool_name = try allocator.dupe(u8, name);
+                    }
+                    for (run.args) |args| try partial.args.append(allocator, try allocator.dupe(u8, args));
+                }
+                var mutable = MutableToolCallRun{
+                    .index = run.index,
+                    .time0 = run.time0,
+                    .last_time = run.time0,
+                    .id = try allocator.dupe(u8, run.id),
+                    .name = if (run.name) |name| try allocator.dupe(u8, name) else null,
+                };
+                for (run.args) |args| try mutable.args.append(allocator, try allocator.dupe(u8, args));
+                try mutable.dt.appendSlice(allocator, run.dt);
+                try self.records.append(allocator, .{ .tool_call_chunks = mutable });
+            },
+            .chunk => |raw| try self.pushChunk(raw.time, raw.chunk),
+        }
     }
 
     fn pushChunk(self: *Accumulator, time_ms: i64, chunk: Chunk) !void {
@@ -263,10 +318,9 @@ pub const Accumulator = struct {
                 try self.appendRaw(time_ms, chunk);
             },
             .usage => |usage| {
-                const normalized = zeroUsage(usage);
-                self.usage = normalized;
+                self.usage = usage;
                 self.saw_usage_chunk = true;
-                try self.appendRaw(time_ms, .{ .usage = normalized });
+                try self.appendRaw(time_ms, .{ .usage = usage });
             },
             .finish => |finish| {
                 self.finish = finish;
@@ -462,7 +516,7 @@ pub const Accumulator = struct {
                 .index = end.index,
                 .block = try self.cloneBlock(end.block),
             } },
-            .usage => |usage| .{ .usage = zeroUsage(usage) },
+            .usage => |usage| .{ .usage = usage },
             .finish => |finish| .{ .finish = finish },
         };
     }
@@ -595,12 +649,6 @@ fn blockTypeOf(block: types.ContentBlock) BlockType {
         .tool_call => .tool_call,
         .raw => .other,
     };
-}
-
-fn zeroUsage(usage: types.Usage) types.Usage {
-    var out = usage;
-    out.total_tokens = usage.total_tokens orelse 0;
-    return out;
 }
 
 fn safeGap(previous: i64, next: i64) ?i64 {
@@ -747,8 +795,10 @@ fn writeUsage(w: *Writer, usage: types.Usage) !void {
     try w.print("{d}", .{usage.input_tokens});
     try w.writeAll(",\"outputTokens\":");
     try w.print("{d}", .{usage.output_tokens});
-    try w.writeAll(",\"totalTokens\":");
-    try w.print("{d}", .{usage.total_tokens orelse 0});
+    if (usage.total_tokens) |value| {
+        try w.writeAll(",\"totalTokens\":");
+        try w.print("{d}", .{value});
+    }
     if (usage.cache_read_tokens) |value| {
         try w.writeAll(",\"cacheReadTokens\":");
         try w.print("{d}", .{value});
@@ -899,7 +949,7 @@ test "provider finish reasons normalize" {
     try testing.expectEqual(Finish.max_tokens, finishFromProvider("max_tokens"));
 }
 
-test "usage maps prompt/completion/total and nulls to zero" {
+test "usage maps prompt/completion/total and keeps absent keys null" {
     const partial = normalizeUsage(.{
         .prompt_tokens = 7,
         .completion_tokens = null,
@@ -907,12 +957,12 @@ test "usage maps prompt/completion/total and nulls to zero" {
     });
     try testing.expectEqual(@as(u64, 7), partial.input_tokens);
     try testing.expectEqual(@as(u64, 0), partial.output_tokens);
-    try testing.expectEqual(@as(u64, 0), partial.total_tokens.?);
+    try testing.expectEqual(@as(?u64, null), partial.total_tokens);
 
     const zero = normalizeUsage(.{});
     try testing.expectEqual(@as(u64, 0), zero.input_tokens);
     try testing.expectEqual(@as(u64, 0), zero.output_tokens);
-    try testing.expectEqual(@as(u64, 0), zero.total_tokens.?);
+    try testing.expectEqual(@as(?u64, null), zero.total_tokens);
 
     const full = normalizeUsage(.{
         .prompt_tokens = 1,
@@ -948,7 +998,7 @@ test "done stop settles one assistant message with packed text chunks" {
     }
     try testing.expectEqual(@as(u64, 7), settlement.usage.?.input_tokens);
     try testing.expectEqual(@as(u64, 3), settlement.usage.?.output_tokens);
-    try testing.expectEqual(@as(u64, 0), settlement.usage.?.total_tokens.?);
+    try testing.expectEqual(@as(?u64, null), settlement.usage.?.total_tokens);
     try testing.expect(!settlement.interrupted);
     try testing.expectEqual(Finish.stop, settlement.finish);
 
@@ -986,7 +1036,7 @@ test "done stop settles one assistant message with packed text chunks" {
     try testing.expect(std.mem.indexOf(
         u8,
         json_text,
-        "\"usage\":{\"inputTokens\":7,\"outputTokens\":3,\"totalTokens\":0}",
+        "\"usage\":{\"inputTokens\":7,\"outputTokens\":3}",
     ) != null);
     try testing.expect(std.mem.indexOf(u8, json_text, "sourceEventSeqs") == null);
     try testing.expect(std.mem.indexOf(u8, json_text, "\"interrupted\"") == null);
@@ -1156,7 +1206,7 @@ test "usage zero and absent normalize as specified" {
     const with_zero = try acc.settle("message-6", "test-provider", "test-model");
     try testing.expectEqual(@as(u64, 0), with_zero.usage.?.input_tokens);
     try testing.expectEqual(@as(u64, 0), with_zero.usage.?.output_tokens);
-    try testing.expectEqual(@as(u64, 0), with_zero.usage.?.total_tokens.?);
+    try testing.expectEqual(@as(?u64, null), with_zero.usage.?.total_tokens);
 
     var absent = Accumulator.init(testing.allocator);
     defer absent.deinit();
