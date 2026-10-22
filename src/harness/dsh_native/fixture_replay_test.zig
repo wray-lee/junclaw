@@ -750,9 +750,9 @@ fn endReasonValue(allocator: Allocator, reason: types.EndReason) !Value {
             try object.put(allocator, "reason", switch (cause) {
                 .user => .{ .object = try objectValue(allocator, &.{.{ "kind", .{ .string = "user" } }}) },
                 .parent => .{ .object = try objectValue(allocator, &.{.{ "kind", .{ .string = "parent" } }}) },
-                .hook => |name| .{ .object = try objectValue(allocator, &.{
+                .hook => |hook_reason| .{ .object = try objectValue(allocator, &.{
                     .{ "kind", .{ .string = "hook" } },
-                    .{ "name", .{ .string = name } },
+                    .{ "reason", .{ .string = hook_reason } },
                 }) },
                 .disposed => .{ .object = try objectValue(allocator, &.{.{ "kind", .{ .string = "disposed" } }}) },
                 .legacy => .{ .object = try objectValue(allocator, &.{.{ "kind", .{ .string = "legacy" } }}) },
@@ -1070,4 +1070,17 @@ test "dsh native max-tokens matches normalized v4 fixture" {
 
 test "dsh native parallel-barrier matches normalized v4 fixture" {
     try runFixture("parallel-barrier");
+}
+
+test "hook abort cause serializes as kind hook and reason" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const value = try endReasonValue(allocator, .{ .aborted = .{ .hook = "policy-hook" } });
+    try std.testing.expectEqualStrings("aborted", value.object.get("kind").?.string);
+    const reason = value.object.get("reason").?.object;
+    try std.testing.expectEqualStrings("hook", reason.get("kind").?.string);
+    try std.testing.expectEqualStrings("policy-hook", reason.get("reason").?.string);
+    try std.testing.expect(reason.get("name") == null);
 }
