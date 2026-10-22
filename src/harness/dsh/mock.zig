@@ -148,6 +148,14 @@ pub const MockDsh = struct {
     projection_json: ?[]u8 = null,
     /// `session/selectModel` request bodies, in arrival order.
     select_model_requests: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Simulated process death: every new connection is reset and the mux is
+    /// shut down until `revive`. Deterministic (no timing).
+    dead: bool = false,
+    /// `session/resume` calls and the last resumed session id.
+    resume_count: u32 = 0,
+    last_resume_session: ?[]u8 = null,
+    /// Times the "process" came back after `kill`.
+    revive_count: u32 = 0,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -178,6 +186,7 @@ pub const MockDsh = struct {
         for (self.closed_sessions.items) |session| self.allocator.free(session);
         self.closed_sessions.deinit(self.allocator);
         if (self.last_prompt_session) |session| self.allocator.free(session);
+        if (self.last_resume_session) |session| self.allocator.free(session);
         if (self.model_catalog_json) |json| self.allocator.free(json);
         if (self.projection_json) |json| self.allocator.free(json);
         for (self.select_model_requests.items) |request| self.allocator.free(request);
@@ -293,6 +302,13 @@ pub const MockDsh = struct {
     fn serve(self: *MockDsh, stream: std_compat.net.Stream) void {
         var keep_open = false;
         defer if (!keep_open) stream.close();
+
+        // A dead process does not answer: closing without reading makes the
+        // peer see a reset, which is what the harness must classify.
+        self.mutex.lock();
+        const dead = self.dead;
+        self.mutex.unlock();
+        if (dead) return;
 
         const request = readRequest(self.allocator, stream) catch return;
         defer self.allocator.free(request.buffer);
@@ -411,6 +427,9 @@ pub const MockDsh = struct {
         } else if (std.mem.eql(u8, method, "session/selectModel")) {
             self.recordSelectModel(body);
             value = try self.allocator.dupe(u8, "{}");
+        } else if (std.mem.eql(u8, method, "session/resume")) {
+            self.recordResume(body);
+            value = try self.allocator.dupe(u8, "{}");
         } else {
             value = try self.allocator.dupe(u8, "{}");
         }
@@ -479,6 +498,18 @@ pub const MockDsh = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.closed_sessions.append(self.allocator, session) catch self.allocator.free(session);
+    }
+
+    /// `session/resume` takes a bare `{sessionId}` args object.
+    fn recordResume(self: *MockDsh, body: []const u8) void {
+        const session = argSessionId(self.allocator, body);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.resume_count += 1;
+        if (session) |id| {
+            if (self.last_resume_session) |old| self.allocator.free(old);
+            self.last_resume_session = id;
+        }
     }
 
     pub fn createCount(self: *MockDsh) u32 {
@@ -559,6 +590,47 @@ pub const MockDsh = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.ws_rejections;
+    }
+
+    /// Simulate the sidecar process dying: shut down the mux socket and reset
+    /// every new connection until `revive`.
+    pub fn kill(self: *MockDsh) void {
+        self.mutex.lock();
+        self.dead = true;
+        if (self.ws) |conn| {
+            conn.open = false;
+            conn.stream.shutdown(.both) catch {};
+        }
+        self.follow_cond.broadcast();
+        self.mutex.unlock();
+    }
+
+    /// Bring the simulated process back; the next boot or RPC succeeds.
+    pub fn revive(self: *MockDsh) void {
+        self.mutex.lock();
+        self.dead = false;
+        self.revive_count += 1;
+        self.mutex.unlock();
+    }
+
+    pub fn reviveCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.revive_count;
+    }
+
+    /// Number of `session/resume` RPCs the harness sent.
+    pub fn resumeCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.resume_count;
+    }
+
+    /// Copy of the last `session/resume` session id; caller frees.
+    pub fn lastResumeSession(self: *MockDsh, allocator: Allocator) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return if (self.last_resume_session) |session| try allocator.dupe(u8, session) else null;
     }
 
     pub fn closeCount(self: *MockDsh) u32 {
@@ -795,6 +867,19 @@ fn requestPromptText(allocator: Allocator, body: []const u8) ?[]u8 {
         else => return null,
     };
     return allocator.dupe(u8, text) catch null;
+}
+
+fn argSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
+    defer parsed.deinit();
+    const root = asObject(parsed.value) orelse return null;
+    const payload = asObject(root.get("payload")) orelse return null;
+    const args = asObject(payload.get("args")) orelse return null;
+    const session = switch (args.get("sessionId") orelse return null) {
+        .string => |text| text,
+        else => return null,
+    };
+    return allocator.dupe(u8, session) catch null;
 }
 
 fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {

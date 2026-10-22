@@ -36,6 +36,11 @@ const DshClient = client_mod.DshClient;
 /// shortcut: a poll slice instead of an eventfd; /stop lands within one slice.
 const poll_slice_ms: u64 = 50;
 
+/// Consecutive failed crash recoveries before the engine stops restarting.
+/// Aligned with sidecar `backoffDelayMs` (200/400/800ms for these attempts);
+/// one successful rebuild resets the count.
+const max_restart_attempts: u32 = 3;
+
 /// Same text `Agent.handleSlashCommand("/stop")` returns, so the host renders a
 /// dsh stop exactly like a native one (the turn reply carries the partial text).
 const stop_ack = "No active background task to stop.";
@@ -174,6 +179,7 @@ pub const DshEngine = struct {
 
         fn deinit(self: *Entry, allocator: Allocator) void {
             self.client.unsubscribe(self.sub);
+            self.client.release();
             allocator.free(self.key);
             if (self.session_file) |path| allocator.free(path);
             allocator.free(self.session_id);
@@ -183,12 +189,22 @@ pub const DshEngine = struct {
     allocator: Allocator,
     opts: Options,
     /// Set only when this engine spawned the process; `boot_url` bypasses it.
-    /// P1 has no auto-restart loop: a dead sidecar surfaces as an error from
-    /// the next RPC. `sidecar.restart`/`backoffDelayMs` are ready for the P2
-    /// loop.
+    /// Owned processes are restarted automatically after a connection-level
+    /// error; an injected `boot_url` is never restarted.
     sidecar: ?sidecar_mod.Sidecar = null,
     /// Set by `ensureBooted`: one HTTP client and one mux socket for every key.
-    client: ?DshClient = null,
+    client: ?*DshClient = null,
+    /// Test seam: boot/restart without a process and return the launch URL
+    /// (owned by the allocator). Non-null makes the engine self-managed.
+    spawn_override: ?*const fn (ctx: ?*anyopaque, allocator: Allocator) anyerror![]u8 = null,
+    spawn_ctx: ?*anyopaque = null,
+    /// Serializes restarts, so one crash never rebuilds two WebSockets.
+    recovery_mutex: std_compat.sync.Mutex = .{},
+    /// Consecutive failed restarts; a successful rebuild resets it.
+    restart_attempts: u32 = 0,
+    /// Bumped on every successful client rebuild. A turn that captured the old
+    /// value knows someone else already recovered and only re-attaches.
+    generation: std.atomic.Value(u64) = .init(0),
     /// One live dsh session per junclaw key, all on this one sidecar.
     entries: std.ArrayListUnmanaged(*Entry) = .empty,
     /// Guards `entries` and each entry's `refs`/`retired`.
@@ -212,7 +228,7 @@ pub const DshEngine = struct {
         }
         self.entries.deinit(self.allocator);
         if (self.sidecar) |*sidecar| sidecar.deinit();
-        if (self.client) |*client| client.deinit();
+        if (self.client) |client| client.release();
     }
 
     /// Idempotent lazy boot. The first caller spawns (or adopts) the sidecar
@@ -237,13 +253,16 @@ pub const DshEngine = struct {
         }
 
         var spawned: ?sidecar_mod.Sidecar = null;
-        var created: ?DshClient = null;
-        errdefer {
-            if (spawned) |*sidecar| sidecar.deinit();
-            if (created) |*value| value.deinit();
-        }
+        var boot_url_owned: ?[]u8 = null;
+        defer if (boot_url_owned) |url| self.allocator.free(url);
+        errdefer if (spawned) |*sidecar| sidecar.deinit();
 
-        const boot_url = if (self.opts.boot_url) |url| url else blk: {
+        const boot_url: []const u8 = if (self.opts.boot_url) |url|
+            url
+        else if (self.spawn_override) |hook| blk: {
+            boot_url_owned = try hook(self.spawn_ctx, self.allocator);
+            break :blk boot_url_owned.?;
+        } else blk: {
             var owned_bin: ?[]u8 = null;
             defer if (owned_bin) |value| self.allocator.free(value);
             var sidecar_opts = self.opts.sidecar;
@@ -258,21 +277,142 @@ pub const DshEngine = struct {
             spawned = try sidecar_mod.Sidecar.start(self.allocator, sidecar_opts);
             break :blk spawned.?.boot_url orelse return error.SidecarNotStarted;
         };
+        const client = try self.connectClient(boot_url);
+
+        self.sidecar = spawned;
+        self.client = client;
+        self.booted = true;
+        spawned = null;
+    }
+
+    /// Exchange the launch URL for the owner cookie and open the one shared
+    /// mux socket. Returns a new heap client; the caller installs it.
+    fn connectClient(self: *Self, boot_url: []const u8) !*DshClient {
         const cookie = try sidecar_mod.fetchOwnerCookieForUrl(self.allocator, boot_url, self.opts.rpc_timeout_ms);
         defer self.allocator.free(cookie);
         const endpoint = try client_mod.parseBootEndpoint(boot_url);
-        created = try DshClient.init(self.allocator, endpoint.base_url, cookie);
-        created.?.rpc_timeout_ms = self.opts.rpc_timeout_ms;
-        created.?.handshake_timeout_ms = self.opts.handshake_timeout_ms;
+
+        const client = try self.allocator.create(DshClient);
+        errdefer self.allocator.destroy(client);
+        client.* = try DshClient.init(self.allocator, endpoint.base_url, cookie);
+        errdefer client.deinit();
+        client.rpc_timeout_ms = self.opts.rpc_timeout_ms;
+        client.handshake_timeout_ms = self.opts.handshake_timeout_ms;
         // One mux socket for the whole process: dsh rejects a second socket
         // for the same API peer with 409 Conflict.
-        try created.?.connectMux();
+        try client.connectMux();
+        return client;
+    }
 
-        self.sidecar = spawned;
-        self.client = created.?;
-        self.booted = true;
-        spawned = null;
-        created = null;
+    /// True when this engine may restart its own sidecar (never an injected
+    /// `boot_url`).
+    fn selfManaged(self: *const Self) bool {
+        return self.opts.boot_url == null and (self.sidecar != null or self.spawn_override != null);
+    }
+
+    /// Restart the sidecar and install a fresh client. Caller holds
+    /// `recovery_mutex`. The previous client is released, but any key still
+    /// bound to it holds a reference until its turn re-attaches.
+    fn restartSidecarLocked(self: *Self) !void {
+        if (self.restart_attempts >= max_restart_attempts) {
+            std.log.warn("dsh sidecar failed to restart {d} times in a row; giving up", .{self.restart_attempts});
+            return error.SidecarCrashLoop;
+        }
+        self.restart_attempts += 1;
+
+        var boot_url_owned: ?[]u8 = null;
+        defer if (boot_url_owned) |url| self.allocator.free(url);
+        const boot_url: []const u8 = if (self.spawn_override) |hook| blk: {
+            boot_url_owned = try hook(self.spawn_ctx, self.allocator);
+            break :blk boot_url_owned.?;
+        } else blk: {
+            const sidecar = if (self.sidecar) |*value| value else return error.SidecarNotStarted;
+            try sidecar.restart();
+            break :blk sidecar.boot_url orelse return error.SidecarNotStarted;
+        };
+        const client = try self.connectClient(boot_url);
+
+        // Swap under the entry-table lock: `createEntryLocked` reads
+        // `self.client` while holding it, and an entry retains before it
+        // releases the lock.
+        self.entries_mutex.lock();
+        const old = self.client;
+        self.client = client;
+        self.entries_mutex.unlock();
+        if (old) |value| value.release();
+
+        _ = self.generation.fetchAdd(1, .release);
+        self.restart_attempts = 0;
+    }
+
+    /// Recover from a connection-level error: restart a self-managed sidecar
+    /// (unless another turn already did) and re-attach every live session.
+    /// `observed_generation` is read before the failing call.
+    fn recover(self: *Self, entry: ?*Entry, observed_generation: u64) !void {
+        self.recovery_mutex.lock();
+        defer self.recovery_mutex.unlock();
+
+        if (self.generation.load(.acquire) == observed_generation) {
+            if (!self.selfManaged()) return error.SidecarNotManaged;
+            try self.restartSidecarLocked();
+        }
+        const client = self.client orelse return error.SidecarNotStarted;
+        try self.reattachAll(entry, client);
+    }
+
+    /// Resume and re-follow every live session on `client`. The caller's entry
+    /// is re-attached under its already-held `turn_mutex`; another entry is
+    /// only touched when its turn mutex is free. A busy turn re-attaches its
+    /// own entry when the dead stream surfaces `ConnectionLost`.
+    fn reattachAll(self: *Self, caller: ?*Entry, client: *DshClient) !void {
+        var snapshot: std.ArrayListUnmanaged(*Entry) = .empty;
+        defer snapshot.deinit(self.allocator);
+
+        {
+            self.entries_mutex.lock();
+            defer self.entries_mutex.unlock();
+            try snapshot.ensureTotalCapacity(self.allocator, self.entries.items.len);
+            for (self.entries.items) |entry| {
+                entry.refs += 1;
+                snapshot.appendAssumeCapacity(entry);
+            }
+        }
+        defer for (snapshot.items) |entry| self.releaseEntry(entry);
+
+        for (snapshot.items) |entry| {
+            if (entry.client == client) continue;
+            if (caller != null and entry == caller.?) {
+                try reattachEntry(entry, client);
+                continue;
+            }
+            if (entry.turn_mutex.tryLock()) {
+                defer entry.turn_mutex.unlock();
+                reattachEntry(entry, client) catch {};
+            }
+        }
+    }
+
+    /// Move `entry` onto the current client after another turn's recovery.
+    /// Caller holds `entry.turn_mutex`.
+    fn ensureAttached(self: *Self, entry: *Entry) !void {
+        self.recovery_mutex.lock();
+        defer self.recovery_mutex.unlock();
+        const client = self.client orelse return error.SidecarNotStarted;
+        if (entry.client == client) return;
+        try reattachEntry(entry, client);
+    }
+
+    /// Point `entry` at `client` and follow its session there. The old client
+    /// is released once no turn is bound to it.
+    fn reattachEntry(entry: *Entry, client: *DshClient) !void {
+        try client.resumeSession(entry.session_id);
+        const sub = try client.subscribe(entry.session_id);
+        client.retain();
+        const old = entry.client;
+        entry.sub = sub;
+        entry.client = client;
+        // Drops the old client (and its subscriptions) once no turn holds it.
+        old.release();
     }
 
     /// Per-key mapping path: `{dir}/{Wyhash(key)}.json`. Caller frees; null
@@ -378,7 +518,12 @@ pub const DshEngine = struct {
             null;
         errdefer if (mapping) |path| self.allocator.free(path);
 
-        const client = &self.client.?;
+        const client = self.client orelse return error.SidecarNotStarted;
+        // Hold the client for the whole network setup; ownership moves to the
+        // entry on success.
+        client.retain();
+        var entry_owns_ref = false;
+        defer if (!entry_owns_ref) client.release();
 
         // A corrupt mapping falls back to a fresh session (design §2.2); an id
         // dsh no longer knows surfaces as an error from this turn.
@@ -426,6 +571,7 @@ pub const DshEngine = struct {
             .refs = 1,
         };
         try self.entries.append(self.allocator, entry);
+        entry_owns_ref = true;
         return entry;
     }
 };
@@ -485,13 +631,27 @@ pub const DshHarness = struct {
         // Lazy boot runs here, on the session's turn thread under the session
         // mutex, never under the session-table lock.
         try engine.ensureBooted();
-        const entry = (try engine.acquireEntry(self.session_key, self.session_file, true)).entry;
+        // A crash while creating this key's session surfaces here; restart and
+        // retry the acquire once.
+        const entry = blk: {
+            const acquired = engine.acquireEntry(self.session_key, self.session_file, true) catch |err| {
+                if (!engine.selfManaged() or !client_mod.isConnectionError(err)) return err;
+                const observed = engine.generation.load(.acquire);
+                try engine.recover(null, observed);
+                break :blk (try engine.acquireEntry(self.session_key, self.session_file, true)).entry;
+            };
+            break :blk acquired.entry;
+        };
         defer engine.releaseEntry(entry);
         entry.turn_mutex.lock();
         defer entry.turn_mutex.unlock();
 
         // A failed `/new` must never fall back to the old dsh session.
         if (entry.reset_failed) return error.SessionResetFailed;
+
+        // Another key's crash recovery may have replaced the client while this
+        // turn waited for the key's turn mutex; re-attach before prompting.
+        try engine.ensureAttached(entry);
 
         // A stop that landed before the prompt still cancels this turn, so a
         // pre-turn requestInterrupt behaves like native's.
@@ -502,7 +662,19 @@ pub const DshHarness = struct {
         const session_id = entry.session_id;
         const sink = input.sink;
 
-        try entry.client.prompt(session_id, input.user_message);
+        // A dead sidecar surfaces here before any text is streamed, so the
+        // prompt is safe to retry once after a restart (no duplicate output).
+        var prompt_retried = false;
+        while (true) {
+            const observed = engine.generation.load(.acquire);
+            entry.client.prompt(session_id, input.user_message) catch |err| {
+                if (!client_mod.isConnectionError(err) or prompt_retried or !engine.selfManaged()) return err;
+                prompt_retried = true;
+                try engine.recover(entry, observed);
+                continue;
+            };
+            break;
+        }
 
         var text: std.ArrayListUnmanaged(u8) = .empty;
         errdefer text.deinit(allocator);
@@ -546,9 +718,18 @@ pub const DshHarness = struct {
                 };
             }
 
+            const observed = engine.generation.load(.acquire);
             var event = entry.sub.nextEvent(@min(@as(u64, @intCast(remaining)), poll_slice_ms)) catch |err| switch (err) {
                 error.Timeout => continue,
-                else => return err,
+                else => {
+                    if (!client_mod.isConnectionError(err) or !engine.selfManaged()) return err;
+                    // The sidecar died mid-turn: restart and re-attach so the
+                    // session continues, then keep the text the user already
+                    // saw (retrying the prompt would duplicate it).
+                    try engine.recover(entry, observed);
+                    if (text.items.len == 0) return err;
+                    return .{ .reply = try text.toOwnedSlice(allocator), .end_reason = .failed };
+                },
             };
             defer client_mod.freeEvent(allocator, &event);
 

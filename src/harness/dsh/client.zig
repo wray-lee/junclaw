@@ -716,6 +716,30 @@ fn connectHandshakeBounded(
     }
 }
 
+/// True when `err` means the sidecar transport died (process gone or the mux
+/// socket closed), rather than one RPC or subscription failing on its own.
+/// `error.ConnectionLost` is the mux's own signal; the rest come from the HTTP
+/// and socket layers.
+pub fn isConnectionError(err: anyerror) bool {
+    return switch (err) {
+        error.ConnectionLost,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.ConnectionAborted,
+        error.ConnectionClose,
+        error.BrokenPipe,
+        error.NetworkUnreachable,
+        error.ReadFailed,
+        error.WriteFailed,
+        error.UnexpectedEndOfStream,
+        error.EndOfStream,
+        error.Closed,
+        error.HttpConnectionClosing,
+        => true,
+        else => false,
+    };
+}
+
 pub const DshClient = struct {
     allocator: Allocator,
     base_url: []u8,
@@ -729,6 +753,24 @@ pub const DshClient = struct {
     mux: ?*Mux = null,
     /// Single-session binding used by the client API and its tests.
     sub: ?*Subscription = null,
+    /// Engine entries hold a ref while they are bound to this client, so a
+    /// restart can free the old client as soon as the last turn moves off it.
+    refs: std.atomic.Value(u32) = .init(1),
+
+    /// Take a reference; the caller must already hold one.
+    pub fn retain(self: *DshClient) void {
+        _ = self.refs.fetchAdd(1, .monotonic);
+    }
+
+    /// Drop a reference, freeing the client (and its mux/subscriptions) when
+    /// it was the last one.
+    pub fn release(self: *DshClient) void {
+        if (self.refs.fetchSub(1, .acq_rel) == 1) {
+            const allocator = self.allocator;
+            self.deinit();
+            allocator.destroy(self);
+        }
+    }
 
     pub fn init(allocator: Allocator, base_url: []const u8, cookie: []const u8) !DshClient {
         const base_copy = try allocator.dupe(u8, base_url);
@@ -850,6 +892,16 @@ pub const DshClient = struct {
 
     pub fn prompt(self: *DshClient, session_id: []const u8, text: []const u8) !void {
         return self.sendPrompt(session_id, text, "queue");
+    }
+
+    /// Re-attach a persisted session after the sidecar restarted, so its next
+    /// prompt continues the same conversation. dsh replies with `{}`.
+    pub fn resumeSession(self: *DshClient, session_id: []const u8) !void {
+        const args = try std.json.Stringify.valueAlloc(self.allocator, .{ .sessionId = session_id }, .{});
+        defer self.allocator.free(args);
+        var reply = try self.call("session/resume", args);
+        defer self.freeReply(&reply);
+        if (!reply.ok) return error.RpcFailed;
     }
 
     pub fn steer(self: *DshClient, session_id: []const u8, text: []const u8) !void {

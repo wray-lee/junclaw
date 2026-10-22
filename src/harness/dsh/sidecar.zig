@@ -280,6 +280,10 @@ pub const Sidecar = struct {
         try child.spawn();
 
         self.child = child;
+        // A failed boot must not leak a half-started process or its pipes:
+        // `restart` retries from a clean state, and a crash loop must not pile
+        // up children. `restart_attempt` is only reset by a successful boot.
+        errdefer self.stop();
         const stdout_file = child.stdout orelse return error.SidecarSpawnFailed;
         const stderr_file = child.stderr orelse return error.SidecarSpawnFailed;
 
@@ -366,6 +370,36 @@ test "restart backoff starts at 200ms, doubles, and caps at 5s" {
     for (expected, 0..) |want, index| {
         try std.testing.expectEqual(want, backoffDelayMs(@intCast(index)));
     }
+}
+
+test "failed boot keeps the restart attempt and reaps the child" {
+    // Regression: a boot failure after spawn left the half-started child and
+    // its pipe threads running until the next restart (or forever, if the
+    // crash-loop cap stopped further restarts).
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    var self = Sidecar{
+        .allocator = allocator,
+        .opts = .{
+            .node_exe = "/bin/false",
+            .bin_js = "unused",
+            .workspace = ".",
+            .dsh_home = "/tmp/dsh-sidecar-test-home",
+            .boot_timeout_ms = 2_000,
+        },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer self.deinit();
+    try self.initSpawnArgs();
+
+    try std.testing.expectError(error.SidecarBootFailed, self.restart());
+    try std.testing.expectEqual(@as(u32, 1), self.restart_attempt);
+    try std.testing.expect(self.child == null);
+    try std.testing.expect(self.stdout_thread == null);
+    try std.testing.expect(self.stderr_thread == null);
+    try std.testing.expect(self.stdout_ctx == null);
 }
 
 test "sidecar environment sets required defaults and honors overrides" {
