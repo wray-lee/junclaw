@@ -588,7 +588,7 @@
   "openIssues": [
     "The task prose says a synthetic abort user message follows the tool results; dsh 0.2.1-rc.2 does not emit one (snapshots and agent.ts:369-372). This fixture follows the recorded ground truth. If the P1 harness intentionally adds one, it is a divergence that must be resolved before comparison.",
     "The task prose names TOOL_ABORTED_BEFORE_DISPATCH; the serialized error code is ABORTED_BEFORE_DISPATCH and the exported constant is TOOL_ABORTED_BEFORE_DISPATCH (tools/src/index.ts:487). The fixture uses the serialized code.",
-    "The P1 driver must implement abort.when.kind=tool-call; the P0 InputFile parser only knows op/text.",
+    "The P1 driver must implement abort.when.kind=tool-started; the P0 InputFile parser only knows op/text.",
     "The Zig harness must emit sourceEventSeqs on tool/result, including the synthetic skipped call, and must not drop synthetic results after abort.",
     "Scheduler-failure recovery (ToolOutcomeUnknownError/ToolNotStartedError, turn/end error) is documented here but not part of this fixture; it needs its own fixture if P1 implements repair.",
     "No jq binary is installed in WSL; the JSONL check uses Python 3.14 plus a Node 24 stdin sentinel (node.exe)."
