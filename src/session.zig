@@ -794,6 +794,17 @@ const DshRouteEndpoint = struct {
     api: []const u8,
 };
 
+/// pi-ai appends `/chat/completions` or `/responses` to the route base URL.
+/// A compatible provider's configured URL may already name that full endpoint
+/// (compatible.zig accepts both), so strip it before handing the URL to dsh.
+fn dshOpenAiBaseUrl(raw: []const u8) []const u8 {
+    var url = raw;
+    if (url.len > 0 and url[url.len - 1] == '/') url = url[0 .. url.len - 1];
+    if (std.mem.endsWith(u8, url, "/chat/completions")) return url[0 .. url.len - "/chat/completions".len];
+    if (std.mem.endsWith(u8, url, "/responses")) return url[0 .. url.len - "/responses".len];
+    return url;
+}
+
 fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoint {
     const kind = providers.classifyProvider(provider);
     switch (kind) {
@@ -827,7 +838,7 @@ fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoi
                 return .{ .base_url = "https://openrouter.ai/api/v1", .api = "openai-completions" };
             };
             return .{
-                .base_url = base_url,
+                .base_url = dshOpenAiBaseUrl(base_url),
                 .api = switch (config.getProviderApiMode(provider)) {
                     .responses => "openai-responses",
                     else => "openai-completions",
@@ -6560,6 +6571,12 @@ test "dsh route maps providers to dsh endpoints and protocols" {
     try testing.expectEqualStrings("https://api.example.com", anthropic_custom.base_url);
     try testing.expectEqualStrings("anthropic-messages", anthropic_custom.api);
 
+    // A compatible URL may already name the full request endpoint; dsh appends
+    // the path itself.
+    const full_endpoint = dshRouteEndpoint(&cfg, "custom:https://api.example.com/v1/chat/completions").?;
+    try testing.expectEqualStrings("https://api.example.com/v1", full_endpoint.base_url);
+    try testing.expectEqualStrings("openai-completions", full_endpoint.api);
+
     // No dsh protocol for these clients.
     try testing.expect(dshRouteEndpoint(&cfg, "gemini") == null);
     try testing.expect(dshRouteEndpoint(&cfg, "vertex") == null);
@@ -6568,7 +6585,7 @@ test "dsh route maps providers to dsh endpoints and protocols" {
     var provider_list = [_]config_types.ProviderEntry{.{
         .name = "proxy",
         .api_key = "test-key",
-        .base_url = "https://api.example.com/v1",
+        .base_url = "https://api.example.com/v1/chat/completions",
         .api_mode = .responses,
     }};
     var proxy_cfg = testConfig();
