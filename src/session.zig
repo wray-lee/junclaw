@@ -815,6 +815,7 @@ fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoi
             else
                 config.getProviderBaseUrl(provider) orelse
                     providers.factory.defaultProviderUrl(provider) orelse return null;
+            if (base_url.len == 0) return null;
             return .{ .base_url = base_url, .api = "anthropic-messages" };
         },
         // These clients always talk to their fixed endpoint; config base_url
@@ -837,8 +838,10 @@ fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoi
                 // fall back to the OpenRouter client.
                 return .{ .base_url = "https://openrouter.ai/api/v1", .api = "openai-completions" };
             };
+            const route_url = dshOpenAiBaseUrl(base_url);
+            if (route_url.len == 0) return null;
             return .{
-                .base_url = dshOpenAiBaseUrl(base_url),
+                .base_url = route_url,
                 .api = switch (config.getProviderApiMode(provider)) {
                     .responses => "openai-responses",
                     else => "openai-completions",
