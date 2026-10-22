@@ -1,0 +1,67 @@
+name: image-full-dsh
+
+# Fork-only: optional full dsh image (node:22-slim + pinned dsh + the
+# harness-enabled binary). Never runs on push to main: manual dispatch or a
+# full-dsh-v* tag only. The lean `image` workflow is unchanged.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["full-dsh-v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: image-full-dsh-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORK_NAME: junclaw
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # A tag full-dsh-v1.2.3 pushes :full-dsh and :full-dsh-v1.2.3.
+      # A manual run pushes :full-dsh and :full-dsh-main-<sha>.
+      - name: Resolve version and image
+        id: ver
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#full-dsh-}"
+          else
+            version="main-$(git rev-parse --short=10 HEAD)"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ env.FORK_NAME }}" >> "$GITHUB_OUTPUT"
+          echo "building ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ env.FORK_NAME }} version ${version}"
+
+      # linux/amd64 only: the ARM64 runtime has not been tested.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: full-dsh
+          platforms: linux/amd64
+          push: true
+          build-args: VERSION=${{ steps.ver.outputs.version }}
+          tags: |
+            ${{ steps.ver.outputs.image }}:full-dsh
+            ${{ steps.ver.outputs.image }}:full-dsh-${{ steps.ver.outputs.version }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
