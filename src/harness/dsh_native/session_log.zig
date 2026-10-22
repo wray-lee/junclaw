@@ -76,12 +76,15 @@ pub const Log = struct {
         try file.writeAll(line);
         try file.sync();
 
+        // Regression: copy before moving the arena into the result; allocating
+        // after the move left the new buffer node out of the returned arena (leak).
+        const header_copy = try copyHeader(arena_allocator, header);
         return .{
             .allocator = allocator,
             .arena = arena,
             .file = file,
             .lock_file = lock_file,
-            .header = try copyHeader(arena_allocator, header),
+            .header = header_copy,
             .next_seq = 0,
             .path = path_copy,
         };
@@ -108,12 +111,13 @@ pub const Log = struct {
         errdefer file.close();
         try file.seekFromEnd(0);
 
+        const header_copy = try copyHeader(arena_allocator, result.header);
         return .{
             .allocator = allocator,
             .arena = arena,
             .file = file,
             .lock_file = lock_file,
-            .header = try copyHeader(arena_allocator, result.header),
+            .header = header_copy,
             .next_seq = @intCast(result.events.len),
             .path = path_copy,
         };
@@ -630,6 +634,27 @@ test "session log round-trips header and events" {
     try std.testing.expectEqualStrings("user/message", result.events[1].event_type);
     try std.testing.expect(result.events[1].surface_op.? == .append);
     try std.testing.expect(result.torn_truncate_to == null);
+}
+
+test "create and open free a header that outgrows the first arena node" {
+    // Regression: the header copy was allocated after the arena was moved into
+    // the result, leaking whenever it needed a new arena node (long cwd/path).
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try TestPaths.init(std.testing.allocator, &tmp);
+    defer paths.deinit();
+
+    const long_cwd = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(long_cwd);
+    @memset(long_cwd, 'a');
+    var header = testHeader();
+    header.cwd = long_cwd;
+
+    var log = try Log.create(std.testing.allocator, paths.log, header);
+    log.close();
+    var reopened = try Log.open(std.testing.allocator, paths.log);
+    try std.testing.expectEqual(long_cwd.len, reopened.header.cwd.?.len);
+    reopened.close();
 }
 
 test "replace surfaceOp round-trips with dsh v4 startSeq/endSeq keys" {

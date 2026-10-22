@@ -226,10 +226,11 @@ test "log path and mapping file round-trip" {
 
     const path = try logPathAlloc(allocator, "/tmp/dsh-home", "/work/example.com", "session-1");
     defer allocator.free(path);
-    try std.testing.expectEqualStrings(
-        "/tmp/dsh-home/sessions/--work-example.com--/session-1/session.v4.jsonl",
-        path,
-    );
+    // Regression: the expected path hard-coded "/" and failed on Windows, where
+    // the path is joined with the native separator.
+    const expected_path = try std.fs.path.join(allocator, &.{ "/tmp/dsh-home", "sessions", "--work-example.com--", "session-1", "session.v4.jsonl" });
+    defer allocator.free(expected_path);
+    try std.testing.expectEqualStrings(expected_path, path);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
