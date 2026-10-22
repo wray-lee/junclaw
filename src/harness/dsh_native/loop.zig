@@ -16,7 +16,8 @@
 //! and `turn/start` / `turn/end` bracket the turn. Input claimed for a step is
 //! fixed before request/start, so a steer arriving mid-stream is never part of
 //! the in-flight request: it is claimed by the next step (Z4). Abort discards
-//! pending input and synthesizes a user message before `turn/end`.
+//! pending input, settles the visible prefix and closes the step before
+//! `turn/end {kind:"aborted"}`; it writes no synthetic user message (B10).
 
 const std = @import("std");
 const inbox = @import("inbox.zig");
@@ -141,7 +142,7 @@ pub const Host = struct {
         out: *std.ArrayListUnmanaged(UserMessage),
     ) anyerror!PreStepDecision,
     /// Serialize a `types.Message` as lossless user/message JSON (used for
-    /// tool `additionalContexts` and the synthetic abort message).
+    /// tool `additionalContexts`).
     serialize_message: *const fn (
         context: *anyopaque,
         allocator: Allocator,
@@ -166,8 +167,6 @@ pub const Config = struct {
     baseline: ?request.Header = null,
     /// Surface content generation at instance start (`agent.ts:128`).
     initial_surface_generation: u64 = 0,
-    /// Synthetic user/message text written on an aborted turn.
-    abort_message_text: []const u8 = "The previous request was aborted.",
     /// Deterministic stream-record clock. Defaults to 0 (no wall clock).
     now_ms: ?*const fn (context: ?*anyopaque) i64 = null,
     clock_context: ?*anyopaque = null,
@@ -385,32 +384,14 @@ pub const Loop = struct {
     }
 
     /// Close an aborted turn: discard pending input (discard-on-interrupt),
-    /// close the step if one started, synthesize the abort user message, then
-    /// `turn/end {kind:"aborted"}`.
+    /// close the step if one started, then `turn/end {kind:"aborted"}`. dsh
+    /// writes no synthetic user message here (B10, agent.ts:452-503).
     fn abortTurn(self: *Loop, step_started: bool) anyerror!Outcome {
         _ = self.inbox.cancel(false);
         if (step_started) {
             _ = try self.emit(.{ .step_end = .{ .turn = self.turn, .step = self.step } });
         }
-        try self.emitAbortMessage();
         return self.endTurn(.{ .aborted = self.abort_cause orelse types.AbortCause{ .user = {} } });
-    }
-
-    fn emitAbortMessage(self: *Loop) !void {
-        const position = Position{ .turn = self.turn, .step = self.step };
-        const arena_allocator = self.allocator();
-        const id = try std.fmt.allocPrint(arena_allocator, "abort-{d}-{d}", .{ position.turn, position.step });
-        const content = [_]types.ContentBlock{.{ .text = self.config.abort_message_text }};
-        const message = types.Message{
-            .id = id,
-            .role = .user,
-            .content = &content,
-            .source = .user,
-        };
-        const json = try self.host.serialize_message(self.host.context, arena_allocator, message);
-        _ = try self.emit(.{
-            .user_message = .{ .position = position, .message = .{ .json = json } },
-        });
     }
 
     fn driveTurn(self: *Loop) anyerror!Outcome {
@@ -559,8 +540,13 @@ pub const Loop = struct {
             }
 
             if (self.turn_ends != null and self.inbox.nextStep().len == 0) {
-                if (self.host.can_turn_end) |gate| _ = try gate(self.host.context, self.turn);
-                break;
+                // `agent/turn-stopping` may queue next-step input and veto the
+                // close; a veto only keeps the turn open with input to run.
+                const allowed = if (self.host.can_turn_end) |gate|
+                    try gate(self.host.context, self.turn)
+                else
+                    true;
+                if (allowed or self.inbox.nextStep().len == 0) break;
             }
             target = .next_step;
         }
@@ -882,6 +868,7 @@ const Harness = struct {
     system_text: []const u8 = "system prompt",
     system_once: bool = true,
     system_hook: ?*const fn (h: *Harness) void = null,
+    system_abort_cause: ?types.AbortCause = null,
     pre_kind: PreStepKind = .enter,
     pre_kind_once: bool = false,
     pre_hook: ?*const fn (h: *Harness) void = null,
@@ -892,6 +879,7 @@ const Harness = struct {
     dispatch_hook: ?*const fn (h: *Harness, allocator: Allocator, call: types.ToolCall) anyerror!registry.ToolResult = null,
     parallel: bool = true,
     allow_turn_end: bool = true,
+    gate_hook: ?*const fn (h: *Harness) void = null,
 
     fn init(allocator: Allocator) Harness {
         return .{ .allocator = allocator, .arena = std.heap.ArenaAllocator.init(allocator) };
@@ -1073,6 +1061,7 @@ fn systemMessages(context: *anyopaque, allocator: Allocator, position: Position,
     if (h.system_once and position.step != 1) return;
     try out.append(allocator, .{ .id = "s1", .text = h.system_text });
     if (h.system_hook) |hook| hook(h);
+    if (h.system_abort_cause) |cause| h.loop.?.abort(cause);
 }
 
 fn preStep(
@@ -1107,6 +1096,7 @@ fn canTurnEnd(context: *anyopaque, turn: u64) !bool {
     _ = turn;
     const h = harnessOf(context);
     h.gate_calls += 1;
+    if (h.gate_hook) |hook| hook(h);
     return h.allow_turn_end;
 }
 
@@ -1382,12 +1372,13 @@ test "user abort mid-stream keeps the visible prefix and discards pending input"
         .assistant_stream,
         .assistant_message,
         .step_end,
-        .user_message,
         .turn_end,
     });
     try testing.expect(h.find(.assistant_message).?.interrupted);
     try testing.expectEqualStrings("partial", h.find(.assistant_message).?.text);
-    try testing.expect(std.mem.indexOf(u8, h.records.items[8].text, "aborted") != null);
+    // B10: abort writes no synthetic user message (dsh 0.2.1-rc.2 ground truth).
+    try testing.expectEqual(@as(usize, 1), h.count(.user_message));
+    try testing.expectEqual(@as(usize, 0), h.count(.assistant_attempt));
     try testing.expect(!loop.inbox.hasPending());
     const reason = reasonOf(outcome);
     try testing.expect(isTag(reason, .aborted));
@@ -1435,7 +1426,6 @@ test "abort during a tool batch synthesizes unstarted calls" {
         .tool_call,
         .tool_result,
         .step_end,
-        .user_message,
         .turn_end,
     });
     const records = h.records.items;
@@ -1444,6 +1434,8 @@ test "abort during a tool batch synthesizes unstarted calls" {
     try testing.expectEqualStrings("tool-b", records[9].call_name);
     try testing.expectEqualStrings(scheduler.TOOL_ABORTED_BEFORE_DISPATCH, records[10].result_code.?);
     try testing.expectEqual(@as(usize, 1), h.dispatches);
+    // B10: the abort itself adds no user/message between tool results and turn/end.
+    try testing.expectEqual(@as(usize, 1), h.count(.user_message));
     try testing.expect(isTag(reasonOf(outcome), .aborted));
 }
 
@@ -1559,9 +1551,9 @@ test "abort before the request boundary writes no partial assistant message" {
         .step_start,
         .system_message,
         .step_end,
-        .user_message,
         .turn_end,
     });
+    try testing.expectEqual(@as(usize, 0), h.count(.user_message));
     try testing.expectEqual(@as(usize, 0), h.count(.request_start));
     try testing.expectEqual(@as(usize, 0), h.count(.assistant_stream));
     try testing.expectEqual(@as(usize, 0), h.count(.assistant_message));
@@ -1770,10 +1762,10 @@ test "abort before the first chunk settles an assistant attempt" {
         .request_start,
         .assistant_attempt,
         .step_end,
-        .user_message,
         .turn_end,
     });
     try testing.expect(h.find(.assistant_attempt).?.interrupted);
+    try testing.expectEqual(@as(usize, 1), h.count(.user_message));
     try testing.expectEqual(@as(usize, 0), h.count(.assistant_message));
     try testing.expect(isTag(reasonOf(outcome), .aborted));
 }
@@ -1802,6 +1794,80 @@ test "provider start failure ends the turn with a typed error" {
     try testing.expect(isTag(reason, .failure));
     try testing.expectEqualStrings("ProviderDown", reason.failure.code);
     try testing.expectEqual(request.Checkpoint.Phase.header_only, loop.lastCheckpoint().phase());
+}
+
+test "every P1a abort cause surfaces in turn/end without a synthetic message" {
+    const causes = [_]types.AbortCause{
+        .{ .user = {} },
+        .{ .parent = {} },
+        .{ .hook = "policy" },
+        .{ .disposed = {} },
+        .{ .legacy = {} },
+    };
+    for (causes) |cause| {
+        var h = Harness.init(std.testing.allocator);
+        defer h.deinit();
+        var loop = try newLoop(&h, testConfig());
+        h.loop = &loop;
+        defer loop.deinit();
+
+        h.system_abort_cause = cause;
+        try steerText(&h, &loop, "m1", "start");
+
+        const outcome = try loop.runTurn();
+        try h.expectKinds(&.{
+            .turn_start,
+            .step_start,
+            .system_message,
+            .step_end,
+            .turn_end,
+        });
+        try testing.expectEqual(@as(usize, 0), h.count(.user_message));
+        const reason = reasonOf(outcome);
+        try testing.expect(isTag(reason, .aborted));
+        try testing.expectEqual(std.meta.activeTag(cause), std.meta.activeTag(reason.aborted));
+        if (std.meta.activeTag(cause) == .hook) {
+            try testing.expectEqualStrings("policy", reason.aborted.hook);
+        }
+    }
+}
+
+test "turn-stopping veto with queued next-step input runs another step" {
+    // Regression: a false `agent/turn-stopping` gate was ignored, so the turn
+    // ended even though the gate had queued next-step input.
+    var h = Harness.init(std.testing.allocator);
+    defer h.deinit();
+    var loop = try newLoop(&h, testConfig());
+    h.loop = &loop;
+    defer loop.deinit();
+
+    h.allow_turn_end = false;
+    h.gate_hook = struct {
+        fn hook(harness: *Harness) void {
+            if (harness.gate_calls == 1) {
+                steerText(harness, harness.loop.?, "m-stop", "one more step") catch @panic("steer failed");
+            } else {
+                harness.allow_turn_end = true;
+            }
+        }
+    }.hook;
+
+    const first = &[_]stream.Event{
+        .{ .chunk = .{ .text_delta = .{ .index = 0, .text = "one" } } },
+        .{ .done = .{ .finish = .stop } },
+    };
+    const second = &[_]stream.Event{
+        .{ .chunk = .{ .text_delta = .{ .index = 0, .text = "two" } } },
+        .{ .done = .{ .finish = .stop } },
+    };
+    try h.script(&.{ Harness.attempt(first), Harness.attempt(second) });
+    try steerText(&h, &loop, "m1", "start");
+
+    const outcome = try loop.runTurn();
+    try testing.expectEqual(@as(usize, 2), h.count(.step_start));
+    try testing.expectEqual(@as(usize, 2), h.gate_calls);
+    try testing.expectEqual(@as(usize, 2), h.count(.user_message));
+    try testing.expect(isTag(reasonOf(outcome), .completed));
 }
 
 fn sharedUserPayloadLen(h: *Harness) usize {
