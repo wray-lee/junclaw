@@ -274,6 +274,7 @@ test "http RPC times out on a wedged sidecar and the client stays usable" {
 
     // The timed-out call leaves no entry and no half-open client state: the
     // same client can issue the request again once the sidecar answers.
+    client.rpc_timeout_ms = wait_ms;
     gate.open();
     const session = try client.createSession("/workspace");
     defer allocator.free(session);
@@ -299,6 +300,7 @@ test "WS handshake times out on a wedged sidecar and the client can retry" {
     try std.testing.expectError(error.HandshakeTimeout, client.connect(mock_mod.session_id));
 
     // A failed handshake leaves `shared` null; the retry opens a fresh socket.
+    client.handshake_timeout_ms = wait_ms;
     gate.open();
     try client.connect(mock_mod.session_id);
 }
