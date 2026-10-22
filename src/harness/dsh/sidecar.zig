@@ -33,6 +33,8 @@ pub const Options = struct {
     profile: ?profile_mod.Route = null,
     /// Upper bound on reading the launch URL from stdout.
     boot_timeout_ms: u64 = 60_000,
+    /// Hang guard for the `/connect` owner-cookie HTTP exchange.
+    rpc_timeout_ms: u64 = 30_000,
 };
 
 /// Exponential restart delay: 200ms, 400ms, … capped at 5s.
@@ -168,11 +170,11 @@ fn killTree(child: *std_compat.process.Child) void {
 
 /// Exchange a launch URL for its owner cookie without spawning a process.
 /// Used by the harness when `boot_url` is injected (tests/external sidecar).
-pub fn fetchOwnerCookieForUrl(allocator: Allocator, boot_url: []const u8) ![]u8 {
+pub fn fetchOwnerCookieForUrl(allocator: Allocator, boot_url: []const u8, timeout_ms: u64) ![]u8 {
     const url = try client.connectUrl(allocator, boot_url);
     defer allocator.free(url);
 
-    const response = try client.httpRequest(allocator, .GET, url, &.{}, null);
+    const response = try client.httpRequest(allocator, .GET, url, &.{}, null, timeout_ms);
     defer allocator.free(response.headers);
     defer allocator.free(response.body);
 
@@ -242,7 +244,7 @@ pub const Sidecar = struct {
     /// GET `/connect?token=…&interactions=answer` and return the owner cookie.
     pub fn fetchOwnerCookie(self: *Sidecar) ![]u8 {
         const boot_url = self.boot_url orelse return error.SidecarNotStarted;
-        return fetchOwnerCookieForUrl(self.allocator, boot_url);
+        return fetchOwnerCookieForUrl(self.allocator, boot_url, self.opts.rpc_timeout_ms);
     }
 
     fn initSpawnArgs(self: *Sidecar) !void {

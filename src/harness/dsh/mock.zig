@@ -119,6 +119,11 @@ pub const MockDsh = struct {
     fail_connect_once: bool = false,
     /// Park `/connect` while non-null (boot-blocking tests).
     connect_gate: ?*ConnectGate = null,
+    /// Park the named RPC while non-null (timeout tests).
+    rpc_gate: ?*ConnectGate = null,
+    rpc_gate_method: []const u8 = "",
+    /// Park the WebSocket upgrade while non-null (handshake-timeout tests).
+    ws_gate: ?*ConnectGate = null,
     /// Echo each prompt back as a delta plus a completed turn/end.
     echo_prompts: bool = false,
     /// Reply value for `session/modelCatalog`; null replies `{}`.
@@ -261,6 +266,10 @@ pub const MockDsh = struct {
         defer self.allocator.free(request.buffer);
 
         if (std.mem.startsWith(u8, request.target, "/api/remote.mux")) {
+            self.mutex.lock();
+            const ws_gate = self.ws_gate;
+            self.mutex.unlock();
+            if (ws_gate) |g| g.enter();
             self.upgrade(stream, request.head) catch return;
             // The harness sends its `session/follow` open as the first frame;
             // bind this connection to that session for prompt/cancel routing.
@@ -317,6 +326,12 @@ pub const MockDsh = struct {
     }
 
     fn serveRpc(self: *MockDsh, stream: std_compat.net.Stream, method: []const u8, body: []const u8) !void {
+        self.mutex.lock();
+        const gate = self.rpc_gate;
+        const hang = gate != null and std.mem.eql(u8, method, self.rpc_gate_method);
+        self.mutex.unlock();
+        if (hang) gate.?.enter();
+
         var value: []u8 = undefined;
         if (std.mem.eql(u8, method, "session/create")) {
             value = try self.nextSessionValue();
@@ -447,6 +462,21 @@ pub const MockDsh = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.connect_gate = gate;
+    }
+
+    /// Park `method` in `gate` until it is opened. The method slice is borrowed.
+    pub fn setRpcGate(self: *MockDsh, gate: ?*ConnectGate, method: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.rpc_gate = gate;
+        self.rpc_gate_method = method;
+    }
+
+    /// Park the WebSocket upgrade in `gate` until it is opened.
+    pub fn setHandshakeGate(self: *MockDsh, gate: ?*ConnectGate) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.ws_gate = gate;
     }
 
     /// Echo each prompt text back as the turn reply (distinct per session).

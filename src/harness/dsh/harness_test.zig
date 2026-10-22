@@ -1104,3 +1104,39 @@ test "dsh resumed session switches an unavailable model to the current default" 
     try std.testing.expect(std.mem.indexOf(u8, select_body, "\"provider\":\"junclaw\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, select_body, "\"model\":\"model-b\"") != null);
 }
+
+test "dsh engine surfaces an RPC timeout and the next turn recovers" {
+    // Regression: a wedged sidecar parked session/create forever, so a turn
+    // never returned and the engine could not recover.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    try engine.ensureBooted();
+
+    var gate = mock_mod.ConnectGate{};
+    defer gate.open();
+    mock.setRpcGate(&gate, "session/create");
+
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    engine.opts.rpc_timeout_ms = 1;
+    try std.testing.expectError(error.RpcTimeout, runOneTurn(&h, "hi"));
+
+    // The failed acquire left no entry behind; the next turn creates one.
+    engine.opts.rpc_timeout_ms = 5_000;
+    gate.open();
+    try setTurnFrames(mock, allocator, &.{"recovered"}, "completed");
+    const result = try runOneTurn(&h, "hi");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("recovered", result.reply);
+    // The released first request still runs in the mock, so only require that
+    // the recovered turn created a session of its own.
+    try std.testing.expect(mock.createCount() >= 1);
+}

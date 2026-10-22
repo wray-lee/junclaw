@@ -60,7 +60,7 @@ test "mock dsh exchanges the boot token for an owner cookie" {
     const connect_url = try client_mod.connectUrl(allocator, boot_url);
     defer allocator.free(connect_url);
 
-    const response = try client_mod.httpRequest(allocator, .GET, connect_url, &.{}, null);
+    const response = try client_mod.httpRequest(allocator, .GET, connect_url, &.{}, null, wait_ms);
     defer allocator.free(response.headers);
     defer allocator.free(response.body);
     try std.testing.expectEqual(@as(u16, 302), response.status);
@@ -252,6 +252,55 @@ test "tool-call delta and tool-call for one callId produce one event" {
         .turn_end => |turn| try std.testing.expectEqualStrings("completed", turn.kind),
         else => return error.TestExpectedTurnEnd,
     }
+}
+
+test "http RPC times out on a wedged sidecar and the client stays usable" {
+    // Regression: httpRequest waited forever when the sidecar accepted the
+    // connection but never answered.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var gate = mock_mod.ConnectGate{};
+    defer gate.open();
+    mock.setRpcGate(&gate, "session/create");
+
+    var client = try newClient(allocator, mock);
+    defer client.deinit();
+    client.rpc_timeout_ms = 1;
+
+    try std.testing.expectError(error.RpcTimeout, client.createSession("/workspace"));
+
+    // The timed-out call leaves no entry and no half-open client state: the
+    // same client can issue the request again once the sidecar answers.
+    gate.open();
+    const session = try client.createSession("/workspace");
+    defer allocator.free(session);
+    try std.testing.expect(session.len > 0);
+}
+
+test "WS handshake times out on a wedged sidecar and the client can retry" {
+    // Regression: connect() blocked forever in the upgrade read when the
+    // sidecar accepted the socket but never sent the 101 response.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var gate = mock_mod.ConnectGate{};
+    defer gate.open();
+    mock.setHandshakeGate(&gate);
+
+    var client = try newClient(allocator, mock);
+    defer client.deinit();
+    client.handshake_timeout_ms = 1;
+
+    try std.testing.expectError(error.HandshakeTimeout, client.connect(mock_mod.session_id));
+
+    // A failed handshake leaves `shared` null; the retry opens a fresh socket.
+    gate.open();
+    try client.connect(mock_mod.session_id);
 }
 
 test "approval displayReason object yields a display string" {

@@ -140,6 +140,10 @@ pub const DshEngine = struct {
         turn_timeout_ms: u64 = 30_000,
         /// Hang guard for `/stop` waiting on dsh's aborted `turn/end`.
         cancel_timeout_ms: u64 = 10_000,
+        /// Hang guard for one HTTP RPC to the sidecar (create/connect/cancel/…).
+        rpc_timeout_ms: u64 = 30_000,
+        /// Hang guard for the WebSocket upgrade handshake.
+        handshake_timeout_ms: u64 = 10_000,
     };
 
     /// One junclaw key's dsh session. The client's WS lives as long as the
@@ -242,6 +246,7 @@ pub const DshEngine = struct {
             var owned_bin: ?[]u8 = null;
             defer if (owned_bin) |value| self.allocator.free(value);
             var sidecar_opts = self.opts.sidecar;
+            sidecar_opts.rpc_timeout_ms = self.opts.rpc_timeout_ms;
             if (sidecar_opts.bin_js.len == 0) {
                 owned_bin = std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_DSH_BIN") catch |err| switch (err) {
                     error.EnvironmentVariableNotFound => return error.DshBinNotConfigured,
@@ -252,7 +257,7 @@ pub const DshEngine = struct {
             spawned = try sidecar_mod.Sidecar.start(self.allocator, sidecar_opts);
             break :blk spawned.?.boot_url orelse return error.SidecarNotStarted;
         };
-        cookie = try sidecar_mod.fetchOwnerCookieForUrl(self.allocator, boot_url);
+        cookie = try sidecar_mod.fetchOwnerCookieForUrl(self.allocator, boot_url, self.opts.rpc_timeout_ms);
         const endpoint = try client_mod.parseBootEndpoint(boot_url);
         base_url = try self.allocator.dupe(u8, endpoint.base_url);
 
@@ -353,6 +358,14 @@ pub const DshEngine = struct {
         return null;
     }
 
+    /// A client wired to this engine's RPC and handshake deadlines.
+    fn newClient(self: *Self) !DshClient {
+        var client = try DshClient.init(self.allocator, self.base_url.?, self.cookie.?);
+        client.rpc_timeout_ms = self.opts.rpc_timeout_ms;
+        client.handshake_timeout_ms = self.opts.handshake_timeout_ms;
+        return client;
+    }
+
     /// Build this key's entry. `adopt` resumes the persisted id instead of
     /// creating a session. Caller holds `entries_mutex`; the returned entry
     /// carries one ref.
@@ -368,7 +381,7 @@ pub const DshEngine = struct {
             null;
         errdefer if (mapping) |path| self.allocator.free(path);
 
-        var client = try DshClient.init(self.allocator, self.base_url.?, self.cookie.?);
+        var client = try self.newClient();
         errdefer client.deinit();
 
         // A corrupt mapping falls back to a fresh session (design §2.2); an id
@@ -680,7 +693,7 @@ pub const DshHarness = struct {
 
         // Build the replacement before touching the old session, so a failed
         // create/connect leaves the key on its current session.
-        var client = try DshClient.init(allocator, engine.base_url.?, engine.cookie.?);
+        var client = try engine.newClient();
         errdefer client.deinit();
         const session_id = try client.createSession(engine.opts.sidecar.workspace);
         errdefer allocator.free(session_id);

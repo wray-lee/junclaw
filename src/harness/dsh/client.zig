@@ -79,16 +79,92 @@ pub const HttpResponse = struct {
     body: []u8,
 };
 
+const HttpIoCell = struct {
+    allocator: Allocator,
+    req: *std.http.Client.Request,
+    body: ?[]const u8,
+    mutex: std_compat.sync.Mutex = .{},
+    finished: bool = false,
+    abandoned: bool = false,
+    result: ?HttpResponse = null,
+    err: ?anyerror = null,
+};
+
+fn freeHttpResponse(allocator: Allocator, response: HttpResponse) void {
+    allocator.free(response.headers);
+    allocator.free(response.body);
+}
+
+/// Worker half: send the request and read the response. Publishes under the
+/// cell lock, or frees the result itself when the caller already gave up.
+fn httpIoWorker(cell: *HttpIoCell) void {
+    const outcome = performHttpExchange(cell);
+    cell.mutex.lock();
+    const abandoned = cell.abandoned;
+    if (!abandoned) {
+        if (outcome) |response| {
+            cell.result = response;
+        } else |err| {
+            cell.err = err;
+        }
+        cell.finished = true;
+    }
+    cell.mutex.unlock();
+
+    if (abandoned) {
+        if (outcome) |response| freeHttpResponse(cell.allocator, response) else |_| {}
+    }
+}
+
+fn performHttpExchange(cell: *HttpIoCell) anyerror!HttpResponse {
+    const req = cell.req;
+    if (cell.body) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var request_body = try req.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(payload);
+        try request_body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    const response_headers = try cell.allocator.dupe(u8, response.head.bytes);
+    errdefer cell.allocator.free(response_headers);
+
+    var aw: std.Io.Writer.Allocating = .init(cell.allocator);
+    defer aw.deinit();
+    var transfer_buffer: [256]u8 = undefined;
+    const reader = response.reader(&transfer_buffer);
+    _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
+        error.ReadFailed => return response.bodyErr().?,
+        else => |e| return e,
+    };
+
+    return .{
+        .status = @intFromEnum(response.head.status),
+        .headers = response_headers,
+        .body = try cell.allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]),
+    };
+}
+
 /// Minimal HTTP/1.1 request to the local sidecar over std.http. No curl
 /// dependency: the dsh image is a bare Node image.
 /// Redirects are never followed: the connect call needs the 302 that carries
 /// the owner cookie, and an RPC redirect is an error, not a new transport.
+///
+/// std.http has no socket timeout of its own, and `Io.Threaded` treats a recv
+/// timeout as a programmer bug, so the exchange runs on a worker and the caller
+/// enforces `timeout_ms`: on expiry it shuts the socket down and joins, which
+/// unwinds the worker with no buffer or connection left behind.
 pub fn httpRequest(
     allocator: Allocator,
     method: std.http.Method,
     url: []const u8,
     headers: []const []const u8,
     body: ?[]const u8,
+    timeout_ms: u64,
 ) !HttpResponse {
     var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
@@ -111,35 +187,36 @@ pub fn httpRequest(
     });
     defer req.deinit();
 
-    if (body) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var request_body = try req.sendBodyUnflushed(&.{});
-        try request_body.writer.writeAll(payload);
-        try request_body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
+    var cell: HttpIoCell = .{ .allocator = allocator, .req = &req, .body = body };
+    const thread = try std.Thread.spawn(.{}, httpIoWorker, .{&cell});
+    const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        cell.mutex.lock();
+        if (cell.finished) {
+            const result = cell.result;
+            const err = cell.err;
+            cell.mutex.unlock();
+            thread.join();
+            if (err) |e| return e;
+            return result.?;
+        }
+        if (std_compat.time.milliTimestamp() >= deadline) {
+            cell.abandoned = true;
+            // Shut down under the cell lock: the worker publishes under the
+            // same lock, so the fd cannot be closed or reused behind our back.
+            if (req.connection) |connection| {
+                const stream = std_compat.net.Stream{
+                    .handle = connection.stream_reader.stream.socket.handle,
+                };
+                stream.shutdown(.both) catch {};
+            }
+            cell.mutex.unlock();
+            thread.join();
+            return error.RpcTimeout;
+        }
+        cell.mutex.unlock();
+        std_compat.thread.sleep(std.time.ns_per_ms);
     }
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    const response_headers = try allocator.dupe(u8, response.head.bytes);
-    errdefer allocator.free(response_headers);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-    var transfer_buffer: [256]u8 = undefined;
-    const reader = response.reader(&transfer_buffer);
-    _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
-        else => |e| return e,
-    };
-
-    return .{
-        .status = @intFromEnum(response.head.status),
-        .headers = response_headers,
-        .body = try allocator.dupe(u8, aw.writer.buffer[0..aw.writer.end]),
-    };
 }
 
 fn parsePort(base_url: []const u8) !u16 {
@@ -372,11 +449,108 @@ fn readerMain(shared: *Shared) void {
 // Client
 // ---------------------------------------------------------------------------
 
+const HandshakeCell = struct {
+    allocator: Allocator,
+    stream: std_compat.net.Stream,
+    host: []const u8,
+    path: []const u8,
+    headers: []const []const u8,
+    mutex: std_compat.sync.Mutex = .{},
+    finished: bool = false,
+    abandoned: bool = false,
+    ws: ?websocket.WsClient = null,
+    err: ?anyerror = null,
+};
+
+/// Worker half of the bounded WS upgrade. The worker owns `stream` in every
+/// outcome: success hands the WsClient to the caller, failure closes it.
+fn handshakeWorker(cell: *HandshakeCell) void {
+    const outcome = websocket.WsClient.connectPlainFromStream(
+        cell.allocator,
+        cell.stream,
+        cell.host,
+        cell.path,
+        cell.headers,
+    );
+    cell.mutex.lock();
+    const abandoned = cell.abandoned;
+    if (!abandoned) {
+        if (outcome) |ws| {
+            cell.ws = ws;
+        } else |err| {
+            cell.err = err;
+        }
+        cell.finished = true;
+    }
+    cell.mutex.unlock();
+
+    if (outcome) |ws| {
+        if (abandoned) {
+            var owned = ws;
+            owned.deinit();
+        }
+    } else |_| {
+        // `connectPlainFromStream` leaves the stream to the caller on failure.
+        cell.stream.close();
+    }
+}
+
+/// Bound the WS upgrade read, which `connectPlainFromStream` leaves unbounded.
+/// Takes ownership of `stream`; on timeout the caller shuts the socket down and
+/// joins the worker, so no half-open connection outlives the call.
+fn connectHandshakeBounded(
+    allocator: Allocator,
+    stream: std_compat.net.Stream,
+    host: []const u8,
+    path: []const u8,
+    headers: []const []const u8,
+    timeout_ms: u64,
+) !websocket.WsClient {
+    var cell: HandshakeCell = .{
+        .allocator = allocator,
+        .stream = stream,
+        .host = host,
+        .path = path,
+        .headers = headers,
+    };
+    const thread = std.Thread.spawn(.{}, handshakeWorker, .{&cell}) catch |err| {
+        stream.close();
+        return err;
+    };
+    const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (true) {
+        cell.mutex.lock();
+        if (cell.finished) {
+            const ws = cell.ws;
+            const err = cell.err;
+            cell.mutex.unlock();
+            thread.join();
+            if (err) |e| return e;
+            return ws.?;
+        }
+        if (std_compat.time.milliTimestamp() >= deadline) {
+            cell.abandoned = true;
+            // Shutdown under the cell lock so the worker cannot close the fd
+            // first; it closes the stream only after taking this lock.
+            stream.shutdown(.both) catch {};
+            cell.mutex.unlock();
+            thread.join();
+            return error.HandshakeTimeout;
+        }
+        cell.mutex.unlock();
+        std_compat.thread.sleep(std.time.ns_per_ms);
+    }
+}
+
 pub const DshClient = struct {
     allocator: Allocator,
     base_url: []u8,
     cookie: []u8,
     port: u16,
+    /// Deadline for one HTTP RPC; the engine copies its option here.
+    rpc_timeout_ms: u64 = 30_000,
+    /// Deadline for the WebSocket upgrade handshake.
+    handshake_timeout_ms: u64 = 10_000,
     shared: ?*Shared = null,
     reader: ?std.Thread = null,
 
@@ -426,13 +600,13 @@ pub const DshClient = struct {
         const handshake_host = try std.fmt.allocPrint(self.allocator, "{s}:{d}", .{ WS_HOST, self.port });
         defer self.allocator.free(handshake_host);
         const stream = try websocket.WsClient.connectTcp(self.allocator, WS_HOST, self.port);
-        errdefer stream.close();
-        shared.ws = try websocket.WsClient.connectPlainFromStream(
+        shared.ws = try connectHandshakeBounded(
             self.allocator,
             stream,
             handshake_host,
             WS_PATH,
             &headers,
+            self.handshake_timeout_ms,
         );
         errdefer shared.ws.?.deinit();
 
@@ -464,7 +638,7 @@ pub const DshClient = struct {
         const response = try httpRequest(self.allocator, .POST, url, &.{
             header,
             "Content-Type: application/json",
-        }, body);
+        }, body, self.rpc_timeout_ms);
         defer self.allocator.free(response.headers);
         defer self.allocator.free(response.body);
 
