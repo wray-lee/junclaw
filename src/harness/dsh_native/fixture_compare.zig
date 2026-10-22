@@ -235,14 +235,10 @@ pub const Normalizer = struct {
                     return;
                 }
                 if (std.mem.indexOf(u8, expected_string, "{{cwd}}") != null) {
-                    const actual_string = try asString(actual);
-                    const replaced = try std.mem.replaceOwned(u8, self.arena, actual_string, self.cwd, "{{cwd}}");
-                    for (replaced) |*byte| {
-                        if (byte.* == '\\') {
-                            byte.* = '/';
-                        }
-                    }
-                    try std.testing.expectEqualStrings(expected_string, replaced);
+                    try std.testing.expectEqualStrings(
+                        expected_string,
+                        try self.substituteCwd(try asString(actual)),
+                    );
                     return;
                 }
                 if (looksLikeToken(expected_string)) return error.UndeclaredToken;
@@ -358,6 +354,14 @@ pub const Normalizer = struct {
         try std.testing.expectEqualStrings(expected, actual);
     }
 
+    /// Rewrite the workspace path to `{{cwd}}`. Only the substituted path
+    /// fragment is tokenized; separators in the rest of the string stay
+    /// significant so a Windows display-path bug is still reported.
+    fn substituteCwd(self: *Normalizer, text: []const u8) ![]const u8 {
+        std.debug.assert(self.cwd.len > 0);
+        return std.mem.replaceOwned(u8, self.arena, text, self.cwd, "{{cwd}}");
+    }
+
     /// Compare a typed message from the surface fold (layer ③).
     pub fn expectMessagesMatch(self: *Normalizer, expected: types.Message, actual: types.Message) !void {
         try std.testing.expectEqual(expected.role, actual.role);
@@ -371,13 +375,7 @@ pub const Normalizer = struct {
                         else => return error.FixtureMismatch,
                     };
                     if (std.mem.indexOf(u8, text, "{{cwd}}") != null) {
-                        const replaced = try std.mem.replaceOwned(u8, self.arena, actual_text, self.cwd, "{{cwd}}");
-                        for (replaced) |*byte| {
-                            if (byte.* == '\\') {
-                                byte.* = '/';
-                            }
-                        }
-                        try std.testing.expectEqualStrings(text, replaced);
+                        try std.testing.expectEqualStrings(text, try self.substituteCwd(actual_text));
                     } else {
                         try self.expectTokenOrString(text, actual_text);
                     }
@@ -438,3 +436,30 @@ pub const Normalizer = struct {
         }
     }
 };
+
+test "cwd substitution keeps separators outside the token significant" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const declared: std.StringHashMapUnmanaged(void) = .empty;
+    const ordinal: std.StringHashMapUnmanaged(void) = .empty;
+    var normalizer = Normalizer{
+        .arena = allocator,
+        .declared = &declared,
+        .ordinal = &ordinal,
+        .cwd = "C:\\work\\project",
+    };
+
+    try normalizer.compareValue(
+        .{ .string = "{{cwd}}/src/main.zig" },
+        .{ .string = "C:\\work\\project/src/main.zig" },
+        .{},
+    );
+    // Regression: normalizing the whole replaced string hid Windows separators
+    // outside the workspace prefix.
+    try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
+        .{ .string = "{{cwd}}/src/main.zig" },
+        .{ .string = "C:\\work\\project\\src\\main.zig" },
+        .{},
+    ));
+}
