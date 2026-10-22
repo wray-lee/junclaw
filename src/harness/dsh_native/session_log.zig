@@ -13,6 +13,7 @@ const std = @import("std");
 const compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const json = @import("json.zig");
+const surface = @import("surface.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -438,7 +439,7 @@ fn parseEvent(allocator: Allocator, value: std.json.Value, expected_seq: u64) !t
             source_event_seqs = seqs;
         }
         if (std.mem.eql(u8, event_type, "assistant/message") and source_event_seqs != null) return error.CorruptLog;
-        if ((surface_op != null or source_event_seqs != null) and !isSurfaceType(event_type)) return error.CorruptLog;
+        if ((surface_op != null or source_event_seqs != null) and !surface.isSurfaceType(event_type)) return error.CorruptLog;
     }
 
     return .{
@@ -463,13 +464,13 @@ fn parseSurfaceOp(value: std.json.Value) !types.SurfaceOp {
             while (iterator.next()) |entry| {
                 const key = entry.key_ptr.*;
                 if (!std.mem.eql(u8, key, "op") and
-                    !std.mem.eql(u8, key, "start") and
-                    !std.mem.eql(u8, key, "end")) return error.InvalidSurfaceOp;
+                    !std.mem.eql(u8, key, "startSeq") and
+                    !std.mem.eql(u8, key, "endSeq")) return error.InvalidSurfaceOp;
             }
             const op = object.get("op") orelse return error.InvalidSurfaceOp;
             if (op != .string or !std.mem.eql(u8, op.string, "replace")) return error.InvalidSurfaceOp;
-            const start = object.get("start") orelse return error.InvalidSurfaceOp;
-            const end = object.get("end") orelse return error.InvalidSurfaceOp;
+            const start = object.get("startSeq") orelse return error.InvalidSurfaceOp;
+            const end = object.get("endSeq") orelse return error.InvalidSurfaceOp;
             if (start != .integer or end != .integer) return error.InvalidSurfaceOp;
             if (start.integer < 0 or end.integer < start.integer) return error.InvalidSurfaceOp;
             return .{ .replace = .{
@@ -482,6 +483,13 @@ fn parseSurfaceOp(value: std.json.Value) !types.SurfaceOp {
 }
 
 fn validateSurface(allocator: Allocator, event: types.Event) !void {
+    // Known non-surface rows must not carry surface metadata; unknown
+    // ignorable rows stay opaque and are passed through unchanged.
+    if ((event.surface_op != null or event.source_event_seqs != null) and
+        isKnownEventType(event.event_type) and !surface.isSurfaceType(event.event_type))
+    {
+        return error.InvalidEvent;
+    }
     if (event.surface_op) |op| {
         switch (op) {
             .append => {},
@@ -535,13 +543,6 @@ fn isCount(value: i64) bool {
 
 fn isSafeInteger(value: i64) bool {
     return value >= -max_safe_integer and value <= max_safe_integer;
-}
-
-fn isSurfaceType(event_type: []const u8) bool {
-    return std.mem.eql(u8, event_type, "system/message") or
-        std.mem.eql(u8, event_type, "user/message") or
-        std.mem.eql(u8, event_type, "assistant/message") or
-        std.mem.eql(u8, event_type, "tool/result");
 }
 
 fn isEnvelopeKey(key: []const u8) bool {
@@ -629,6 +630,98 @@ test "session log round-trips header and events" {
     try std.testing.expectEqualStrings("user/message", result.events[1].event_type);
     try std.testing.expect(result.events[1].surface_op.? == .append);
     try std.testing.expect(result.torn_truncate_to == null);
+}
+
+test "replace surfaceOp round-trips with dsh v4 startSeq/endSeq keys" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try TestPaths.init(std.testing.allocator, &tmp);
+    defer paths.deinit();
+
+    // Regression: replace surfaceOp with startSeq/endSeq keys from real dsh v4 logs was rejected as CorruptLog
+    const header = "{\"type\":\"session\",\"version\":4,\"id\":\"session-1\",\"createdAt\":1,\"isSeeded\":false,\"delegationDepth\":0}\n";
+    const turn = "{\"type\":\"turn/start\",\"seq\":0,\"time\":1,\"data\":{\"turn\":1}}\n";
+    const step = "{\"type\":\"step/start\",\"seq\":1,\"time\":2,\"data\":{\"turn\":1,\"step\":1}}\n";
+    const replace = "{\"type\":\"user/message\",\"seq\":2,\"time\":3,\"data\":{\"turn\":1,\"step\":1},\"surfaceOp\":{\"op\":\"replace\",\"startSeq\":0,\"endSeq\":1}}\n";
+    try writeRaw(paths.log, header ++ turn ++ step ++ replace);
+
+    var result = try readLog(std.testing.allocator, paths.log);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 3), result.events.len);
+    try std.testing.expect(result.events[2].surface_op.? == .replace);
+    try std.testing.expectEqual(@as(u64, 0), result.events[2].surface_op.?.replace.start_seq);
+    try std.testing.expectEqual(@as(u64, 1), result.events[2].surface_op.?.replace.end_seq);
+
+    // serialize -> parse keeps the same physical keys and value.
+    const line = try json.eventLineAlloc(std.testing.allocator, result.events[2]);
+    defer std.testing.allocator.free(line);
+    try std.testing.expectEqualStrings(replace, line);
+    const round_trip = try std.mem.concat(std.testing.allocator, u8, &.{ header, turn, step, line });
+    defer std.testing.allocator.free(round_trip);
+    try writeRaw(paths.log, round_trip);
+    var reparsed = try readLog(std.testing.allocator, paths.log);
+    defer reparsed.deinit();
+    try std.testing.expect(reparsed.events[2].surface_op.? == .replace);
+    try std.testing.expectEqual(@as(u64, 1), reparsed.events[2].surface_op.?.replace.end_seq);
+
+    // Pre-v4 `start`/`end` keys are not the physical format: fail closed.
+    const legacy = "{\"type\":\"user/message\",\"seq\":2,\"time\":3,\"data\":{\"turn\":1,\"step\":1},\"surfaceOp\":{\"op\":\"replace\",\"start\":0,\"end\":1}}\n";
+    try writeRaw(paths.log, header ++ turn ++ step ++ legacy);
+    try std.testing.expectError(error.CorruptLog, readLog(std.testing.allocator, paths.log));
+}
+
+test "developer/message carries surface metadata on read and write" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try TestPaths.init(std.testing.allocator, &tmp);
+    defer paths.deinit();
+
+    // Regression: developer/message with surfaceOp was misclassified as CorruptLog by session_log.isSurfaceType
+    try std.testing.expect(surface.isSurfaceType("developer/message"));
+    const header = "{\"type\":\"session\",\"version\":4,\"id\":\"session-1\",\"createdAt\":1,\"isSeeded\":false,\"delegationDepth\":0}\n";
+    const turn = "{\"type\":\"turn/start\",\"seq\":0,\"time\":1,\"data\":{\"turn\":1}}\n";
+    const developer = "{\"type\":\"developer/message\",\"seq\":1,\"time\":2,\"data\":{\"message\":{\"role\":\"developer\",\"content\":[]}},\"sourceEventSeqs\":[0],\"surfaceOp\":\"append\"}\n";
+    try writeRaw(paths.log, header ++ turn ++ developer);
+
+    var result = try readLog(std.testing.allocator, paths.log);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 2), result.events.len);
+    try std.testing.expect(result.events[1].surface_op.? == .append);
+    try std.testing.expectEqualSlices(u64, &.{0}, result.events[1].source_event_seqs.?);
+
+    // The write path is symmetric: metadata is accepted on surface types,
+    // rejected on known non-surface types, and unknown ignorable rows pass
+    // through unchanged.
+    var data_arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer data_arena.deinit();
+    const arena_allocator = data_arena.allocator();
+    const write_log = try std.fs.path.join(std.testing.allocator, &.{ paths.base, "write.v4.jsonl" });
+    defer std.testing.allocator.free(write_log);
+    var log = try Log.create(std.testing.allocator, write_log, testHeader());
+    const turn_data = try testData(arena_allocator, "{\"turn\":1}");
+    const developer_data = try testData(arena_allocator, "{\"message\":{\"role\":\"developer\",\"content\":[]}}");
+    try std.testing.expectEqual(@as(u64, 0), try log.append("turn/start", turn_data, .{ .time_ms = 1 }));
+    try std.testing.expectEqual(@as(u64, 1), try log.append("developer/message", developer_data, .{
+        .time_ms = 2,
+        .surface_op = .append,
+        .source_event_seqs = &.{0},
+    }));
+    try std.testing.expectError(error.InvalidEvent, log.append("turn/start", turn_data, .{ .time_ms = 3, .surface_op = .append }));
+    try std.testing.expectError(error.InvalidEvent, log.append("turn/start", turn_data, .{ .time_ms = 3, .source_event_seqs = &.{0} }));
+    try std.testing.expectEqual(@as(u64, 2), try log.append("plugin/future-thing", turn_data, .{
+        .time_ms = 4,
+        .surface_op = .{ .replace = .{ .start_seq = 0, .end_seq = 0 } },
+        .source_event_seqs = &.{0},
+        .ignorable = true,
+    }));
+    log.close();
+
+    var written = try readLog(std.testing.allocator, write_log);
+    defer written.deinit();
+    try std.testing.expectEqual(@as(usize, 3), written.events.len);
+    try std.testing.expect(written.events[1].surface_op.? == .append);
+    try std.testing.expectEqualSlices(u64, &.{0}, written.events[1].source_event_seqs.?);
+    try std.testing.expect(written.events[2].ignorable);
 }
 
 test "resume reopens the log and keeps seq contiguous" {
@@ -723,7 +816,7 @@ test "unknown ignorable events are retained while unknown required events fail c
     const known = "{\"type\":\"session/title\",\"seq\":0,\"time\":1,\"data\":{\"title\":\"example.com\"}}\n";
     // Opaque metadata is retained but not interpreted, so even references this
     // build would reject on a known type must not fail the read.
-    const opaque_event = "{\"type\":\"plugin/future-thing\",\"seq\":1,\"time\":2,\"data\":{\"x\":1},\"surfaceOp\":{\"op\":\"replace\",\"start\":9,\"end\":1},\"sourceEventSeqs\":[[9,1]],\"ignorable\":true}\n";
+    const opaque_event = "{\"type\":\"plugin/future-thing\",\"seq\":1,\"time\":2,\"data\":{\"x\":1},\"surfaceOp\":{\"op\":\"replace\",\"startSeq\":9,\"endSeq\":1},\"sourceEventSeqs\":[[9,1]],\"ignorable\":true}\n";
     try writeRaw(paths.log, header ++ known ++ opaque_event);
 
     var result = try readLog(std.testing.allocator, paths.log);

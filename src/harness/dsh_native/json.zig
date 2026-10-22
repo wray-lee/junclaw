@@ -55,7 +55,7 @@ pub fn writeEvent(w: *Writer, event: types.Event) !void {
         switch (op) {
             .append => try std.json.Stringify.value("append", .{}, w),
             .replace => |replacement| try w.print(
-                "{{\"op\":\"replace\",\"start\":{d},\"end\":{d}}}",
+                "{{\"op\":\"replace\",\"startSeq\":{d},\"endSeq\":{d}}}",
                 .{ replacement.start_seq, replacement.end_seq },
             ),
         }
