@@ -139,6 +139,52 @@ To pin a release tag or switch registries later, override `NULLCLAW_IMAGE`:
 NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gateway up -d gateway
 ```
 
+### Full dsh image (optional)
+
+The fork also publishes a full image that bundles the [dsh](https://github.com/deepseek-ai/deepseek-harness) sidecar harness with the same `nullclaw` binary:
+
+```bash
+docker pull ghcr.io/<owner>/junclaw:full-dsh
+```
+
+Tags:
+
+- `:full-dsh` — latest build of the `full-dsh` target
+- `:full-dsh-<version>` — build from a `full-dsh-v*` tag or a manual CI run
+
+Build it locally from the repository Dockerfile target:
+
+```bash
+docker build --target full-dsh -t junclaw:full-dsh .
+```
+
+**Platform:** `linux/amd64` only. The ARM64 runtime has not been tested, so this image does not claim ARM64 support.
+
+**Size and memory (measured on linux/amd64):**
+
+- Image: 1.4 GB (1,441,200,646 bytes) uncompressed, 250 MB (261,122,565 bytes) compressed (`docker save | gzip`)
+- RSS: about 3 MB idle (gateway running, dsh not started); about 287 MB for the container at peak during a turn, with the dsh sidecar peaking at about 315 MB VmRSS (an earlier probe measured 202-244 MB for shorter turns)
+
+Plan for at least 512 MB of memory per container; 1 GB is safer.
+
+**Enabling dsh:** `agent.harness` still defaults to `native`. The image sets `NULLCLAW_DSH_BIN` and `DSH_HOME=/nullclaw-data/.dsh`, but you must opt in explicitly:
+
+```json
+{
+  "agent": {
+    "harness": "dsh"
+  }
+}
+```
+
+Keep your normal `models.providers` configuration in `config.json`; the harness writes a `junclaw` route into dsh's web profile. `HOME`, `NULLCLAW_HOME`, and the workspace stay under `/nullclaw-data` (uid 65534).
+
+**Behavior differences:**
+
+- dsh runs its own agent loop and tools inside the container. junclaw `memory`, `cron`, and `tools` are not automatically exposed to dsh; bridging them needs an MCP server or a dsh plugin.
+- Approvals, when surfaced, support only `allow-once` and `reject` (dsh has no allow-always). The current P1 harness does not yet surface approval prompts to channels.
+- The dsh web profile is pinned to `0.2.1-rc.2`; the image installs it from a committed lock file with integrity hashes.
+
 ## Option 3: Build from Source (cross-platform)
 
 ```bash

@@ -135,6 +135,52 @@ Profile 含义：
 NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gateway up -d gateway
 ```
 
+### full-dsh 镜像（可选）
+
+本分叉还提供一个内置 [dsh](https://github.com/deepseek-ai/deepseek-harness) sidecar harness 的完整镜像，`nullclaw` 二进制与精简镜像相同：
+
+```bash
+docker pull ghcr.io/<owner>/junclaw:full-dsh
+```
+
+标签：
+
+- `:full-dsh` —— `full-dsh` target 的最新构建
+- `:full-dsh-<version>` —— 由 `full-dsh-v*` 标签或手动 CI 运行产生
+
+本地构建：
+
+```bash
+docker build --target full-dsh -t junclaw:full-dsh .
+```
+
+**平台：** 仅 `linux/amd64`。ARM64 运行时尚未实测，因此该镜像不声明支持 ARM64。
+
+**体积与内存（linux/amd64 实测）：**
+
+- 镜像：未压缩 1.4 GB（1,441,200,646 字节），压缩后 250 MB（261,122,565 字节）（`docker save | gzip`）
+- RSS：空闲约 3 MB（gateway 运行、dsh 未启动）；一轮对话时容器峰值约 287 MB，dsh sidecar 的 VmRSS 峰值约 315 MB（早期探针在较短轮次下测得 202-244 MB）
+
+建议每容器至少 512 MB 内存，1 GB 更稳。
+
+**启用 dsh：** `agent.harness` 默认仍是 `native`。镜像已设置 `NULLCLAW_DSH_BIN` 与 `DSH_HOME=/nullclaw-data/.dsh`，但仍需显式开启：
+
+```json
+{
+  "agent": {
+    "harness": "dsh"
+  }
+}
+```
+
+`config.json` 里照常配置 `models.providers`；harness 会把 `junclaw` 路由写入 dsh 的 web profile。`HOME`、`NULLCLAW_HOME` 与工作区仍在 `/nullclaw-data` 下（uid 65534）。
+
+**行为差异：**
+
+- dsh 在容器内运行自己的 agent 循环和工具。junclaw 的 `memory`、`cron`、`tools` 不会自动暴露给 dsh；要打通需要 MCP server 或 dsh 插件。
+- 审批（在接入后）只支持 `allow-once` 和 `reject`，dsh 没有 allow-always。当前 P1 harness 尚未把审批提示暴露到频道。
+- dsh web profile 固定为 `0.2.1-rc.2`；镜像用提交进仓库的 lock 文件安装，带 integrity 校验。
+
 ## 方式三：源码构建（通用）
 
 ```bash
