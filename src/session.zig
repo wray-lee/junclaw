@@ -2739,6 +2739,29 @@ pub const SessionManager = struct {
         }
     };
 
+    /// User-facing text for a dsh turn that failed with a Zig error. Null
+    /// means "not a dsh failure the user can act on", so the error propagates
+    /// unchanged (OOM, protocol bugs, native-path errors).
+    fn dshTurnErrorMessage(allocator: Allocator, err: anyerror) ?[]const u8 {
+        const text = switch (err) {
+            error.SidecarBootFailed => "dsh 引擎启动失败，请检查 dsh 安装与配置后重试。",
+            error.ConnectionLost => "与 dsh 引擎的连接已断开，请稍后重试。",
+            error.TurnTimeout => "dsh 引擎响应超时，请稍后重试。",
+            error.WsHandshakeFailed => "无法与 dsh 引擎建立连接（WebSocket 握手失败），请稍后重试。",
+            else => return null,
+        };
+        return allocator.dupe(u8, text) catch null;
+    }
+
+    /// dsh reports an upstream provider failure (500/429) as `turn_result.error`
+    /// text while returning an empty or partial reply. Keep any partial reply
+    /// and append the mapped failure so the user sees why the turn ended.
+    fn dshFailedTurnReply(allocator: Allocator, upstream: []const u8, partial: []const u8) ![]const u8 {
+        if (partial.len == 0)
+            return std.fmt.allocPrint(allocator, "上游模型服务返回错误：{s}", .{upstream});
+        return std.fmt.allocPrint(allocator, "{s}\n\n上游模型服务返回错误：{s}", .{ partial, upstream });
+    }
+
     /// Track every message consumed by one Agent.turn, including messages
     /// drained while a post-turn follow-up is itself running.
     ///
@@ -2791,9 +2814,32 @@ pub const SessionManager = struct {
             input.drain_ctx = drain_ctx;
             break :blk session.turnHarness().runTurn(input) catch |err| {
                 finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                // A dsh engine failure is a reply the user can act on; native
+                // errors keep propagating to the existing classification path.
+                if (comptime dsh_enabled) {
+                    if (session.dsh != null) {
+                        if (dshTurnErrorMessage(self.allocator, err)) |message| {
+                            session.agent.last_turn_interrupted = false;
+                            return message;
+                        }
+                    }
+                }
                 return err;
             };
         };
+        // Regression: the port's failure text was only freed, so a dsh turn
+        // that ended with an upstream 500/429 surfaced as an empty reply.
+        if (comptime dsh_enabled) {
+            if (session.dsh != null) {
+                if (turn_result.@"error") |message| {
+                    defer self.allocator.free(message);
+                    defer self.allocator.free(turn_result.reply);
+                    session.agent.last_turn_interrupted = false;
+                    finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                    return try dshFailedTurnReply(self.allocator, message, turn_result.reply);
+                }
+            }
+        }
         // Only `reply` is returned; the port hands failure text to the host.
         defer if (turn_result.@"error") |message| self.allocator.free(message);
         // dsh reports interruption through the port; the host's /stop tail
@@ -6844,6 +6890,76 @@ test "dsh boot does not block session creation under the manager lock" {
     const reply = turn.reply.?;
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("slow boot", reply);
+}
+
+test "dsh turn failures map to user-facing text" {
+    const cases = [_]struct { err: anyerror, needle: []const u8 }{
+        .{ .err = error.SidecarBootFailed, .needle = "dsh 引擎启动失败" },
+        .{ .err = error.ConnectionLost, .needle = "连接已断开" },
+        .{ .err = error.TurnTimeout, .needle = "响应超时" },
+        .{ .err = error.WsHandshakeFailed, .needle = "WebSocket 握手失败" },
+    };
+    for (cases) |case| {
+        const message = SessionManager.dshTurnErrorMessage(testing.allocator, case.err).?;
+        defer testing.allocator.free(message);
+        try testing.expect(std.mem.indexOf(u8, message, case.needle) != null);
+    }
+    try testing.expect(SessionManager.dshTurnErrorMessage(testing.allocator, error.OutOfMemory) == null);
+}
+
+test "dsh failed turn reply copies a 64KB upstream message without leaking" {
+    const upstream = try testing.allocator.alloc(u8, 64 * 1024 + 7);
+    defer testing.allocator.free(upstream);
+    @memset(upstream, 'e');
+
+    const reply = try SessionManager.dshFailedTurnReply(testing.allocator, upstream, "");
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.endsWith(u8, reply, upstream));
+
+    const combined = try SessionManager.dshFailedTurnReply(testing.allocator, upstream, "partial answer");
+    defer testing.allocator.free(combined);
+    try testing.expect(std.mem.startsWith(u8, combined, "partial answer\n\n"));
+}
+
+test "dsh upstream turn error reaches the user instead of an empty reply" {
+    // Regression: the port's `error` text was freed without being shown, so an
+    // upstream 500/429 ended the turn with an empty reply.
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try dshSessionTestConfig(&tmp);
+    defer testing.allocator.free(setup.base);
+    defer testing.allocator.free(setup.config_path);
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    const error_frame = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{{\"type\":\"event\"," ++
+            "\"event\":{{\"type\":\"turn/end\",\"data\":{{\"reason\":{{\"kind\":\"error\"," ++
+            "\"error\":{{\"message\":{f}}}}}}}}}}}}}",
+        .{std.json.fmt("upstream provider returned 429", .{})},
+    );
+    defer testing.allocator.free(error_frame);
+    try dsh_mock.setTurnFrames(&.{error_frame});
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &setup.cfg);
+    defer sm.deinit();
+
+    const reply = try sm.processMessageStreaming("cli:main:dsh-upstream-error", "hello", null, null, null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("上游模型服务返回错误：upstream provider returned 429", reply);
 }
 
 test "harness display trust uses the real session key for shared channels" {
