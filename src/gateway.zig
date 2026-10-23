@@ -1018,6 +1018,26 @@ fn buildWebhookSuccessResponse(
     return buf.toOwnedSlice(allocator);
 }
 
+/// Body for a synchronous (worker-style) webhook turn. A failed turn returns
+/// `userFacingAgentErrorJson` directly: it must not fall through to the
+/// generic ack that an empty `InboundResult` otherwise produces.
+fn buildSyncWebhookTurnBody(
+    allocator: std.mem.Allocator,
+    req_allocator: std.mem.Allocator,
+    observer: *GatewayThreadObserver,
+    turn: anyerror!session_mod.SessionManager.InboundResult,
+    start_seq: u64,
+) []const u8 {
+    const result = turn catch |err| return userFacingAgentErrorJson(err);
+    const text = result.reply orelse
+        session_mod.SessionManager.consumedNotice(result.action) orelse
+        return "{\"status\":\"received\"}";
+    defer if (result.reply != null) allocator.free(text);
+    const tool_events = observer.collectSince(req_allocator, start_seq) catch &.{};
+    const thread_events_json = buildThreadEventsJson(req_allocator, tool_events) catch "[]";
+    return buildWebhookSuccessResponse(req_allocator, text, thread_events_json) catch "{\"status\":\"received\"}";
+}
+
 const MediaTranscribeResult = struct {
     status: []const u8,
     body: []const u8,
@@ -6473,24 +6493,13 @@ pub fn run(
                             } else if (local_agent_runtime_opt) |*runtime| {
                                 const sm = &runtime.session_mgr;
                                 const start_seq = gateway_thread_observer.currentSeq();
-                                const result = sm.processInboundMessage(routing.session_key, msg_text, routing.conversation_context) catch |err| blk: {
-                                    response_body = userFacingAgentErrorJson(err);
-                                    break :blk session_mod.SessionManager.InboundResult{};
-                                };
-                                if (result.reply) |r| {
-                                    defer allocator.free(r);
-                                    const tool_events = gateway_thread_observer.collectSince(req_allocator, start_seq) catch &.{};
-                                    const thread_events_json = buildThreadEventsJson(req_allocator, tool_events) catch "[]";
-                                    const json_resp = buildWebhookSuccessResponse(req_allocator, r, thread_events_json) catch null;
-                                    response_body = json_resp orelse "{\"status\":\"received\"}";
-                                } else if (session_mod.SessionManager.consumedNotice(result.action)) |notice| {
-                                    const tool_events = gateway_thread_observer.collectSince(req_allocator, start_seq) catch &.{};
-                                    const thread_events_json = buildThreadEventsJson(req_allocator, tool_events) catch "[]";
-                                    const json_resp = buildWebhookSuccessResponse(req_allocator, notice, thread_events_json) catch null;
-                                    response_body = json_resp orelse "{\"status\":\"received\"}";
-                                } else {
-                                    response_body = "{\"status\":\"received\"}";
-                                }
+                                response_body = buildSyncWebhookTurnBody(
+                                    allocator,
+                                    req_allocator,
+                                    &gateway_thread_observer,
+                                    sm.processInboundMessage(routing.session_key, msg_text, routing.conversation_context),
+                                    start_seq,
+                                );
                             } else {
                                 response_body = "{\"status\":\"received\"}";
                             }
@@ -11015,6 +11024,40 @@ test "buildWebhookSuccessResponse includes thread_events" {
     try std.testing.expectEqualStrings("ok", parsed.value.object.get("status").?.string);
     try std.testing.expectEqualStrings("hello", parsed.value.object.get("response").?.string);
     try std.testing.expect(parsed.value.object.get("thread_events").? == .array);
+}
+
+test "sync webhook turn error body is not overwritten by the generic ack" {
+    // Regression: the catch set the error JSON and then fell through to the
+    // empty InboundResult's else branch, so the caller got {"status":"received"}.
+    var observer = GatewayThreadObserver.init(std.testing.allocator);
+    defer observer.deinit();
+    const body = buildSyncWebhookTurnBody(
+        std.testing.allocator,
+        std.testing.allocator,
+        &observer,
+        error.RateLimited,
+        observer.currentSeq(),
+    );
+    try std.testing.expectEqualStrings("{\"error\":\"provider rate limit\"}", body);
+}
+
+test "sync webhook turn body frees a 64KB reply" {
+    var observer = GatewayThreadObserver.init(std.testing.allocator);
+    defer observer.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const reply = try std.testing.allocator.alloc(u8, 64 * 1024 + 9);
+    @memset(reply, 'a');
+    const body = buildSyncWebhookTurnBody(
+        std.testing.allocator,
+        arena.allocator(),
+        &observer,
+        session_mod.SessionManager.InboundResult{ .reply = reply },
+        observer.currentSeq(),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"status\":\"ok\",\"response\":\"") != null);
+    try std.testing.expect(body.len > reply.len);
 }
 
 // ── jsonWrapChallenge tests ─────────────────────────────────────

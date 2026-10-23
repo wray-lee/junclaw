@@ -56,10 +56,20 @@ const follow_records = [_]struct { seq: u64, json: []const u8 }{
     .{ .seq = 3, .json = "{\"seq\":3,\"type\":\"event\",\"event\":{\"type\":\"turn/end\",\"data\":{\"reason\":{\"kind\":\"completed\"}}}}" },
 };
 
-/// One upgraded WS connection, bound to the dsh session its follow stream named.
+/// One client `session/follow` open on the mux socket.
+const StreamBinding = struct {
+    session: []u8,
+    stream_id: []u8,
+};
+
+/// The one admitted WS connection, like dsh's per-peer socket.
 const WsConn = struct {
     stream: std_compat.net.Stream,
-    session: []u8,
+    thread: ?std.Thread = null,
+    /// False once the reader saw the peer close; a later upgrade may replace it.
+    open: bool = true,
+    /// Follow streams opened on this socket; guarded by `MockDsh.mutex`.
+    streams: std.ArrayListUnmanaged(StreamBinding) = .empty,
 };
 
 /// Test gate that parks the mock's `/connect` handler (and with it the boot)
@@ -104,8 +114,11 @@ pub const MockDsh = struct {
     turn_frames: std.ArrayListUnmanaged([]u8) = .empty,
     /// Frames streamed by `session/cancel` before the aborted `turn/end`.
     cancel_frames: std.ArrayListUnmanaged([]u8) = .empty,
-    /// Each harness client opens one WS; frames go to the session's latest one.
-    ws_conns: std.ArrayListUnmanaged(WsConn) = .empty,
+    /// dsh admits one WS per API peer; a second handshake is answered 409.
+    ws: ?*WsConn = null,
+    ws_rejections: u32 = 0,
+    /// Wakes a prompt/cancel handler once the session's follow stream opens.
+    follow_cond: std_compat.sync.Condition = .{},
     /// Session ids the harness sent `session/close` for.
     closed_sessions: std.ArrayListUnmanaged([]u8) = .empty,
     /// Harness-test observability; guarded by `mutex`.
@@ -126,12 +139,34 @@ pub const MockDsh = struct {
     ws_gate: ?*ConnectGate = null,
     /// Echo each prompt back as a delta plus a completed turn/end.
     echo_prompts: bool = false,
+    /// When false, `session/cancel` acks but leaves the turn running (no
+    /// aborted `turn/end`), so the cancel-timeout fallback is reachable.
+    cancel_ends_turn: bool = true,
+    /// When true, `session/cancel` answers `session/not-found`, like dsh does
+    /// once the turn ended and its agent detached (/stop race tests).
+    cancel_not_found: bool = false,
     /// Reply value for `session/modelCatalog`; null replies `{}`.
     model_catalog_json: ?[]u8 = null,
     /// Reply value for `session/projections`; null replies `{}`.
     projection_json: ?[]u8 = null,
     /// `session/selectModel` request bodies, in arrival order.
     select_model_requests: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Simulated process death: every new connection is reset and the mux is
+    /// shut down until `revive`. Deterministic (no timing).
+    dead: bool = false,
+    /// Times the "process" came back after `kill`.
+    revive_count: u32 = 0,
+    /// `request.requestId` of every `session/prompt`, in arrival order.
+    prompt_request_ids: std.ArrayListUnmanaged([]u8) = .empty,
+    /// Drop the next prompt reply (after recording it) and close the mux, as a
+    /// crash between admission and response would.
+    drop_prompt_reply_once: bool = false,
+    /// Drop every prompt reply until cleared: a sidecar that boots and
+    /// handshakes but dies on its first RPC.
+    drop_prompt_replies: bool = false,
+    /// Answer this many `session/prompt` calls with `session/writer-held`,
+    /// like dsh does when another process still owns the session.
+    prompt_writer_held: u32 = 0,
 
     pub fn init(allocator: Allocator) !*MockDsh {
         const address = try std_compat.net.Address.parseIp("127.0.0.1", 0);
@@ -153,14 +188,17 @@ pub const MockDsh = struct {
         } else |_| {}
         if (self.thread) |thread| thread.join();
         self.server.deinit();
-        for (self.ws_conns.items) |conn| {
-            conn.stream.close();
-            self.allocator.free(conn.session);
-        }
-        self.ws_conns.deinit(self.allocator);
+        self.mutex.lock();
+        const ws = self.ws;
+        self.ws = null;
+        self.follow_cond.broadcast();
+        self.mutex.unlock();
+        if (ws) |conn| self.freeConn(conn);
         for (self.closed_sessions.items) |session| self.allocator.free(session);
         self.closed_sessions.deinit(self.allocator);
         if (self.last_prompt_session) |session| self.allocator.free(session);
+        for (self.prompt_request_ids.items) |id| self.allocator.free(id);
+        self.prompt_request_ids.deinit(self.allocator);
         if (self.model_catalog_json) |json| self.allocator.free(json);
         if (self.projection_json) |json| self.allocator.free(json);
         for (self.select_model_requests.items) |request| self.allocator.free(request);
@@ -170,6 +208,21 @@ pub const MockDsh = struct {
         clearFrames(self.allocator, &self.cancel_frames);
         self.cancel_frames.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Close the socket, join its reader, and release every binding.
+    fn freeConn(self: *MockDsh, conn: *WsConn) void {
+        // Shut down before joining: closing an fd under a blocked std.Io read
+        // is a programmer error there, while shutdown wakes it with EOF.
+        conn.stream.shutdown(.both) catch {};
+        if (conn.thread) |thread| thread.join();
+        conn.stream.close();
+        for (conn.streams.items) |binding| {
+            self.allocator.free(binding.session);
+            self.allocator.free(binding.stream_id);
+        }
+        conn.streams.deinit(self.allocator);
+        self.allocator.destroy(conn);
     }
 
     pub fn port(self: *const MockDsh) u16 {
@@ -262,6 +315,13 @@ pub const MockDsh = struct {
         var keep_open = false;
         defer if (!keep_open) stream.close();
 
+        // A dead process does not answer: closing without reading makes the
+        // peer see a reset, which is what the harness must classify.
+        self.mutex.lock();
+        const dead = self.dead;
+        self.mutex.unlock();
+        if (dead) return;
+
         const request = readRequest(self.allocator, stream) catch return;
         defer self.allocator.free(request.buffer);
 
@@ -270,18 +330,41 @@ pub const MockDsh = struct {
             const ws_gate = self.ws_gate;
             self.mutex.unlock();
             if (ws_gate) |g| g.enter();
-            self.upgrade(stream, request.head) catch return;
-            // The harness sends its `session/follow` open as the first frame;
-            // bind this connection to that session for prompt/cancel routing.
-            const session = readFollowSession(self.allocator, stream) catch return;
+
             self.mutex.lock();
-            self.ws_conns.append(self.allocator, .{ .stream = stream, .session = session }) catch {
-                self.mutex.unlock();
-                self.allocator.free(session);
+            const previous = self.ws;
+            const busy = if (previous) |conn| conn.open else false;
+            if (busy) self.ws_rejections += 1;
+            self.mutex.unlock();
+            if (busy) {
+                // dsh: one socket per authenticated peer (rpc-host.ts:150).
+                writeHttp(stream, "409 Conflict", "", "conflict") catch {};
                 return;
-            };
+            }
+            if (previous) |conn| {
+                // The peer closed it, so the slot is free (real dsh would also
+                // require a fresh owner-cookie exchange before reconnecting).
+                self.freeConn(conn);
+                self.mutex.lock();
+                if (self.ws == conn) self.ws = null;
+                self.mutex.unlock();
+            }
+
+            self.upgrade(stream, request.head) catch return;
+            const conn = self.allocator.create(WsConn) catch return;
+            conn.* = .{ .stream = stream };
+            self.mutex.lock();
+            self.ws = conn;
             self.ws_connections += 1;
             self.mutex.unlock();
+            conn.thread = std.Thread.spawn(.{}, wsReaderMain, .{ self, conn }) catch {
+                self.mutex.lock();
+                self.ws = null;
+                self.follow_cond.broadcast();
+                self.mutex.unlock();
+                self.allocator.destroy(conn);
+                return;
+            };
             keep_open = true;
             return;
         }
@@ -356,8 +439,18 @@ pub const MockDsh = struct {
         } else if (std.mem.eql(u8, method, "session/selectModel")) {
             self.recordSelectModel(body);
             value = try self.allocator.dupe(u8, "{}");
-        } else {
+        } else if (std.mem.eql(u8, method, "session/prompt") or
+            std.mem.eql(u8, method, "session/cancel") or
+            std.mem.eql(u8, method, "session/close"))
+        {
             value = try self.allocator.dupe(u8, "{}");
+        } else {
+            // The dsh gateway only routes typert-registered Remote endpoints;
+            // anything else (e.g. `session/resume`, which exists only in the
+            // stdio SDK) is a 404. Keep the mock honest so a call to one
+            // cannot pass on a blanket `ok:true`.
+            try writeHttp(stream, "404 Not Found", "Content-Type: text/plain\r\n", "unknown endpoint");
+            return;
         }
         defer self.allocator.free(value);
 
@@ -367,6 +460,52 @@ pub const MockDsh = struct {
         if (is_prompt) self.recordPrompt(body);
         if (is_cancel) self.recordCancel();
         if (std.mem.eql(u8, method, "session/close")) self.recordClose(body);
+
+        if (is_cancel) {
+            self.mutex.lock();
+            const not_found = self.cancel_not_found;
+            self.mutex.unlock();
+            if (not_found) {
+                try writeHttp(
+                    stream,
+                    "200 OK",
+                    "Content-Type: application/json\r\n",
+                    "{\"result\":{\"ok\":false,\"error\":{\"code\":\"session/not-found\"," ++
+                        "\"message\":\"session not attached\"}}}",
+                );
+                return;
+            }
+        }
+
+        if (is_prompt) {
+            self.mutex.lock();
+            const held = self.prompt_writer_held > 0;
+            if (held) self.prompt_writer_held -= 1;
+            self.mutex.unlock();
+            if (held) {
+                try writeHttp(
+                    stream,
+                    "200 OK",
+                    "Content-Type: application/json\r\n",
+                    "{\"result\":{\"ok\":false,\"error\":{\"code\":\"session/writer-held\"," ++
+                        "\"message\":\"session is owned by another writer\"}}}",
+                );
+                return;
+            }
+        }
+
+        if (is_prompt and self.takeDropPromptReply()) {
+            // Crash after admitting the prompt but before replying: close the
+            // mux too, because a restarted process would have lost it.
+            self.mutex.lock();
+            if (self.ws) |conn| {
+                conn.open = false;
+                conn.stream.shutdown(.both) catch {};
+            }
+            self.follow_cond.broadcast();
+            self.mutex.unlock();
+            return;
+        }
 
         const response = try std.fmt.allocPrint(
             self.allocator,
@@ -406,11 +545,15 @@ pub const MockDsh = struct {
 
     fn recordPrompt(self: *MockDsh, body: []const u8) void {
         const session = requestSessionId(self.allocator, body) orelse return;
+        const request_id = requestString(self.allocator, body, "requestId");
         self.mutex.lock();
         defer self.mutex.unlock();
         self.prompt_count += 1;
         if (self.last_prompt_session) |old| self.allocator.free(old);
         self.last_prompt_session = session;
+        if (request_id) |id| {
+            self.prompt_request_ids.append(self.allocator, id) catch self.allocator.free(id);
+        }
     }
 
     fn recordCancel(self: *MockDsh) void {
@@ -424,6 +567,30 @@ pub const MockDsh = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         self.closed_sessions.append(self.allocator, session) catch self.allocator.free(session);
+    }
+
+    /// Answer the next prompt with a dropped connection instead of a reply,
+    /// after recording it (crash-between-admission-and-response).
+    pub fn dropNextPromptReply(self: *MockDsh) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.drop_prompt_reply_once = true;
+    }
+
+    /// Drop every prompt reply from now on; used to prove a crash streak is
+    /// counted even when each restart boots and handshakes successfully.
+    pub fn dropAllPromptReplies(self: *MockDsh) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.drop_prompt_replies = true;
+    }
+
+    fn takeDropPromptReply(self: *MockDsh) bool {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const drop = self.drop_prompt_reply_once or self.drop_prompt_replies;
+        self.drop_prompt_reply_once = false;
+        return drop;
     }
 
     pub fn createCount(self: *MockDsh) u32 {
@@ -486,10 +653,73 @@ pub const MockDsh = struct {
         self.echo_prompts = enabled;
     }
 
+    /// Let `session/cancel` ack without ending the turn (cancel-timeout tests).
+    pub fn setCancelEndsTurn(self: *MockDsh, enabled: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_ends_turn = enabled;
+    }
+
+    /// Answer `session/cancel` with `session/not-found` (turn already ended).
+    pub fn setCancelNotFound(self: *MockDsh, enabled: bool) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.cancel_not_found = enabled;
+    }
+
+    /// Answer the next `count` prompts with `session/writer-held`.
+    pub fn setPromptWriterHeld(self: *MockDsh, count: u32) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.prompt_writer_held = count;
+    }
+
     pub fn wsConnections(self: *MockDsh) u32 {
         self.mutex.lock();
         defer self.mutex.unlock();
         return self.ws_connections;
+    }
+
+    /// Second-and-later upgrades answered `409 Conflict`.
+    pub fn wsRejections(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.ws_rejections;
+    }
+
+    /// Simulate the sidecar process dying: shut down the mux socket and reset
+    /// every new connection until `revive`.
+    pub fn kill(self: *MockDsh) void {
+        self.mutex.lock();
+        self.dead = true;
+        if (self.ws) |conn| {
+            conn.open = false;
+            conn.stream.shutdown(.both) catch {};
+        }
+        self.follow_cond.broadcast();
+        self.mutex.unlock();
+    }
+
+    /// Bring the simulated process back; the next boot or RPC succeeds.
+    pub fn revive(self: *MockDsh) void {
+        self.mutex.lock();
+        self.dead = false;
+        self.revive_count += 1;
+        self.mutex.unlock();
+    }
+
+    pub fn reviveCount(self: *MockDsh) u32 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.revive_count;
+    }
+
+    /// Copy of the request id of the `index`-th `session/prompt`; caller frees.
+    pub fn promptRequestIdAt(self: *MockDsh, allocator: Allocator, index: usize) !?[]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (index >= self.prompt_request_ids.items.len) return null;
+        return try allocator.dupe(u8, self.prompt_request_ids.items[index]);
     }
 
     pub fn closeCount(self: *MockDsh) u32 {
@@ -517,21 +747,40 @@ pub const MockDsh = struct {
     /// Newest connection bound to `session`: a resumed process opens a fresh
     /// WS for an id that an earlier harness instance also used. Caller holds
     /// `mutex`.
-    fn wsForSessionLocked(self: *MockDsh, session: []const u8) ?std_compat.net.Stream {
-        var index = self.ws_conns.items.len;
-        while (index > 0) {
-            index -= 1;
-            const conn = self.ws_conns.items[index];
-            if (std.mem.eql(u8, conn.session, session)) return conn.stream;
+    /// The stream id the client opened for this session. Parks the handler
+    /// until the follow open lands, so a prompt can never outrun its stream.
+    fn waitForStreamIdLocked(self: *MockDsh, session: []const u8) ?[]const u8 {
+        while (true) {
+            if (self.ws) |conn| {
+                for (conn.streams.items) |binding| {
+                    if (std.mem.eql(u8, binding.session, session)) return binding.stream_id;
+                }
+                self.follow_cond.wait(&self.mutex);
+            } else return null;
         }
-        return null;
+    }
+
+    fn writeFrameForStreamLocked(
+        self: *MockDsh,
+        conn: *WsConn,
+        stream_id: []const u8,
+        frame: []const u8,
+    ) !void {
+        const routed = try frameForStream(self.allocator, frame, stream_id);
+        defer self.allocator.free(routed);
+        try writeTextFrame(conn.stream, routed);
+    }
+
+    fn writeSessionFramesLocked(self: *MockDsh, session: []const u8, frames: []const []const u8) !void {
+        const stream_id = self.waitForStreamIdLocked(session) orelse return;
+        const conn = self.ws orelse return;
+        for (frames) |frame| try self.writeFrameForStreamLocked(conn, stream_id, frame);
     }
 
     fn sendTurnFrames(self: *MockDsh, session: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ws = self.wsForSessionLocked(session) orelse return;
-        for (self.turn_frames.items) |frame| try writeTextFrame(ws, frame);
+        try self.writeSessionFramesLocked(session, self.turn_frames.items);
     }
 
     /// Reply with the prompt's own text, so concurrent sessions are
@@ -542,21 +791,25 @@ pub const MockDsh = struct {
         defer self.allocator.free(text);
         const delta = try textDeltaFrame(self.allocator, 0, text);
         defer self.allocator.free(delta);
+        const frames = [_][]const u8{ delta, turn_completed_frame };
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ws = self.wsForSessionLocked(session) orelse return;
-        try writeTextFrame(ws, delta);
-        try writeTextFrame(ws, turn_completed_frame);
+        try self.writeSessionFramesLocked(session, &frames);
     }
 
     /// A cancelled turn commits its delivered prefix before the terminal frame.
     fn sendCancelFrames(self: *MockDsh, session: []const u8) !void {
         self.mutex.lock();
         defer self.mutex.unlock();
-        const ws = self.wsForSessionLocked(session) orelse return;
-        for (self.cancel_frames.items) |frame| try writeTextFrame(ws, frame);
-        try writeTextFrame(ws, turn_aborted_frame);
+        const stream_id = self.waitForStreamIdLocked(session) orelse return;
+        const conn = self.ws orelse return;
+        for (self.cancel_frames.items) |frame| {
+            try self.writeFrameForStreamLocked(conn, stream_id, frame);
+        }
+        if (self.cancel_ends_turn) {
+            try self.writeFrameForStreamLocked(conn, stream_id, turn_aborted_frame);
+        }
     }
 
     fn buildSnapshot(self: *MockDsh, body: []const u8) ![]u8 {
@@ -705,18 +958,23 @@ fn requestPromptText(allocator: Allocator, body: []const u8) ?[]u8 {
     return allocator.dupe(u8, text) catch null;
 }
 
-fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
+/// String field of `payload.args.request`; caller frees.
+fn requestString(allocator: Allocator, body: []const u8, field: []const u8) ?[]u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
     const root = asObject(parsed.value) orelse return null;
     const payload = asObject(root.get("payload")) orelse return null;
     const args = asObject(payload.get("args")) orelse return null;
     const request = asObject(args.get("request")) orelse return null;
-    const session = switch (request.get("sessionId") orelse return null) {
-        .string => |text| text,
+    const text = switch (request.get(field) orelse return null) {
+        .string => |value| value,
         else => return null,
     };
-    return allocator.dupe(u8, session) catch null;
+    return allocator.dupe(u8, text) catch null;
+}
+
+fn requestSessionId(allocator: Allocator, body: []const u8) ?[]u8 {
+    return requestString(allocator, body, "sessionId");
 }
 
 fn asObject(value: ?std.json.Value) ?std.json.ObjectMap {
@@ -743,12 +1001,17 @@ fn writeHttp(
     try stream.writeAll(body);
 }
 
-/// Read the first client text frame (the harness's `session/follow` open) and
-/// return the session id it names. Client frames are masked (RFC 6455 §5.3).
-fn readFollowSession(allocator: Allocator, stream: std_compat.net.Stream) ![]u8 {
+/// Read one masked text frame from the client; null on a close frame or EOF.
+/// Client frames are masked (RFC 6455 §5.3).
+fn readClientFrame(allocator: Allocator, stream: std_compat.net.Stream) !?[]u8 {
     var header: [2]u8 = undefined;
-    try readExact(stream, &header);
-    if ((header[0] & 0x0f) != 0x01) return error.NotTextFrame;
+    readExact(stream, &header) catch |err| switch (err) {
+        error.ConnectionClosed => return null,
+        else => return err,
+    };
+    const opcode = header[0] & 0x0f;
+    if (opcode == 0x08) return null;
+    if (opcode != 0x01) return error.NotTextFrame;
     const masked = (header[1] & 0x80) != 0;
     var length: u64 = header[1] & 0x7f;
     if (length == 126) {
@@ -764,19 +1027,109 @@ fn readFollowSession(allocator: Allocator, stream: std_compat.net.Stream) ![]u8 
     var mask: [4]u8 = .{ 0, 0, 0, 0 };
     if (masked) try readExact(stream, &mask);
     const payload = try allocator.alloc(u8, @intCast(length));
-    defer allocator.free(payload);
+    errdefer allocator.free(payload);
     try readExact(stream, payload);
     if (masked) {
         for (payload, 0..) |*byte, index| byte.* ^= mask[index % 4];
     }
+    return payload;
+}
 
-    // Test-only frames come from `protocol.buildFollowOpen`; a plain search is
-    // enough for its flat `"sessionId":"<id>"` field.
-    const marker = "\"sessionId\":\"";
-    const start = (std.mem.indexOf(u8, payload, marker) orelse return error.NoSessionId) +
-        marker.len;
-    const end = std.mem.indexOfScalarPos(u8, payload, start, '"') orelse return error.NoSessionId;
-    return try allocator.dupe(u8, payload[start..end]);
+/// Reader half of the one mux socket: register `session/follow` opens and drop
+/// cancelled streams. Any close lets the next upgrade in (dsh would also
+/// require a fresh owner-cookie exchange, which the mock does not model).
+fn wsReaderMain(self: *MockDsh, conn: *WsConn) void {
+    while (true) {
+        const text = readClientFrame(self.allocator, conn.stream) catch break;
+        const frame = text orelse break;
+        defer self.allocator.free(frame);
+        handleClientFrame(self, conn, frame);
+    }
+    self.mutex.lock();
+    conn.open = false;
+    self.follow_cond.broadcast();
+    self.mutex.unlock();
+}
+
+fn handleClientFrame(self: *MockDsh, conn: *WsConn, text: []const u8) void {
+    const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, text, .{}) catch return;
+    defer parsed.deinit();
+    const root = asObject(parsed.value) orelse return;
+    const kind = switch (root.get("type") orelse return) {
+        .string => |value| value,
+        else => return,
+    };
+
+    if (std.mem.eql(u8, kind, "cancel")) {
+        const stream_id = switch (root.get("streamId") orelse return) {
+            .string => |value| value,
+            else => return,
+        };
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (conn.streams.items, 0..) |binding, index| {
+            if (!std.mem.eql(u8, binding.stream_id, stream_id)) continue;
+            const removed = conn.streams.swapRemove(index);
+            self.allocator.free(removed.session);
+            self.allocator.free(removed.stream_id);
+            break;
+        }
+        return;
+    }
+
+    if (!std.mem.eql(u8, kind, "open")) return;
+    const endpoint = switch (root.get("endpoint") orelse return) {
+        .string => |value| value,
+        else => return,
+    };
+    // The mock has no waterfall surface, so `$events` opens need no state.
+    if (!std.mem.eql(u8, endpoint, "session/follow")) return;
+    const stream_id_raw = switch (root.get("streamId") orelse return) {
+        .string => |value| value,
+        else => return,
+    };
+    const session_raw = followSessionId(root) orelse return;
+
+    const session = self.allocator.dupe(u8, session_raw) catch return;
+    const stream_id = self.allocator.dupe(u8, stream_id_raw) catch {
+        self.allocator.free(session);
+        return;
+    };
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    if (self.ws != conn) {
+        self.allocator.free(session);
+        self.allocator.free(stream_id);
+        return;
+    }
+    conn.streams.append(self.allocator, .{ .session = session, .stream_id = stream_id }) catch {
+        self.allocator.free(session);
+        self.allocator.free(stream_id);
+        return;
+    };
+    self.follow_cond.broadcast();
+}
+
+fn followSessionId(root: std.json.ObjectMap) ?[]const u8 {
+    const payload = asObject(root.get("payload")) orelse return null;
+    const args = asObject(payload.get("args")) orelse return null;
+    const request = asObject(args.get("request")) orelse return null;
+    const address = asObject(request.get("address")) orelse return null;
+    return switch (address.get("sessionId") orelse return null) {
+        .string => |value| value,
+        else => null,
+    };
+}
+
+/// Rewrite the mock frames' placeholder stream id to the client's real one.
+fn frameForStream(allocator: Allocator, frame: []const u8, stream_id: []const u8) ![]u8 {
+    const marker = "\"streamId\":\"follow\"";
+    const at = std.mem.indexOf(u8, frame, marker) orelse return allocator.dupe(u8, frame);
+    return std.fmt.allocPrint(allocator, "{s}\"streamId\":\"{s}\"{s}", .{
+        frame[0..at],
+        stream_id,
+        frame[at + marker.len ..],
+    });
 }
 
 fn readExact(stream: std_compat.net.Stream, buffer: []u8) !void {

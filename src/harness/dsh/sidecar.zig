@@ -35,6 +35,11 @@ pub const Options = struct {
     boot_timeout_ms: u64 = 60_000,
     /// Hang guard for the `/connect` owner-cookie HTTP exchange.
     rpc_timeout_ms: u64 = 30_000,
+    /// Test seam replacing the `/proc` sweep of leftover dsh processes; null
+    /// runs the real sweep. The sweep is what lets a restarted gateway take
+    /// back `session.lock` from an orphaned sidecar.
+    reap: ?*const fn (ctx: ?*anyopaque, opts: *const Options, exclude_pid: ?i32) void = null,
+    reap_ctx: ?*anyopaque = null,
 };
 
 /// Exponential restart delay: 200ms, 400ms, … capped at 5s.
@@ -168,6 +173,188 @@ fn killTree(child: *std_compat.process.Child) void {
     }
 }
 
+/// How long the sweep waits for a SIGKILLed orphan to disappear from /proc
+/// (and so release the session lock). Bounded; a stuck process does not block.
+const ORPHAN_EXIT_TIMEOUT_MS: u64 = 2_000;
+
+/// Kill dsh processes a previous gateway left behind for this DSH_HOME. A
+/// SIGKILLed gateway does not take its sidecar down (the sidecar is its own
+/// process group), and that orphan keeps `session.lock`, so a fresh dsh
+/// answers `session/writer-held` instead of resuming the session.
+/// shortcut: one DSH_HOME should serve one gateway; a second gateway or a
+/// hand-started dsh for the same home can still be swept. Upgrade when
+/// multiple gateways must share a home.
+pub fn reapOrphans(allocator: Allocator, opts: Options, exclude_pid: ?i32) void {
+    if (opts.reap) |hook| {
+        hook(opts.reap_ctx, &opts, exclude_pid);
+        return;
+    }
+    if (comptime builtin.os.tag != .linux) return;
+    reapOrphansIn(allocator, "/proc", opts.bin_js, opts.dsh_home, exclude_pid, killOrphan, null);
+}
+
+/// Test seam: `proc_root` and `killer` are injectable so a fake tree can be
+/// swept without touching the real process table.
+pub fn reapOrphansIn(
+    allocator: Allocator,
+    proc_root: []const u8,
+    bin_js: []const u8,
+    dsh_home: []const u8,
+    exclude_pid: ?i32,
+    killer: *const fn (ctx: ?*anyopaque, pid: i32) void,
+    killer_ctx: ?*anyopaque,
+) void {
+    const pids = collectOrphans(allocator, proc_root, bin_js, dsh_home, exclude_pid, ownPid()) catch return;
+    defer allocator.free(pids);
+    for (pids) |pid| killer(killer_ctx, pid);
+    // The lock is released by process teardown, which can trail the signal.
+    for (pids) |pid| waitPidGone(allocator, proc_root, pid);
+}
+
+/// The gateway's own pid, or null where the sweep cannot run.
+fn ownPid() ?i32 {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        .macos => @intCast(std.c.getpid()),
+        else => null,
+    };
+}
+
+fn readPpid(allocator: Allocator, proc_root: []const u8, pid: i32) ?i32 {
+    var name_buf: [16]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}", .{pid}) catch return null;
+    const stat = readProcFile(allocator, proc_root, name, "stat") orelse return null;
+    defer allocator.free(stat);
+    // `pid (comm) state ppid …`; comm may contain spaces and parentheses.
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    var fields = std.mem.tokenizeScalar(u8, stat[close + 1 ..], ' ');
+    _ = fields.next() orelse return null; // state
+    const ppid_text = fields.next() orelse return null;
+    return std.fmt.parseInt(i32, ppid_text, 10) catch null;
+}
+
+/// True when `pid` is the gateway, one of its ancestors, or one of its
+/// descendants. The sweep must never kill the process tree running it.
+fn inOwnProcessTree(allocator: Allocator, proc_root: []const u8, pid: i32, self_pid: i32) bool {
+    if (pid == self_pid) return true;
+    var current = self_pid;
+    var hops: usize = 0;
+    while (hops < 64) : (hops += 1) {
+        const ppid = readPpid(allocator, proc_root, current) orelse break;
+        if (ppid <= 0 or ppid == current) break;
+        if (ppid == pid) return true;
+        current = ppid;
+    }
+    current = pid;
+    hops = 0;
+    while (hops < 64) : (hops += 1) {
+        const ppid = readPpid(allocator, proc_root, current) orelse return false;
+        if (ppid <= 0 or ppid == current) return false;
+        if (ppid == self_pid) return true;
+        current = ppid;
+    }
+    return false;
+}
+
+/// Pids whose argv carries this exact `bin_js` and whose environment carries
+/// this exact `DSH_HOME`. Excludes `exclude_pid` (the live sidecar of this
+/// gateway, which must survive a retry sweep) and the gateway's own process
+/// tree.
+fn collectOrphans(
+    allocator: Allocator,
+    proc_root: []const u8,
+    bin_js: []const u8,
+    dsh_home: []const u8,
+    exclude_pid: ?i32,
+    self_pid: ?i32,
+) ![]i32 {
+    const home = std.mem.trimEnd(u8, dsh_home, "/");
+    const expected_home = try std.fmt.allocPrint(allocator, "DSH_HOME={s}", .{home});
+    defer allocator.free(expected_home);
+
+    var pids: std.ArrayListUnmanaged(i32) = .empty;
+    errdefer pids.deinit(allocator);
+
+    var dir = try std_compat.fs.openDirAbsolute(proc_root, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
+        if (pid <= 0) continue;
+        if (exclude_pid) |excluded| if (pid == excluded) continue;
+        if (self_pid) |own| if (inOwnProcessTree(allocator, proc_root, pid, own)) continue;
+        if (!processOwnsHome(allocator, proc_root, entry.name, bin_js, expected_home)) continue;
+        try pids.append(allocator, pid);
+    }
+    // /proc iteration order is arbitrary; a stable order keeps the sweep and
+    // its tests deterministic.
+    std.mem.sort(i32, pids.items, {}, std.sort.asc(i32));
+    return pids.toOwnedSlice(allocator);
+}
+
+fn processOwnsHome(
+    allocator: Allocator,
+    proc_root: []const u8,
+    pid_name: []const u8,
+    bin_js: []const u8,
+    expected_home: []const u8,
+) bool {
+    const cmdline = readProcFile(allocator, proc_root, pid_name, "cmdline") orelse return false;
+    defer allocator.free(cmdline);
+    if (!containsNulEntry(cmdline, bin_js)) return false;
+
+    const environ = readProcFile(allocator, proc_root, pid_name, "environ") orelse return false;
+    defer allocator.free(environ);
+    return containsNulEntry(environ, expected_home);
+}
+
+/// Reads one /proc file, or null when it is gone or unreadable (another
+/// user's process, a zombie). 64 KiB covers any realistic cmdline/environ.
+fn readProcFile(
+    allocator: Allocator,
+    proc_root: []const u8,
+    pid_name: []const u8,
+    file_name: []const u8,
+) ?[]u8 {
+    const path = std.fs.path.join(allocator, &.{ proc_root, pid_name, file_name }) catch return null;
+    defer allocator.free(path);
+    const file = std_compat.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    return file.readToEndAlloc(allocator, 64 * 1024) catch null;
+}
+
+fn containsNulEntry(data: []const u8, needle: []const u8) bool {
+    // An empty needle equals every NUL-delimited entry (and /proc/cmdline
+    // ends with a NUL), so it would match any process.
+    if (needle.len == 0) return false;
+    var it = std.mem.splitScalar(u8, data, 0);
+    while (it.next()) |entry| if (std.mem.eql(u8, entry, needle)) return true;
+    return false;
+}
+
+fn killOrphan(_: ?*anyopaque, pid: i32) void {
+    if (comptime builtin.os.tag == .windows) return;
+    // The sidecar leads its own process group (pgid = 0); kill the group so
+    // any workers dsh spawned die with it.
+    std.posix.kill(-pid, std.posix.SIG.KILL) catch {
+        std.posix.kill(pid, std.posix.SIG.KILL) catch {};
+    };
+}
+
+fn waitPidGone(allocator: Allocator, proc_root: []const u8, pid: i32) void {
+    const name = std.fmt.allocPrint(allocator, "{d}", .{pid}) catch return;
+    defer allocator.free(name);
+    const path = std.fs.path.join(allocator, &.{ proc_root, name }) catch return;
+    defer allocator.free(path);
+
+    const deadline = std_compat.time.milliTimestamp() + @as(i64, @intCast(ORPHAN_EXIT_TIMEOUT_MS));
+    while (std_compat.time.milliTimestamp() < deadline) {
+        std_compat.fs.accessAbsolute(path, .{}) catch return;
+        std_compat.thread.sleep(5 * std.time.ns_per_ms);
+    }
+}
+
 /// Exchange a launch URL for its owner cookie without spawning a process.
 /// Used by the harness when `boot_url` is injected (tests/external sidecar).
 pub fn fetchOwnerCookieForUrl(allocator: Allocator, boot_url: []const u8, timeout_ms: u64) ![]u8 {
@@ -200,6 +387,8 @@ pub const Sidecar = struct {
     argv: []const []const u8 = &.{},
     env_map: ?*std_compat.process.EnvMap = null,
     child: ?std_compat.process.Child = null,
+    /// The live child's pid (POSIX only), so a retry sweep can spare it.
+    child_pid: ?i32 = null,
     stdout_ctx: ?*OutputCtx = null,
     stdout_thread: ?std.Thread = null,
     stderr_thread: ?std.Thread = null,
@@ -227,6 +416,10 @@ pub const Sidecar = struct {
         self.arena.deinit();
     }
 
+    pub fn pid(self: *const Sidecar) ?i32 {
+        return self.child_pid;
+    }
+
     /// Kill the current process (and its group), back off, then reboot and
     /// exchange a fresh owner cookie. The backoff grows while restarts fail.
     pub fn restart(self: *Sidecar) !void {
@@ -251,8 +444,11 @@ pub const Sidecar = struct {
         const arena = self.arena.allocator();
 
         var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-        try argv.append(arena, self.opts.node_exe);
-        try argv.append(arena, self.opts.bin_js);
+        // The argv must outlive the caller's strings: `ensureBooted` frees its
+        // NULLCLAW_DSH_BIN copy when the spawn block ends, while restart()
+        // reuses argv. Keep owned copies in the sidecar arena.
+        try argv.append(arena, try arena.dupe(u8, self.opts.node_exe));
+        try argv.append(arena, try arena.dupe(u8, self.opts.bin_js));
         for ([_][]const u8{ "--profile", profile_mod.profile_name, "--no-open", "--host", "127.0.0.1", "--port", "0" }) |argument| {
             try argv.append(arena, argument);
         }
@@ -270,6 +466,11 @@ pub const Sidecar = struct {
     }
 
     fn spawnAndBoot(self: *Sidecar) !void {
+        // A gateway killed with SIGKILL leaves its sidecar running, still
+        // holding session.lock; clear those before dsh boots, or every resume
+        // answers session/writer-held.
+        reapOrphans(self.allocator, self.opts, null);
+
         var child = std_compat.process.Child.init(self.argv, self.allocator);
         child.cwd = self.opts.workspace;
         child.env_map = self.env_map;
@@ -280,6 +481,11 @@ pub const Sidecar = struct {
         try child.spawn();
 
         self.child = child;
+        if (comptime builtin.os.tag != .windows) self.child_pid = child.id;
+        // A failed boot must not leak a half-started process or its pipes:
+        // `restart` retries from a clean state, and a crash loop must not pile
+        // up children. `restart_attempt` is only reset by a successful boot.
+        errdefer self.stop();
         const stdout_file = child.stdout orelse return error.SidecarSpawnFailed;
         const stderr_file = child.stderr orelse return error.SidecarSpawnFailed;
 
@@ -323,6 +529,7 @@ pub const Sidecar = struct {
     }
 
     fn stop(self: *Sidecar) void {
+        self.child_pid = null;
         if (self.child) |*child| killTree(child);
 
         // The process group is dead, so the pipes report EOF and readers exit.
@@ -366,6 +573,62 @@ test "restart backoff starts at 200ms, doubles, and caps at 5s" {
     for (expected, 0..) |want, index| {
         try std.testing.expectEqual(want, backoffDelayMs(@intCast(index)));
     }
+}
+
+test "failed boot keeps the restart attempt and reaps the child" {
+    // Regression: a boot failure after spawn left the half-started child and
+    // its pipe threads running until the next restart (or forever, if the
+    // crash-loop cap stopped further restarts).
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    var self = Sidecar{
+        .allocator = allocator,
+        .opts = .{
+            .node_exe = "/bin/false",
+            .bin_js = "unused",
+            .workspace = ".",
+            .dsh_home = "/tmp/dsh-sidecar-test-home",
+            .boot_timeout_ms = 2_000,
+        },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer self.deinit();
+    try self.initSpawnArgs();
+
+    try std.testing.expectError(error.SidecarBootFailed, self.restart());
+    try std.testing.expectEqual(@as(u32, 1), self.restart_attempt);
+    try std.testing.expect(self.child == null);
+    try std.testing.expect(self.stdout_thread == null);
+    try std.testing.expect(self.stderr_thread == null);
+    try std.testing.expect(self.stdout_ctx == null);
+}
+
+test "spawn argv owns copies of node_exe and bin_js" {
+    // Regression: argv held slices into the caller's strings. `ensureBooted`
+    // frees its NULLCLAW_DSH_BIN copy when the spawn block ends, so restart()
+    // ran `node` with a dangling module path ("Cannot find module
+    // '/nullclaw-data/workspace/@…'") for every reused argv.
+    const allocator = std.testing.allocator;
+    const node_src = try allocator.dupe(u8, "node-test");
+    defer allocator.free(node_src);
+    const bin_src = try allocator.dupe(u8, "/opt/dsh/lib/bin.js");
+    defer allocator.free(bin_src);
+
+    var sidecar = Sidecar{
+        .allocator = allocator,
+        .opts = .{ .node_exe = node_src, .bin_js = bin_src, .workspace = "/tmp", .dsh_home = "/tmp" },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer sidecar.deinit();
+    try sidecar.initSpawnArgs();
+
+    // Stand in for the caller mutating its copies after start() returned.
+    @memset(node_src, 'X');
+    @memset(bin_src, 'X');
+    try std.testing.expectEqualStrings("node-test", sidecar.argv[0]);
+    try std.testing.expectEqualStrings("/opt/dsh/lib/bin.js", sidecar.argv[1]);
 }
 
 test "sidecar environment sets required defaults and honors overrides" {
@@ -427,4 +690,168 @@ test "boot URL has one owner across adopt and teardown" {
 
     sidecar.clearSessionState();
     try std.testing.expect(sidecar.boot_url == null);
+}
+
+fn writeProcEntry(dir: std_compat.fs.Dir, name: []const u8, cmdline: []const u8, environ: []const u8) !void {
+    try dir.makeDir(name);
+    var entry = try dir.openDir(name, .{});
+    defer entry.close();
+    try entry.writeFile(.{ .sub_path = "cmdline", .data = cmdline });
+    try entry.writeFile(.{ .sub_path = "environ", .data = environ });
+}
+
+test "collectOrphans matches dsh by bin path and DSH_HOME" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "100", "node\x00/opt/dsh/lib/bin.js\x00--profile\x00web\x00", "PATH=/usr/bin\x00DSH_HOME=/tmp/dsh-home\x00");
+    // Another DSH_HOME, another dsh install, the excluded live sidecar, and a
+    // non-pid entry: none of these belong to this engine.
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "101", "node\x00/opt/dsh/lib/bin.js\x00", "DSH_HOME=/tmp/other-home\x00");
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "102", "node\x00/opt/other/bin.js\x00", "DSH_HOME=/tmp/dsh-home\x00");
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "103", "node\x00/opt/dsh/lib/bin.js\x00", "DSH_HOME=/tmp/dsh-home\x00");
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "self", "nullclaw\x00", "DSH_HOME=/tmp/dsh-home\x00");
+
+    const pids = try collectOrphans(allocator, root, "/opt/dsh/lib/bin.js", "/tmp/dsh-home", 103, null);
+    defer allocator.free(pids);
+    try std.testing.expectEqualSlices(i32, &.{100}, pids);
+}
+
+const KillLog = struct {
+    allocator: Allocator,
+    root: []const u8,
+    pids: std.ArrayListUnmanaged(i32) = .empty,
+};
+
+fn recordKill(ctx: ?*anyopaque, pid: i32) void {
+    const log: *KillLog = @ptrCast(@alignCast(ctx.?));
+    log.pids.append(log.allocator, pid) catch {};
+    // Model the kernel reaping the process so the bounded wait returns now.
+    const name = std.fmt.allocPrint(log.allocator, "{d}", .{pid}) catch return;
+    defer log.allocator.free(name);
+    var dir = std_compat.fs.openDirAbsolute(log.root, .{}) catch return;
+    defer dir.close();
+    dir.deleteTree(name) catch {};
+}
+
+test "reapOrphansIn kills every leftover dsh for the home" {
+    // Regression: a SIGKILLed gateway left its sidecar as an orphan (PPid=1)
+    // holding session.lock; the next gateway's dsh answered session/writer-held.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "100", "node\x00/opt/dsh/lib/bin.js\x00", "DSH_HOME=/tmp/dsh-home\x00");
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "101", "node\x00/opt/dsh/lib/bin.js\x00", "DSH_HOME=/tmp/other-home\x00");
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "102", "node\x00/opt/dsh/lib/bin.js\x00", "DSH_HOME=/tmp/dsh-home\x00");
+
+    var log = KillLog{ .allocator = allocator, .root = root };
+    defer log.pids.deinit(allocator);
+    reapOrphansIn(allocator, root, "/opt/dsh/lib/bin.js", "/tmp/dsh-home", null, recordKill, &log);
+
+    try std.testing.expectEqualSlices(i32, &.{ 100, 102 }, log.pids.items);
+    // The sweep waited for each pid to leave the proc tree.
+    var dir = try std_compat.fs.openDirAbsolute(root, .{});
+    defer dir.close();
+    try std.testing.expectError(error.FileNotFound, dir.openDir("100", .{}));
+    try std.testing.expectError(error.FileNotFound, dir.openDir("102", .{}));
+}
+
+fn writeProcStat(dir: std_compat.fs.Dir, name: []const u8, ppid: i32) !void {
+    var entry = try dir.openDir(name, .{});
+    defer entry.close();
+    var buf: [64]u8 = undefined;
+    const stat = try std.fmt.bufPrint(&buf, "{s} (dsh) S {d} 1 1 1\n", .{ name, ppid });
+    try entry.writeFile(.{ .sub_path = "stat", .data = stat });
+}
+
+test "empty bin path never matches a gateway-shaped process" {
+    // Regression: an empty bin_js matched the trailing NUL of /proc/cmdline,
+    // so the sweep killed the gateway itself (argv "nullclaw", DSH_HOME set).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "100", "nullclaw\x00", "DSH_HOME=/tmp/dsh-home\x00");
+    const pids = try collectOrphans(allocator, root, "", "/tmp/dsh-home", null, null);
+    defer allocator.free(pids);
+    try std.testing.expectEqualSlices(i32, &.{}, pids);
+}
+
+test "sweep spares the gateway process tree and kills orphans" {
+    // Regression: every same-bin+home process was killed, including the live
+    // sidecar child of this gateway and the gateway's own ancestors.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = std_compat.fs.Dir.wrap(tmp.dir);
+    const root = try raw.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const cmdline = "node\x00/opt/dsh/lib/bin.js\x00";
+    const environ = "DSH_HOME=/tmp/dsh-home\x00";
+
+    // Gateway 999, its parent 500, and init.
+    try writeProcEntry(raw, "999", cmdline, environ);
+    try writeProcStat(raw, "999", 500);
+    try writeProcEntry(raw, "500", cmdline, environ);
+    try writeProcStat(raw, "500", 1);
+    // Children of the gateway: the live sidecar 200 and its grandchild 600.
+    try writeProcEntry(raw, "200", cmdline, environ);
+    try writeProcStat(raw, "200", 999);
+    try writeProcEntry(raw, "600", cmdline, environ);
+    try writeProcStat(raw, "600", 200);
+    // Orphans: adopted by init, and one whose parent is already gone.
+    try writeProcEntry(raw, "400", cmdline, environ);
+    try writeProcStat(raw, "400", 1);
+    try writeProcEntry(raw, "401", cmdline, environ);
+
+    const pids = try collectOrphans(allocator, root, "/opt/dsh/lib/bin.js", "/tmp/dsh-home", null, 999);
+    defer allocator.free(pids);
+    try std.testing.expectEqualSlices(i32, &.{ 400, 401 }, pids);
+}
+
+const ReapCtl = struct { calls: u32 = 0, last_exclude: ?i32 = null };
+
+fn countReap(ctx: ?*anyopaque, _: *const Options, exclude_pid: ?i32) void {
+    const ctl: *ReapCtl = @ptrCast(@alignCast(ctx.?));
+    ctl.calls += 1;
+    ctl.last_exclude = exclude_pid;
+}
+
+test "sidecar start reaps leftovers before spawning" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi or builtin.os.tag == .freestanding) {
+        return error.SkipZigTest;
+    }
+    const allocator = std.testing.allocator;
+    var ctl = ReapCtl{};
+    var self = Sidecar{
+        .allocator = allocator,
+        .opts = .{
+            .node_exe = "/bin/false",
+            .bin_js = "unused",
+            .workspace = ".",
+            .dsh_home = "/tmp/dsh-sidecar-test-home",
+            .boot_timeout_ms = 2_000,
+            .reap = countReap,
+            .reap_ctx = &ctl,
+        },
+        .arena = std.heap.ArenaAllocator.init(allocator),
+    };
+    defer self.deinit();
+    try self.initSpawnArgs();
+
+    try std.testing.expectError(error.SidecarBootFailed, self.spawnAndBoot());
+    try std.testing.expectEqual(@as(u32, 1), ctl.calls);
+    try std.testing.expectEqual(@as(?i32, null), ctl.last_exclude);
 }

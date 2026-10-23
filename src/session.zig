@@ -786,9 +786,10 @@ const AgentRuntime = struct {
 };
 
 /// Endpoint and wire protocol for the dsh route derived from junclaw's
-/// provider config. Null when dsh cannot speak the provider's protocol
-/// (Gemini/Vertex native APIs, Azure api-key auth, Ollama's native API, CLI
-/// providers); the profile is then left alone.
+/// provider config. Returns error.DshProviderUnsupported when dsh cannot
+/// speak the provider's protocol (Gemini/Vertex native APIs, Azure api-key
+/// auth, Ollama's native API, CLI providers) so the turn fails loudly instead
+/// of leaving the profile empty and letting dsh use its built-in model.
 const DshRouteEndpoint = struct {
     base_url: []const u8,
     api: []const u8,
@@ -805,7 +806,30 @@ fn dshOpenAiBaseUrl(raw: []const u8) []const u8 {
     return url;
 }
 
-fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoint {
+/// dsh appends `/v1/messages` (and does not duplicate a trailing `/v1`), so a
+/// configured base_url that already names the version or the full endpoint
+/// would otherwise turn into `/v1/v1/messages`.
+fn dshAnthropicBaseUrl(raw: []const u8) []const u8 {
+    var url = raw;
+    if (url.len > 0 and url[url.len - 1] == '/') url = url[0 .. url.len - 1];
+    if (std.mem.endsWith(u8, url, "/v1/messages")) return url[0 .. url.len - "/v1/messages".len];
+    if (std.mem.endsWith(u8, url, "/v1")) return url[0 .. url.len - "/v1".len];
+    return url;
+}
+
+fn dshOpenAiEndpoint(config: *const Config, provider: []const u8, base_url: []const u8) !DshRouteEndpoint {
+    const route_url = dshOpenAiBaseUrl(base_url);
+    if (route_url.len == 0) return error.DshProviderUrlInvalid;
+    return .{
+        .base_url = route_url,
+        .api = switch (config.getProviderApiMode(provider)) {
+            .responses => "openai-responses",
+            else => "openai-completions",
+        },
+    };
+}
+
+fn dshRouteEndpoint(config: *const Config, provider: []const u8) !DshRouteEndpoint {
     const kind = providers.classifyProvider(provider);
     switch (kind) {
         .anthropic_provider => {
@@ -814,15 +838,18 @@ fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoi
                 provider["anthropic-custom:".len..]
             else
                 config.getProviderBaseUrl(provider) orelse
-                    providers.factory.defaultProviderUrl(provider) orelse return null;
-            if (base_url.len == 0) return null;
-            return .{ .base_url = base_url, .api = "anthropic-messages" };
+                    providers.factory.defaultProviderUrl(provider) orelse return error.DshProviderUrlInvalid;
+            const route_url = dshAnthropicBaseUrl(base_url);
+            if (route_url.len == 0) return error.DshProviderUrlInvalid;
+            return .{ .base_url = route_url, .api = "anthropic-messages" };
         },
-        // These clients always talk to their fixed endpoint; config base_url
-        // and api_mode are ignored by createProvider.
-        .openai_provider, .openrouter_provider => return .{
-            .base_url = providers.factory.defaultProviderUrl(provider) orelse return null,
-            .api = "openai-completions",
+        // dsh speaks the OpenAI wire protocol for these clients, so honor the
+        // configured base_url and api_mode instead of forcing the vendor
+        // default that createProvider uses.
+        .openai_provider, .openrouter_provider => {
+            const base_url = config.getProviderBaseUrl(provider) orelse
+                providers.factory.defaultProviderUrl(provider) orelse return error.DshProviderUrlInvalid;
+            return dshOpenAiEndpoint(config, provider, base_url);
         },
         .compatible_provider, .unknown => {
             const base_url = config.getProviderBaseUrl(provider) orelse blk: {
@@ -838,17 +865,9 @@ fn dshRouteEndpoint(config: *const Config, provider: []const u8) ?DshRouteEndpoi
                 // fall back to the OpenRouter client.
                 return .{ .base_url = "https://openrouter.ai/api/v1", .api = "openai-completions" };
             };
-            const route_url = dshOpenAiBaseUrl(base_url);
-            if (route_url.len == 0) return null;
-            return .{
-                .base_url = route_url,
-                .api = switch (config.getProviderApiMode(provider)) {
-                    .responses => "openai-responses",
-                    else => "openai-completions",
-                },
-            };
+            return dshOpenAiEndpoint(config, provider, base_url);
         },
-        else => return null,
+        else => return error.DshProviderUnsupported,
     }
 }
 
@@ -2080,20 +2099,19 @@ pub const SessionManager = struct {
                 else
                     model_ref;
                 if (model.len > 0) {
-                    if (dshRouteEndpoint(self.config, provider)) |endpoint| {
-                        profile_base_url = try self.allocator.dupe(u8, endpoint.base_url);
-                        profile_model = try self.allocator.dupe(u8, model);
-                        const models = try self.allocator.alloc([]const u8, 1);
-                        models[0] = profile_model.?;
-                        profile_models = models;
-                        opts.sidecar.profile = .{
-                            .base_url = profile_base_url.?,
-                            .api = endpoint.api,
-                            .models = profile_models.?,
-                            .default_model = profile_model.?,
-                            .api_key = self.config.defaultProviderKey(),
-                        };
-                    }
+                    const endpoint = try dshRouteEndpoint(self.config, provider);
+                    profile_base_url = try self.allocator.dupe(u8, endpoint.base_url);
+                    profile_model = try self.allocator.dupe(u8, model);
+                    const models = try self.allocator.alloc([]const u8, 1);
+                    models[0] = profile_model.?;
+                    profile_models = models;
+                    opts.sidecar.profile = .{
+                        .base_url = profile_base_url.?,
+                        .api = endpoint.api,
+                        .models = profile_models.?,
+                        .default_model = profile_model.?,
+                        .api_key = self.config.defaultProviderKey(),
+                    };
                 }
             }
 
@@ -2739,6 +2757,31 @@ pub const SessionManager = struct {
         }
     };
 
+    /// User-facing text for a dsh turn that failed with a Zig error. Null
+    /// means "not a dsh failure the user can act on", so the error propagates
+    /// unchanged (OOM, protocol bugs, native-path errors).
+    fn dshTurnErrorMessage(allocator: Allocator, err: anyerror) ?[]const u8 {
+        const text = switch (err) {
+            error.SidecarBootFailed => "dsh 引擎启动失败，请检查 dsh 安装与配置后重试。",
+            error.ConnectionLost => "与 dsh 引擎的连接已断开，请稍后重试。",
+            error.TurnTimeout => "dsh 引擎响应超时，请稍后重试。",
+            error.WsHandshakeFailed => "无法与 dsh 引擎建立连接（WebSocket 握手失败），请稍后重试。",
+            error.DshProviderUnsupported => "该 provider 不支持 dsh harness，请用 agent.harness=native 或换 provider。",
+            error.DshProviderUrlInvalid => "dsh 路由的 provider base_url 无效，请检查 models.providers 配置。",
+            else => return null,
+        };
+        return allocator.dupe(u8, text) catch null;
+    }
+
+    /// dsh reports an upstream provider failure (500/429) as `turn_result.error`
+    /// text while returning an empty or partial reply. Keep any partial reply
+    /// and append the mapped failure so the user sees why the turn ended.
+    fn dshFailedTurnReply(allocator: Allocator, upstream: []const u8, partial: []const u8) ![]const u8 {
+        if (partial.len == 0)
+            return std.fmt.allocPrint(allocator, "上游模型服务返回错误：{s}", .{upstream});
+        return std.fmt.allocPrint(allocator, "{s}\n\n上游模型服务返回错误：{s}", .{ partial, upstream });
+    }
+
     /// Track every message consumed by one Agent.turn, including messages
     /// drained while a post-turn follow-up is itself running.
     ///
@@ -2791,9 +2834,32 @@ pub const SessionManager = struct {
             input.drain_ctx = drain_ctx;
             break :blk session.turnHarness().runTurn(input) catch |err| {
                 finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                // A dsh engine failure is a reply the user can act on; native
+                // errors keep propagating to the existing classification path.
+                if (comptime dsh_enabled) {
+                    if (session.dsh != null) {
+                        if (dshTurnErrorMessage(self.allocator, err)) |message| {
+                            session.agent.last_turn_interrupted = false;
+                            return message;
+                        }
+                    }
+                }
                 return err;
             };
         };
+        // Regression: the port's failure text was only freed, so a dsh turn
+        // that ended with an upstream 500/429 surfaced as an empty reply.
+        if (comptime dsh_enabled) {
+            if (session.dsh != null) {
+                if (turn_result.@"error") |message| {
+                    defer self.allocator.free(message);
+                    defer self.allocator.free(turn_result.reply);
+                    session.agent.last_turn_interrupted = false;
+                    finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                    return try dshFailedTurnReply(self.allocator, message, turn_result.reply);
+                }
+            }
+        }
         // Only `reply` is returned; the port hands failure text to the host.
         defer if (turn_result.@"error") |message| self.allocator.free(message);
         // dsh reports interruption through the port; the host's /stop tail
@@ -3115,7 +3181,12 @@ pub const SessionManager = struct {
             return gate_reply;
         }
 
-        const session = try self.getOrCreateForTurn(session_key, true);
+        const session = self.getOrCreateForTurn(session_key, true) catch |err| {
+            // dsh routing failures surface while creating the session; return
+            // the actionable text instead of a bare Zig error name.
+            if (dshTurnErrorMessage(self.allocator, err)) |message| return message;
+            return err;
+        };
         errdefer self.abandonTurn(session);
 
         // A /stop that landed before this session existed recorded a pre-turn
@@ -6554,36 +6625,38 @@ test "agent.harness=dsh is ignored in a default build" {
 test "dsh route maps providers to dsh endpoints and protocols" {
     const cfg = testConfig();
 
-    const anthropic = dshRouteEndpoint(&cfg, "anthropic").?;
+    const anthropic = try dshRouteEndpoint(&cfg, "anthropic");
     try testing.expectEqualStrings("https://api.anthropic.com", anthropic.base_url);
     try testing.expectEqualStrings("anthropic-messages", anthropic.api);
 
-    const openai = dshRouteEndpoint(&cfg, "openai").?;
+    const openai = try dshRouteEndpoint(&cfg, "openai");
     try testing.expectEqualStrings("https://api.openai.com/v1", openai.base_url);
     try testing.expectEqualStrings("openai-completions", openai.api);
 
-    const openrouter = dshRouteEndpoint(&cfg, "openrouter").?;
+    const openrouter = try dshRouteEndpoint(&cfg, "openrouter");
     try testing.expectEqualStrings("https://openrouter.ai/api/v1", openrouter.base_url);
     try testing.expectEqualStrings("openai-completions", openrouter.api);
 
-    const custom = dshRouteEndpoint(&cfg, "custom:https://api.example.com/v1").?;
+    const custom = try dshRouteEndpoint(&cfg, "custom:https://api.example.com/v1");
     try testing.expectEqualStrings("https://api.example.com/v1", custom.base_url);
     try testing.expectEqualStrings("openai-completions", custom.api);
 
-    const anthropic_custom = dshRouteEndpoint(&cfg, "anthropic-custom:https://api.example.com").?;
+    const anthropic_custom = try dshRouteEndpoint(&cfg, "anthropic-custom:https://api.example.com");
     try testing.expectEqualStrings("https://api.example.com", anthropic_custom.base_url);
     try testing.expectEqualStrings("anthropic-messages", anthropic_custom.api);
 
     // A compatible URL may already name the full request endpoint; dsh appends
     // the path itself.
-    const full_endpoint = dshRouteEndpoint(&cfg, "custom:https://api.example.com/v1/chat/completions").?;
+    const full_endpoint = try dshRouteEndpoint(&cfg, "custom:https://api.example.com/v1/chat/completions");
     try testing.expectEqualStrings("https://api.example.com/v1", full_endpoint.base_url);
     try testing.expectEqualStrings("openai-completions", full_endpoint.api);
 
     // No dsh protocol for these clients.
-    try testing.expect(dshRouteEndpoint(&cfg, "gemini") == null);
-    try testing.expect(dshRouteEndpoint(&cfg, "vertex") == null);
-    try testing.expect(dshRouteEndpoint(&cfg, "ollama") == null);
+    try testing.expectError(error.DshProviderUnsupported, dshRouteEndpoint(&cfg, "gemini"));
+    try testing.expectError(error.DshProviderUnsupported, dshRouteEndpoint(&cfg, "vertex"));
+    try testing.expectError(error.DshProviderUnsupported, dshRouteEndpoint(&cfg, "azure"));
+    try testing.expectError(error.DshProviderUnsupported, dshRouteEndpoint(&cfg, "ollama"));
+    try testing.expectError(error.DshProviderUnsupported, dshRouteEndpoint(&cfg, "claude-cli"));
 
     var provider_list = [_]config_types.ProviderEntry{.{
         .name = "proxy",
@@ -6593,9 +6666,113 @@ test "dsh route maps providers to dsh endpoints and protocols" {
     }};
     var proxy_cfg = testConfig();
     proxy_cfg.providers = &provider_list;
-    const proxy = dshRouteEndpoint(&proxy_cfg, "proxy").?;
+    const proxy = try dshRouteEndpoint(&proxy_cfg, "proxy");
     try testing.expectEqualStrings("https://api.example.com/v1", proxy.base_url);
     try testing.expectEqualStrings("openai-responses", proxy.api);
+}
+
+test "dsh route prefers configured openai and openrouter base urls" {
+    // Regression: the openai/openrouter dsh route forced defaultProviderUrl
+    // and ignored models.providers[...].base_url, so requests bypassed the
+    // configured proxy or gateway.
+    var providers_cfg = [_]config_types.ProviderEntry{
+        .{
+            .name = "openai",
+            .api_key = "test-key",
+            .base_url = "https://gateway.example.com/v1/chat/completions",
+        },
+        .{
+            .name = "openrouter",
+            .api_key = "test-key",
+            .base_url = "https://router.example.com/api/v1",
+        },
+    };
+    var cfg = testConfig();
+    cfg.providers = &providers_cfg;
+
+    const openai = try dshRouteEndpoint(&cfg, "openai");
+    try testing.expectEqualStrings("https://gateway.example.com/v1", openai.base_url);
+    try testing.expectEqualStrings("openai-completions", openai.api);
+
+    const openrouter = try dshRouteEndpoint(&cfg, "openrouter");
+    try testing.expectEqualStrings("https://router.example.com/api/v1", openrouter.base_url);
+    try testing.expectEqualStrings("openai-completions", openrouter.api);
+}
+
+test "dsh route maps openai api_mode responses to the responses protocol" {
+    // Regression: api_mode=responses was ignored for the openai provider, so
+    // dsh sent chat-completions requests to a responses-only endpoint.
+    var providers_cfg = [_]config_types.ProviderEntry{.{
+        .name = "openai",
+        .api_key = "test-key",
+        .api_mode = .responses,
+    }};
+    var cfg = testConfig();
+    cfg.providers = &providers_cfg;
+
+    const openai = try dshRouteEndpoint(&cfg, "openai");
+    try testing.expectEqualStrings("https://api.openai.com/v1", openai.base_url);
+    try testing.expectEqualStrings("openai-responses", openai.api);
+}
+
+test "agent.harness=dsh fails loudly for a provider dsh cannot route" {
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    // Regression: an unsupported provider left the profile empty, letting dsh
+    // silently fall back to its built-in default model.
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.default_provider = "gemini";
+    cfg.default_model = "gemini/gemini-pro";
+    cfg.agent.harness = .dsh;
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    try testing.expectError(error.DshProviderUnsupported, sm.getOrCreate("cli:main:local"));
+}
+
+test "dsh route strips anthropic version and messages suffixes" {
+    // Regression: an anthropic base_url ending in /v1 or /v1/messages made dsh
+    // request /v1/v1/messages (404).
+    {
+        var providers_cfg = [_]config_types.ProviderEntry{.{
+            .name = "anthropic",
+            .api_key = "test-key",
+            .base_url = "https://api.example.com/v1",
+        }};
+        var cfg = testConfig();
+        cfg.providers = &providers_cfg;
+        const endpoint = try dshRouteEndpoint(&cfg, "anthropic");
+        try testing.expectEqualStrings("https://api.example.com", endpoint.base_url);
+        try testing.expectEqualStrings("anthropic-messages", endpoint.api);
+    }
+    {
+        var providers_cfg = [_]config_types.ProviderEntry{.{
+            .name = "anthropic",
+            .api_key = "test-key",
+            .base_url = "https://api.example.com/v1/messages",
+        }};
+        var cfg = testConfig();
+        cfg.providers = &providers_cfg;
+        const endpoint = try dshRouteEndpoint(&cfg, "anthropic");
+        try testing.expectEqualStrings("https://api.example.com", endpoint.base_url);
+    }
+    {
+        var providers_cfg = [_]config_types.ProviderEntry{.{
+            .name = "anthropic",
+            .api_key = "test-key",
+            .base_url = "https://v1.example.com",
+        }};
+        var cfg = testConfig();
+        cfg.providers = &providers_cfg;
+        // A host named v1 is not a version path.
+        const endpoint = try dshRouteEndpoint(&cfg, "anthropic");
+        try testing.expectEqualStrings("https://v1.example.com", endpoint.base_url);
+    }
+    {
+        var cfg = testConfig();
+        const endpoint = try dshRouteEndpoint(&cfg, "anthropic-custom:https://api.example.com/v1/messages");
+        try testing.expectEqualStrings("https://api.example.com", endpoint.base_url);
+    }
 }
 
 test "agent.harness=dsh selects the dsh engine in a dsh build" {
@@ -6844,6 +7021,78 @@ test "dsh boot does not block session creation under the manager lock" {
     const reply = turn.reply.?;
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("slow boot", reply);
+}
+
+test "dsh turn failures map to user-facing text" {
+    const cases = [_]struct { err: anyerror, needle: []const u8 }{
+        .{ .err = error.SidecarBootFailed, .needle = "dsh 引擎启动失败" },
+        .{ .err = error.ConnectionLost, .needle = "连接已断开" },
+        .{ .err = error.TurnTimeout, .needle = "响应超时" },
+        .{ .err = error.WsHandshakeFailed, .needle = "WebSocket 握手失败" },
+        .{ .err = error.DshProviderUnsupported, .needle = "该 provider 不支持 dsh harness，请用 agent.harness=native 或换 provider" },
+        .{ .err = error.DshProviderUrlInvalid, .needle = "base_url 无效" },
+    };
+    for (cases) |case| {
+        const message = SessionManager.dshTurnErrorMessage(testing.allocator, case.err).?;
+        defer testing.allocator.free(message);
+        try testing.expect(std.mem.indexOf(u8, message, case.needle) != null);
+    }
+    try testing.expect(SessionManager.dshTurnErrorMessage(testing.allocator, error.OutOfMemory) == null);
+}
+
+test "dsh failed turn reply copies a 64KB upstream message without leaking" {
+    const upstream = try testing.allocator.alloc(u8, 64 * 1024 + 7);
+    defer testing.allocator.free(upstream);
+    @memset(upstream, 'e');
+
+    const reply = try SessionManager.dshFailedTurnReply(testing.allocator, upstream, "");
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.endsWith(u8, reply, upstream));
+
+    const combined = try SessionManager.dshFailedTurnReply(testing.allocator, upstream, "partial answer");
+    defer testing.allocator.free(combined);
+    try testing.expect(std.mem.startsWith(u8, combined, "partial answer\n\n"));
+}
+
+test "dsh upstream turn error reaches the user instead of an empty reply" {
+    // Regression: the port's `error` text was freed without being shown, so an
+    // upstream 500/429 ended the turn with an empty reply.
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const mock_mod = @import("harness/dsh/mock.zig");
+    var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
+    defer dsh_mock.deinit();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var setup = try dshSessionTestConfig(&tmp);
+    defer testing.allocator.free(setup.base);
+    defer testing.allocator.free(setup.config_path);
+
+    const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
+        dsh_mock.port(),
+        mock_mod.test_token,
+    });
+    defer testing.allocator.free(boot_url);
+    dsh_test_boot_url = boot_url;
+    defer dsh_test_boot_url = null;
+
+    const error_frame = try std.fmt.allocPrint(
+        testing.allocator,
+        "{{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{{\"type\":\"event\"," ++
+            "\"event\":{{\"type\":\"turn/end\",\"data\":{{\"reason\":{{\"kind\":\"error\"," ++
+            "\"error\":{{\"message\":{f}}}}}}}}}}}}}",
+        .{std.json.fmt("upstream provider returned 429", .{})},
+    );
+    defer testing.allocator.free(error_frame);
+    try dsh_mock.setTurnFrames(&.{error_frame});
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &setup.cfg);
+    defer sm.deinit();
+
+    const reply = try sm.processMessageStreaming("cli:main:dsh-upstream-error", "hello", null, null, null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("上游模型服务返回错误：upstream provider returned 429", reply);
 }
 
 test "harness display trust uses the real session key for shared channels" {

@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const std_compat = @import("compat");
 const client_mod = @import("client.zig");
 const protocol = @import("protocol.zig");
 const mock_mod = @import("mock.zig");
@@ -85,6 +86,72 @@ test "mock dsh exchanges the boot token for an owner cookie" {
     try std.testing.expectEqualStrings(mock_mod.session_id, session);
 }
 
+test "mock dsh answers unrouted methods with 404 like the gateway" {
+    // Regression: every unknown method answered ok:true, so a call to a method
+    // the real gateway does not route (session/resume exists only in the stdio
+    // SDK) stayed green here and 404ed in production.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var client = try newClient(allocator, mock);
+    defer client.deinit();
+    try std.testing.expectError(
+        error.UnexpectedStatus,
+        client.call("session/resume", "{\"sessionId\":\"mock-sess-1\"}"),
+    );
+}
+
+/// Send a WebSocket upgrade by hand so a 409 rejection does not go through the
+/// client's handshake logging (the test runner fails a test on any err log).
+fn rawMuxUpgrade(allocator: Allocator, mock: *MockDsh) ![]u8 {
+    const address = try std_compat.net.Address.parseIp("127.0.0.1", mock.port());
+    const stream = try std_compat.net.tcpConnectToAddress(address);
+    defer stream.close();
+    try stream.writeAll(
+        "GET /api/remote.mux HTTP/1.1\r\n" ++
+            "Host: 127.0.0.1\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Sec-WebSocket-Key: dGVzdA==\r\n" ++
+            "Sec-WebSocket-Version: 13\r\n\r\n",
+    );
+    var buffer: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buffer.deinit(allocator);
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        const n = stream.read(&chunk) catch break;
+        if (n == 0) break;
+        try buffer.appendSlice(allocator, chunk[0..n]);
+        if (std.mem.indexOf(u8, buffer.items, "\r\n\r\n") != null) break;
+    }
+    return buffer.toOwnedSlice(allocator);
+}
+
+test "mock dsh rejects a second WebSocket with 409 Conflict" {
+    // Regression: dsh admits one socket per authenticated peer
+    // (rpc-host.ts admitConnection answers 409 to a second one). The old
+    // harness opened one WS per key, so the second key failed its handshake.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var first = try newClient(allocator, mock);
+    defer first.deinit();
+    const session = try first.createSession("/workspace");
+    defer allocator.free(session);
+    try first.connect(session);
+
+    const response = try rawMuxUpgrade(allocator, mock);
+    defer allocator.free(response);
+    try std.testing.expect(std.mem.startsWith(u8, response, "HTTP/1.1 409 Conflict"));
+
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 1), mock.wsRejections());
+}
+
 test "mock dsh streams text deltas in order" {
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
     const allocator = std.testing.allocator;
@@ -129,6 +196,40 @@ test "mock dsh streams text deltas in order" {
     }
     try std.testing.expectEqualStrings("one two three", text.items);
     try std.testing.expect(saw_completed);
+}
+
+test "a 64 KiB delta routes through the mux" {
+    // The testing allocator fails this test on any leaked frame, event or
+    // stream string on the new subscription path.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const text = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(text);
+    @memset(text, 'x');
+    const delta = try mock_mod.textDeltaFrame(allocator, 0, text);
+    defer allocator.free(delta);
+    try mock.setTurnFrames(&.{ delta, mock_mod.turn_completed_frame });
+
+    var client = try newClient(allocator, mock);
+    defer client.deinit();
+    const session = try newSession(allocator, &client);
+    defer allocator.free(session);
+    try client.prompt(session, "big");
+
+    var event = try client.nextEvent(wait_ms);
+    defer client_mod.freeEvent(allocator, &event);
+    switch (event.event) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .text_delta => |value| try std.testing.expectEqual(@as(usize, 64 * 1024), value.text.len),
+            else => return error.TestUnexpectedEvent,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+    var end = try client.nextEvent(wait_ms);
+    defer client_mod.freeEvent(allocator, &end);
 }
 
 test "turn/end kinds map at the protocol layer" {

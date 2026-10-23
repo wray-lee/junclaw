@@ -6,6 +6,7 @@ const std_compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const port = @import("../port.zig");
 const harness_mod = @import("harness.zig");
+const client_mod = @import("client.zig");
 const mock_mod = @import("mock.zig");
 const sidecar_mod = @import("sidecar.zig");
 const profile_mod = @import("profile.zig");
@@ -45,6 +46,51 @@ fn freeEngine(engine: *DshEngine) void {
     const allocator = engine.allocator;
     engine.deinit();
     allocator.destroy(engine);
+}
+
+/// Test seam standing in for the sidecar process: each call "boots" the mock
+/// and returns its URL. Tests script failures to model a crash loop.
+const SpawnCtl = struct {
+    mock: *MockDsh,
+    /// Successful and failed spawn calls, including the initial boot.
+    calls: u32 = 0,
+    /// Fail this many recovery calls (never the initial boot).
+    fail_calls: u32 = 0,
+
+    fn spawn(ctx: ?*anyopaque, allocator: Allocator) anyerror![]u8 {
+        const self: *SpawnCtl = @ptrCast(@alignCast(ctx.?));
+        self.calls += 1;
+        if (self.calls > 1) {
+            if (self.fail_calls > 0) {
+                self.fail_calls -= 1;
+                return error.ConnectionRefused;
+            }
+            self.mock.revive();
+        }
+        return std.fmt.allocPrint(
+            allocator,
+            "http://127.0.0.1:{d}/?token={s}",
+            .{ self.mock.port(), mock_mod.test_token },
+        );
+    }
+};
+
+/// Engine that owns a (simulated) sidecar, so crash recovery is enabled.
+fn newManagedEngine(
+    allocator: Allocator,
+    ctl: *SpawnCtl,
+    session_file: ?[]const u8,
+) !*DshEngine {
+    const engine = try allocator.create(DshEngine);
+    engine.* = DshEngine.init(allocator, .{
+        .sidecar = .{ .bin_js = "unused", .workspace = test_cwd, .dsh_home = "/tmp/dsh-home" },
+        .session_file = session_file,
+        .turn_timeout_ms = 5_000,
+        .cancel_timeout_ms = 5_000,
+    });
+    engine.spawn_override = SpawnCtl.spawn;
+    engine.spawn_ctx = ctl;
+    return engine;
 }
 
 /// Absolute path inside a test tmp dir, so the harness can create the file.
@@ -172,6 +218,14 @@ fn waitForSink(sink: *RecordingSink, at_least: usize) void {
 fn waitForPrompt(mock: *MockDsh, at_least: u32) void {
     const deadline = std_compat.time.milliTimestamp() + 5_000;
     while (mock.promptCount() < at_least and std_compat.time.milliTimestamp() < deadline) {
+        std_compat.thread.sleep(std.time.ns_per_ms);
+    }
+}
+
+/// Hang guard, never asserted: waits until the subscription has queued frames.
+fn waitForQueued(sub: *client_mod.Subscription, at_least: usize) void {
+    const deadline = std_compat.time.milliTimestamp() + 5_000;
+    while (sub.queuedCount() < at_least and std_compat.time.milliTimestamp() < deadline) {
         std_compat.thread.sleep(std.time.ns_per_ms);
     }
 }
@@ -346,6 +400,57 @@ test "dsh /stop keeps a committed partial with no deltas" {
     defer allocator.free(result.reply);
 
     try std.testing.expectEqualStrings("partial answer", result.reply);
+    try std.testing.expectEqual(port.EndReason.interrupted, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+}
+
+test "dsh /stop racing a finished turn keeps the streamed reply" {
+    // Regression: when the turn ended between the /stop flag and the RPC, dsh
+    // answered session/not-found; cancelOn turned that into error.RpcFailed and
+    // runTurn's errdefer dropped the reply the user had already seen.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    // The turn streams one delta and completes; the sink holds the turn thread
+    // after the delta, so /stop lands while the terminal frame is already out.
+    const delta = try mock_mod.textDeltaFrame(allocator, 0, "partial");
+    defer allocator.free(delta);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ delta, end });
+    // By the time the cancel RPC arrives the agent is detached.
+    mock.setCancelNotFound(true);
+
+    var sink = RecordingSink{
+        .block_after = 0,
+        .released = std.atomic.Value(bool).init(false),
+    };
+    var turn = TurnThread{ .harness = &h, .input = .{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+
+    waitForSink(&sink, 1);
+    const ack = try h.harness().handleLocalCommand("/stop");
+    try std.testing.expectEqualStrings("No active background task to stop.", ack.?);
+    sink.released.store(true, .release);
+
+    thread.join();
+    try std.testing.expect(turn.failure == null);
+    const result = turn.result.?;
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("partial", result.reply);
     try std.testing.expectEqual(port.EndReason.interrupted, result.end_reason);
     try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
 }
@@ -661,11 +766,54 @@ test "dsh two keys run their own sessions on one engine" {
     try std.testing.expectEqualStrings("alpha", first.reply);
     try std.testing.expectEqualStrings("beta", second.reply);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
-    // One process-wide engine: two keys share a single boot/connect.
+    // One process-wide engine: two keys share a single boot/connect and the
+    // one WebSocket dsh admits for this API token.
     try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
     // Each prompt landed on the session the key created for itself.
     try std.testing.expectEqualStrings("mock-sess-1", first_session);
     try std.testing.expectEqualStrings("mock-sess-2", second_session);
+}
+
+test "dsh three keys stream over one admitted WebSocket" {
+    // Regression: dsh admits one WS per authenticated peer (rpc-host.ts
+    // admitConnection answers 409 to a second socket). The old per-key client
+    // opened a second WS, got 409 Conflict, and that key's turn failed with
+    // WsHandshakeFailed and an empty reply.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "test-key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "test-key-b");
+    defer hb.deinit();
+    var hc = try DshHarness.init(engine, "test-key-c");
+    defer hc.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"alpha"}, "completed");
+    const first = try runOneTurn(&ha, "hi");
+    defer allocator.free(first.reply);
+    try setTurnFrames(mock, allocator, &.{"beta"}, "completed");
+    const second = try runOneTurn(&hb, "hi");
+    defer allocator.free(second.reply);
+    try setTurnFrames(mock, allocator, &.{"gamma"}, "completed");
+    const third = try runOneTurn(&hc, "hi");
+    defer allocator.free(third.reply);
+
+    try std.testing.expectEqualStrings("alpha", first.reply);
+    try std.testing.expectEqualStrings("beta", second.reply);
+    try std.testing.expectEqualStrings("gamma", third.reply);
+    try std.testing.expectEqual(@as(u32, 3), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
 
 test "dsh key switch reuses its session and leaves the other key open" {
@@ -702,7 +850,9 @@ test "dsh key switch reuses its session and leaves the other key open" {
     try std.testing.expectEqualStrings("mock-sess-1", prompted);
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
     try std.testing.expectEqual(@as(u32, 0), mock.closeCount());
-    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
+    // Both keys follow over the one admitted mux socket.
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
 
 test "dsh /new closes only its key's session" {
@@ -908,6 +1058,10 @@ test "dsh concurrent turns keep their own session key" {
     try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
     try std.testing.expectEqual(@as(u32, 2), mock.createCount());
     try std.testing.expectEqual(@as(u32, 1), mock.connectCount());
+    // Concurrent first turns must still open exactly one mux socket: the
+    // 409-on-second-socket mock would fail one of the turns otherwise.
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
 }
 
 /// Engine whose boot rewrites a junclaw-owned profile route.
@@ -1139,4 +1293,924 @@ test "dsh engine surfaces an RPC timeout and the next turn recovers" {
     // The released first request still runs in the mock, so only require that
     // the recovered turn created a session of its own.
     try std.testing.expect(mock.createCount() >= 1);
+}
+
+test "dsh turn timeout cancels and drains before reporting" {
+    // Regression: TurnTimeout returned without session/cancel, so the dsh turn
+    // kept running and its frames landed in the next turn.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    engine.opts.turn_timeout_ms = 5;
+    engine.opts.cancel_timeout_ms = 5_000;
+    // The cancel streams text and the turn only ends with its aborted frame.
+    const late = try mock_mod.textDeltaFrame(allocator, 0, "late");
+    defer allocator.free(late);
+    try mock.setTurnFrames(&.{});
+    try mock.setCancelFrames(&.{late});
+
+    try std.testing.expectError(error.TurnTimeout, runOneTurn(&h, "one"));
+    // The engine cancelled and drained the aborted turn/end before returning.
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+
+    try setTurnFrames(mock, allocator, &.{"second"}, "completed");
+    const result = try runOneTurn(&h, "two");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("second", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+}
+
+test "dsh turn timeout without a cancel ack returns partial text" {
+    // Regression: CancelTimeout propagated as an error, dropping the text the
+    // turn had already streamed to the user.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    // Generous enough that the prompt's delta is parked in the sink before the
+    // deadline; the sink then holds the loop until the test releases it.
+    engine.opts.turn_timeout_ms = 500;
+    engine.opts.cancel_timeout_ms = 5;
+    // The cancel acks but never ends the turn.
+    mock.setCancelEndsTurn(false);
+    try setTurnFrames(mock, allocator, &.{"partial"}, null);
+
+    // Hold the loop inside the delta so the deadline passes with text already
+    // accumulated: the sink gates the ordering, no wall-clock assertion.
+    var sink = RecordingSink{
+        .block_after = 0,
+        .released = std.atomic.Value(bool).init(false),
+    };
+    var turn = TurnThread{ .harness = &h, .input = .{
+        .user_message = "one",
+        .sink = sink.sink(),
+        .live_stream = true,
+    } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+
+    waitForSink(&sink, 1);
+    try std.testing.expectEqualStrings("partial", sink.text());
+    sink.released.store(true, .release);
+    thread.join();
+
+    try std.testing.expect(turn.failure == null);
+    const result = turn.result.?;
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("partial", result.reply);
+    try std.testing.expectEqual(port.EndReason.failed, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+}
+
+test "dsh cancel timeout drops the old turn's frames before the next prompt" {
+    // Regression: a cancel that acked but never ended the turn left the old
+    // turn's delta/committed/turn_end in the per-session queue; the next turn
+    // consumed them as its own reply instead of the new turn's frames.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    // The turn stays in flight; the cancel acks and gives up at once, then the
+    // still-running turn's frames arrive in the persistent subscription queue.
+    engine.opts.cancel_timeout_ms = 0;
+    mock.setCancelEndsTurn(false);
+    try mock.setTurnFrames(&.{});
+    const stale_delta = try mock_mod.textDeltaFrame(allocator, 0, "stale ");
+    defer allocator.free(stale_delta);
+    const stale_committed = try mock_mod.committedMessageFrame(allocator, "stale answer", true);
+    defer allocator.free(stale_committed);
+    const stale_end = try endFrame(allocator, "completed");
+    defer allocator.free(stale_end);
+    try mock.setCancelFrames(&.{ stale_delta, stale_committed, stale_end });
+
+    var turn = TurnThread{ .harness = &h, .input = .{ .user_message = "one" } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+    waitForPrompt(mock, 1);
+    const ack = try h.harness().handleLocalCommand("/stop");
+    try std.testing.expectEqualStrings("No active background task to stop.", ack.?);
+    thread.join();
+    try std.testing.expect(turn.failure == null);
+    const first = turn.result.?;
+    defer allocator.free(first.reply);
+    try std.testing.expectEqual(port.EndReason.interrupted, first.end_reason);
+
+    // The old turn's frames land after runTurn returned; the next turn must
+    // ignore them and answer only from its own frames.
+    const entry = engine.acquireExisting("test-key").?;
+    defer engine.releaseEntry(entry);
+    waitForQueued(entry.sub, 3);
+    try std.testing.expect(entry.sub.queuedCount() >= 3);
+
+    try setTurnFrames(mock, allocator, &.{"second"}, "completed");
+    const result = try runOneTurn(&h, "two");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("second", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+}
+
+test "dsh turn timeout consumes a stop armed during the cancel drain" {
+    // Regression: a /stop armed while the timeout cancel drained stayed set
+    // and cancelled the next prompt instead of ending with the timed-out turn.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    engine.opts.turn_timeout_ms = 5;
+    engine.opts.cancel_timeout_ms = 5_000;
+    try mock.setTurnFrames(&.{});
+    var gate = mock_mod.ConnectGate{};
+    mock.setRpcGate(&gate, "session/cancel");
+
+    var turn = TurnThread{ .harness = &h, .input = .{ .user_message = "one" } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+    gate.waitEntered();
+    // The turn still holds its mutex, so this stop targets the timed-out turn.
+    h.harness().requestInterrupt();
+    gate.open();
+    thread.join();
+
+    try std.testing.expectEqual(error.TurnTimeout, turn.failure.?);
+    try std.testing.expectEqual(@as(u32, 1), mock.cancelCount());
+
+    // The stop was consumed by the timed-out turn; it must not cancel this
+    // prompt pre-emptively.
+    try setTurnFrames(mock, allocator, &.{"second"}, "completed");
+    const result = try runOneTurn(&h, "two");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("second", result.reply);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+}
+
+test "dsh port reset starts a fresh dsh session for its key" {
+    // Regression: reset() was a no-op, so /new through the port hook kept
+    // prompting the old dsh session.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_file = try tempSessionFile(allocator, &tmp);
+    defer allocator.free(session_file);
+    const mapping = try keySessionFile(allocator, session_file, "test-key");
+    defer allocator.free(mapping);
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"first"}, "completed");
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+    try std.testing.expectEqualStrings("first", first.reply);
+    try std.testing.expectEqual(@as(u32, 1), mock.createCount());
+
+    h.harness().reset();
+    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.closeCount());
+    try std.testing.expect(mock.wasClosed("mock-sess-1"));
+
+    try setTurnFrames(mock, allocator, &.{"second"}, "completed");
+    const second = try runOneTurn(&h, "two");
+    defer allocator.free(second.reply);
+    try std.testing.expectEqualStrings("second", second.reply);
+
+    const prompted = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(prompted);
+    try std.testing.expectEqualStrings("mock-sess-2", prompted);
+    const persisted = (try sidecar_mod.loadSessionId(allocator, mapping)).?;
+    defer allocator.free(persisted);
+    try std.testing.expectEqualStrings("mock-sess-2", persisted);
+}
+
+test "dsh failed reset makes the next turn report instead of reusing the old session" {
+    // Regression: a failed /new left the key on the old dsh session, so the
+    // next turn silently continued the cleared conversation.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_file = try tempSessionFile(allocator, &tmp);
+    defer allocator.free(session_file);
+    const map_a = try keySessionFile(allocator, session_file, "key-a");
+    defer allocator.free(map_a);
+    const map_b = try keySessionFile(allocator, session_file, "key-b");
+    defer allocator.free(map_b);
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, session_file);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "key-b");
+    defer hb.deinit();
+
+    mock.setEchoPrompts(true);
+    const first_a = try runOneTurn(&ha, "one");
+    defer allocator.free(first_a.reply);
+    const first_b = try runOneTurn(&hb, "one");
+    defer allocator.free(first_b.reply);
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+
+    // Rewriting the mapping fails when its path is a directory: the eager
+    // create succeeds, so the swap is half done and must not be reused.
+    try fs_compat.deletePath(map_a);
+    try std_compat.fs.makeDirAbsolute(map_a);
+    try fs_compat.deletePath(map_b);
+    try std_compat.fs.makeDirAbsolute(map_b);
+
+    // handleLocalCommand path: the error reaches the caller.
+    try std.testing.expectError(error.IsDir, ha.harness().handleLocalCommand("/new"));
+    // Port path: void, so the failure only surfaces on the next turn.
+    hb.harness().reset();
+
+    try std.testing.expectError(error.SessionResetFailed, runOneTurn(&ha, "after"));
+    try std.testing.expectError(error.SessionResetFailed, runOneTurn(&hb, "after"));
+    // Neither turn prompted dsh with the old session.
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+}
+
+test "dsh /new after an idle sidecar crash recovers instead of bricking the key" {
+    // Regression: resetKeySession used the dead client directly and set
+    // reset_failed; runTurn then reported SessionResetFailed on every later
+    // turn, and nothing ever recovered the key.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const session_file = try tempSessionFile(allocator, &tmp);
+    defer allocator.free(session_file);
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, session_file);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"first"}, "completed");
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    // Idle crash, and the first recovery spawn also fails: /new reports the
+    // error and marks the key instead of silently reusing the old session.
+    mock.kill();
+    ctl.fail_calls = 1;
+    try std.testing.expectError(error.ConnectionRefused, h.harness().handleLocalCommand("/new"));
+    try std.testing.expectError(error.SessionResetFailed, runOneTurn(&h, "blocked"));
+
+    // A retried /new recovers the sidecar, swaps the session and clears the
+    // flag; the key is usable again.
+    try setTurnFrames(mock, allocator, &.{"after"}, "completed");
+    const ack = try h.harness().handleLocalCommand("/new");
+    try std.testing.expectEqualStrings("Session cleared.", ack.?);
+    const second = try runOneTurn(&h, "two");
+    defer allocator.free(second.reply);
+    try std.testing.expectEqualStrings("after", second.reply);
+    try std.testing.expectEqual(@as(u32, 2), mock.createCount());
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+    // One boot, one failed recovery, one successful recovery.
+    try std.testing.expectEqual(@as(u32, 3), ctl.calls);
+}
+
+test "dsh sidecar crash restarts and resumes the same session" {
+    // Regression: a dead sidecar only surfaced as an error; nothing restarted
+    // it and the conversation was never resumed.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"before"}, "completed");
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+    try std.testing.expectEqualStrings("before", first.reply);
+    const session = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(session);
+    try std.testing.expectEqual(@as(u32, 1), mock.createCount());
+
+    mock.kill();
+    try setTurnFrames(mock, allocator, &.{"after"}, "completed");
+    const second = try runOneTurn(&h, "two");
+    defer allocator.free(second.reply);
+    try std.testing.expectEqualStrings("after", second.reply);
+
+    // One restart; re-attach is `session/follow` (session/resume is not a
+    // Remote method and the mock 404s it), and the prompt landed on the same
+    // dsh session.
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+    const prompted = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(prompted);
+    try std.testing.expectEqualStrings(session, prompted);
+    try std.testing.expectEqual(@as(u32, 1), mock.createCount());
+    // A successful recovery resets the consecutive-failure count.
+    try std.testing.expectEqual(@as(u32, 0), engine.restart_attempts);
+}
+
+test "dsh prompt retry after a crash reuses the requestId" {
+    // Regression: every retry minted a fresh requestId, so dsh inserted the
+    // same user message twice instead of returning the original acceptance.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setEchoPrompts(true);
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    // The sidecar admits the prompt, then dies before answering: the client
+    // sees a connection error and resends after the restart.
+    mock.dropNextPromptReply();
+    const retried = try runOneTurn(&h, "retry-me");
+    defer allocator.free(retried.reply);
+    try std.testing.expectEqualStrings("retry-me", retried.reply);
+
+    // Index 0 is the first turn; the dropped prompt and its retry follow.
+    try std.testing.expectEqual(@as(u32, 3), mock.promptCount());
+    const dropped_id = (try mock.promptRequestIdAt(allocator, 1)).?;
+    defer allocator.free(dropped_id);
+    const retry_id = (try mock.promptRequestIdAt(allocator, 2)).?;
+    defer allocator.free(retry_id);
+    try std.testing.expectEqualStrings(dropped_id, retry_id);
+}
+
+test "dsh sidecar restart attempts grow on failure and reset on success" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"first"}, "completed");
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    // Two recovery spawns fail before the third one works.
+    ctl.fail_calls = 2;
+    mock.kill();
+    try std.testing.expectError(error.ConnectionRefused, runOneTurn(&h, "two"));
+    try std.testing.expectEqual(@as(u32, 1), engine.restart_attempts);
+    try std.testing.expectError(error.ConnectionRefused, runOneTurn(&h, "three"));
+    try std.testing.expectEqual(@as(u32, 2), engine.restart_attempts);
+    try std.testing.expectEqual(@as(u32, 0), mock.reviveCount());
+
+    try setTurnFrames(mock, allocator, &.{"recovered"}, "completed");
+    const fourth = try runOneTurn(&h, "four");
+    defer allocator.free(fourth.reply);
+    try std.testing.expectEqualStrings("recovered", fourth.reply);
+    try std.testing.expectEqual(@as(u32, 0), engine.restart_attempts);
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+    // One boot plus three recovery attempts.
+    try std.testing.expectEqual(@as(u32, 4), ctl.calls);
+}
+
+test "dsh sidecar crash loop reports a clear error and stops restarting" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"first"}, "completed");
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    ctl.fail_calls = 100;
+    mock.kill();
+    // max_restart_attempts failed recoveries...
+    for (0..3) |_| {
+        try std.testing.expectError(error.ConnectionRefused, runOneTurn(&h, "again"));
+    }
+    try std.testing.expectEqual(@as(u32, 3), engine.restart_attempts);
+    // ...then the next turn reports instead of spawning another process.
+    try std.testing.expectError(error.SidecarCrashLoop, runOneTurn(&h, "again"));
+    try std.testing.expectEqual(@as(u32, 4), ctl.calls);
+    try std.testing.expectEqual(@as(u32, 0), mock.reviveCount());
+}
+
+test "dsh crash loop counts crashes after a successful boot and handshake" {
+    // Regression: restartSidecarLocked cleared restart_attempts as soon as
+    // connectClient succeeded, so a sidecar that booted and then died on its
+    // first RPC restarted forever instead of tripping the crash-loop limit.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    try setTurnFrames(mock, allocator, &.{"first"}, "completed");
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    // Every restart now boots and handshakes, then dies on the prompt.
+    mock.dropAllPromptReplies();
+    for (0..3) |_| {
+        const outcome = runOneTurn(&h, "again");
+        if (outcome) |result| {
+            allocator.free(result.reply);
+            if (result.@"error") |message| allocator.free(message);
+            return error.TestUnexpectedResult;
+        } else |err| {
+            try std.testing.expect(client_mod.isConnectionError(err));
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 3), engine.restart_attempts);
+    // The fourth crash must not spawn another process.
+    try std.testing.expectError(error.SidecarCrashLoop, runOneTurn(&h, "again"));
+    try std.testing.expectEqual(@as(u32, 4), ctl.calls);
+    try std.testing.expectEqual(@as(u32, 3), mock.reviveCount());
+}
+
+test "dsh stale turn does not restart a sidecar another turn recovered" {
+    // Regression: recovery compared a global generation counter. A turn that
+    // still held the old client read the counter after another turn's restart,
+    // saw it unchanged, and restarted a second time -- killing the fresh
+    // sidecar and the turn attached to it.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "key-b");
+    defer hb.deinit();
+
+    mock.setEchoPrompts(true);
+    const first_a = try runOneTurn(&ha, "a-one");
+    defer allocator.free(first_a.reply);
+    const first_b = try runOneTurn(&hb, "b-one");
+    defer allocator.free(first_b.reply);
+
+    // Key A is mid-turn (one delta, no terminal frame) when the sidecar dies.
+    // Key B then runs from A's sink while the mock is dead: B recovers to a
+    // fresh client. When control returns to A, its old subscription fails.
+    mock.setEchoPrompts(false);
+    try setTurnFrames(mock, allocator, &.{"partial"}, null);
+
+    const ReentrantCrash = struct {
+        allocator: Allocator,
+        mock: *MockDsh,
+        harness: *DshHarness,
+        fired: bool = false,
+        failure: ?anyerror = null,
+        reply: ?[]const u8 = null,
+
+        fn sink(self: *@This()) port.Sink {
+            return .{ .ctx = @ptrCast(self), .emit = emit };
+        }
+
+        fn emit(ctx: *anyopaque, event: port.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (self.fired) return;
+            switch (event) {
+                .delta => {},
+                else => return,
+            }
+            self.fired = true;
+            self.mock.kill();
+            setTurnFrames(self.mock, self.allocator, &.{"b-after"}, "completed") catch |err| {
+                self.failure = err;
+                return;
+            };
+            const result = runOneTurn(self.harness, "b-crash") catch |err| {
+                self.failure = err;
+                return;
+            };
+            self.reply = result.reply;
+            if (result.@"error") |message| self.allocator.free(message);
+        }
+    };
+
+    var reentrant = ReentrantCrash{ .allocator = allocator, .mock = mock, .harness = &hb };
+    const slow = try ha.harness().runTurn(.{ .user_message = "slow-a", .sink = reentrant.sink() });
+    defer allocator.free(slow.reply);
+
+    try std.testing.expect(reentrant.failure == null);
+    try std.testing.expect(reentrant.reply != null);
+    defer allocator.free(reentrant.reply.?);
+    try std.testing.expectEqualStrings("b-after", reentrant.reply.?);
+
+    // A kept the text it had already streamed and re-attached to the client B
+    // recovered, without a second restart.
+    try std.testing.expectEqualStrings("partial", slow.reply);
+    try std.testing.expectEqual(port.EndReason.failed, slow.end_reason);
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+    try std.testing.expectEqual(@as(u32, 2), ctl.calls);
+    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
+}
+
+test "dsh crash mid-turn keeps partial text and reattaches every key" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "key-b");
+    defer hb.deinit();
+
+    mock.setEchoPrompts(true);
+    const first_a = try runOneTurn(&ha, "a-one");
+    defer allocator.free(first_a.reply);
+    const a_session = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(a_session);
+    const first_b = try runOneTurn(&hb, "b-one");
+    defer allocator.free(first_b.reply);
+    const b_session = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(b_session);
+    try std.testing.expect(!std.mem.eql(u8, a_session, b_session));
+
+    // Key A has a turn in flight (one delta, no terminal frame) when the
+    // sidecar dies.
+    mock.setEchoPrompts(false);
+    try setTurnFrames(mock, allocator, &.{"partial"}, null);
+    var sink = RecordingSink{};
+    var turn = TurnThread{
+        .harness = &ha,
+        .input = .{ .user_message = "slow", .sink = sink.sink() },
+    };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+    waitForSink(&sink, 1);
+    mock.kill();
+    thread.join();
+
+    // The turn reports the text the user already saw, not an error that drops
+    // it (and not a retry that would duplicate it).
+    try std.testing.expect(turn.failure == null);
+    try std.testing.expect(turn.result != null);
+    const slow = turn.result.?;
+    defer allocator.free(slow.reply);
+    try std.testing.expectEqualStrings("partial", slow.reply);
+    try std.testing.expectEqual(port.EndReason.failed, slow.end_reason);
+
+    // One restart re-attached both live sessions over `session/follow`.
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+
+    // The other key continues on its original session without a restart.
+    mock.setEchoPrompts(true);
+    const second_b = try runOneTurn(&hb, "b-two");
+    defer allocator.free(second_b.reply);
+    try std.testing.expectEqualStrings("b-two", second_b.reply);
+    const prompted_b = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(prompted_b);
+    try std.testing.expectEqualStrings(b_session, prompted_b);
+
+    // The interrupted key also resumes its own conversation.
+    const second_a = try runOneTurn(&ha, "a-two");
+    defer allocator.free(second_a.reply);
+    try std.testing.expectEqualStrings("a-two", second_a.reply);
+    const prompted_a = (try mock.lastPromptSession(allocator)).?;
+    defer allocator.free(prompted_a);
+    try std.testing.expectEqualStrings(a_session, prompted_a);
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+    // One boot + one restart, and no turn rebuilt a second mux: dsh would
+    // answer a concurrent second WebSocket with 409.
+    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
+}
+
+test "dsh two in-flight turns share one restart" {
+    // Two keys are mid-turn when the sidecar dies. Both recover through the
+    // single recovery lock: one restart, one WebSocket, two resumes.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var ha = try DshHarness.init(engine, "key-a");
+    defer ha.deinit();
+    var hb = try DshHarness.init(engine, "key-b");
+    defer hb.deinit();
+
+    mock.setEchoPrompts(true);
+    const first_a = try runOneTurn(&ha, "a-one");
+    defer allocator.free(first_a.reply);
+    const first_b = try runOneTurn(&hb, "b-one");
+    defer allocator.free(first_b.reply);
+
+    mock.setEchoPrompts(false);
+    try setTurnFrames(mock, allocator, &.{"partial"}, null);
+    var sink_a = RecordingSink{};
+    var sink_b = RecordingSink{};
+    var turn_a = TurnThread{
+        .harness = &ha,
+        .input = .{ .user_message = "slow-a", .sink = sink_a.sink() },
+    };
+    var turn_b = TurnThread{
+        .harness = &hb,
+        .input = .{ .user_message = "slow-b", .sink = sink_b.sink() },
+    };
+    const thread_a = try std.Thread.spawn(.{}, TurnThread.main, .{&turn_a});
+    const thread_b = try std.Thread.spawn(.{}, TurnThread.main, .{&turn_b});
+    waitForSink(&sink_a, 1);
+    waitForSink(&sink_b, 1);
+    mock.kill();
+    thread_a.join();
+    thread_b.join();
+
+    for ([_]*TurnThread{ &turn_a, &turn_b }) |turn| {
+        try std.testing.expect(turn.failure == null);
+        try std.testing.expect(turn.result != null);
+        defer allocator.free(turn.result.?.reply);
+        try std.testing.expectEqualStrings("partial", turn.result.?.reply);
+        try std.testing.expectEqual(port.EndReason.failed, turn.result.?.end_reason);
+    }
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+    try std.testing.expectEqual(@as(u32, 2), mock.wsConnections());
+    try std.testing.expectEqual(@as(u32, 0), mock.wsRejections());
+}
+
+test "dsh injected boot_url is not restarted after a crash" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setEchoPrompts(true);
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+    mock.kill();
+
+    if (runOneTurn(&h, "two")) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expect(client_mod.isConnectionError(err));
+    }
+    // The owner manages this sidecar; the engine must not reconnect on its own.
+    try std.testing.expectEqual(@as(u32, 1), mock.wsConnections());
+    mock.revive();
+}
+
+test "dsh crash recovery keeps a large payload leak-free" {
+    // Leak regression for the restart path: the retired client, the owned
+    // launch URL and the resumed follow stream must all be released, even
+    // when the turn carries more than 64KB.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    var ctl = SpawnCtl{ .mock = mock };
+    const engine = try newManagedEngine(allocator, &ctl, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setEchoPrompts(true);
+    const first = try runOneTurn(&h, "one");
+    defer allocator.free(first.reply);
+
+    mock.kill();
+    const big = try allocator.alloc(u8, 70 * 1024);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    const second = try runOneTurn(&h, big);
+    defer allocator.free(second.reply);
+    try std.testing.expectEqual(big.len, second.reply.len);
+    try std.testing.expectEqual(@as(u32, 1), mock.reviveCount());
+}
+
+const HarnessReapCtl = struct { calls: u32 = 0, last_exclude: ?i32 = null };
+
+fn countHarnessReap(ctx: ?*anyopaque, _: *const sidecar_mod.Options, exclude_pid: ?i32) void {
+    const ctl: *HarnessReapCtl = @ptrCast(@alignCast(ctx.?));
+    ctl.calls += 1;
+    ctl.last_exclude = exclude_pid;
+}
+
+test "dsh writer-held prompt reaps leftovers and retries the same session" {
+    // Regression: an orphaned sidecar holding session.lock made dsh answer
+    // session/writer-held; the harness folded it into error.RpcFailed and the
+    // turn failed without clearing the leftover writer.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ctl = HarnessReapCtl{};
+    engine.opts.sidecar.reap = countHarnessReap;
+    engine.opts.sidecar.reap_ctx = &ctl;
+
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setPromptWriterHeld(1);
+    try setTurnFrames(mock, allocator, &.{"resumed after reap"}, "completed");
+
+    const result = try runOneTurn(&h, "hi");
+    defer allocator.free(result.reply);
+    try std.testing.expectEqualStrings("resumed after reap", result.reply);
+    try std.testing.expectEqual(@as(u32, 1), ctl.calls);
+    try std.testing.expectEqual(@as(?i32, null), ctl.last_exclude);
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+}
+
+test "persistent writer-held returns SessionWriterHeld after one reap" {
+    // The turn must fail with the real cause, not retry forever and not fall
+    // back to a fresh session (which would drop the conversation history).
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var ctl = HarnessReapCtl{};
+    engine.opts.sidecar.reap = countHarnessReap;
+    engine.opts.sidecar.reap_ctx = &ctl;
+
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+
+    mock.setPromptWriterHeld(std.math.maxInt(u32));
+    try setTurnFrames(mock, allocator, &.{"unreachable"}, "completed");
+
+    try std.testing.expectError(error.SessionWriterHeld, runOneTurn(&h, "hi"));
+    try std.testing.expectEqual(@as(u32, 1), ctl.calls);
+    try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
+}
+
+const ProcKillLog = struct {
+    allocator: Allocator,
+    root: []const u8,
+    pids: std.ArrayListUnmanaged(i32) = .empty,
+};
+
+fn recordProcKill(ctx: ?*anyopaque, pid: i32) void {
+    const log: *ProcKillLog = @ptrCast(@alignCast(ctx.?));
+    log.pids.append(log.allocator, pid) catch {};
+    var name_buf: [16]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}", .{pid}) catch return;
+    var dir = std_compat.fs.openDirAbsolute(log.root, .{}) catch return;
+    defer dir.close();
+    dir.deleteTree(name) catch {};
+}
+
+fn ignoreReap(_: ?*anyopaque, _: *const sidecar_mod.Options, _: ?i32) void {}
+
+fn writeFakeProc(dir: std_compat.fs.Dir, name: []const u8, cmdline: []const u8, environ: []const u8) !void {
+    try dir.makeDir(name);
+    var entry = try dir.openDir(name, .{});
+    defer entry.close();
+    try entry.writeFile(.{ .sub_path = "cmdline", .data = cmdline });
+    try entry.writeFile(.{ .sub_path = "environ", .data = environ });
+}
+
+test "empty configured bin resolves from env and the sweep spares the gateway" {
+    // Regression: the production constructor leaves bin_js empty and the
+    // resolved path lived only in ensureBooted's local copy. The writer-held
+    // sweep then ran with an empty needle, matched every process, and killed
+    // the gateway itself.
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = std_compat.fs.Dir.wrap(tmp.dir);
+    const root = try raw.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(home);
+    const bin = try std.fs.path.join(allocator, &.{ root, "bin.js" });
+    defer allocator.free(bin);
+
+    const key_z = try allocator.dupeZ(u8, "NULLCLAW_DSH_BIN");
+    defer allocator.free(key_z);
+    const bin_z = try allocator.dupeZ(u8, bin);
+    defer allocator.free(bin_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, bin_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    const engine = try allocator.create(DshEngine);
+    engine.* = DshEngine.init(allocator, .{
+        .sidecar = .{
+            .node_exe = "/bin/false",
+            .bin_js = "",
+            .workspace = root,
+            .dsh_home = home,
+            .boot_timeout_ms = 2_000,
+            .reap = ignoreReap,
+        },
+    });
+    defer {
+        engine.deinit();
+        allocator.destroy(engine);
+    }
+
+    try std.testing.expectError(error.SidecarBootFailed, engine.ensureBooted());
+    // The resolved path must outlive the failed boot for the sweep.
+    try std.testing.expectEqualStrings(bin, engine.opts.sidecar.bin_js);
+
+    const environ = try std.fmt.allocPrint(allocator, "DSH_HOME={s}\x00", .{home});
+    defer allocator.free(environ);
+    const dsh_cmdline = try std.fmt.allocPrint(allocator, "node\x00{s}\x00", .{bin});
+    defer allocator.free(dsh_cmdline);
+    // The gateway's own argv ("nullclaw") plus a real leftover dsh.
+    try writeFakeProc(raw, "100", "nullclaw\x00", environ);
+    try writeFakeProc(raw, "101", dsh_cmdline, environ);
+
+    var log = ProcKillLog{ .allocator = allocator, .root = root };
+    defer log.pids.deinit(allocator);
+    sidecar_mod.reapOrphansIn(allocator, root, engine.opts.sidecar.bin_js, engine.opts.sidecar.dsh_home, null, recordProcKill, &log);
+
+    try std.testing.expectEqualSlices(i32, &.{101}, log.pids.items);
 }

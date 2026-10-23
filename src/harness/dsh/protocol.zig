@@ -278,8 +278,38 @@ pub fn parseServerFrame(allocator: Allocator, frame_json: []const u8) !ServerEve
     const parsed = std.json.parseFromSlice(Value, allocator, frame_json, .{}) catch
         return error.InvalidJson;
     defer parsed.deinit();
+    return parseServerValue(allocator, frame_json, parsed.value);
+}
 
-    var value = parsed.value;
+/// One mux frame plus the outer `streamId` that routes it to a session.
+/// `stream_id` is owned by the caller; the event is owned as usual.
+pub const RoutedFrame = struct {
+    stream_id: ?[]u8,
+    event: ServerEvent,
+};
+
+/// One JSON parse per frame: the mux reader needs the stream id and the event.
+pub fn parseRoutedServerFrame(allocator: Allocator, frame_json: []const u8) !RoutedFrame {
+    const parsed = std.json.parseFromSlice(Value, allocator, frame_json, .{}) catch
+        return error.InvalidJson;
+    defer parsed.deinit();
+
+    var stream_id: ?[]u8 = null;
+    if (asObject(parsed.value)) |root| {
+        if (root.get("streamId")) |value| switch (value) {
+            .string => |text| stream_id = try allocator.dupe(u8, text),
+            else => {},
+        };
+    }
+    errdefer if (stream_id) |id| allocator.free(id);
+    return .{
+        .stream_id = stream_id,
+        .event = try parseServerValue(allocator, frame_json, parsed.value),
+    };
+}
+
+fn parseServerValue(allocator: Allocator, frame_json: []const u8, root_value: Value) !ServerEvent {
+    var value = root_value;
     if (asObject(value)) |root| {
         if (stringField(root, "type")) |kind| {
             if (std.mem.eql(u8, kind, "item")) {
@@ -849,6 +879,26 @@ test "parseServerFrame handles wrapped text-delta chunks" {
                 try std.testing.expectEqual(@as(u32, 0), text.index);
                 try std.testing.expectEqualStrings("slow-12 ", text.text);
             },
+            else => return error.TestUnexpectedChunk,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
+test "parseRoutedServerFrame keeps the outer stream id" {
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"item\",\"streamId\":\"follow-7\",\"value\":{\"type\":\"assistant-stream\"," ++
+        "\"data\":{\"type\":\"text-delta\",\"index\":0,\"text\":\"hi\"}}}";
+    const routed = try parseRoutedServerFrame(allocator, frame);
+    defer {
+        if (routed.stream_id) |id| allocator.free(id);
+        freeServerEvent(allocator, routed.event);
+    }
+    try std.testing.expectEqualStrings("follow-7", routed.stream_id.?);
+    switch (routed.event) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .text_delta => |text| try std.testing.expectEqualStrings("hi", text.text),
             else => return error.TestUnexpectedChunk,
         },
         else => return error.TestUnexpectedEvent,
