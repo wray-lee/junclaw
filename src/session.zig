@@ -2400,7 +2400,10 @@ pub const SessionManager = struct {
                 const restored = dropRowsBeforeLastCompactionSummary(
                     recentHistoryWindow(entries, session.agent.max_history_messages),
                 );
-                if (restored.len > 0) {
+                // The in-process engine resumes its own JSONL; replaying store
+                // rows into the agent would give it a second, stale context and
+                // persist the previous reply as the next turn's.
+                if (restored.len > 0 and selected_config.agent.harness != .dsh_native) {
                     restorePersistedSessionState(session, restored);
                 }
                 if (try store.loadUsage(session_key)) |total_tokens| {
@@ -7430,6 +7433,14 @@ const DshNativeFixture = struct {
     }
 
     fn manager(self: *DshNativeFixture, provider: *DshNativeScriptedProvider) SessionManager {
+        return self.managerWithStore(provider, null);
+    }
+
+    fn managerWithStore(
+        self: *DshNativeFixture,
+        provider: *DshNativeScriptedProvider,
+        session_store: ?memory_mod.SessionStore,
+    ) SessionManager {
         var noop = observability.NoopObserver{};
         return SessionManager.init(
             testing.allocator,
@@ -7438,7 +7449,7 @@ const DshNativeFixture = struct {
             &.{},
             null,
             noop.observer(),
-            null,
+            session_store,
             null,
         );
     }
@@ -7840,6 +7851,113 @@ test "dsh-native: restart resumes the same JSONL for the session key" {
     defer testing.allocator.free(log_bytes);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "first answer") != null);
     try testing.expect(std.mem.indexOf(u8, log_bytes, "second answer") != null);
+}
+
+test "dsh-native: a restarted session persists the fresh reply, not the previous one" {
+    // Regression: restore replayed the store rows into agent.history, so the
+    // first turn after a restart persisted the previous assistant reply as
+    // this turn's answer (turn 1 "first answer", turn 2 "second answer", the
+    // store recorded "first answer").
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "first answer" },
+        .{ .text = "second answer" },
+    });
+    defer provider.deinit();
+
+    const key = "cli:main:dsh-native-restart-store";
+    {
+        var sm = fixture.managerWithStore(&provider, store);
+        defer sm.deinit();
+        const resp = try sm.processMessage(key, "hello", null);
+        defer testing.allocator.free(resp);
+        try testing.expectEqualStrings("first answer", resp);
+        const session = try sm.getOrCreate(key);
+        try testing.expectEqual(@as(usize, 0), session.agent.history.items.len);
+    }
+    var restored_history_len: usize = 0;
+    {
+        var sm = fixture.managerWithStore(&provider, store);
+        defer sm.deinit();
+        const session = try sm.getOrCreate(key);
+        restored_history_len = session.agent.history.items.len;
+
+        const resp = try sm.processMessage(key, "again", null);
+        defer testing.allocator.free(resp);
+        try testing.expectEqualStrings("second answer", resp);
+    }
+
+    const messages = try store.loadMessages(testing.allocator, key);
+    defer memory_mod.freeMessages(testing.allocator, messages);
+    try testing.expect(messages.len >= 2);
+    const last = messages[messages.len - 1];
+    try testing.expectEqualStrings("assistant", last.role);
+    try testing.expectEqualStrings("second answer", last.content);
+
+    // Stored rows stay out of the agent: the engine owns the resumed context.
+    try testing.expectEqual(@as(usize, 0), restored_history_len);
+}
+
+test "dsh-native: session creation keeps agent.history empty under stored rows" {
+    // Regression: getOrCreate appended every stored row to agent.history for
+    // dsh-native, duplicating the context the engine already resumes.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const key = "cli:main:dsh-native-history-gate";
+    try store.saveMessage(key, "user", "stale question");
+    try store.saveMessage(key, "assistant", "stale answer");
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "unused" },
+    });
+    defer provider.deinit();
+    var sm = fixture.managerWithStore(&provider, store);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate(key);
+    try testing.expectEqual(@as(usize, 0), session.agent.history.items.len);
+    // Usage restoration is outside the gate and still runs.
+    try testing.expect(session.agent.total_tokens > 0);
+}
+
+test "default native session still restores persisted history" {
+    // Guard: the dsh-native gate must leave the native (default) path as is.
+    var mock = MockProvider{ .response = "reply" };
+    const cfg = testConfig();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const key = "cli:main:native-restore";
+    try store.saveMessage(key, "user", "earlier question");
+    try store.saveMessage(key, "assistant", "earlier answer");
+
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &cfg,
+        mock.provider(),
+        &.{},
+        sqlite_mem.memory(),
+        noop.observer(),
+        store,
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate(key);
+    try testing.expectEqual(@as(usize, 2), session.agent.history.items.len);
+    try testing.expectEqualStrings("earlier question", session.agent.history.items[0].content);
+    try testing.expectEqualStrings("earlier answer", session.agent.history.items[1].content);
 }
 
 test "harness display trust uses the real session key for shared channels" {
