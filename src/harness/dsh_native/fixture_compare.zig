@@ -287,7 +287,9 @@ pub const Normalizer = struct {
                     );
                     return;
                 }
-                if (std.mem.indexOf(u8, expected_string, "{{cwd}}") != null) {
+                if (std.mem.indexOf(u8, expected_string, "{{cwd}}") != null or
+                    std.mem.indexOf(u8, expected_string, "<path>") != null)
+                {
                     try self.expectTextMatch(expected_string, actual_string);
                     return;
                 }
@@ -558,6 +560,17 @@ test "path values normalize separators but other text keeps them significant" {
     try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
         .{ .string = "<path>{{cwd}}/a.txt</path>" },
         .{ .string = "<path>C:\\work\\project\\b.txt</path>" },
+        .{},
+    ));
+    // `<path>` normalizes even without a cwd token in the expected text.
+    try normalizer.compareValue(
+        .{ .string = "<path>src/main.zig</path>" },
+        .{ .string = "<path>src\\main.zig</path>" },
+        .{},
+    );
+    try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
+        .{ .string = "<path>src/main.zig</path>" },
+        .{ .string = "<path>src\\other.zig</path>" },
         .{},
     ));
 }
