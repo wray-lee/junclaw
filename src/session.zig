@@ -47,6 +47,9 @@ const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const harness_port = @import("harness/port.zig");
 const native_harness = @import("harness/native.zig");
+/// The in-process dsh engine (`agent.harness = "dsh-native"`). No build flag
+/// gates it, so the import is unconditional.
+const dsh_native_mod = @import("harness/dsh_native/harness.zig");
 const build_options = @import("build_options");
 const dsh_enabled = build_options.enable_harness_dsh;
 const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
@@ -102,6 +105,71 @@ const DshEngineSlot = if (dsh_enabled) struct {
     mutex: std_compat.sync.Mutex = .{},
     state: ?DshEngineState = null,
 } else struct {};
+
+/// Per-session in-process dsh engine. The options borrow the session's
+/// provider/model/workspace and the owned path strings here; the harness must
+/// outlive `init` at this stable address.
+const DshNativeState = struct {
+    harness: dsh_native_mod.DshNativeHarness,
+    dsh_home: []u8,
+    session_dir: []u8,
+    /// Owned because `/model` frees `agent.model_name`; the harness borrows
+    /// this slice for its lifetime.
+    // shortcut: /model switches the native agent only — the engine keeps the
+    // model it was created with until the session is recreated (P2).
+    model: []u8,
+    /// The engine's cumulative `TurnResult.total_tokens` after the last turn.
+    /// The counter restarts at 0 on /new, so `/new` resets this too.
+    reported_total_tokens: u64 = 0,
+    /// `Event.usage` count. A turn that emitted none falls back to the
+    /// `total_tokens` delta, so the ledger never double counts.
+    usage_events: u64 = 0,
+
+    fn init(allocator: Allocator, config: *const Config, session: *Session) !DshNativeState {
+        const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
+        // Defaults mirror the sidecar's layout so both engines find the same
+        // `dsh-sessions/{hash}.json` mapping for a key.
+        const dsh_home = if (config.agent.dsh_home) |path|
+            try allocator.dupe(u8, path)
+        else
+            try std_compat.fs.path.join(allocator, &.{ config_dir, ".dsh" });
+        errdefer allocator.free(dsh_home);
+        const session_dir = if (config.agent.dsh_session_dir) |path|
+            try allocator.dupe(u8, path)
+        else
+            try std_compat.fs.path.join(allocator, &.{ config_dir, "dsh-sessions" });
+        errdefer allocator.free(session_dir);
+        const model = try allocator.dupe(u8, session.agent.model_name);
+        errdefer allocator.free(model);
+
+        var harness = try dsh_native_mod.DshNativeHarness.init(allocator, .{
+            .session_key = session.session_key,
+            .dsh_home = dsh_home,
+            .session_dir = session_dir,
+            .workspace_dir = session.agent.workspace_dir,
+            .provider = session.agent.provider,
+            .provider_name = session.agent.provider.getName(),
+            .model = model,
+            .reasoning_effort = config.reasoning_effort,
+            .max_tokens = session.agent.max_tokens_override,
+            .persona = config.agent.dsh_persona orelse "",
+            .approval_policy = config.agent.dsh_approval_policy,
+            .sandbox = config.agent.dsh_sandbox,
+            .max_parallel_tools = config.agent.dsh_max_parallel_tools,
+            .on_corrupt = config.agent.dsh_on_corrupt,
+            .temperature = session.agent.temperature,
+        });
+        errdefer harness.deinit(allocator);
+        return .{ .harness = harness, .dsh_home = dsh_home, .session_dir = session_dir, .model = model };
+    }
+
+    fn deinit(self: *DshNativeState, allocator: Allocator) void {
+        self.harness.deinit(allocator);
+        allocator.free(self.dsh_home);
+        allocator.free(self.session_dir);
+        allocator.free(self.model);
+    }
+};
 
 /// Test seam: point session-created dsh harnesses at an in-process mock
 /// instead of spawning a sidecar. Production never sets it.
@@ -457,6 +525,9 @@ pub const Session = struct {
     /// Set only when `agent.harness = "dsh"`, this build has the adapter and
     /// the sidecar started; `turnHarness()` prefers it over `harness`.
     dsh: ?DshState = null,
+    /// Set only when `agent.harness = "dsh-native"`; `turnHarness()` prefers
+    /// it over everything else.
+    dsh_native: ?DshNativeState = null,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
     owned_memory_session_id: ?[]u8 = null,
@@ -497,11 +568,14 @@ pub const Session = struct {
         return &self.agent;
     }
 
-    /// The engine this session's turns run on: dsh when selected, otherwise
-    /// the native adapter. The dsh handle owns an immutable key copy; the
-    /// native adapter still refreshes its key because a legacy key can be
-    /// canonicalized after session creation.
+    /// The engine this session's turns run on: dsh-native or dsh when
+    /// selected, otherwise the native adapter. The dsh handles own immutable
+    /// key copies; the native adapter still refreshes its key because a legacy
+    /// key can be canonicalized after session creation.
     fn turnHarness(self: *Session) harness_port.Harness {
+        if (self.dsh_native) |*d| {
+            return d.harness.harness();
+        }
         if (comptime dsh_enabled) {
             if (self.dsh) |*d| {
                 return d.harness.harness();
@@ -518,6 +592,19 @@ pub const Session = struct {
     /// would run every native command twice, because that adapter *is* the
     /// agent call.
     fn handleLocalCommand(self: *Session, content: []const u8) !?[]const u8 {
+        if (self.dsh_native) |*d| {
+            if (try d.harness.harness().handleLocalCommand(content)) |reply| {
+                // The engine's reply is borrowed; host replies are owned.
+                return try self.agent.allocator.dupe(u8, reply);
+            }
+            // `/new` must also rotate the engine session (new id, JSONL and
+            // mapping). The ack and agent-state reset stay the native ones.
+            if (agent_mod.commands.planTurnInput(content).clear_session) {
+                d.harness.harness().reset();
+                d.reported_total_tokens = 0;
+            }
+            return self.agent.handleSlashCommand(content);
+        }
         if (comptime dsh_enabled) {
             if (self.dsh) |*d| {
                 if (try d.harness.harness().handleLocalCommand(content)) |reply| {
@@ -534,6 +621,10 @@ pub const Session = struct {
     /// Interrupt the engine that owns this session's turns. Native resolves to
     /// the same `Agent` call, so the default path is unchanged.
     pub fn requestInterrupt(self: *Session) void {
+        if (self.dsh_native) |*d| {
+            d.harness.harness().requestInterrupt();
+            return;
+        }
         if (comptime dsh_enabled) {
             if (self.dsh) |*d| {
                 d.harness.harness().requestInterrupt();
@@ -546,6 +637,10 @@ pub const Session = struct {
     /// Clear an interrupt that no turn consumed, e.g. a `/stop` that landed
     /// during reply delivery. Native resolves to the same `Agent` call.
     pub fn clearInterrupt(self: *Session) void {
+        if (self.dsh_native) |*d| {
+            d.harness.harness().clearInterrupt();
+            return;
+        }
         if (comptime dsh_enabled) {
             if (self.dsh) |*d| {
                 d.harness.harness().clearInterrupt();
@@ -556,6 +651,7 @@ pub const Session = struct {
     }
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
+        if (self.dsh_native) |*d| d.deinit(allocator);
         if (self.dsh) |*d| d.deinit();
         self.agent.deinit();
         if (self.provider_holder) |*holder| holder.deinit();
@@ -2270,6 +2366,17 @@ pub const SessionManager = struct {
         key_owned_by_session = true;
         session_initialized = true;
 
+        if (selected_config.agent.harness == .dsh_native) {
+            session.dsh_native = try DshNativeState.init(self.allocator, selected_config, session);
+            // The mapping is the resume source, exactly like the sidecar: a
+            // restarted host with the same key reopens the same JSONL.
+            try session.dsh_native.?.harness.harness().restore(.{
+                .messages = &.{},
+                .session_key = owned_key,
+                .workspace_dir = session.agent.workspace_dir,
+                .dsh_home = session.dsh_native.?.dsh_home,
+            });
+        }
         if (comptime dsh_enabled) {
             if (selected_config.agent.harness == .dsh) {
                 // Attach the handle now; the sidecar boots on the first turn.
@@ -2332,6 +2439,11 @@ pub const SessionManager = struct {
     /// Wipe the state a reset must clear. Shared by maybeResetLocked and the
     /// restore-time check so both paths clear exactly the same things.
     fn clearSessionForReset(session: *Session) void {
+        if (session.dsh_native) |*d| {
+            // New dsh session id + JSONL, atomically rewritten mapping.
+            d.harness.harness().reset();
+            d.reported_total_tokens = 0;
+        }
         agent_mod.commands.clearSessionState(&session.agent);
         const store = session.agent.session_store orelse return;
         store.clearMessages(session.session_key) catch {};
@@ -2400,12 +2512,15 @@ pub const SessionManager = struct {
     }
 
     /// The host side of the port: maps the engine's `Event` union back onto the
-    /// two sinks the channels already own. A host that wants to watch usage
-    /// events adds an `Event.usage` arm here; the engine never touches
-    /// `usage_record_callback`, which stays installed once at session creation.
+    /// two sinks the channels already own. `Event.usage` only reaches the
+    /// ledger for dsh-native: the native engine reports usage through
+    /// `usage_record_callback` and never emits this event, so there is no
+    /// double count either way.
     const PortEventSink = struct {
         stream: ?streaming.Sink,
         progress: ?agent_mod.ProgressSink,
+        manager: *SessionManager,
+        session: *Session,
 
         fn emit(ctx: *anyopaque, event: harness_port.Event) void {
             const self: *PortEventSink = @ptrCast(@alignCast(ctx));
@@ -2416,9 +2531,11 @@ pub const SessionManager = struct {
                 .progress => |hint| {
                     if (self.progress) |sink| sink.emit(hint);
                 },
-                // The host keeps writing the usage ledger from the agent's own
-                // usage_record_callback; nothing consumes this today.
-                .usage => {},
+                .usage => |record| {
+                    if (self.session.dsh_native != null) {
+                        self.manager.recordHarnessUsage(self.session, record);
+                    }
+                },
                 // dsh-native observational events; the host renders nothing
                 // for them yet (P2 wires approval/question/compaction UI).
                 else => {},
@@ -2469,6 +2586,51 @@ pub const SessionManager = struct {
     fn usageRecordForwarder(ctx_ptr: *anyopaque, record: Agent.UsageRecord) void {
         const self: *SessionManager = @ptrCast(@alignCast(ctx_ptr));
         self.appendUsageRecord(record);
+    }
+
+    /// dsh-native usage: the in-process engine never calls
+    /// `usage_record_callback`, so its `Event.usage` goes through the same
+    /// ledger path here. Native and sidecar sessions never take this branch.
+    fn recordHarnessUsage(self: *SessionManager, session: *Session, record: Agent.UsageRecord) void {
+        const d = if (session.dsh_native) |*value| value else return;
+        var usage = record.usage;
+        if (usage.total_tokens == 0 and (usage.prompt_tokens > 0 or usage.completion_tokens > 0)) {
+            usage.total_tokens = usage.prompt_tokens +| usage.completion_tokens;
+        }
+        d.usage_events += 1;
+        session.agent.total_tokens +|= usage.total_tokens;
+        session.agent.last_turn_usage = usage;
+        session.agent.total_cost_usd += cost_mod.TokenUsage.fromProviders(record.model, usage).cost();
+        if (usage.total_tokens > 0) {
+            const metric = observability.ObserverMetric{ .tokens_used = usage.total_tokens };
+            self.observer.recordMetric(&metric);
+        }
+        self.appendUsageRecord(.{
+            .ts = record.ts,
+            .provider = record.provider,
+            .model = record.model,
+            .usage = usage,
+            .success = record.success,
+        });
+    }
+
+    /// Fallback when the engine emitted no `Event.usage` this turn (a provider
+    /// that omits usage, or a sink-less path): account the cumulative
+    /// `TurnResult.total_tokens` delta once. When events were seen the ledger
+    /// already has them, so only the baseline moves.
+    fn reconcileHarnessUsage(self: *SessionManager, session: *Session, total: u64, events_before: u64) void {
+        const d = if (session.dsh_native) |*value| value else return;
+        if (d.usage_events == events_before and total > d.reported_total_tokens) {
+            const delta: u32 = @intCast(@min(total - d.reported_total_tokens, std.math.maxInt(u32)));
+            self.recordHarnessUsage(session, .{
+                .ts = std_compat.time.timestamp(),
+                .provider = session.agent.provider.getName(),
+                .model = session.agent.model_name,
+                .usage = .{ .total_tokens = delta },
+                .success = true,
+            });
+        }
+        d.reported_total_tokens = total;
     }
 
     fn usageLedgerPath(self: *SessionManager) ?[]u8 {
@@ -2812,11 +2974,24 @@ pub const SessionManager = struct {
         // message cannot inherit it and answer "Interrupted by /stop" without
         // ever calling the provider.
         defer session.clearInterrupt();
+        const usage_events_before = if (session.dsh_native) |*d| d.usage_events else 0;
+        var harness_ran = false;
         const turn_result = blk: {
-            // `Agent.turn` is native-only: a dsh engine receives the prompt
-            // itself, so a local command would reach dsh as text. Answer known
-            // commands on the engine instead. A pre-turn /stop still wins like
-            // native's: leave it for runTurn, which aborts before the prompt.
+            // `Agent.turn` is native-only: an engine that owns turns receives
+            // the prompt itself, so a local command would reach it as text.
+            // Answer known commands on the engine instead. A pre-turn /stop
+            // still wins like native's: leave it for runTurn, which aborts
+            // before the prompt.
+            if (session.dsh_native) |*d| {
+                if (!d.harness.interruptPending() and
+                    agent_mod.commands.isKnownSlashCommand(turn_input.user_message))
+                {
+                    break :blk harness_port.TurnResult{
+                        .reply = try session.handleLocalCommand(turn_input.user_message) orelse
+                            return error.SlashCommandDispatchMismatch,
+                    };
+                }
+            }
             if (comptime dsh_enabled) {
                 if (session.dsh) |*d| {
                     if (!d.harness.interruptPending() and
@@ -2835,7 +3010,7 @@ pub const SessionManager = struct {
             var input = turn_input;
             input.drain = drain;
             input.drain_ctx = drain_ctx;
-            break :blk session.turnHarness().runTurn(input) catch |err| {
+            const result = session.turnHarness().runTurn(input) catch |err| {
                 finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
                 // A dsh engine failure is a reply the user can act on; native
                 // errors keep propagating to the existing classification path.
@@ -2849,25 +3024,31 @@ pub const SessionManager = struct {
                 }
                 return err;
             };
+            harness_ran = true;
+            break :blk result;
         };
         // Regression: the port's failure text was only freed, so a dsh turn
-        // that ended with an upstream 500/429 surfaced as an empty reply.
-        if (comptime dsh_enabled) {
-            if (session.dsh != null) {
-                if (turn_result.@"error") |message| {
-                    defer self.allocator.free(message);
-                    defer self.allocator.free(turn_result.reply);
-                    session.agent.last_turn_interrupted = false;
-                    finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
-                    return try dshFailedTurnReply(self.allocator, message, turn_result.reply);
-                }
+        // that ended with an upstream 500/429 surfaced as an empty reply. The
+        // in-process engine reports failures the same way.
+        if (session.dsh != null or session.dsh_native != null) {
+            if (turn_result.@"error") |message| {
+                defer self.allocator.free(message);
+                defer self.allocator.free(turn_result.reply);
+                session.agent.last_turn_interrupted = false;
+                finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
+                return try dshFailedTurnReply(self.allocator, message, turn_result.reply);
             }
         }
         // Only `reply` is returned; the port hands failure text to the host.
         defer if (turn_result.@"error") |message| self.allocator.free(message);
-        // dsh reports interruption through the port; the host's /stop tail
-        // (pending-injection discard and notices) reads the agent flag.
-        session.agent.last_turn_interrupted = turn_result.end_reason == .interrupted;
+        // Engines report interruption through the port; the host's /stop tail
+        // (pending-injection discard and notices) reads the agent flag. The
+        // in-process kernel reports /stop as `.aborted` with a user cause.
+        session.agent.last_turn_interrupted = turn_result.end_reason == .interrupted or
+            (session.dsh_native != null and turn_result.end_reason == .aborted);
+        if (harness_ran and session.dsh_native != null) {
+            self.reconcileHarnessUsage(session, turn_result.total_tokens, usage_events_before);
+        }
         finalizeSteerRefs(steer_sink, self.allocator, refs, .done);
         return turn_result.reply;
     }
@@ -2891,6 +3072,15 @@ pub const SessionManager = struct {
         const late_content = (try session.drainInjectionWithRefs(self.allocator, self.allocator, &refs)) orelse return false;
         defer self.allocator.free(late_content);
 
+        // An engine that owns its inbox already folded every steer it accepted
+        // into the turn. A message still pending here arrived after the final
+        // step, so it runs as a new turn (dsh followup semantics), with its own
+        // persisted transcript row, instead of being merged into the primary
+        // turn. The native-only live "\n\n" separator is not emitted: there is
+        // no merged assistant message to join in the stream. This host returns
+        // one reply per inbound message, so the transport string still carries
+        // both replies (see the combine below).
+        const owns_inbox = session.turnHarness().info().owns_inbox;
         // Regression: the combined reply joins the two turns with "\n\n" but
         // nothing streamed that separator, so the preview (primary followed by
         // the follow-up's own stream) was not a prefix of the reply. Emit it
@@ -2898,7 +3088,7 @@ pub const SessionManager = struct {
         // agent callback after every turn, so writing to agent.stream_callback
         // here would be dropped; go through the host's suppressing sink so the
         // live-draft rule applies to the separator exactly as before the port.
-        if (live_stream) {
+        if (live_stream and !owns_inbox) {
             if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta("\n\n") });
         }
         const follow_up_response = self.runTurnWithSteerSink(session, &refs, steer_sink, .{
@@ -3236,15 +3426,23 @@ pub const SessionManager = struct {
         // policy, decided once from the primary content (as before the port).
         const suppress_live = shouldSuppressLiveForRedaction(session.agent.redactor, content, display_rehydrate_allowed);
 
-        var port_sink_ctx = PortEventSink{ .stream = stream_sink, .progress = progress_sink };
+        var port_sink_ctx = PortEventSink{
+            .stream = stream_sink,
+            .progress = progress_sink,
+            .manager = self,
+            .session = session,
+        };
         var suppressing_sink = SuppressingSink{
             .inner = .{ .ctx = @ptrCast(&port_sink_ctx), .emit = PortEventSink.emit },
             .suppress_live = suppress_live,
         };
-        const port_sink: ?harness_port.Sink = if (stream_sink != null or progress_sink != null)
-            suppressing_sink.sink()
-        else
-            null;
+        // dsh-native reports usage only through the sink, so it is installed
+        // even when the channel has no live stream to feed.
+        const port_sink: ?harness_port.Sink =
+            if (stream_sink != null or progress_sink != null or session.dsh_native != null)
+                suppressing_sink.sink()
+            else
+                null;
 
         var completed_turns: u64 = 0;
         var primary_failed = false;
@@ -6607,6 +6805,7 @@ test "agent.harness default keeps the native turn path" {
 
     const session = try sm.getOrCreate("cli:main:local");
     try testing.expect(session.dsh == null);
+    try testing.expect(session.dsh_native == null);
     const h = session.turnHarness();
     try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), h.ptr);
     try testing.expectEqualStrings(session.session_key, session.harness.session_key);
@@ -7096,6 +7295,499 @@ test "dsh upstream turn error reaches the user instead of an empty reply" {
     const reply = try sm.processMessageStreaming("cli:main:dsh-upstream-error", "hello", null, null, null);
     defer testing.allocator.free(reply);
     try testing.expectEqualStrings("上游模型服务返回错误：upstream provider returned 429", reply);
+}
+
+// ── dsh-native integration (agent.harness = "dsh-native") ──────────────────
+
+const DshNativeScriptedReply = struct {
+    text: []const u8 = "",
+    tool_calls: []const providers.ToolCall = &.{},
+    prompt_tokens: u32 = 10,
+    completion_tokens: u32 = 5,
+};
+
+/// Scripted provider for the in-process engine. `Provider.chatWithTools`
+/// falls back to `chat` for this vtable, which is the adapter's model call.
+const DshNativeScriptedProvider = struct {
+    replies: []const DshNativeScriptedReply,
+    allocator: Allocator,
+    chat_calls: usize = 0,
+    /// User-role text of the latest request, for history assertions.
+    users: std.ArrayListUnmanaged(u8) = .empty,
+    /// Runs inside the blocking call, where a real /stop lands.
+    on_chat: ?*const fn (ctx: *anyopaque) void = null,
+    on_chat_ctx: ?*anyopaque = null,
+
+    const vtable = Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitFn,
+    };
+
+    fn init(allocator: Allocator, replies: []const DshNativeScriptedReply) DshNativeScriptedProvider {
+        return .{ .replies = replies, .allocator = allocator };
+    }
+
+    fn deinit(self: *DshNativeScriptedProvider) void {
+        self.users.deinit(self.allocator);
+    }
+
+    fn provider(self: *DshNativeScriptedProvider) Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    fn chatWithSystem(
+        _: *anyopaque,
+        allocator: Allocator,
+        _: ?[]const u8,
+        _: []const u8,
+        _: []const u8,
+        _: f64,
+    ) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        _: []const u8,
+        _: f64,
+    ) anyerror!providers.ChatResponse {
+        const self: *DshNativeScriptedProvider = @ptrCast(@alignCast(ptr));
+        self.chat_calls += 1;
+        self.users.clearRetainingCapacity();
+        for (request.messages) |message| {
+            if (message.role != .user) continue;
+            if (self.users.items.len > 0) try self.users.appendSlice(self.allocator, "\n---\n");
+            try self.users.appendSlice(self.allocator, message.content);
+        }
+        if (self.on_chat) |hook| {
+            if (self.on_chat_ctx) |ctx| hook(ctx);
+        }
+        const script = self.replies[@min(self.chat_calls - 1, self.replies.len - 1)];
+        const calls = try allocator.alloc(providers.ToolCall, script.tool_calls.len);
+        for (script.tool_calls, 0..) |call, index| {
+            calls[index] = .{
+                .id = try allocator.dupe(u8, call.id),
+                .name = try allocator.dupe(u8, call.name),
+                .arguments = try allocator.dupe(u8, call.arguments),
+            };
+        }
+        return .{
+            .content = try allocator.dupe(u8, script.text),
+            .tool_calls = calls,
+            .usage = .{
+                .prompt_tokens = script.prompt_tokens,
+                .completion_tokens = script.completion_tokens,
+                .total_tokens = script.prompt_tokens + script.completion_tokens,
+            },
+        };
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return false;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "mock";
+    }
+
+    fn deinitFn(_: *anyopaque) void {}
+};
+
+/// Temp workspace + config that selects the in-process engine. The mapping and
+/// session logs land under the temp root, so tests never touch user state.
+const DshNativeFixture = struct {
+    tmp: std.testing.TmpDir,
+    base: []u8,
+    config_path: []u8,
+    cfg: Config,
+
+    fn init() !DshNativeFixture {
+        var tmp = testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(testing.allocator, ".");
+        errdefer testing.allocator.free(base);
+        const config_path = try std.fs.path.join(testing.allocator, &.{ base, "config.json" });
+        errdefer testing.allocator.free(config_path);
+        var cfg = testConfig();
+        cfg.workspace_dir = base;
+        cfg.config_path = config_path;
+        cfg.agent.harness = .dsh_native;
+        return .{ .tmp = tmp, .base = base, .config_path = config_path, .cfg = cfg };
+    }
+
+    fn deinit(self: *DshNativeFixture) void {
+        testing.allocator.free(self.config_path);
+        testing.allocator.free(self.base);
+        self.tmp.cleanup();
+    }
+
+    fn manager(self: *DshNativeFixture, provider: *DshNativeScriptedProvider) SessionManager {
+        var noop = observability.NoopObserver{};
+        return SessionManager.init(
+            testing.allocator,
+            &self.cfg,
+            provider.provider(),
+            &.{},
+            null,
+            noop.observer(),
+            null,
+            null,
+        );
+    }
+
+    fn mappingPath(self: *DshNativeFixture, allocator: Allocator, session_key: []const u8) ![]u8 {
+        const name = try std.fmt.allocPrint(allocator, "{x}.json", .{std.hash.Wyhash.hash(0, session_key)});
+        defer allocator.free(name);
+        return std.fs.path.join(allocator, &.{ self.base, "dsh-sessions", name });
+    }
+};
+
+fn readDshNativeLog(path: []const u8) ![]u8 {
+    return fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, path, 1 << 20);
+}
+
+test "dsh-native: plain turn runs in process, reports usage and selects the engine" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.diagnostics.token_usage_ledger_enabled = true;
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "hello from dsh-native" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-text";
+    const resp = try sm.processMessage(key, "hi", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("hello from dsh-native", resp);
+    try testing.expectEqual(@as(usize, 1), provider.chat_calls);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "hi") != null);
+
+    const session = try sm.getOrCreate(key);
+    try testing.expect(session.dsh_native != null);
+    try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.dsh_native.?.harness)), session.turnHarness().ptr);
+    try testing.expectEqual(@as(u64, 1), session.turn_count);
+    try testing.expectEqual(@as(u32, 15), session.agent.last_turn_usage.total_tokens);
+
+    // The ledger is the native one: one row per model call.
+    const ledger_path = try std.fs.path.join(testing.allocator, &.{ fixture.base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+    const ledger = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, ledger_path, 64 * 1024);
+    defer testing.allocator.free(ledger);
+    try testing.expect(std.mem.indexOf(u8, ledger, "\"total_tokens\":15") != null);
+    try testing.expect(std.mem.indexOf(u8, ledger, "\"provider\":\"mock\"") != null);
+}
+
+test "dsh-native: a 64KB reply is returned without leaking" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    const big = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = big },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const resp = try sm.processMessage("cli:main:dsh-native-big", "hi", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings(big, resp);
+}
+
+test "dsh-native: tool turn executes the call and answers from its result" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    const note_path = try std.fs.path.join(testing.allocator, &.{ fixture.base, "note.txt" });
+    defer testing.allocator.free(note_path);
+    {
+        const file = try fs_compat.createPath(note_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("tool says hi");
+    }
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{
+            .tool_calls = &.{.{
+                .id = "call-1",
+                .name = "read",
+                .arguments = "{\"file_path\":\"note.txt\"}",
+            }},
+        },
+        .{ .text = "tool done" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-tool";
+    const resp = try sm.processMessage(key, "read the note", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("tool done", resp);
+    try testing.expectEqual(@as(usize, 2), provider.chat_calls);
+    // The second request carries the tool result back to the model.
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "tool says hi") != null);
+
+    const session = try sm.getOrCreate(key);
+    try testing.expectEqual(@as(u64, 1), session.turn_count);
+    try testing.expectEqual(@as(u32, 15), session.agent.last_turn_usage.total_tokens);
+    try testing.expectEqual(@as(u64, 30), session.agent.total_tokens);
+}
+
+test "dsh-native: host /stop aborts the in-process turn" {
+    const Probe = struct {
+        manager: *SessionManager = undefined,
+        key: []const u8,
+        fn onChat(ctx: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            _ = self.manager.requestTurnInterrupt(self.key);
+        }
+    };
+
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "never delivered" },
+        .{ .text = "next turn ok" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-stop";
+    var probe = Probe{ .manager = &sm, .key = key };
+    provider.on_chat = Probe.onChat;
+    provider.on_chat_ctx = @ptrCast(&probe);
+
+    const resp = try sm.processMessage(key, "long task", null);
+    defer testing.allocator.free(resp);
+    // The kernel closes a cancelled turn with an empty partial reply and a
+    // typed abort; the host's /stop tail keys off the agent flag.
+    try testing.expectEqualStrings("", resp);
+    try testing.expectEqual(@as(usize, 1), provider.chat_calls);
+    const session = try sm.getOrCreate(key);
+    try testing.expect(session.agent.last_turn_interrupted);
+
+    // The consumed interrupt does not poison the next turn.
+    provider.on_chat = null;
+    provider.on_chat_ctx = null;
+    const next = try sm.processMessage(key, "again", null);
+    defer testing.allocator.free(next);
+    try testing.expectEqualStrings("next turn ok", next);
+}
+
+test "dsh-native: /new rotates the engine session and rewrites the mapping" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "one" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-new";
+    const first = try sm.processMessage(key, "hello", null);
+    defer testing.allocator.free(first);
+
+    const session = try sm.getOrCreate(key);
+    const first_id = try testing.allocator.dupe(u8, session.dsh_native.?.harness.session_id);
+    defer testing.allocator.free(first_id);
+    const first_log = try testing.allocator.dupe(u8, session.dsh_native.?.harness.log.?.path);
+    defer testing.allocator.free(first_log);
+
+    const ack = try sm.processMessage(key, "/new", null);
+    defer testing.allocator.free(ack);
+    try testing.expect(std.mem.indexOf(u8, ack, "Session cleared") != null);
+    // A local command never reaches the model.
+    try testing.expectEqual(@as(usize, 1), provider.chat_calls);
+
+    const new_id = session.dsh_native.?.harness.session_id;
+    try testing.expect(!std.mem.eql(u8, first_id, new_id));
+    const new_log = session.dsh_native.?.harness.log.?.path;
+    try testing.expect(!std.mem.eql(u8, first_log, new_log));
+
+    // The mapping is rewritten atomically to the new id (sidecar format).
+    const mapping_path = try fixture.mappingPath(testing.allocator, key);
+    defer testing.allocator.free(mapping_path);
+    const mapping = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, mapping_path, 4096);
+    defer testing.allocator.free(mapping);
+    const expected = try std.fmt.allocPrint(testing.allocator, "{{\"sessionId\":\"{s}\"}}", .{new_id});
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, mapping);
+}
+
+test "dsh-native: a message the engine never claimed runs as a new turn" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "first answer" },
+        .{ .text = "late answer" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-late";
+    const first = try sm.processMessage(key, "initial", null);
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("first answer", first);
+
+    const session = try sm.getOrCreate(key);
+    try session.injectMidTurn(testing.allocator, "late message");
+
+    var response: []const u8 = try testing.allocator.dupe(u8, "first answer");
+    defer testing.allocator.free(response);
+    var completed: u64 = 0;
+    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed, null, false, null));
+    try testing.expectEqual(@as(u64, 1), completed);
+    try testing.expectEqual(@as(usize, 2), provider.chat_calls);
+    try testing.expect(std.mem.indexOf(u8, response, "late answer") != null);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "late message") != null);
+    try testing.expect(!session.hasInjection());
+
+    // Two engine turns, not one: the late message is its own dsh turn.
+    const log_path = session.dsh_native.?.harness.log.?.path;
+    const log_bytes = try readDshNativeLog(log_path);
+    defer testing.allocator.free(log_bytes);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, log_bytes, "\"turn/start\""));
+}
+
+test "dsh-native: owns_inbox skips the native follow-up reply separator" {
+    const Probe = struct {
+        separator_seen: bool = false,
+        fn emit(ctx: *anyopaque, event: harness_port.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .delta => |chunk| {
+                    if (std.mem.eql(u8, chunk.delta, "\n\n")) self.separator_seen = true;
+                },
+                else => {},
+            }
+        }
+        fn sink(self: *@This()) harness_port.Sink {
+            return .{ .ctx = @ptrCast(self), .emit = emit };
+        }
+    };
+
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "first answer" },
+        .{ .text = "late answer" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-separator";
+    const first = try sm.processMessage(key, "initial", null);
+    defer testing.allocator.free(first);
+
+    const session = try sm.getOrCreate(key);
+    try session.injectMidTurn(testing.allocator, "late message");
+    var response: []const u8 = try testing.allocator.dupe(u8, "first answer");
+    defer testing.allocator.free(response);
+    var completed: u64 = 0;
+    var probe = Probe{};
+    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed, null, true, probe.sink()));
+    // The late message is a separate dsh turn, so the native-only live
+    // separator that joins two merged replies is not emitted.
+    try testing.expect(!probe.separator_seen);
+    try testing.expect(std.mem.indexOf(u8, response, "late answer") != null);
+}
+
+test "dsh-native: usage accumulates across turns and writes one ledger row each" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.diagnostics.token_usage_ledger_enabled = true;
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-usage";
+    const one = try sm.processMessage(key, "first", null);
+    defer testing.allocator.free(one);
+    const two = try sm.processMessage(key, "second", null);
+    defer testing.allocator.free(two);
+
+    const session = try sm.getOrCreate(key);
+    try testing.expectEqual(@as(u64, 30), session.agent.total_tokens);
+    try testing.expectEqual(@as(u32, 15), session.agent.last_turn_usage.total_tokens);
+
+    const ledger_path = try std.fs.path.join(testing.allocator, &.{ fixture.base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+    const ledger = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, ledger_path, 64 * 1024);
+    defer testing.allocator.free(ledger);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, ledger, "\"total_tokens\":15"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, ledger, "\"ts\":"));
+}
+
+test "dsh-native: restart resumes the same JSONL for the session key" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "first answer" },
+        .{ .text = "second answer" },
+    });
+    defer provider.deinit();
+
+    const key = "cli:main:dsh-native-resume";
+    var first_id: []u8 = undefined;
+    var first_log: []u8 = undefined;
+    {
+        var sm = fixture.manager(&provider);
+        defer sm.deinit();
+        const resp = try sm.processMessage(key, "hello", null);
+        defer testing.allocator.free(resp);
+        try testing.expectEqualStrings("first answer", resp);
+        const session = try sm.getOrCreate(key);
+        first_id = try testing.allocator.dupe(u8, session.dsh_native.?.harness.session_id);
+        first_log = try testing.allocator.dupe(u8, session.dsh_native.?.harness.log.?.path);
+    }
+    defer testing.allocator.free(first_id);
+    defer testing.allocator.free(first_log);
+
+    {
+        var sm = fixture.manager(&provider);
+        defer sm.deinit();
+        const session = try sm.getOrCreate(key);
+        try testing.expect(session.dsh_native != null);
+        try testing.expectEqualStrings(first_id, session.dsh_native.?.harness.session_id);
+        try testing.expectEqualStrings(first_log, session.dsh_native.?.harness.log.?.path);
+
+        const resp = try sm.processMessage(key, "again", null);
+        defer testing.allocator.free(resp);
+        try testing.expectEqualStrings("second answer", resp);
+        // The rebuilt surface carries the previous turn into the request.
+        try testing.expect(std.mem.indexOf(u8, provider.users.items, "hello") != null);
+    }
+
+    const log_bytes = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, first_log, 1 << 20);
+    defer testing.allocator.free(log_bytes);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, "first answer") != null);
+    try testing.expect(std.mem.indexOf(u8, log_bytes, "second answer") != null);
 }
 
 test "harness display trust uses the real session key for shared channels" {
