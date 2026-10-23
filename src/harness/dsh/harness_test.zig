@@ -2125,3 +2125,92 @@ test "persistent writer-held returns SessionWriterHeld after one reap" {
     try std.testing.expectEqual(@as(u32, 1), ctl.calls);
     try std.testing.expectEqual(@as(u32, 2), mock.promptCount());
 }
+
+const ProcKillLog = struct {
+    allocator: Allocator,
+    root: []const u8,
+    pids: std.ArrayListUnmanaged(i32) = .empty,
+};
+
+fn recordProcKill(ctx: ?*anyopaque, pid: i32) void {
+    const log: *ProcKillLog = @ptrCast(@alignCast(ctx.?));
+    log.pids.append(log.allocator, pid) catch {};
+    var name_buf: [16]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}", .{pid}) catch return;
+    var dir = std_compat.fs.openDirAbsolute(log.root, .{}) catch return;
+    defer dir.close();
+    dir.deleteTree(name) catch {};
+}
+
+fn ignoreReap(_: ?*anyopaque, _: *const sidecar_mod.Options, _: ?i32) void {}
+
+fn writeFakeProc(dir: std_compat.fs.Dir, name: []const u8, cmdline: []const u8, environ: []const u8) !void {
+    try dir.makeDir(name);
+    var entry = try dir.openDir(name, .{});
+    defer entry.close();
+    try entry.writeFile(.{ .sub_path = "cmdline", .data = cmdline });
+    try entry.writeFile(.{ .sub_path = "environ", .data = environ });
+}
+
+test "empty configured bin resolves from env and the sweep spares the gateway" {
+    // Regression: the production constructor leaves bin_js empty and the
+    // resolved path lived only in ensureBooted's local copy. The writer-held
+    // sweep then ran with an empty needle, matched every process, and killed
+    // the gateway itself.
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    const c = @cImport({
+        @cInclude("stdlib.h");
+    });
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = std_compat.fs.Dir.wrap(tmp.dir);
+    const root = try raw.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(home);
+    const bin = try std.fs.path.join(allocator, &.{ root, "bin.js" });
+    defer allocator.free(bin);
+
+    const key_z = try allocator.dupeZ(u8, "NULLCLAW_DSH_BIN");
+    defer allocator.free(key_z);
+    const bin_z = try allocator.dupeZ(u8, bin);
+    defer allocator.free(bin_z);
+    try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, bin_z.ptr, 1));
+    defer _ = c.unsetenv(key_z.ptr);
+
+    const engine = try allocator.create(DshEngine);
+    engine.* = DshEngine.init(allocator, .{
+        .sidecar = .{
+            .node_exe = "/bin/false",
+            .bin_js = "",
+            .workspace = root,
+            .dsh_home = home,
+            .boot_timeout_ms = 2_000,
+            .reap = ignoreReap,
+        },
+    });
+    defer {
+        engine.deinit();
+        allocator.destroy(engine);
+    }
+
+    try std.testing.expectError(error.SidecarBootFailed, engine.ensureBooted());
+    // The resolved path must outlive the failed boot for the sweep.
+    try std.testing.expectEqualStrings(bin, engine.opts.sidecar.bin_js);
+
+    const environ = try std.fmt.allocPrint(allocator, "DSH_HOME={s}\x00", .{home});
+    defer allocator.free(environ);
+    const dsh_cmdline = try std.fmt.allocPrint(allocator, "node\x00{s}\x00", .{bin});
+    defer allocator.free(dsh_cmdline);
+    // The gateway's own argv ("nullclaw") plus a real leftover dsh.
+    try writeFakeProc(raw, "100", "nullclaw\x00", environ);
+    try writeFakeProc(raw, "101", dsh_cmdline, environ);
+
+    var log = ProcKillLog{ .allocator = allocator, .root = root };
+    defer log.pids.deinit(allocator);
+    sidecar_mod.reapOrphansIn(allocator, root, engine.opts.sidecar.bin_js, engine.opts.sidecar.dsh_home, null, recordProcKill, &log);
+
+    try std.testing.expectEqualSlices(i32, &.{101}, log.pids.items);
+}

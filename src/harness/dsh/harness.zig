@@ -188,6 +188,9 @@ pub const DshEngine = struct {
 
     allocator: Allocator,
     opts: Options,
+    /// `opts.sidecar.bin_js` resolved from the environment at boot, owned by
+    /// the engine. Kept alive for restarts and the writer-held sweep.
+    bin_js_owned: ?[]u8 = null,
     /// Set only when this engine spawned the process; `boot_url` bypasses it.
     /// Owned processes are restarted automatically after a connection-level
     /// error; an injected `boot_url` is never restarted.
@@ -228,6 +231,7 @@ pub const DshEngine = struct {
         self.entries.deinit(self.allocator);
         if (self.sidecar) |*sidecar| sidecar.deinit();
         if (self.client) |client| client.release();
+        if (self.bin_js_owned) |value| self.allocator.free(value);
     }
 
     /// Idempotent lazy boot. The first caller spawns (or adopts) the sidecar
@@ -262,16 +266,18 @@ pub const DshEngine = struct {
             boot_url_owned = try hook(self.spawn_ctx, self.allocator);
             break :blk boot_url_owned.?;
         } else blk: {
-            var owned_bin: ?[]u8 = null;
-            defer if (owned_bin) |value| self.allocator.free(value);
             var sidecar_opts = self.opts.sidecar;
             sidecar_opts.rpc_timeout_ms = self.opts.rpc_timeout_ms;
             if (sidecar_opts.bin_js.len == 0) {
-                owned_bin = std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_DSH_BIN") catch |err| switch (err) {
+                const resolved = std_compat.process.getEnvVarOwned(self.allocator, "NULLCLAW_DSH_BIN") catch |err| switch (err) {
                     error.EnvironmentVariableNotFound => return error.DshBinNotConfigured,
                     else => return err,
                 };
-                sidecar_opts.bin_js = owned_bin.?;
+                // Persist: restarts and the writer-held sweep must see the
+                // real bin path, not the empty needle that matches every pid.
+                self.bin_js_owned = resolved;
+                self.opts.sidecar.bin_js = resolved;
+                sidecar_opts.bin_js = resolved;
             }
             spawned = try sidecar_mod.Sidecar.start(self.allocator, sidecar_opts);
             break :blk spawned.?.boot_url orelse return error.SidecarNotStarted;

@@ -367,6 +367,11 @@ pub const Subscription = struct {
         for (self.queue.items) |*event| freeEvent(self.allocator, event);
         self.queue.clearRetainingCapacity();
 
+        // Tombstones from an earlier drain belong to a turn that is already
+        // gone; keeping them leaked one call id per cancelled turn.
+        for (self.stale_calls.items) |call_id| self.allocator.free(call_id);
+        self.stale_calls.clearRetainingCapacity();
+
         // A turn stopped mid tool-call leaves argument fragments pending.
         // Free them and tombstone the ids so the completion cannot surface as
         // the next turn's `.tool_call` progress.
@@ -1252,6 +1257,34 @@ test "drain drops a half-streamed tool call and its late completion" {
         },
         else => return error.TestUnexpectedEvent,
     }
+}
+
+test "drain releases tombstones from earlier drains" {
+    // Regression: each drain appended tombstones but only a late completion
+    // or deinit freed them, leaking one call id per cancelled turn.
+    const allocator = std.testing.allocator;
+    var shared = Subscription{
+        .allocator = allocator,
+        .session_id = try allocator.dupe(u8, "session-test"),
+        .stream_id = try allocator.dupe(u8, "follow"),
+    };
+    defer shared.deinitContents();
+
+    try shared.pushFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\",\"callId\":\"call-1\"," ++
+            "\"name\":\"read\",\"argumentsDelta\":\"{\"}}",
+    );
+    shared.drain();
+    try std.testing.expectEqual(@as(usize, 1), shared.stale_calls.items.len);
+
+    try shared.pushFrame(
+        "{\"type\":\"assistant-stream\",\"data\":{\"type\":\"tool-call-delta\",\"callId\":\"call-2\"," ++
+            "\"name\":\"read\",\"argumentsDelta\":\"{\"}}",
+    );
+    shared.drain();
+    // Only this drain's tombstone survives; the earlier one is released.
+    try std.testing.expectEqual(@as(usize, 1), shared.stale_calls.items.len);
+    try std.testing.expectEqualStrings("call-2", shared.stale_calls.items[0]);
 }
 
 test "writer-held RPC error is distinct from a generic RPC failure" {

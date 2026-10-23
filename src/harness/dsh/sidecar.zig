@@ -181,6 +181,9 @@ const ORPHAN_EXIT_TIMEOUT_MS: u64 = 2_000;
 /// SIGKILLed gateway does not take its sidecar down (the sidecar is its own
 /// process group), and that orphan keeps `session.lock`, so a fresh dsh
 /// answers `session/writer-held` instead of resuming the session.
+/// shortcut: one DSH_HOME should serve one gateway; a second gateway or a
+/// hand-started dsh for the same home can still be swept. Upgrade when
+/// multiple gateways must share a home.
 pub fn reapOrphans(allocator: Allocator, opts: Options, exclude_pid: ?i32) void {
     if (opts.reap) |hook| {
         hook(opts.reap_ctx, &opts, exclude_pid);
@@ -190,7 +193,9 @@ pub fn reapOrphans(allocator: Allocator, opts: Options, exclude_pid: ?i32) void 
     reapOrphansIn(allocator, "/proc", opts.bin_js, opts.dsh_home, exclude_pid, killOrphan, null);
 }
 
-fn reapOrphansIn(
+/// Test seam: `proc_root` and `killer` are injectable so a fake tree can be
+/// swept without touching the real process table.
+pub fn reapOrphansIn(
     allocator: Allocator,
     proc_root: []const u8,
     bin_js: []const u8,
@@ -199,22 +204,69 @@ fn reapOrphansIn(
     killer: *const fn (ctx: ?*anyopaque, pid: i32) void,
     killer_ctx: ?*anyopaque,
 ) void {
-    const pids = collectOrphans(allocator, proc_root, bin_js, dsh_home, exclude_pid) catch return;
+    const pids = collectOrphans(allocator, proc_root, bin_js, dsh_home, exclude_pid, ownPid()) catch return;
     defer allocator.free(pids);
     for (pids) |pid| killer(killer_ctx, pid);
     // The lock is released by process teardown, which can trail the signal.
     for (pids) |pid| waitPidGone(allocator, proc_root, pid);
 }
 
+/// The gateway's own pid, or null where the sweep cannot run.
+fn ownPid() ?i32 {
+    return switch (builtin.os.tag) {
+        .linux => @intCast(std.os.linux.getpid()),
+        .macos => @intCast(std.c.getpid()),
+        else => null,
+    };
+}
+
+fn readPpid(allocator: Allocator, proc_root: []const u8, pid: i32) ?i32 {
+    var name_buf: [16]u8 = undefined;
+    const name = std.fmt.bufPrint(&name_buf, "{d}", .{pid}) catch return null;
+    const stat = readProcFile(allocator, proc_root, name, "stat") orelse return null;
+    defer allocator.free(stat);
+    // `pid (comm) state ppid …`; comm may contain spaces and parentheses.
+    const close = std.mem.lastIndexOfScalar(u8, stat, ')') orelse return null;
+    var fields = std.mem.tokenizeScalar(u8, stat[close + 1 ..], ' ');
+    _ = fields.next() orelse return null; // state
+    const ppid_text = fields.next() orelse return null;
+    return std.fmt.parseInt(i32, ppid_text, 10) catch null;
+}
+
+/// True when `pid` is the gateway, one of its ancestors, or one of its
+/// descendants. The sweep must never kill the process tree running it.
+fn inOwnProcessTree(allocator: Allocator, proc_root: []const u8, pid: i32, self_pid: i32) bool {
+    if (pid == self_pid) return true;
+    var current = self_pid;
+    var hops: usize = 0;
+    while (hops < 64) : (hops += 1) {
+        const ppid = readPpid(allocator, proc_root, current) orelse break;
+        if (ppid <= 0 or ppid == current) break;
+        if (ppid == pid) return true;
+        current = ppid;
+    }
+    current = pid;
+    hops = 0;
+    while (hops < 64) : (hops += 1) {
+        const ppid = readPpid(allocator, proc_root, current) orelse return false;
+        if (ppid <= 0 or ppid == current) return false;
+        if (ppid == self_pid) return true;
+        current = ppid;
+    }
+    return false;
+}
+
 /// Pids whose argv carries this exact `bin_js` and whose environment carries
 /// this exact `DSH_HOME`. Excludes `exclude_pid` (the live sidecar of this
-/// gateway, which must survive a retry sweep).
+/// gateway, which must survive a retry sweep) and the gateway's own process
+/// tree.
 fn collectOrphans(
     allocator: Allocator,
     proc_root: []const u8,
     bin_js: []const u8,
     dsh_home: []const u8,
     exclude_pid: ?i32,
+    self_pid: ?i32,
 ) ![]i32 {
     const home = std.mem.trimEnd(u8, dsh_home, "/");
     const expected_home = try std.fmt.allocPrint(allocator, "DSH_HOME={s}", .{home});
@@ -231,6 +283,7 @@ fn collectOrphans(
         const pid = std.fmt.parseInt(i32, entry.name, 10) catch continue;
         if (pid <= 0) continue;
         if (exclude_pid) |excluded| if (pid == excluded) continue;
+        if (self_pid) |own| if (inOwnProcessTree(allocator, proc_root, pid, own)) continue;
         if (!processOwnsHome(allocator, proc_root, entry.name, bin_js, expected_home)) continue;
         try pids.append(allocator, pid);
     }
@@ -272,6 +325,9 @@ fn readProcFile(
 }
 
 fn containsNulEntry(data: []const u8, needle: []const u8) bool {
+    // An empty needle equals every NUL-delimited entry (and /proc/cmdline
+    // ends with a NUL), so it would match any process.
+    if (needle.len == 0) return false;
     var it = std.mem.splitScalar(u8, data, 0);
     while (it.next()) |entry| if (std.mem.eql(u8, entry, needle)) return true;
     return false;
@@ -660,7 +716,7 @@ test "collectOrphans matches dsh by bin path and DSH_HOME" {
     try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "103", "node\x00/opt/dsh/lib/bin.js\x00", "DSH_HOME=/tmp/dsh-home\x00");
     try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "self", "nullclaw\x00", "DSH_HOME=/tmp/dsh-home\x00");
 
-    const pids = try collectOrphans(allocator, root, "/opt/dsh/lib/bin.js", "/tmp/dsh-home", 103);
+    const pids = try collectOrphans(allocator, root, "/opt/dsh/lib/bin.js", "/tmp/dsh-home", 103, null);
     defer allocator.free(pids);
     try std.testing.expectEqualSlices(i32, &.{100}, pids);
 }
@@ -706,6 +762,63 @@ test "reapOrphansIn kills every leftover dsh for the home" {
     defer dir.close();
     try std.testing.expectError(error.FileNotFound, dir.openDir("100", .{}));
     try std.testing.expectError(error.FileNotFound, dir.openDir("102", .{}));
+}
+
+fn writeProcStat(dir: std_compat.fs.Dir, name: []const u8, ppid: i32) !void {
+    var entry = try dir.openDir(name, .{});
+    defer entry.close();
+    var buf: [64]u8 = undefined;
+    const stat = try std.fmt.bufPrint(&buf, "{s} (dsh) S {d} 1 1 1\n", .{ name, ppid });
+    try entry.writeFile(.{ .sub_path = "stat", .data = stat });
+}
+
+test "empty bin path never matches a gateway-shaped process" {
+    // Regression: an empty bin_js matched the trailing NUL of /proc/cmdline,
+    // so the sweep killed the gateway itself (argv "nullclaw", DSH_HOME set).
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    try writeProcEntry(std_compat.fs.Dir.wrap(tmp.dir), "100", "nullclaw\x00", "DSH_HOME=/tmp/dsh-home\x00");
+    const pids = try collectOrphans(allocator, root, "", "/tmp/dsh-home", null, null);
+    defer allocator.free(pids);
+    try std.testing.expectEqualSlices(i32, &.{}, pids);
+}
+
+test "sweep spares the gateway process tree and kills orphans" {
+    // Regression: every same-bin+home process was killed, including the live
+    // sidecar child of this gateway and the gateway's own ancestors.
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const raw = std_compat.fs.Dir.wrap(tmp.dir);
+    const root = try raw.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const cmdline = "node\x00/opt/dsh/lib/bin.js\x00";
+    const environ = "DSH_HOME=/tmp/dsh-home\x00";
+
+    // Gateway 999, its parent 500, and init.
+    try writeProcEntry(raw, "999", cmdline, environ);
+    try writeProcStat(raw, "999", 500);
+    try writeProcEntry(raw, "500", cmdline, environ);
+    try writeProcStat(raw, "500", 1);
+    // Children of the gateway: the live sidecar 200 and its grandchild 600.
+    try writeProcEntry(raw, "200", cmdline, environ);
+    try writeProcStat(raw, "200", 999);
+    try writeProcEntry(raw, "600", cmdline, environ);
+    try writeProcStat(raw, "600", 200);
+    // Orphans: adopted by init, and one whose parent is already gone.
+    try writeProcEntry(raw, "400", cmdline, environ);
+    try writeProcStat(raw, "400", 1);
+    try writeProcEntry(raw, "401", cmdline, environ);
+
+    const pids = try collectOrphans(allocator, root, "/opt/dsh/lib/bin.js", "/tmp/dsh-home", null, 999);
+    defer allocator.free(pids);
+    try std.testing.expectEqualSlices(i32, &.{ 400, 401 }, pids);
 }
 
 const ReapCtl = struct { calls: u32 = 0, last_exclude: ?i32 = null };
