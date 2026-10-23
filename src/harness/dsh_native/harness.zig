@@ -377,7 +377,7 @@ pub const DshNativeHarness = struct {
 
         var read = session_log.readLog(self.allocator, self.log.?.path) catch |err| {
             if (self.opts.on_corrupt != .native) return err;
-            try self.openNewSession(null);
+            try self.startFresh();
             return;
         };
         defer read.deinit();
@@ -392,7 +392,13 @@ pub const DshNativeHarness = struct {
             if (std.mem.eql(u8, event.event_type, "permission/preset")) self.context_written = true;
         }
         try self.rebuildSurface(read.events, arena);
-        if (self.goal_store) |store| try store.rebuild(read.events);
+        if (self.goal_store) |store| store.rebuild(read.events) catch |err| {
+            // Same policy as a corrupt log: a projection the log cannot
+            // replay starts a fresh session instead of wedging every open.
+            if (self.opts.on_corrupt != .native) return err;
+            try self.startFresh();
+            return;
+        };
         self.buildLoop();
         if (baseline) |header| {
             const loop = &self.loop.?;
@@ -641,10 +647,6 @@ pub const DshNativeHarness = struct {
             if (!continues) break;
             const driver = if (self.goal_driver) |*value| value else break;
             const continuation = (try driver.next(arena)) orelse break;
-            self.goal_tools.?.authority = .{
-                .direct_human = false,
-                .goal_round = self.goal_store.?.find(),
-            };
             _ = try loop.followup(continuation);
             outcome = try loop.runTurn();
         }
@@ -898,17 +900,33 @@ pub const DshNativeHarness = struct {
         // dsh stores `user/message` with the message at the top level of
         // `data` (no inner `message` key); `surface.fold` reads it that way.
         const data = try parseValue(arena, message.json);
-        const seq = try self.appendEvent("user/message", data, .append, message.source_event_seqs);
-        // Goal rounds are admitted exactly where dsh folds them: on the logged
-        // `user/message`. `roundsStarted` therefore has one owner (`goal.Store`).
+        // Fold before logging: a goal round the projection rejects (stale
+        // revision, wrong phase) must not leave a user/message the log can
+        // never replay.
+        // Regression: logging first turned one rejected goal round into a
+        // session that failed every later open/restore with GoalInvalidChange.
         if (self.goal_store) |store| {
             try store.applyEvent(.{
                 .event_type = "user/message",
-                .seq = seq,
+                .seq = 0,
                 .time_ms = 0,
                 .data = data,
             });
         }
+        // Authority follows the admitted message, not the loop position: a
+        // goal followup queued before a pause can be admitted in a later
+        // human turn and must stay autonomous. Wrap-ups keep the open turn.
+        if (self.goal_tools) |tools| {
+            const kind = messageSourceKind(data);
+            if (std.mem.eql(u8, kind, "goal")) {
+                if (self.goal_store) |store| {
+                    tools.authority = .{ .direct_human = false, .goal_round = store.find() };
+                }
+            } else if (!std.mem.eql(u8, kind, "tool-goal")) {
+                tools.authority = .{};
+            }
+        }
+        const seq = try self.appendEvent("user/message", data, .append, message.source_event_seqs);
         try self.addSurfaceSnapshot(arena, try surface_mod.messageFromEvent(arena, .{
             .event_type = "user/message",
             .seq = seq,
@@ -1619,10 +1637,87 @@ pub const DshNativeHarness = struct {
     }
 };
 
+/// `source.kind` of a logged message, or "" when absent.
+fn messageSourceKind(data: Value) []const u8 {
+    const object = switch (data) {
+        .object => |value| value,
+        else => return "",
+    };
+    const source = switch (object.get("source") orelse return "") {
+        .object => |value| value,
+        else => return "",
+    };
+    return switch (source.get("kind") orelse return "") {
+        .string => |value| value,
+        else => return "",
+    };
+}
+
 /// A v4 session id: 32 lowercase hex characters from a CSPRNG.
 fn newSessionId(allocator: Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
     compat.crypto.random.bytes(&bytes);
     const hex = std.fmt.bytesToHex(bytes, .lower);
     return allocator.dupe(u8, &hex);
+}
+
+test "dsh-native harness: a rejected goal round never reaches the log" {
+    // Regression: user/message was logged before `goal.Store` folded it, so a
+    // stale goal round left a record every later open/restore failed to replay.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(dsh_home);
+    try fs_compat.makePath(dsh_home);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace);
+    try fs_compat.makePath(workspace);
+
+    // The provider is unused: this drives the host emit path directly.
+    var engine = try DshNativeHarness.init(allocator, .{
+        .session_key = "test-session-key",
+        .dsh_home = dsh_home,
+        .workspace_dir = workspace,
+        .provider = undefined,
+        .provider_name = "",
+        .model = "",
+    });
+    defer engine.deinit(allocator);
+    engine.log = try session_store.createLog(allocator, dsh_home, workspace, "test-session", .{
+        .id = "test-session",
+        .created_at = 0,
+        .cwd = workspace,
+    });
+    engine.goal_store.?.attachLog(&engine.log.?);
+
+    const store = engine.goal_store.?;
+    _ = try store.create("ship it", 4);
+
+    const stale = loop_mod.UserMessage{
+        .json = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"stale\"}],\"source\":{\"kind\":\"goal\",\"goalId\":\"goal-1\",\"revision\":2,\"round\":1},\"id\":\"stale\"}",
+    };
+    try std.testing.expectError(error.GoalInvalidChange, engine.appendUserMessage(.{ .turn = 1, .step = 1 }, stale));
+
+    var read = try session_log.readLog(allocator, engine.log.?.path);
+    defer read.deinit();
+    try std.testing.expectEqual(@as(usize, 1), read.events.len);
+    try std.testing.expectEqualStrings("goal/change", read.events[0].event_type);
+
+    const round = loop_mod.UserMessage{
+        .json = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"round one\"}],\"source\":{\"kind\":\"goal\",\"goalId\":\"goal-1\",\"revision\":1,\"round\":1},\"id\":\"round-1\"}",
+    };
+    _ = try engine.appendUserMessage(.{ .turn = 2, .step = 1 }, round);
+    try std.testing.expectEqual(@as(u32, 1), store.rounds_started);
+    // Authority is derived from the admitted message, not the loop position.
+    try std.testing.expect(!engine.goal_tools.?.authority.direct_human);
+    try std.testing.expectEqualStrings("goal-1", engine.goal_tools.?.authority.goal_round.?.id);
+
+    const human = loop_mod.UserMessage{
+        .json = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"source\":{\"kind\":\"user\"},\"id\":\"human-1\"}",
+    };
+    _ = try engine.appendUserMessage(.{ .turn = 3, .step = 1 }, human);
+    try std.testing.expect(engine.goal_tools.?.authority.direct_human);
 }

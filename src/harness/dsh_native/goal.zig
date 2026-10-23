@@ -438,6 +438,15 @@ pub fn activationName(activation: Activation) []const u8 {
     return @tagName(activation);
 }
 
+/// dsh `transitionError`'s `expected ${allowed.join(' or ')}` per operation.
+fn allowedPhases(action: []const u8) []const u8 {
+    if (std.mem.eql(u8, action, "pause") or std.mem.eql(u8, action, "block")) return "active";
+    if (std.mem.eql(u8, action, "resume") or std.mem.eql(u8, action, "complete")) {
+        return "active or paused or blocked";
+    }
+    return "a valid source phase";
+}
+
 /// Stable machine-routable failure code (dsh `GoalError.code`).
 pub fn errorCode(err: anyerror) []const u8 {
     return switch (err) {
@@ -457,7 +466,9 @@ pub fn errorCode(err: anyerror) []const u8 {
 }
 
 /// Human-readable failure message, using the current goal for context.
-pub fn describeError(self: *const Store, allocator: Allocator, err: anyerror, action: []const u8) ![]const u8 {
+/// `ref` is the requested compare-and-set identity, when the caller has one;
+/// dsh quotes it in the stale-ref message.
+pub fn describeError(self: *const Store, allocator: Allocator, err: anyerror, action: []const u8, ref: ?Ref) ![]const u8 {
     return switch (err) {
         error.GoalNotFound => try allocator.dupe(u8, "no current goal"),
         error.GoalAlreadyExists => if (self.current) |current|
@@ -465,14 +476,21 @@ pub fn describeError(self: *const Store, allocator: Allocator, err: anyerror, ac
         else
             try allocator.dupe(u8, "a goal already exists"),
         error.GoalStaleRevision => if (self.current) |current|
-            try std.fmt.allocPrint(allocator, "stale goal ref; current is \"{s}\" revision {d}", .{ current.id, current.revision })
+            if (ref) |requested|
+                try std.fmt.allocPrint(
+                    allocator,
+                    "stale goal ref \"{s}\" revision {d}; current is \"{s}\" revision {d}",
+                    .{ requested.id, requested.revision, current.id, current.revision },
+                )
+            else
+                try std.fmt.allocPrint(allocator, "stale goal ref; current is \"{s}\" revision {d}", .{ current.id, current.revision })
         else
             try allocator.dupe(u8, "stale goal ref; no current goal"),
         error.GoalInvalidTransition => if (self.current) |current|
             try std.fmt.allocPrint(
                 allocator,
-                "cannot {s} goal \"{s}\" from phase \"{s}\"; expected a valid source phase",
-                .{ action, current.id, phaseName(current.phase) },
+                "cannot {s} goal \"{s}\" from phase \"{s}\"; expected {s}",
+                .{ action, current.id, phaseName(current.phase), allowedPhases(action) },
             )
         else
             try std.fmt.allocPrint(allocator, "cannot {s} without a current goal", .{action}),
@@ -763,6 +781,35 @@ test "goal rejects invalid transitions, stale refs, and bad arguments" {
     const replaced = try store.create("replacement", 2);
     try testing.expectEqualStrings("goal-2", replaced.id);
     try testing.expectEqual(Phase.active, replaced.phase);
+}
+
+test "goal error text matches dsh for stale refs and transitions" {
+    // Regression: the stale message omitted the requested ref, and the
+    // transition message omitted dsh's allowed-phase list.
+    var store = Store.init(testing.allocator);
+    defer store.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var at: i64 = 100;
+    store.clock = .{ .context = &at, .now = fixedClock };
+
+    const created = try store.create("objective", 4);
+    try testing.expectError(error.GoalStaleRevision, store.pause(.{ .id = created.id, .revision = 9 }));
+    const stale = try describeError(&store, arena.allocator(), error.GoalStaleRevision, "pause", .{ .id = created.id, .revision = 9 });
+    try testing.expectEqualStrings(
+        "stale goal ref \"goal-1\" revision 9; current is \"goal-1\" revision 1",
+        stale,
+    );
+    const transition = try describeError(&store, arena.allocator(), error.GoalInvalidTransition, "resume", null);
+    try testing.expectEqualStrings(
+        "cannot resume goal \"goal-1\" from phase \"active\"; expected active or paused or blocked",
+        transition,
+    );
+    const pause = try describeError(&store, arena.allocator(), error.GoalInvalidTransition, "pause", null);
+    try testing.expectEqualStrings(
+        "cannot pause goal \"goal-1\" from phase \"active\"; expected active",
+        pause,
+    );
 }
 
 test "goal resume needs round budget" {

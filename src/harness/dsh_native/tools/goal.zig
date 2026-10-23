@@ -78,9 +78,9 @@ fn createGoal(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
     if (!self.authority.direct_human) return authorityFailure(allocator);
     const objective = optionalString(args, "objective") orelse "";
     const cap = roundCap(optionalInteger(args, "max_goal_rounds")) catch |err|
-        return failureFor(allocator, self.store, err, "create");
+        return failureFor(allocator, self.store, err, "create", null);
     _ = self.store.create(objective, cap) catch |err|
-        return failureFor(allocator, self.store, err, "create");
+        return failureFor(allocator, self.store, err, "create", null);
     return success(allocator, try renderValue(allocator, self.store));
 }
 
@@ -108,9 +108,9 @@ fn updateGoal(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
                 return failure(allocator, "GOAL_TOOL_INVALID_UPDATE", "blocked_reason is valid only with action blocked");
             }
             const cap = roundCap(max_rounds) catch |err|
-                return failureFor(allocator, self.store, err, "edit");
+                return failureFor(allocator, self.store, err, "edit", ref);
             _ = self.store.edit(ref, objective, cap) catch |err|
-                return failureFor(allocator, self.store, err, "edit");
+                return failureFor(allocator, self.store, err, "edit", ref);
         },
         .pause, .@"resume" => {
             if (!self.authority.direct_human) return authorityFailure(allocator);
@@ -129,9 +129,9 @@ fn updateGoal(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
                 }
             }
             const snapshot = if (action == .pause)
-                self.store.pause(ref) catch |err| return failureFor(allocator, self.store, err, "pause")
+                self.store.pause(ref) catch |err| return failureFor(allocator, self.store, err, "pause", ref)
             else
-                self.store.@"resume"(ref) catch |err| return failureFor(allocator, self.store, err, "resume");
+                self.store.@"resume"(ref) catch |err| return failureFor(allocator, self.store, err, "resume", ref);
             _ = snapshot;
         },
         .complete, .blocked => {
@@ -169,13 +169,13 @@ fn updateGoal(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
                     }
                 }
                 const snapshot = self.store.block(ref, "model-reported", blocked_reason.?) catch |err|
-                    return failureFor(allocator, self.store, err, "block");
+                    return failureFor(allocator, self.store, err, "block", ref);
                 if (round_authority != null) {
                     wrapup = try wrapupContext(allocator, snapshot, blocked_reason.?);
                 }
             } else {
                 const snapshot = self.store.complete(ref) catch |err|
-                    return failureFor(allocator, self.store, err, "complete");
+                    return failureFor(allocator, self.store, err, "complete", ref);
                 if (round_authority != null) {
                     wrapup = try wrapupContext(allocator, snapshot, null);
                 }
@@ -278,8 +278,8 @@ fn failure(allocator: Allocator, code: []const u8, message: []const u8) !registr
     } };
 }
 
-fn failureFor(allocator: Allocator, store: *goal.Store, err: anyerror, action: []const u8) !registry.ToolResult {
-    const message = try goal.describeError(store, allocator, err, action);
+fn failureFor(allocator: Allocator, store: *goal.Store, err: anyerror, action: []const u8, ref: ?goal.Ref) !registry.ToolResult {
+    const message = try goal.describeError(store, allocator, err, action, ref);
     return failure(allocator, goal.errorCode(err), message);
 }
 

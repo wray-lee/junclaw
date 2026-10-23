@@ -714,3 +714,114 @@ test "dsh-native adapter: the goal round cap blocks instead of following up" {
         blocked.blocked_reason.?.message,
     );
 }
+
+test "dsh-native adapter: a restored session keeps the goal and runs the next round" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        // Turn 1: create the goal, then round 1 reports blocked.
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":4}" }} },
+        .{ .text = "goal created" },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "update_goal", .arguments = "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"blocked\",\"blocked_reason\":\"waiting on the registry\"}" }} },
+        .{ .text = "blocked after round one" },
+        // After restore: the human resumes, then round 2 completes the goal.
+        .{ .tool_calls = &.{.{ .id = "call-3", .name = "update_goal", .arguments = "{\"goal_id\":\"goal-1\",\"revision\":2,\"action\":\"resume\"}" }} },
+        .{ .text = "resumed" },
+        .{ .tool_calls = &.{.{ .id = "call-4", .name = "update_goal", .arguments = "{\"goal_id\":\"goal-1\",\"revision\":3,\"action\":\"complete\"}" }} },
+        .{ .text = "finished after restore" },
+    });
+    defer fx.deinit();
+
+    const first_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        engine.goal_tools.?.blocked_after = 1;
+        const result = try engine.harness().runTurn(turnInput("start the goal"));
+        allocator.free(result.reply);
+        try testing.expectEqual(goal_mod.Phase.blocked, engine.goal_store.?.find().?.phase);
+        try testing.expectEqual(@as(u32, 1), engine.goal_store.?.rounds_started);
+        try testing.expectEqual(@as(u32, 2), engine.goal_store.?.find().?.revision);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(first_id);
+
+    // A fresh process: the goal projection and the surface both come from the
+    // JSONL through the public restore path.
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(first_id, restored.session_id);
+    const replayed = restored.goal_store.?.find().?;
+    try testing.expectEqual(goal_mod.Phase.blocked, replayed.phase);
+    try testing.expectEqual(@as(u32, 2), replayed.revision);
+    try testing.expectEqual(@as(u32, 1), restored.goal_store.?.rounds_started);
+    try testing.expectEqual(goal_mod.Activation.disarmed, restored.goal_store.?.activation);
+
+    const result = try restored.harness().runTurn(turnInput("resume and finish"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("finished after restore", result.persisted_reply.?);
+    try testing.expect(requestContains(fx.provider.requests.items[6], "Round: 2/4"));
+    try testing.expect(requestContains(fx.provider.requests.items[4], "blocked after round one"));
+
+    const done = restored.goal_store.?.find().?;
+    try testing.expectEqual(goal_mod.Phase.complete, done.phase);
+    try testing.expectEqual(@as(u32, 2), restored.goal_store.?.rounds_started);
+    try testing.expectEqual(@as(u32, 4), done.revision);
+}
+
+test "dsh-native adapter: an unreplayable goal projection follows on_corrupt" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":1}" }} },
+        .{ .text = "goal created" },
+        .{ .text = "still working" },
+    });
+    defer fx.deinit();
+
+    const first_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const result = try engine.harness().runTurn(turnInput("start the goal"));
+        defer allocator.free(result.reply);
+        try testing.expect(result.@"error" == null);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(first_id);
+
+    // Simulate the pre-fix pollution: a goal round the projection rejects.
+    const path = try fx.logPath(allocator, first_id);
+    defer allocator.free(path);
+    {
+        var log = try session_log.Log.open(allocator, path);
+        defer log.close();
+        var parsed = try std.json.parseFromSlice(
+            std.json.Value,
+            allocator,
+            "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"stale\"}],\"source\":{\"kind\":\"goal\",\"goalId\":\"goal-1\",\"revision\":9,\"round\":1},\"id\":\"stale\"}",
+            .{},
+        );
+        defer parsed.deinit();
+        _ = try log.append("user/message", parsed.value, .{ .surface_op = .append });
+    }
+
+    // Default policy stays fail-closed.
+    {
+        var strict = try DshNativeHarness.init(allocator, fx.options());
+        defer strict.deinit(allocator);
+        try testing.expectError(error.GoalInvalidChange, strict.harness().restore(.{ .messages = &.{} }));
+    }
+
+    var opts = fx.options();
+    opts.on_corrupt = .native;
+    var restored = try DshNativeHarness.init(allocator, opts);
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    try testing.expect(!std.mem.eql(u8, first_id, restored.session_id));
+    try testing.expect(restored.goal_store.?.find() == null);
+
+    // The mapping follows the fresh session, so the next restart resumes it.
+    const mapping = try fx.mappingPath(allocator);
+    defer allocator.free(mapping);
+    const text = try readLogText(allocator, mapping);
+    defer allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, restored.session_id) != null);
+}

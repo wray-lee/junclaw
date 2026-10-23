@@ -230,7 +230,7 @@ fn missingGoal(allocator: Allocator, action: []const u8) !Result {
 }
 
 fn storeError(allocator: Allocator, store: *goal.Store, err: anyerror, action: []const u8) !Result {
-    const message = try goal.describeError(store, allocator, err, action);
+    const message = try goal.describeError(store, allocator, err, action, null);
     return .{ .kind = .failure, .text = message };
 }
 
