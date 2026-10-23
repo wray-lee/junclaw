@@ -17,7 +17,8 @@
 //! - Runtime context (working directory / sandbox / approval policy) is
 //!   appended to the system prompt rather than being a separate
 //!   `runtime-context` user message (dsh emits the latter; P3).
-//! - Approvals, questions, compaction, goal, plan and slash commands are P2;
+//! - Approvals, questions, compaction, plan and slash commands are P2; goal
+//!   commands stay unwired (rounds and wrap-ups are P2b);
 //!   `handleLocalCommand` stays null.
 //! - `restore` reattaches to the JSONL and rebuilds the surface. Nothing else
 //!   is replayed: this adapter never leaves durable pending inbox input, and
@@ -44,6 +45,7 @@ const registry = @import("tools/registry.zig");
 const builtins_mod = @import("tools/builtins.zig");
 const bash_mod = @import("tools/bash.zig");
 const goal_mod = @import("goal.zig");
+const goal_rounds = @import("goal_rounds.zig");
 const goal_tools = @import("tools/goal.zig");
 const execute = @import("tools/execute.zig");
 const scheduler = @import("tools/scheduler.zig");
@@ -119,6 +121,7 @@ pub const DshNativeHarness = struct {
     bash: ?*bash_mod.Context = null,
     goal_store: ?*goal_mod.Store = null,
     goal_tools: ?*goal_tools.Context = null,
+    goal_driver: ?goal_rounds.Driver = null,
     system_prompt: []const u8 = "",
     spill_dir: []const u8 = "",
 
@@ -249,6 +252,7 @@ pub const DshNativeHarness = struct {
         try goal_context.register(&self.registry, self.allocator);
         self.goal_store = goal_store;
         self.goal_tools = goal_context;
+        self.goal_driver = .{ .store = goal_store };
 
         const names = try perm.alloc([]const u8, registry.core_schemas.len);
         for (registry.core_schemas, 0..) |schema, index| names[index] = schema.name;
@@ -319,6 +323,7 @@ pub const DshNativeHarness = struct {
             store.reset();
             store.attachLog(null);
         }
+        if (self.goal_driver) |*driver| driver.pending = null;
         if (self.log) |*log| {
             log.close();
             self.log = null;
@@ -589,6 +594,10 @@ pub const DshNativeHarness = struct {
         const arena = self.arena.allocator();
         self.in_turn = true;
         defer self.in_turn = false;
+        // A goal round is one kernel turn; never leak that authority forward.
+        defer {
+            if (self.goal_tools) |tools| tools.authority = .{};
+        }
         self.sink = input.sink;
         self.live_stream = input.live_stream;
         self.drain = input.drain;
@@ -616,7 +625,29 @@ pub const DshNativeHarness = struct {
             self.context_written = true;
         }
 
-        const outcome = try loop.runTurn();
+        // Automatic goal continuation: after a completed turn, the driver
+        // reserves at most one `<goal_round>` followup and the kernel runs it
+        // as another turn in this session; terminal goal phases stop it.
+        var outcome = try loop.runTurn();
+        while (true) {
+            const reason = switch (outcome) {
+                .ended => |value| value,
+                .paused => return error.UnexpectedPause,
+            };
+            const continues = switch (reason) {
+                .completed => true,
+                else => false,
+            };
+            if (!continues) break;
+            const driver = if (self.goal_driver) |*value| value else break;
+            const continuation = (try driver.next(arena)) orelse break;
+            self.goal_tools.?.authority = .{
+                .direct_human = false,
+                .goal_round = self.goal_store.?.find(),
+            };
+            _ = try loop.followup(continuation);
+            outcome = try loop.runTurn();
+        }
         const reason = switch (outcome) {
             .ended => |value| value,
             .paused => return error.UnexpectedPause,
@@ -868,6 +899,16 @@ pub const DshNativeHarness = struct {
         // `data` (no inner `message` key); `surface.fold` reads it that way.
         const data = try parseValue(arena, message.json);
         const seq = try self.appendEvent("user/message", data, .append, message.source_event_seqs);
+        // Goal rounds are admitted exactly where dsh folds them: on the logged
+        // `user/message`. `roundsStarted` therefore has one owner (`goal.Store`).
+        if (self.goal_store) |store| {
+            try store.applyEvent(.{
+                .event_type = "user/message",
+                .seq = seq,
+                .time_ms = 0,
+                .data = data,
+            });
+        }
         try self.addSurfaceSnapshot(arena, try surface_mod.messageFromEvent(arena, .{
             .event_type = "user/message",
             .seq = seq,

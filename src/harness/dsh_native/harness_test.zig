@@ -11,6 +11,7 @@ const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
 const port = @import("../port.zig");
 const harness_mod = @import("harness.zig");
+const goal_mod = @import("goal.zig");
 const session_log = @import("session_log.zig");
 const session_store = @import("session_store.zig");
 const types = @import("types.zig");
@@ -594,4 +595,122 @@ test "dsh-native adapter: session paths are built with the native separator" {
     defer allocator.free(mapping);
     try testing.expect(std.mem.startsWith(u8, mapping, fx.session_dir));
     try testing.expect(std.mem.endsWith(u8, mapping, ".json"));
+}
+
+test "dsh-native adapter: goal complete waits for the wrap-up reply" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":4}" }} },
+        .{ .text = "goal created" },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "update_goal", .arguments = "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"complete\"}" }} },
+        .{ .text = "Shipped and verified the whole objective." },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+
+    const result = try engine.harness().runTurn(turnInput("ship the goal"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqualStrings("Shipped and verified the whole objective.", result.persisted_reply.?);
+    try testing.expectEqual(@as(u64, 4), result.turn_count);
+    try testing.expectEqual(@as(usize, 4), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[2], "<goal_round>"));
+    try testing.expect(requestContains(fx.provider.requests.items[2], "Round: 1/4"));
+    try testing.expect(requestContains(fx.provider.requests.items[3], "<goal_complete>"));
+    try testing.expect(requestContains(fx.provider.requests.items[3], "Objective: \"ship it\""));
+
+    try testing.expectEqual(goal_mod.Phase.complete, engine.goal_store.?.find().?.phase);
+    try testing.expectEqual(@as(u32, 1), engine.goal_store.?.rounds_started);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var rounds: usize = 0;
+    var wrapups: usize = 0;
+    var last_turn_end: ?[]const u8 = null;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "turn/end")) {
+            last_turn_end = event.data.object.get("reason").?.object.get("kind").?.string;
+            continue;
+        }
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        const message = event.data.object;
+        const source = message.get("source").?.object;
+        const kind = source.get("kind").?.string;
+        if (std.mem.eql(u8, kind, "goal")) {
+            rounds += 1;
+            try testing.expectEqual(@as(i64, 1), source.get("round").?.integer);
+        } else if (std.mem.eql(u8, kind, "tool-goal")) {
+            wrapups += 1;
+            const text = message.get("content").?.array.items[0].object.get("text").?.string;
+            try testing.expect(std.mem.startsWith(u8, text, "<goal_complete>"));
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), rounds);
+    try testing.expectEqual(@as(usize, 1), wrapups);
+    // The wrap-up reply closed the last kernel turn normally, not by a hard stop.
+    try testing.expectEqualStrings("completed", last_turn_end.?);
+}
+
+test "dsh-native adapter: goal blocked waits for the wrap-up reply" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":4}" }} },
+        .{ .text = "goal created" },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "update_goal", .arguments = "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"blocked\",\"blocked_reason\":\"the registry is read-only\"}" }} },
+        .{ .text = "Blocked on the registry; tell me how to proceed." },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.goal_tools.?.blocked_after = 1;
+
+    const result = try engine.harness().runTurn(turnInput("ship the goal"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqualStrings("Blocked on the registry; tell me how to proceed.", result.persisted_reply.?);
+    try testing.expectEqual(@as(usize, 4), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[3], "<goal_blocked>"));
+    try testing.expect(requestContains(fx.provider.requests.items[3], "Blocked: \"the registry is read-only\""));
+
+    const blocked = engine.goal_store.?.find().?;
+    try testing.expectEqual(goal_mod.Phase.blocked, blocked.phase);
+    try testing.expectEqualStrings("model-reported", blocked.blocked_reason.?.code);
+    try testing.expectEqual(@as(u32, 1), engine.goal_store.?.rounds_started);
+}
+
+test "dsh-native adapter: the goal round cap blocks instead of following up" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":1}" }} },
+        .{ .text = "goal created" },
+        .{ .text = "still working" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+
+    const result = try engine.harness().runTurn(turnInput("ship the goal"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqualStrings("still working", result.persisted_reply.?);
+    // Three model calls total: the two-step human turn and exactly one goal round.
+    try testing.expectEqual(@as(usize, 3), fx.provider.requests.items.len);
+    try testing.expectEqual(@as(u32, 1), engine.goal_store.?.rounds_started);
+
+    const blocked = engine.goal_store.?.find().?;
+    try testing.expectEqual(goal_mod.Phase.blocked, blocked.phase);
+    try testing.expectEqualStrings("round-limit", blocked.blocked_reason.?.code);
+    try testing.expectEqualStrings(
+        "Goal reached its configured limit of 1 rounds.",
+        blocked.blocked_reason.?.message,
+    );
 }

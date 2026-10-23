@@ -8,11 +8,12 @@
 //! edit, pause and resume need a direct human turn; complete and blocked also
 //! accept the current goal round.
 //!
-//! shortcut: the round driver is not wired yet, so callers leave `authority`
-//! at its default (direct human); the driver will set `goal_round` per turn.
+//! The harness supplies `authority` per turn: direct human for user turns, and
+//! the admitted goal snapshot for automatic rounds (`goal_rounds.Driver`).
 
 const std = @import("std");
 const generated = @import("../generated/tool_schemas.zig");
+const render = @import("../generated/tool_render.zig");
 const goal = @import("../goal.zig");
 const registry = @import("registry.zig");
 const types = @import("../types.zig");
@@ -98,6 +99,7 @@ fn updateGoal(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
     const objective = optionalText(args, "objective");
     const max_rounds = optionalRound(args, "max_goal_rounds");
     const blocked_reason = optionalText(args, "blocked_reason");
+    var wrapup: ?types.Message = null;
 
     switch (action) {
         .edit => {
@@ -166,14 +168,59 @@ fn updateGoal(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
                         return failure(allocator, "GOAL_TOOL_BLOCK_THRESHOLD", message);
                     }
                 }
-                _ = self.store.block(ref, "model-reported", blocked_reason.?) catch |err|
+                const snapshot = self.store.block(ref, "model-reported", blocked_reason.?) catch |err|
                     return failureFor(allocator, self.store, err, "block");
+                if (round_authority != null) {
+                    wrapup = try wrapupContext(allocator, snapshot, blocked_reason.?);
+                }
             } else {
-                _ = self.store.complete(ref) catch |err| return failureFor(allocator, self.store, err, "complete");
+                const snapshot = self.store.complete(ref) catch |err|
+                    return failureFor(allocator, self.store, err, "complete");
+                if (round_authority != null) {
+                    wrapup = try wrapupContext(allocator, snapshot, null);
+                }
             }
         },
     }
-    return success(allocator, try renderValue(allocator, self.store));
+    var result = try success(allocator, try renderValue(allocator, self.store));
+    if (wrapup) |message| {
+        const contexts = try allocator.alloc(types.Message, 1);
+        contexts[0] = message;
+        result.success.additional_contexts = contexts;
+    }
+    return result;
+}
+
+/// dsh `renderWrapupContext`: the closing-message instruction deferred as a
+/// `tool-goal` notice after an autonomous terminal update. The objective and
+/// blocked reason are JSON-quoted, exactly as `JSON.stringify` renders them.
+fn wrapupContext(
+    allocator: Allocator,
+    snapshot: goal.Snapshot,
+    blocked_reason: ?[]const u8,
+) !types.Message {
+    const objective = try std.json.Stringify.valueAlloc(allocator, snapshot.objective, .{});
+    const text = if (blocked_reason) |reason| blk: {
+        const encoded = try std.json.Stringify.valueAlloc(allocator, reason, .{});
+        break :blk try std.fmt.allocPrint(allocator, render.goal.blocked_wrapup, .{
+            objective,
+            encoded,
+        });
+    } else try std.fmt.allocPrint(allocator, render.goal.complete_wrapup, .{objective});
+    const content = try allocator.alloc(types.ContentBlock, 1);
+    content[0] = .{ .text = text };
+    var source: std.json.ObjectMap = .empty;
+    try source.put(allocator, "kind", .{ .string = "tool-goal" });
+    try source.put(allocator, "form", .{ .string = "notice" });
+    return .{
+        .id = try std.fmt.allocPrint(allocator, "goal-wrapup-{s}-{d}", .{
+            snapshot.id,
+            snapshot.revision,
+        }),
+        .role = .user,
+        .content = content,
+        .source = .{ .other = .{ .object = source } },
+    };
 }
 
 const Action = enum { edit, pause, @"resume", complete, blocked };
@@ -478,6 +525,83 @@ test "update_goal rejects invalid argument combinations with dsh codes" {
         try testing.expect(result == .failure);
         try testing.expectEqualStrings(case.code, result.failure.error_info.code);
     }
+}
+
+test "update_goal defers the generated complete wrap-up during a goal round" {
+    var fixture = try Fixture.init(testing.allocator);
+    defer fixture.deinit();
+    _ = try fixture.call(createGoal, try fixture.args("{\"objective\":\"ship it\",\"max_goal_rounds\":4}"));
+    fixture.context.authority = .{ .direct_human = false, .goal_round = fixture.store.find().? };
+
+    const result = try fixture.call(updateGoal, try fixture.args(
+        "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"complete\"}",
+    ));
+    try testing.expect(result == .success);
+    try testing.expectEqual(@as(usize, 1), result.success.additional_contexts.len);
+
+    const context = result.success.additional_contexts[0];
+    const arena = fixture.arena.allocator();
+    try testing.expectEqual(types.MessageRole.user, context.role);
+    const objective = try std.json.Stringify.valueAlloc(arena, "ship it", .{});
+    const expected = try std.fmt.allocPrint(arena, render.goal.complete_wrapup, .{objective});
+    try testing.expectEqualStrings(expected, context.content[0].text);
+    try testing.expectEqualStrings("tool-goal", context.source.other.object.get("kind").?.string);
+    try testing.expectEqualStrings("notice", context.source.other.object.get("form").?.string);
+}
+
+test "update_goal defers the generated blocked wrap-up during a goal round" {
+    var fixture = try Fixture.init(testing.allocator);
+    defer fixture.deinit();
+    _ = try fixture.call(createGoal, try fixture.args("{\"objective\":\"ship it\",\"max_goal_rounds\":4}"));
+    try fixture.store.applyUserMessageValue("goal-1", 1, 1);
+    try fixture.store.applyUserMessageValue("goal-1", 1, 2);
+    try fixture.store.applyUserMessageValue("goal-1", 1, 3);
+    fixture.context.authority = .{ .direct_human = false, .goal_round = fixture.store.find().? };
+
+    const result = try fixture.call(updateGoal, try fixture.args(
+        "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"blocked\",\"blocked_reason\":\"registry is read-only\"}",
+    ));
+    try testing.expect(result == .success);
+    try testing.expectEqual(@as(usize, 1), result.success.additional_contexts.len);
+
+    const context = result.success.additional_contexts[0];
+    const arena = fixture.arena.allocator();
+    const objective = try std.json.Stringify.valueAlloc(arena, "ship it", .{});
+    const reason = try std.json.Stringify.valueAlloc(arena, "registry is read-only", .{});
+    const expected = try std.fmt.allocPrint(arena, render.goal.blocked_wrapup, .{ objective, reason });
+    try testing.expectEqualStrings(expected, context.content[0].text);
+}
+
+test "update_goal defers no wrap-up for a direct human turn" {
+    var fixture = try Fixture.init(testing.allocator);
+    defer fixture.deinit();
+    _ = try fixture.call(createGoal, try fixture.args("{\"objective\":\"ship it\"}"));
+
+    const result = try fixture.call(updateGoal, try fixture.args(
+        "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"complete\"}",
+    ));
+    try testing.expect(result == .success);
+    try testing.expectEqual(@as(usize, 0), result.success.additional_contexts.len);
+}
+
+test "goal wrap-up handles a 64 KiB objective without leaks" {
+    var fixture = try Fixture.init(testing.allocator);
+    defer fixture.deinit();
+    const arena = fixture.arena.allocator();
+    const objective = try arena.alloc(u8, 64 * 1024);
+    @memset(objective, 'x');
+    const quoted = try std.json.Stringify.valueAlloc(arena, objective, .{});
+    const args_text = try std.fmt.allocPrint(arena, "{{\"objective\":{s},\"max_goal_rounds\":4}}", .{quoted});
+    _ = try fixture.call(createGoal, try fixture.args(args_text));
+    fixture.context.authority = .{ .direct_human = false, .goal_round = fixture.store.find().? };
+
+    const result = try fixture.call(updateGoal, try fixture.args(
+        "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"complete\"}",
+    ));
+    try testing.expect(result == .success);
+    const text = result.success.additional_contexts[0].content[0].text;
+    try testing.expect(text.len >= 64 * 1024);
+    try testing.expect(std.mem.startsWith(u8, text, "<goal_complete>"));
 }
 
 test "goal tools handle a 64 KiB objective without leaks" {

@@ -37,7 +37,8 @@ pub const ToolResult = union(enum) {
         meta: ?Value = null,
         /// User messages spliced into the next-step inbox, not the tool result.
         additional_contexts: []const types.Message = &.{},
-        /// Stop the turn after this result batch (goal wrap-up; goal tools are P2).
+        /// Stop the turn after this result batch (dsh `concludesTurn`; the goal
+        /// wrap-up uses additional contexts instead).
         concludes_turn: bool = false,
         /// Presentation hint: keep it intact through wrapping; not model-visible.
         replaces_selected_content: bool = false,
