@@ -835,6 +835,19 @@ pub const Agent = struct {
         return reply;
     }
 
+    /// Close a turn that fails before producing a reply. Tool results and
+    /// nudges are user-role messages, so without this the transcript tail is a
+    /// half-finished tool round; the next user message would continue it and
+    /// every later turn would inherit the malformed history.
+    fn appendFailedTurnClosing(self: *Agent) !void {
+        if (self.history.items.len > 0 and
+            self.history.items[self.history.items.len - 1].role == .assistant) return;
+        try self.appendOwnedHistoryMessage(.{
+            .role = .assistant,
+            .content = try self.dupeForHistory("[No assistant reply was produced for this turn.]"),
+        });
+    }
+
     /// Forward a provider retry notice to the live draft. Retry text is built
     /// here and borrowed only for the synchronous callback; a null `retry`
     /// clears the indicator after the retried call resumes.
@@ -1137,8 +1150,8 @@ pub const Agent = struct {
 
     const EmptyResponseNudge = enum { generic, settled_tools, reasoning_only };
 
-    fn classifyEmptyResponseNudge(has_hidden_reasoning: bool, tools_ran_this_turn: bool) EmptyResponseNudge {
-        if (has_hidden_reasoning) return .reasoning_only;
+    fn classifyEmptyResponseNudge(has_reasoning: bool, tools_ran_this_turn: bool) EmptyResponseNudge {
+        if (has_reasoning) return .reasoning_only;
         if (tools_ran_this_turn) return .settled_tools;
         return .generic;
     }
@@ -2918,17 +2931,22 @@ pub const Agent = struct {
                         tool_use_retry_count += 1;
                         continue;
                     }
+                    try self.appendFailedTurnClosing();
                     return error.NoResponseContent;
                 }
 
                 if (trimmed_display_text.len == 0) {
-                    // Reasoning-only replies (content absent, reasoning present)
-                    // are only a stall when reasoning is not surfaced as the
-                    // answer (reasoning_mode == .off).
-                    const has_hidden_reasoning = self.reasoning_mode == .off and
-                        response.reasoning_content != null and
+                    // Regression: a reasoning-only reply in .stream (the
+                    // production Telegram mode) or .on was classified as a
+                    // plain empty reply because only .off counted reasoning.
+                    // After a tool round that meant settled_tools, whose nudge
+                    // cap is one, so the next reasoning-only round failed the
+                    // turn. Stream reasoning is already shown live and
+                    // composeFinalReply must not prepend it again, so it is
+                    // nudged (reasoning_only, cap two) rather than promoted.
+                    const has_reasoning = response.reasoning_content != null and
                         response.reasoning_content.?.len > 0;
-                    const nudge_kind = classifyEmptyResponseNudge(has_hidden_reasoning, tools_ran_this_turn);
+                    const nudge_kind = classifyEmptyResponseNudge(has_reasoning, tools_ran_this_turn);
                     self.freeResponseFields(&response);
                     if (empty_response_retry_count < emptyResponseNudgeCap(nudge_kind) and
                         iteration + 1 < self.max_tool_iterations)
@@ -2938,6 +2956,7 @@ pub const Agent = struct {
                         empty_response_retry_count += 1;
                         continue;
                     }
+                    try self.appendFailedTurnClosing();
                     return error.NoResponseContent;
                 }
 
@@ -14683,6 +14702,93 @@ test "Agent turn fails after two reasoning-only retries" {
 
     try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
     try std.testing.expectEqual(@as(usize, 3), state.idx);
+}
+
+test "Regression: stream reasoning-only reply after tools is nudged twice and recovers" {
+    // Regression: before the fix, reasoning_mode == .stream (the production
+    // Telegram config) and .on classified a reasoning-only reply as a plain
+    // empty reply, because only .off counted the reasoning. After a tool round
+    // that meant settled_tools, whose nudge cap is one: the first nudge was
+    // consumed, the next reasoning-only round returned
+    // error.NoResponseContent, and the session was left on a half-finished
+    // tool round. Every later turn then failed the same way. Stream reasoning
+    // is already shown live and composeFinalReply must not prepend it again,
+    // so it is nudged as reasoning_only (cap two), not promoted to the reply.
+    const allocator = std.testing.allocator;
+    for ([_]Agent.ReasoningMode{ .stream, .on }) |mode| {
+        var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+            .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "" } },
+            .{ .reasoning_only = "thinking a" },
+            .{ .reasoning_only = "thinking b" },
+            .{ .text = "final answer" },
+        } };
+        const provider = scriptedProvider(&state);
+        var noop = observability.NoopObserver{};
+        var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+        defer agent.deinit();
+        agent.reasoning_mode = mode;
+
+        const response = try agent.turn("run probe");
+        defer allocator.free(response);
+        try std.testing.expectEqualStrings("final answer", response);
+        try std.testing.expectEqual(@as(usize, 4), state.idx);
+    }
+}
+
+test "Regression: empty reply after tools closes history with an assistant message" {
+    // Regression: the settled_tools nudge cap is one, so a second empty reply
+    // returned error.NoResponseContent with the transcript tail still a user
+    // message (tool results plus nudge). The next turn appended its user
+    // message behind that half-finished tool round, so the whole session kept
+    // failing. The failure exit must close the transcript with an assistant
+    // message; the nudge and tool results are left untouched.
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .tool_call = .{ .name = "probe", .args = "{\"value\":1}", .content = "" } },
+        .{ .empty = {} },
+        .{ .empty = {} },
+        .{ .text = "final answer" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("run probe"));
+    try std.testing.expectEqual(@as(usize, 3), state.idx);
+
+    const nudge = agent.history.items[agent.history.items.len - 2];
+    try std.testing.expect(nudge.role == .user);
+    try std.testing.expectEqualStrings(Agent.SETTLED_TOOLS_NO_ANSWER_NUDGE, nudge.content);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last.role == .assistant);
+    try std.testing.expect(last.content.len > 0);
+}
+
+test "Regression: finish_tool_use failure closes history with an assistant message" {
+    // Regression: the finish_tool_use-without-call failure exit returned
+    // error.NoResponseContent with the nudge (a user message) as the
+    // transcript tail, the same half-turn that made later turns fail.
+    const allocator = std.testing.allocator;
+    var state = ScriptedTurnProvider{ .scripts = &[_]TurnScript{
+        .{ .finish_tool_use = "" },
+        .{ .finish_tool_use = "" },
+        .{ .text = "done" },
+    } };
+    const provider = scriptedProvider(&state);
+    var noop = observability.NoopObserver{};
+    var agent = makeTurnAgent(allocator, provider, &[_]Tool{}, try allocator.alloc(ToolSpec, 0), noop.observer());
+    defer agent.deinit();
+
+    try std.testing.expectError(error.NoResponseContent, agent.turn("go"));
+    try std.testing.expectEqual(@as(usize, 2), state.idx);
+
+    const nudge = agent.history.items[agent.history.items.len - 2];
+    try std.testing.expect(nudge.role == .user);
+    try std.testing.expectEqualStrings(Agent.TOOL_USE_WITHOUT_CALL_NUDGE, nudge.content);
+    const last = agent.history.items[agent.history.items.len - 1];
+    try std.testing.expect(last.role == .assistant);
+    try std.testing.expect(last.content.len > 0);
 }
 
 test "Agent turn returns announcing prose without a structural retry (step-5 shape)" {
