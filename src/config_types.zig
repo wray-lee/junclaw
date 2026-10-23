@@ -463,24 +463,98 @@ pub const ReasoningMode = enum {
 
 /// Turn engine for newly created sessions (`agent.harness`). `dsh` only takes
 /// effect in a binary built with `-Dharness_dsh=true`; the default build
-/// ignores it and keeps using `native`.
+/// ignores it and keeps using `native`. `dsh-native` is the in-process Zig
+/// engine (`src/harness/dsh_native/`) and needs no build flag.
 pub const HarnessKind = enum {
     native,
+    /// dsh sidecar over the Remote API (needs `-Dharness_dsh=true`).
     dsh,
+    /// dsh reimplemented in Zig, in process.
+    dsh_native,
 
     pub fn toSlice(self: HarnessKind) []const u8 {
         return switch (self) {
             .native => "native",
             .dsh => "dsh",
+            .dsh_native => "dsh-native",
         };
     }
 
     pub fn fromSlice(s: []const u8) ?HarnessKind {
         if (std.ascii.eqlIgnoreCase(s, "native")) return .native;
         if (std.ascii.eqlIgnoreCase(s, "dsh")) return .dsh;
+        if (std.ascii.eqlIgnoreCase(s, "dsh-native")) return .dsh_native;
         return null;
     }
 };
+
+/// `agent.dsh_approval_policy`: whether tool calls that need approval prompt
+/// the host. Non-interactive channels always behave as `never`.
+pub const DshApprovalPolicy = enum {
+    ask,
+    never,
+
+    pub fn toSlice(self: DshApprovalPolicy) []const u8 {
+        return switch (self) {
+            .ask => "ask",
+            .never => "never",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?DshApprovalPolicy {
+        if (std.ascii.eqlIgnoreCase(s, "ask")) return .ask;
+        if (std.ascii.eqlIgnoreCase(s, "never")) return .never;
+        return null;
+    }
+};
+
+/// `agent.dsh_sandbox`. String values match
+/// `harness/dsh_native/context.zig`'s `SandboxMode` one to one.
+pub const DshSandbox = enum {
+    read_only,
+    workspace_write,
+    danger_full_access,
+
+    pub fn toSlice(self: DshSandbox) []const u8 {
+        return switch (self) {
+            .read_only => "read-only",
+            .workspace_write => "workspace-write",
+            .danger_full_access => "danger-full-access",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?DshSandbox {
+        if (std.ascii.eqlIgnoreCase(s, "read-only")) return .read_only;
+        if (std.ascii.eqlIgnoreCase(s, "workspace-write")) return .workspace_write;
+        if (std.ascii.eqlIgnoreCase(s, "danger-full-access")) return .danger_full_access;
+        return null;
+    }
+};
+
+/// `agent.dsh_on_corrupt`: what a dsh-native session does when its JSONL log
+/// cannot be read or repaired.
+pub const DshOnCorrupt = enum {
+    /// Refuse the turn and report the parse error.
+    fail,
+    /// Start a fresh dsh session and continue with the native history.
+    native,
+
+    pub fn toSlice(self: DshOnCorrupt) []const u8 {
+        return switch (self) {
+            .fail => "fail",
+            .native => "native",
+        };
+    }
+
+    pub fn fromSlice(s: []const u8) ?DshOnCorrupt {
+        if (std.ascii.eqlIgnoreCase(s, "fail")) return .fail;
+        if (std.ascii.eqlIgnoreCase(s, "native")) return .native;
+        return null;
+    }
+};
+
+/// dsh `maxParallelToolCalls` default (`tools/scheduler.zig`).
+pub const DEFAULT_DSH_MAX_PARALLEL_TOOLS: usize = 10;
 
 pub const AgentConfig = struct {
     /// When true (default), history is auto-compacted once it crosses the
@@ -532,6 +606,25 @@ pub const AgentConfig = struct {
     auto_disable_vision_on_error: bool = true,
     /// Redact PII in outbound provider messages for the root agent.
     enable_pii_redaction: bool = true,
+
+    // ── dsh-native engine (`harness = "dsh-native"`) ──────────────
+    /// dsh home (session JSONL + session-key mapping root). Null means
+    /// `<config dir>/.dsh`.
+    dsh_home: ?[]const u8 = null,
+    /// Where dsh session ids are persisted per host session key. Null means
+    /// `<config dir>/dsh-sessions`.
+    dsh_session_dir: ?[]const u8 = null,
+    /// Whether a tool call that needs approval prompts the host. Non-interactive
+    /// channels behave as `never` regardless of this value.
+    dsh_approval_policy: DshApprovalPolicy = .ask,
+    /// File-sandbox mode shown to the model and enforced by dsh-native tools.
+    dsh_sandbox: DshSandbox = .workspace_write,
+    /// Parallel tool pool size; dsh's default is 10.
+    dsh_max_parallel_tools: usize = DEFAULT_DSH_MAX_PARALLEL_TOOLS,
+    /// Extra system-prompt persona. Null keeps dsh's own identity.
+    dsh_persona: ?[]const u8 = null,
+    /// What a corrupt dsh session log does.
+    dsh_on_corrupt: DshOnCorrupt = .fail,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;

@@ -215,7 +215,8 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 ### `agent.harness`
 
-- 选择新建会话使用的回合引擎，可选值为 `native`（默认）和 `dsh`。省略该键即保持 `native`。
+- 选择新建会话使用的回合引擎，可选值为 `native`（默认）、`dsh`（sidecar）和 `dsh-native`（进程内）。省略该键即保持 `native`。
+- `dsh` 与 `dsh-native` 是两个不同的引擎。`dsh` 通过 Remote API 驱动 DeepSeek-Harness 的 Node sidecar，需要 `-Dharness_dsh=true` 构建；`dsh-native` 是用 Zig 重写、在 nullclaw 进程内运行的实现，不需要构建开关，也不需要 `NULLCLAW_DSH_BIN`，由下面一组 `agent.dsh_*` 键配置。两者都不改变 `native` 路径。
 - `dsh` 需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。
 - 在 dsh 构建中，整个进程共用一个 dsh sidecar，并在第一个 dsh 回合惰性启动，启动过程不在会话表锁内。因此会话创建保持很快，所有 dsh 会话共用同一个 sidecar。
 - `NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。未设置或 sidecar 启动失败时，该回合返回错误（呈现给用户），下一个回合会重试启动。sidecar 使用配置的 agent 工作目录，profile 保存在 `<配置目录>/.dsh`，每个会话的 dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
@@ -227,6 +228,35 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 {
   "agent": {
     "harness": "dsh"
+  }
+}
+```
+
+### `agent.dsh_*`（dsh-native 引擎）
+
+以下键只对 `agent.harness` 为 `dsh-native` 的会话生效；`native` 和 `dsh` sidecar 会忽略它们。
+
+- `agent.dsh_home`（字符串，默认 `<配置目录>/.dsh`）：dsh home 根目录。会话 JSONL 日志与会话键映射都放在它下面。
+- `agent.dsh_session_dir`（字符串，默认 `<配置目录>/dsh-sessions`）：每个宿主会话键对应的 dsh 会话 id 的持久化目录。
+- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：需要审批的工具调用如何处理。`ask` 把请求交给宿主，没有可用交互界面时按拒绝处理；`never` 不提示，直接拒绝所有审批请求。非交互渠道（cron、heartbeat、webhook、A2A）的回合无论配置什么值都按 `never` 运行，后台回合绝不会卡在等人上。
+- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：dsh-native 工具的文件策略，也是模型看到的策略句子。取值与 dsh 的 `SandboxMode` 名称完全一致。
+- `agent.dsh_max_parallel_tools`（大于 0 的整数，默认 `10`）：并行工具池大小。dsh 自身的默认值就是 10；设得过大将提高 provider 侧并发与超时风险。
+- `agent.dsh_persona`（字符串，默认未设置）：追加到 dsh 系统提示的 persona 文本。未设置时保留 dsh 内置身份。
+- `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个 dsh 会话，沿用 native 历史继续。
+
+P1b 状态：`dsh-native` 引擎分阶段移植中。上述键已经可以解析和校验，但适配器尚未接好，因此选择 `dsh-native` 的会话目前仍运行 native 引擎。审批提示、用户提问、plan 模式、goal、压缩命令和六个 dsh 斜杠命令也尚未实现。
+
+示例：
+
+```json
+{
+  "agent": {
+    "harness": "dsh-native",
+    "dsh_home": "/var/lib/nullclaw/dsh",
+    "dsh_approval_policy": "never",
+    "dsh_sandbox": "workspace-write",
+    "dsh_max_parallel_tools": 10,
+    "dsh_on_corrupt": "fail"
   }
 }
 ```

@@ -1910,6 +1910,47 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 self.agent.harness = types.HarnessKind.fromSlice(v.string) orelse
                     return error.InvalidHarness;
             }
+            // `save()` writes the optional dsh keys as null when unset, so null
+            // means "keep the default" rather than an invalid value.
+            if (ag.object.get("dsh_home")) |v| {
+                if (v != .string and v != .null) return error.InvalidDshHome;
+                if (v == .string) {
+                    if (v.string.len == 0) return error.InvalidDshHome;
+                    self.agent.dsh_home = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (ag.object.get("dsh_session_dir")) |v| {
+                if (v != .string and v != .null) return error.InvalidDshSessionDir;
+                if (v == .string) {
+                    if (v.string.len == 0) return error.InvalidDshSessionDir;
+                    self.agent.dsh_session_dir = try self.allocator.dupe(u8, v.string);
+                }
+            }
+            if (ag.object.get("dsh_approval_policy")) |v| {
+                if (v != .string) return error.InvalidDshApprovalPolicy;
+                self.agent.dsh_approval_policy = types.DshApprovalPolicy.fromSlice(v.string) orelse
+                    return error.InvalidDshApprovalPolicy;
+            }
+            if (ag.object.get("dsh_sandbox")) |v| {
+                if (v != .string) return error.InvalidDshSandbox;
+                self.agent.dsh_sandbox = types.DshSandbox.fromSlice(v.string) orelse
+                    return error.InvalidDshSandbox;
+            }
+            if (ag.object.get("dsh_max_parallel_tools")) |v| {
+                if (v != .integer) return error.InvalidDshMaxParallelTools;
+                self.agent.dsh_max_parallel_tools = std.math.cast(usize, v.integer) orelse
+                    return error.InvalidDshMaxParallelTools;
+                if (self.agent.dsh_max_parallel_tools == 0) return error.InvalidDshMaxParallelTools;
+            }
+            if (ag.object.get("dsh_persona")) |v| {
+                if (v != .string and v != .null) return error.InvalidDshPersona;
+                if (v == .string) self.agent.dsh_persona = try self.allocator.dupe(u8, v.string);
+            }
+            if (ag.object.get("dsh_on_corrupt")) |v| {
+                if (v != .string) return error.InvalidDshOnCorrupt;
+                self.agent.dsh_on_corrupt = types.DshOnCorrupt.fromSlice(v.string) orelse
+                    return error.InvalidDshOnCorrupt;
+            }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {
                 if (fg_val == .array) {

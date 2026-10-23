@@ -1378,6 +1378,13 @@ pub const Config = struct {
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
             .enable_pii_redaction = self.agent.enable_pii_redaction,
+            .dsh_home = self.agent.dsh_home,
+            .dsh_session_dir = self.agent.dsh_session_dir,
+            .dsh_approval_policy = self.agent.dsh_approval_policy.toSlice(),
+            .dsh_sandbox = self.agent.dsh_sandbox.toSlice(),
+            .dsh_max_parallel_tools = self.agent.dsh_max_parallel_tools,
+            .dsh_persona = self.agent.dsh_persona,
+            .dsh_on_corrupt = self.agent.dsh_on_corrupt.toSlice(),
         }, ",\n");
 
         // Channels
@@ -1548,6 +1555,7 @@ pub const Config = struct {
         NoDefaultModel,
         TemperatureOutOfRange,
         InvalidAgentTimezone,
+        InvalidDshMaxParallelTools,
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
@@ -1622,6 +1630,9 @@ pub const Config = struct {
         }
         if (!config_types.AgentConfig.isValidTimezone(self.agent.timezone)) {
             return ValidationError.InvalidAgentTimezone;
+        }
+        if (self.agent.dsh_max_parallel_tools == 0) {
+            return ValidationError.InvalidDshMaxParallelTools;
         }
         for (self.agents) |agent_cfg| {
             if (namedAgentUsesReservedRootId(agent_cfg.name)) {
@@ -1842,6 +1853,7 @@ pub const Config = struct {
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
             ValidationError.InvalidAgentTimezone => std.debug.print("Config error: agent.timezone must be 'UTC' or a fixed offset like 'UTC+08:00'.\n", .{}),
+            ValidationError.InvalidDshMaxParallelTools => std.debug.print("Config error: agent.dsh_max_parallel_tools must be greater than 0.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
@@ -6969,6 +6981,156 @@ test "agent.harness rejects invalid values" {
         error.InvalidHarness,
         cfg.parseJson("{\"agent\":{\"harness\":true}}"),
     );
+}
+
+test "parse agent.harness dsh-native" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson("{\"agent\":{\"harness\":\"dsh-native\"}}");
+    try std.testing.expectEqual(config_types.HarnessKind.dsh_native, cfg.agent.harness);
+    try std.testing.expectEqualStrings("dsh-native", cfg.agent.harness.toSlice());
+    // The sidecar's "dsh" must not be swallowed by the new spelling.
+    try std.testing.expectEqual(config_types.HarnessKind.dsh, config_types.HarnessKind.fromSlice("dsh").?);
+    try std.testing.expectEqual(@as(?config_types.HarnessKind, null), config_types.HarnessKind.fromSlice("dsh_native"));
+}
+
+test "agent.dsh_* defaults" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson("{}");
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.agent.dsh_home);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.agent.dsh_session_dir);
+    try std.testing.expectEqual(config_types.DshApprovalPolicy.ask, cfg.agent.dsh_approval_policy);
+    try std.testing.expectEqual(config_types.DshSandbox.workspace_write, cfg.agent.dsh_sandbox);
+    try std.testing.expectEqual(config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS, cfg.agent.dsh_max_parallel_tools);
+    try std.testing.expectEqual(@as(usize, 10), cfg.agent.dsh_max_parallel_tools);
+    // Pin the config default to the engine's own constant so they cannot drift.
+    try std.testing.expectEqual(
+        @import("harness/dsh_native/tools/scheduler.zig").DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+        config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS,
+    );
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.agent.dsh_persona);
+    try std.testing.expectEqual(config_types.DshOnCorrupt.fail, cfg.agent.dsh_on_corrupt);
+}
+
+test "parse agent.dsh_* keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson(
+        \\{"agent":{"dsh_home":"/tmp/dsh-home","dsh_session_dir":"/tmp/dsh-sessions",
+        \\"dsh_approval_policy":"never","dsh_sandbox":"read-only",
+        \\"dsh_max_parallel_tools":4,"dsh_persona":"be terse","dsh_on_corrupt":"native"}}
+    );
+    try std.testing.expectEqualStrings("/tmp/dsh-home", cfg.agent.dsh_home.?);
+    try std.testing.expectEqualStrings("/tmp/dsh-sessions", cfg.agent.dsh_session_dir.?);
+    try std.testing.expectEqual(config_types.DshApprovalPolicy.never, cfg.agent.dsh_approval_policy);
+    try std.testing.expectEqual(config_types.DshSandbox.read_only, cfg.agent.dsh_sandbox);
+    try std.testing.expectEqual(@as(usize, 4), cfg.agent.dsh_max_parallel_tools);
+    try std.testing.expectEqualStrings("be terse", cfg.agent.dsh_persona.?);
+    try std.testing.expectEqual(config_types.DshOnCorrupt.native, cfg.agent.dsh_on_corrupt);
+}
+
+test "agent.dsh_sandbox spells every engine SandboxMode" {
+    // One value per dsh-native SandboxMode, same tag order, hyphenated spec
+    // names (`read-only`, `workspace-write`, `danger-full-access`).
+    const ctx = @import("harness/dsh_native/context.zig");
+    inline for (@typeInfo(ctx.SandboxMode).@"enum".fields) |field| {
+        const ours = @field(config_types.DshSandbox, field.name);
+        try std.testing.expectEqual(field.value, @intFromEnum(ours));
+        try std.testing.expectEqual(ours, config_types.DshSandbox.fromSlice(config_types.DshSandbox.toSlice(ours)).?);
+    }
+    try std.testing.expectEqualStrings("workspace-write", config_types.DshSandbox.workspace_write.toSlice());
+}
+
+test "agent.dsh_* reject invalid values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    const cases = [_]struct { json: []const u8, want: anyerror }{
+        .{ .json = "{\"agent\":{\"dsh_home\":42}}", .want = error.InvalidDshHome },
+        .{ .json = "{\"agent\":{\"dsh_home\":\"\"}}", .want = error.InvalidDshHome },
+        .{ .json = "{\"agent\":{\"dsh_session_dir\":42}}", .want = error.InvalidDshSessionDir },
+        .{ .json = "{\"agent\":{\"dsh_approval_policy\":\"auto\"}}", .want = error.InvalidDshApprovalPolicy },
+        .{ .json = "{\"agent\":{\"dsh_sandbox\":\"workspace_write\"}}", .want = error.InvalidDshSandbox },
+        .{ .json = "{\"agent\":{\"dsh_max_parallel_tools\":0}}", .want = error.InvalidDshMaxParallelTools },
+        .{ .json = "{\"agent\":{\"dsh_max_parallel_tools\":-1}}", .want = error.InvalidDshMaxParallelTools },
+        .{ .json = "{\"agent\":{\"dsh_persona\":7}}", .want = error.InvalidDshPersona },
+        .{ .json = "{\"agent\":{\"dsh_on_corrupt\":\"retry\"}}", .want = error.InvalidDshOnCorrupt },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.want, cfg.parseJson(case.json));
+    }
+}
+
+test "agent.dsh_max_parallel_tools is validated" {
+    const allocator = std.testing.allocator;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    cfg.default_provider = "test-provider";
+    cfg.default_model = "test-model";
+    cfg.secrets.encrypt = true;
+    try cfg.validate();
+    cfg.agent.dsh_max_parallel_tools = 0;
+    try std.testing.expectError(Config.ValidationError.InvalidDshMaxParallelTools, cfg.validate());
+}
+
+test "save writes dsh keys and roundtrips them" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const allocator = std.testing.allocator;
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{ .workspace_dir = base, .config_path = config_path, .allocator = allocator };
+    cfg.agent.dsh_persona = "test persona";
+    cfg.agent.dsh_approval_policy = .never;
+    cfg.agent.dsh_sandbox = .danger_full_access;
+    cfg.agent.dsh_max_parallel_tools = 3;
+    cfg.agent.dsh_on_corrupt = .native;
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 256 * 1024);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"dsh_approval_policy\": \"never\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"dsh_sandbox\": \"danger-full-access\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"dsh_max_parallel_tools\": 3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "    \"dsh_on_corrupt\": \"native\"") != null);
+
+    // Defaults are written as null and must parse back as "unset", not error.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{ .workspace_dir = base, .config_path = config_path, .allocator = arena.allocator() };
+    try loaded.parseJson(content);
+    try std.testing.expectEqual(@as(?[]const u8, null), loaded.agent.dsh_home);
+    try std.testing.expectEqualStrings("test persona", loaded.agent.dsh_persona.?);
+    try std.testing.expectEqual(config_types.DshApprovalPolicy.never, loaded.agent.dsh_approval_policy);
+    try std.testing.expectEqual(config_types.DshSandbox.danger_full_access, loaded.agent.dsh_sandbox);
+    try std.testing.expectEqual(@as(usize, 3), loaded.agent.dsh_max_parallel_tools);
+    try std.testing.expectEqual(config_types.DshOnCorrupt.native, loaded.agent.dsh_on_corrupt);
+}
+
+test "agent.dsh_* parse a 64KB persona without leaking" {
+    // Regression: optional dsh strings are duped into the config arena; a
+    // >64KB value must not be dropped, truncated, or leaked.
+    const allocator = std.testing.allocator;
+    const big = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(big);
+    @memset(big, 'p');
+    const json = try std.fmt.allocPrint(allocator, "{{\"agent\":{{\"dsh_persona\":\"{s}\"}}}}", .{big});
+    defer allocator.free(json);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
+    try cfg.parseJson(json);
+    try std.testing.expectEqual(big.len, cfg.agent.dsh_persona.?.len);
 }
 
 test "parse agent.reasoning_mode" {

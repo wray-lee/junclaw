@@ -235,7 +235,8 @@ Example:
 
 ### `agent.harness`
 
-- Selects the turn engine for newly created sessions: `native` (default) or `dsh`. Omitting the key keeps `native`.
+- Selects the turn engine for newly created sessions: `native` (default), `dsh` (sidecar), or `dsh-native` (in-process). Omitting the key keeps `native`.
+- `dsh` and `dsh-native` are different engines. `dsh` runs the DeepSeek-Harness Node sidecar over its Remote API and needs a `-Dharness_dsh=true` build. `dsh-native` is a Zig reimplementation that runs in the nullclaw process, needs no build flag and no `NULLCLAW_DSH_BIN`, and is configured by the `agent.dsh_*` keys below. None of them changes the `native` path.
 - `dsh` requires a binary built with `-Dharness_dsh=true`. A default build ignores the value, logs one warning, and keeps running the native engine; it never starts a dsh sidecar.
 - In a dsh build, one dsh sidecar is shared by the whole process and starts lazily on the first dsh turn, outside the session-table lock. Session creation therefore stays fast, and all dsh sessions use the same sidecar.
 - `NULLCLAW_DSH_BIN` must point at dsh's `lib/bin.js`. If it is unset or the sidecar fails to boot, that turn returns an error (shown to the user) and the next turn retries the boot. The sidecar uses the configured agent workspace, keeps its profile in `<config dir>/.dsh`, and persists each session's dsh id in `<config dir>/dsh-sessions/`.
@@ -247,6 +248,35 @@ Example:
 {
   "agent": {
     "harness": "dsh"
+  }
+}
+```
+
+### `agent.dsh_*` (dsh-native engine)
+
+These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` and the `dsh` sidecar ignore them.
+
+- `agent.dsh_home` (string, default `<config dir>/.dsh`): dsh home root. Session JSONL logs and the session-key mapping live under it.
+- `agent.dsh_session_dir` (string, default `<config dir>/dsh-sessions`): where each host session key's dsh session id is persisted.
+- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): what a tool call that needs approval does. `ask` routes the request to the host and denies when no interactive UI is attached; `never` denies every approval request without prompting. Turns that run for non-interactive channels (cron, heartbeat, webhooks, A2A) always behave as `never`, whatever the configured value, so a background turn can never block on a human.
+- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): file policy for the dsh-native tools and the policy sentence the model sees. The values are exactly dsh's `SandboxMode` names.
+- `agent.dsh_max_parallel_tools` (integer > 0, default `10`): size of the parallel tool pool. dsh's own default is 10; large values raise provider-side concurrency and timeout risk.
+- `agent.dsh_persona` (string, default unset): extra persona text appended to dsh's system prompt. Unset keeps dsh's built-in identity.
+- `agent.dsh_on_corrupt` (`"fail"` | `"native"`, default `"fail"`): what a session does when its dsh JSONL log cannot be read or repaired. `fail` refuses the turn and reports the parse error; `native` starts a fresh dsh session and carries on with the native history.
+
+P1b status: the `dsh-native` engine is being ported in stages. The keys above are parsed and validated now, but the adapter is not wired yet, so a session that selects `dsh-native` still runs the native engine. Approval prompts, user questions, plan mode, goal, compaction commands and the six dsh slash commands are not implemented yet either.
+
+Example:
+
+```json
+{
+  "agent": {
+    "harness": "dsh-native",
+    "dsh_home": "/var/lib/nullclaw/dsh",
+    "dsh_approval_policy": "never",
+    "dsh_sandbox": "workspace-write",
+    "dsh_max_parallel_tools": 10,
+    "dsh_on_corrupt": "fail"
   }
 }
 ```
