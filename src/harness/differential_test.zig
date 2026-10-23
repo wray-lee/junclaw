@@ -482,6 +482,7 @@ const DualSink = struct {
             .delta => |chunk| streaming.forwardProviderChunk(self.stream, chunk),
             .progress => |hint| self.progress.emit(hint),
             .usage => {},
+            else => {},
         }
     }
 };

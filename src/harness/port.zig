@@ -14,8 +14,8 @@
 //! - parallel tools / approvals / ask_user_question: they need new `Event`
 //!   variants and `TurnInput` fields, which is why `Event` is a union and
 //!   `TurnInput` is a struct rather than positional arguments.
-//! - typed end reasons: `EndReason` (from dsh, trimmed to five) replaces the
-//!   host guessing from `last_turn_interrupted`.
+//! - typed end reasons: `EndReason` (from dsh) replaces the host guessing from
+//!   `last_turn_interrupted`.
 
 const std = @import("std");
 const providers = @import("../providers/root.zig");
@@ -43,6 +43,31 @@ pub const Event = union(enum) {
     /// receiver must not disturb it. It exists so a ported engine can report
     /// usage without the host reaching past the
     usage: agent_mod.Agent.UsageRecord,
+    /// A turn began. Emitted by engines that own their own loop (dsh-native).
+    turn_start: struct { turn: u64 },
+    /// One model request started inside a turn.
+    step_start: struct { turn: u64, step: u64 },
+    /// A complete assistant message (the non-delta form of `delta`). Borrowed.
+    assistant_message: struct { text: []const u8 },
+    /// A tool call the engine is about to run. Borrowed; arguments are
+    /// sensitive and must not be rendered raw by the sink.
+    tool_call: struct { call_id: []const u8, name: []const u8, arguments_json: []const u8 },
+    /// The outcome of a `tool_call` with the same `call_id`. Borrowed.
+    tool_result: struct { call_id: []const u8, name: []const u8, output: []const u8, is_error: bool },
+    // P2 reserved below: P1b engines never emit these, and the host ignores
+    // them until the approval/question/command surfaces are wired.
+    /// The engine is blocked on a host approval decision.
+    approval_request: struct { id: []const u8, call_id: []const u8, tool_name: []const u8, reason: []const u8 },
+    /// `ask_user_question` is waiting for an answer.
+    question: struct { id: []const u8, question: []const u8, detail: []const u8 },
+    /// The engine compacted its history.
+    compaction: struct { reason: []const u8, tokens_before: u64, tokens_after: u64 },
+    /// Goal state changed.
+    goal: struct { status: []const u8, objective: []const u8 },
+    /// Plan mode was entered (`active = true`) or left.
+    plan: struct { active: bool },
+    /// A local slash command was routed to the engine.
+    command: struct { name: []const u8, arguments: []const u8 },
 };
 
 /// Where the engine delivers `Event`s. `ctx` is owned by the host.
@@ -73,9 +98,59 @@ pub const TurnInput = struct {
     /// `Agent.DrainCallback` so the existing `SteerDrainContext` keeps working.
     drain: ?agent_mod.DrainCallback = null,
     drain_ctx: ?*anyopaque = null,
+    /// Host session identity (`Session.session_key`); borrowed.
+    session_key: ?[]const u8 = null,
+    /// Absolute agent workspace for this turn; borrowed. Engines that sandbox
+    /// file tools resolve relative paths against it.
+    workspace_dir: ?[]const u8 = null,
+    /// Engine session id from an earlier restore, when the host has one.
+    session_id: ?[]const u8 = null,
+    /// Provider/model for this turn; null means "the engine's own default".
+    provider: ?[]const u8 = null,
+    model: ?[]const u8 = null,
+    /// Local command being dispatched (set by `handleLocalCommand` paths).
+    command: ?[]const u8 = null,
+    /// Blocking host interaction. Null means the engine must fail closed:
+    /// approvals are denied and questions report "unavailable".
+    interaction: ?Interaction = null,
 };
 
-/// Why a turn ended. dsh has seven; only these three are reachable in phase 0.
+/// Blocking callbacks into the host UI. All payloads are borrowed for the
+/// duration of the call; the reply is owned by the host and stays valid until
+/// the callback returns (the engine must copy anything it keeps).
+pub const Interaction = struct {
+    ctx: *anyopaque,
+    /// `allowed-once` runs the call; anything else denies it.
+    requestApproval: *const fn (ctx: *anyopaque, request: ApprovalRequest) anyerror!ApprovalDecision,
+    /// Answers, one entry per question id. Empty means "unavailable".
+    askQuestions: *const fn (ctx: *anyopaque, questions: []const Question) anyerror![]const Answer,
+    /// Plan-mode review; `approve = false` keeps the plan active.
+    planReview: *const fn (ctx: *anyopaque, plan: []const u8) anyerror!bool,
+};
+
+pub const ApprovalRequest = struct {
+    id: []const u8,
+    call_id: []const u8,
+    tool_name: []const u8,
+    reason: []const u8,
+};
+
+/// dsh `ApprovalOutcome` (`user-approval/src/types.ts:32`).
+pub const ApprovalDecision = enum { allowed_once, rejected, cancelled, unavailable };
+
+pub const Question = struct {
+    id: []const u8,
+    question: []const u8,
+    detail: []const u8 = "",
+};
+
+pub const Answer = struct {
+    id: []const u8,
+    /// Answer text, or the chosen option label.
+    text: []const u8,
+};
+
+/// Why a turn ended. Mirrors dsh's `TurnEndReasonMap` tags.
 pub const EndReason = enum {
     completed,
     /// A /stop landed and the agent halted the turn (`last_turn_interrupted`).
@@ -89,6 +164,15 @@ pub const EndReason = enum {
     failed,
     /// The model hit its output cap. Reserved for phase 1.
     max_tokens,
+    /// The turn was cancelled from inside the engine. `TurnResult.abort_cause`
+    /// says why.
+    aborted,
+    /// The engine failed with a structured code/message; `TurnResult.error_code`
+    /// and `TurnResult.@"error"` carry it. Like `.failed`, the Zig error path
+    /// still runs.
+    @"error",
+    /// The engine forked the session and stopped the turn.
+    forked,
 };
 
 /// What the engine returns. `reply` is owned by the engine's allocator and the
@@ -105,6 +189,16 @@ pub const TurnResult = struct {
     end_reason: EndReason = .completed,
     /// True when this turn compacted the history.
     compacted: bool = false,
+    /// Why `end_reason == .aborted`. Null for every other reason.
+    abort_cause: ?[]const u8 = null,
+    /// Machine-readable code for `end_reason == .@"error"`; `.@"error"` holds
+    /// the human text.
+    error_code: ?[]const u8 = null,
+    /// dsh session id this turn ran under, once the engine has one. Borrowed
+    /// from the engine; the host copies it into the session-key mapping.
+    dsh_session_id: ?[]const u8 = null,
+    /// Model turns executed, for engines whose turn can span several.
+    turn_count: u64 = 0,
 };
 
 /// What the host hands the engine to rebuild a session after a restart.
@@ -112,6 +206,13 @@ pub const RestoreInput = struct {
     messages: []const memory_mod.MessageEntry,
     total_tokens: u64 = 0,
     compaction_count: u64 = 0,
+    /// Host session identity; borrowed.
+    session_key: ?[]const u8 = null,
+    workspace_dir: ?[]const u8 = null,
+    /// Engine session id to resume; null starts a fresh engine session.
+    dsh_session_id: ?[]const u8 = null,
+    /// dsh home (session JSONL + mapping root); null keeps the engine default.
+    dsh_home: ?[]const u8 = null,
 };
 
 /// Live read-only view of the engine's configuration. NOT a snapshot: every
@@ -127,6 +228,17 @@ pub const Info = struct {
     queue_mode: config_types.QueueMode,
     reasoning_mode: config_types.ReasoningMode,
     redactor: ?*redaction.Redactor,
+    /// Which engine this is. The host uses it to skip native-only post-turn
+    /// work. Defaults to `.native` so an engine that does not fill it keeps
+    /// the pre-port behavior.
+    harness_kind: config_types.HarnessKind = .native,
+    /// True when the engine owns its own inbox: the host must not run the
+    /// post-turn "late steer merge" path (it would inject into the wrong loop).
+    owns_inbox: bool = false,
+    /// True when the engine answers local slash commands itself.
+    supports_commands: bool = false,
+    /// Engine session id, when it has one. Borrowed.
+    dsh_session_id: ?[]const u8 = null,
 };
 
 /// A turn engine. `ptr` points at the implementation's state.
@@ -322,6 +434,7 @@ const EventSink = struct {
                 self.usages += 1;
                 self.last_total_tokens = u.usage.total_tokens;
             },
+            else => {},
         }
     }
 
@@ -409,4 +522,99 @@ test "port: info returns live values, not a snapshot" {
     fake.model_name = "changed-model";
     const second = fake.harness().info();
     try testing.expectEqualStrings("changed-model", second.model_name);
+}
+
+test "port: P1b fields default to native behavior" {
+    // A native engine that fills nothing new must look exactly as before.
+    const info = Info{
+        .provider_name = "p",
+        .model_name = "m",
+        .workspace_dir = "/tmp/w",
+        .allowed_paths = &.{},
+        .has_own_autonomy = false,
+        .queue_mode = .steer,
+        .reasoning_mode = .off,
+        .redactor = null,
+    };
+    try testing.expectEqual(config_types.HarnessKind.native, info.harness_kind);
+    try testing.expect(!info.owns_inbox);
+    try testing.expect(!info.supports_commands);
+    try testing.expectEqual(@as(?[]const u8, null), info.dsh_session_id);
+
+    const result = TurnResult{ .reply = "x" };
+    try testing.expectEqual(@as(?[]const u8, null), result.abort_cause);
+    try testing.expectEqual(@as(?[]const u8, null), result.error_code);
+    try testing.expectEqual(@as(?[]const u8, null), result.dsh_session_id);
+    try testing.expectEqual(@as(u64, 0), result.turn_count);
+
+    const input = TurnInput{ .user_message = "hi" };
+    try testing.expectEqual(@as(?[]const u8, null), input.session_key);
+    try testing.expectEqual(@as(?[]const u8, null), input.workspace_dir);
+    try testing.expectEqual(@as(?[]const u8, null), input.session_id);
+    try testing.expectEqual(@as(?[]const u8, null), input.provider);
+    try testing.expectEqual(@as(?[]const u8, null), input.model);
+    try testing.expectEqual(@as(?[]const u8, null), input.command);
+    try testing.expectEqual(@as(?Interaction, null), input.interaction);
+
+    const restore = RestoreInput{ .messages = &.{} };
+    try testing.expectEqual(@as(?[]const u8, null), restore.session_key);
+    try testing.expectEqual(@as(?[]const u8, null), restore.workspace_dir);
+    try testing.expectEqual(@as(?[]const u8, null), restore.dsh_session_id);
+    try testing.expectEqual(@as(?[]const u8, null), restore.dsh_home);
+}
+
+test "port: EndReason keeps the enum and covers dsh's tags" {
+    // EndReason must stay an enum: native.zig/dsh harness switch on tags only.
+    const reasons = [_]EndReason{ .completed, .interrupted, .blocked, .failed, .max_tokens, .aborted, .@"error", .forked };
+    try testing.expectEqual(@as(usize, 8), @typeInfo(EndReason).@"enum".fields.len);
+    for (reasons) |reason| {
+        try testing.expectEqual(reason, @as(EndReason, @enumFromInt(@intFromEnum(reason))));
+    }
+}
+
+test "port: every new Event variant carries borrowed payload only" {
+    // No owned slices and no allocator in any P1b payload: the sink cannot be
+    // handed ownership it would have to free.
+    inline for (@typeInfo(Event).@"union".fields) |field| {
+        if (comptime isPrePortEvent(field.name)) continue;
+        const info = @typeInfo(field.type);
+        inline for (info.@"struct".fields) |payload_field| {
+            const t = payload_field.type;
+            try testing.expect(t == []const u8 or t == u64 or t == bool);
+        }
+    }
+}
+
+fn isPrePortEvent(comptime name: []const u8) bool {
+    return comptime std.mem.eql(u8, name, "delta") or
+        std.mem.eql(u8, name, "progress") or
+        std.mem.eql(u8, name, "usage");
+}
+
+test "port: 64KB event payloads pass through the sink without copying" {
+    // Regression: a large tool result must reach the sink as the same borrowed
+    // slice; an accidental dupe here would leak on every turn.
+    const big = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+
+    const Recorder = struct {
+        len: usize = 0,
+        ptr: [*]const u8 = undefined,
+        fn emit(ctx: *anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            switch (event) {
+                .tool_result => |r| {
+                    self.len = r.output.len;
+                    self.ptr = r.output.ptr;
+                },
+                else => {},
+            }
+        }
+    };
+    var rec = Recorder{};
+    const sink = Sink{ .ctx = @ptrCast(&rec), .emit = Recorder.emit };
+    sink.send(.{ .tool_result = .{ .call_id = "c1", .name = "grep", .output = big, .is_error = false } });
+    try testing.expectEqual(big.len, rec.len);
+    try testing.expectEqual(@intFromPtr(big.ptr), @intFromPtr(rec.ptr));
 }

@@ -2419,6 +2419,9 @@ pub const SessionManager = struct {
                 // The host keeps writing the usage ledger from the agent's own
                 // usage_record_callback; nothing consumes this today.
                 .usage => {},
+                // dsh-native observational events; the host renders nothing
+                // for them yet (P2 wires approval/question/compaction UI).
+                else => {},
             }
         }
     };

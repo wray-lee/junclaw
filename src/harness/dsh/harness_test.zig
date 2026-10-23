@@ -183,6 +183,7 @@ const RecordingSink = struct {
             },
             .progress => _ = self.progress.fetchAdd(1, .monotonic),
             .usage => {},
+            else => {},
         }
     }
 
