@@ -1,14 +1,18 @@
-//! P1 fixture replay: drive `input.json` through the real loop/tool scheduler,
+//! P1/P2b fixture replay: drive `input.json` through the real loop/tool
+//! scheduler (plus the goal store and round driver for the goal-* scenarios),
 //! replay `replay.json` through the provider callback, write the v4 session log
 //! and compare its normalized JSONL with `expected.v4.jsonl`.
 //!
-//! Fixtures are ground truth; see test/fixtures/dsh_native/manifest.json.
+//! Fixtures are ground truth; see each scenario's manifest.json.
 
 const std = @import("std");
 const builtins_mod = @import("tools/builtins.zig");
 const compat = @import("compat");
 const fixture_compare = @import("fixture_compare.zig");
 const fs_compat = @import("../../fs_compat.zig");
+const goal = @import("goal.zig");
+const goal_command = @import("goal_command.zig");
+const goal_rounds = @import("goal_rounds.zig");
 const inbox = @import("inbox.zig");
 const loop_mod = @import("loop.zig");
 const prompt = @import("prompt.zig");
@@ -16,6 +20,7 @@ const registry = @import("tools/registry.zig");
 const replay_provider = @import("replay_provider.zig");
 const request = @import("request.zig");
 const scheduler = @import("tools/scheduler.zig");
+const tools_goal = @import("tools/goal.zig");
 const session_log = @import("session_log.zig");
 const stream = @import("stream.zig");
 const surface = @import("surface.zig");
@@ -48,10 +53,14 @@ const InputFile = struct {
         config: ?SessionConfig = null,
         when: ?When = null,
         cause: ?[]const u8 = null,
+        /// Goal rounds to run for this op before returning (mid-run stop).
+        rounds: ?u32 = null,
     };
 
     const SessionConfig = struct {
         maxParallelToolCalls: ?usize = null,
+        /// dsh blockedAfterConsecutiveRounds (tool-goal config).
+        goalBlockedAfter: ?u32 = null,
     };
 
     const When = struct {
@@ -104,6 +113,11 @@ const Driver = struct {
     system_prompt: []const u8,
     tools: []const request.ToolSchema,
     triggers: []const Trigger,
+    goal_store: ?*goal.Store = null,
+    goal_tools: ?*tools_goal.Context = null,
+    goal_driver: ?goal_rounds.Driver = null,
+    goal_command: ?*goal_command.Goal = null,
+    log_path: []const u8 = "",
     loop: ?*loop_mod.Loop = null,
     next_message: u64 = 0,
     first_request: bool = true,
@@ -153,7 +167,24 @@ fn hostEmit(context: *anyopaque, event: loop_mod.Event) anyerror!u64 {
         },
         .user_message => |payload| {
             const data = try fixture_compare.parseJson(allocator, payload.message.json);
-            return d.append("user/message", data, .append);
+            const seq = try d.append("user/message", data, .append);
+            try d.surface_messages.append(allocator, try surface.messageFromEvent(allocator, .{
+                .event_type = "user/message",
+                .seq = seq,
+                .time_ms = 0,
+                .data = data,
+            }));
+            // Goal rounds are admitted exactly where dsh folds them: on the
+            // logged user/message (single owner of roundsStarted).
+            if (d.goal_store) |store| {
+                try store.applyEvent(.{
+                    .event_type = "user/message",
+                    .seq = seq,
+                    .time_ms = 0,
+                    .data = data,
+                });
+            }
+            return seq;
         },
         .request_start => |payload| {
             var seq: u64 = 0;
@@ -222,9 +253,18 @@ fn hostEmit(context: *anyopaque, event: loop_mod.Event) anyerror!u64 {
             }));
             var data = try positionValue(allocator, payload.position);
             try data.put(allocator, "message", message);
+            var wrapups: ?[]Value = null;
             switch (payload.result) {
                 .success => |success| {
                     if (success.meta) |meta| try data.put(allocator, "meta", meta);
+                    if (success.additional_contexts.len > 0) {
+                        const values = try allocator.alloc(Value, success.additional_contexts.len);
+                        for (success.additional_contexts, 0..) |wrapup, index| {
+                            const json = try hostSerializeMessage(@ptrCast(d), allocator, wrapup);
+                            values[index] = try fixture_compare.parseJson(allocator, json);
+                        }
+                        wrapups = values;
+                    }
                 },
                 .failure => |failure| {
                     var error_value: Obj = .empty;
@@ -243,6 +283,14 @@ fn hostEmit(context: *anyopaque, event: loop_mod.Event) anyerror!u64 {
                 .surface_op = .append,
                 .source_event_seqs = &source_seqs,
             });
+            if (wrapups) |values| {
+                const splice = try objectValue(allocator, &.{
+                    .{ "target", .{ .string = "next-step" } },
+                    .{ "start", .{ .integer = 0 } },
+                    .{ "inserted", try messageArray(allocator, values) },
+                });
+                _ = try d.append("agent/inbox/spliced", .{ .object = splice }, null);
+            }
             for (d.triggers) |trigger| {
                 if (trigger.op == .steer and trigger.kind == .tool_result and
                     std.mem.eql(u8, trigger.call_id, call.id))
@@ -271,7 +319,9 @@ fn hostSystemMessages(
     position: loop_mod.Position,
     out: *std.ArrayListUnmanaged(loop_mod.SystemMessage),
 ) anyerror!void {
-    if (position.step != 1) return;
+    // dsh logs the system prompt once per projection (the recording has one
+    // system/message across turns); later turns reuse the folded message.
+    if (position.turn != 1 or position.step != 1) return;
     const d: *Driver = @ptrCast(@alignCast(context));
     const id = try std.fmt.allocPrint(allocator, "system-{d}", .{position.turn});
     try out.append(allocator, .{ .id = id, .text = d.system_prompt });
@@ -287,7 +337,6 @@ fn hostPreStep(
     _ = allocator;
     _ = out;
     const d: *Driver = @ptrCast(@alignCast(context));
-    _ = position;
     if (claimed.next_turn.len > 0) {
         const data = try objectValue(d.arena, &.{
             .{ "target", .{ .string = "next-turn" } },
@@ -306,7 +355,7 @@ fn hostPreStep(
         });
         _ = try d.append("agent/inbox/spliced", .{ .object = data }, null);
     }
-    return .{};
+    return .{ .starts_request_series = position.step == 1 and position.turn > 1 };
 }
 
 fn hostSerializeMessage(
@@ -384,12 +433,6 @@ fn abortCause(name: []const u8) types.AbortCause {
 fn queueSteer(d: *Driver, text: []const u8) !void {
     const id = try d.nextId();
     const json = try userMessageJson(d.arena, id, text);
-    try d.surface_messages.append(d.arena, .{
-        .id = id,
-        .role = .user,
-        .content = &.{.{ .text = text }},
-        .source = .user,
-    });
     const data = try objectValue(d.arena, &.{
         .{ "target", .{ .string = "next-step" } },
         .{ "start", .{ .integer = 0 } },
@@ -402,12 +445,6 @@ fn queueSteer(d: *Driver, text: []const u8) !void {
 fn queuePrompt(d: *Driver, text: []const u8) !void {
     const id = try d.nextId();
     const json = try userMessageJson(d.arena, id, text);
-    try d.surface_messages.append(d.arena, .{
-        .id = id,
-        .role = .user,
-        .content = &.{.{ .text = text }},
-        .source = .user,
-    });
     const data = try objectValue(d.arena, &.{
         .{ "target", .{ .string = "next-turn" } },
         .{ "start", .{ .integer = 0 } },
@@ -946,6 +983,317 @@ fn runFixture(scenario: []const u8) !void {
         try std.testing.expect(recorded.messages.len > 0);
     }
 
+    try verifyLog(allocator, fixture_allocator, &log, log_path, expected_records, &declared, &ordinal, cwd);
+}
+
+// ---------------------------------------------------------------------------
+// Goal scenarios
+// ---------------------------------------------------------------------------
+
+/// Deterministic goal-domain clock: createdAt/updatedAt are pinned in expected.
+const goal_fixture_clock_ms: i64 = 300;
+
+fn goalFixtureClock(_: ?*anyopaque) i64 {
+    return goal_fixture_clock_ms;
+}
+
+/// Build the kernel loop over this driver, optionally resuming from a header.
+fn installLoop(d: *Driver, allocator: Allocator, baseline: ?request.Header) !void {
+    if (d.loop) |existing| {
+        existing.deinit();
+        allocator.destroy(existing);
+        d.loop = null;
+    }
+    const loop = try allocator.create(loop_mod.Loop);
+    loop.* = loop_mod.Loop.init(std.heap.ArenaAllocator.init(allocator), .{
+        .provider = test_provider,
+        .model = test_model,
+        .tools = d.tools,
+        .max_parallel_tools = d.max_parallel,
+        .baseline = baseline,
+    }, .{
+        .context = @ptrCast(d),
+        .emit = hostEmit,
+        .system_messages = hostSystemMessages,
+        .pre_step = hostPreStep,
+        .serialize_message = hostSerializeMessage,
+        .provider = .{
+            .context = @ptrCast(d),
+            .begin = providerBegin,
+            .next = providerNext,
+            .cancel = providerCancel,
+        },
+        .classifier = .{ .context = @ptrCast(d), .is_concurrency_safe = classifierIsSafe },
+        .dispatcher = .{ .context = @ptrCast(d), .dispatch = dispatcherCall },
+    });
+    d.loop = loop;
+}
+
+fn runGoalCommand(d: *Driver, raw_input: []const u8) !void {
+    _ = try d.goal_command.?.dispatch(d.arena, raw_input);
+}
+
+fn logGoalRoundSplice(d: *Driver, message: inbox.Message) !void {
+    const parsed = try fixture_compare.parseJson(d.arena, message.data);
+    const data = try objectValue(d.arena, &.{
+        .{ "target", .{ .string = "next-turn" } },
+        .{ "start", .{ .integer = 0 } },
+        .{ "inserted", try messageArray(d.arena, &.{parsed}) },
+    });
+    _ = try d.append("agent/inbox/spliced", .{ .object = data }, null);
+}
+
+fn queueGoalRound(d: *Driver, message: inbox.Message) !void {
+    try logGoalRoundSplice(d, message);
+    if (d.loop) |l| _ = try l.followup(.{ .id = message.id, .data = message.data });
+}
+
+/// Run automatic goal rounds until the driver stops (terminal phase, round
+/// cap, or max_rounds when a fixture needs a mid-run process stop).
+fn runGoalRounds(d: *Driver, max_rounds: ?u32) !void {
+    var rounds: u32 = 0;
+    while (true) {
+        if (max_rounds) |limit| {
+            if (rounds >= limit) return;
+        }
+        const driver = if (d.goal_driver) |*value| value else return;
+        const continuation = (try driver.next(d.arena)) orelse return;
+        rounds += 1;
+        try queueGoalRound(d, continuation);
+        d.goal_tools.?.authority = .{
+            .direct_human = false,
+            .goal_round = d.goal_store.?.find(),
+        };
+        const outcome = try d.loop.?.runTurn();
+        d.goal_tools.?.authority = .{};
+        switch (outcome) {
+            .ended => |reason| switch (reason) {
+                .completed => {},
+                else => return,
+            },
+            .paused => return error.UnexpectedPause,
+        }
+    }
+}
+
+fn runHumanTurn(d: *Driver, text: []const u8, max_rounds: ?u32) !void {
+    try queuePrompt(d, text);
+    d.goal_tools.?.authority = .{};
+    const outcome = try d.loop.?.runTurn();
+    switch (outcome) {
+        .ended => |reason| switch (reason) {
+            .completed => {},
+            else => return,
+        },
+        .paused => return error.UnexpectedPause,
+    }
+    try runGoalRounds(d, max_rounds);
+}
+
+/// Drop process-local state and reopen the same session log, like the adapter
+/// restore: fold the surface, rebuild the goal projection (disarmed on load),
+/// and start a fresh loop continuing the turn sequence.
+fn restartFixture(d: *Driver, allocator: Allocator) !void {
+    const baseline = if (d.loop) |loop| loop.last_header else null;
+    const last_turn = if (d.loop) |loop| loop.turn else 0;
+    d.log.close();
+    d.log.* = try session_log.Log.open(allocator, d.log_path);
+
+    var read = try session_log.readLog(allocator, d.log_path);
+    defer read.deinit();
+    try d.goal_store.?.rebuild(read.events);
+    if (d.goal_driver) |*driver| driver.pending = null;
+
+    d.surface_messages.clearRetainingCapacity();
+    var fold = try surface.fold(allocator, read.events);
+    defer fold.deinit();
+    for (fold.nodes) |node| {
+        try d.surface_messages.append(d.arena, try cloneMessage(d.arena, node.message));
+    }
+
+    try installLoop(d, allocator, baseline);
+    d.loop.?.turn = last_turn;
+}
+
+fn runGoalFixture(scenario: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const dir = try fixtureDirAlloc(allocator, scenario);
+    defer allocator.free(dir);
+
+    var fixture_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer fixture_arena_state.deinit();
+    const fixture_allocator = fixture_arena_state.allocator();
+
+    const input_bytes = try fixture_compare.readFixture(allocator, dir, "input.json");
+    defer allocator.free(input_bytes);
+    const input = try std.json.parseFromSliceLeaky(InputFile, fixture_allocator, input_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+
+    const replay_bytes = try fixture_compare.readFixture(allocator, dir, "replay.json");
+    defer allocator.free(replay_bytes);
+    const expected_bytes = try fixture_compare.readFixture(allocator, dir, "expected.v4.jsonl");
+    defer allocator.free(expected_bytes);
+    const expected_records = try fixture_compare.parseJsonl(fixture_allocator, expected_bytes);
+    const manifest_bytes = try fixture_compare.readFixture(allocator, dir, "manifest.json");
+    defer allocator.free(manifest_bytes);
+    const manifest = try fixture_compare.parseJson(fixture_allocator, manifest_bytes);
+
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    var ordinal: std.StringHashMapUnmanaged(void) = .empty;
+    try fixture_compare.loadDeclaredTokens(allocator, manifest, &declared, &ordinal);
+    defer declared.deinit(allocator);
+    defer ordinal.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_dir = compat.fs.Dir.wrap(tmp.dir);
+    const root = try tmp_dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const cwd = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(cwd);
+    try fs_compat.makePath(cwd);
+    const log_path = try std.fs.path.join(allocator, &.{ root, "session.v4.jsonl" });
+    defer allocator.free(log_path);
+    const spill_dir = try std.fs.path.join(allocator, &.{ root, "spill" });
+    defer allocator.free(spill_dir);
+
+    var max_parallel: usize = scheduler.DEFAULT_MAX_PARALLEL_TOOL_CALLS;
+    var blocked_after: u32 = tools_goal.blocked_after_consecutive_rounds;
+    for (input.steps) |step| {
+        if (!std.mem.eql(u8, step.op, "newSession")) continue;
+        if (step.config) |config| {
+            if (config.maxParallelToolCalls) |value| max_parallel = value;
+            if (config.goalBlockedAfter) |value| blocked_after = value;
+        }
+        if (step.workspace) |workspace_value| {
+            const files = switch (workspace_value) {
+                .object => |object| object,
+                else => return error.InvalidWorkspace,
+            };
+            var iterator = files.iterator();
+            while (iterator.next()) |entry| {
+                const content = switch (entry.value_ptr.*) {
+                    .string => |text| text,
+                    else => return error.InvalidWorkspace,
+                };
+                const path = try std.fs.path.join(allocator, &.{ cwd, entry.key_ptr.* });
+                defer allocator.free(path);
+                if (std.fs.path.dirname(path)) |parent| try fs_compat.makePath(parent);
+                const file = try fs_compat.createPath(path, .{ .truncate = true });
+                defer file.close();
+                try file.writeAll(content);
+            }
+        }
+    }
+
+    var provider = try replay_provider.ReplayProvider.initFromJson(allocator, replay_bytes);
+    defer provider.deinit();
+
+    var builtins = builtins_mod.Builtins{ .cwd = cwd, .spill_dir = spill_dir };
+    var tool_registry = registry.Registry.init();
+    defer tool_registry.deinit(allocator);
+    try builtins.register(&tool_registry, allocator);
+
+    var goal_store = goal.Store.init(allocator);
+    defer goal_store.deinit();
+    goal_store.clock = .{ .now = goalFixtureClock };
+    var goal_tools = tools_goal.Context{ .store = &goal_store };
+    goal_tools.blocked_after = blocked_after;
+    try goal_tools.register(&tool_registry, allocator);
+    var goal_cmd = goal_command.Goal{ .store = &goal_store };
+
+    const tools = try orderedToolSchemas(allocator);
+    defer allocator.free(tools);
+
+    var log = try session_log.Log.create(allocator, log_path, .{
+        .id = "fixture-session",
+        .created_at = session_created_at,
+        .cwd = cwd,
+        .is_seeded = false,
+        .delegation_depth = 0,
+    });
+    goal_store.attachLog(&log);
+
+    var driver = Driver{
+        .arena = fixture_allocator,
+        .log = &log,
+        .provider = &provider,
+        .registry = &tool_registry,
+        .max_parallel = max_parallel,
+        .system_prompt = try prompt.buildSystemPrompt(fixture_allocator, .{
+            .persona_prefix = headless_persona,
+        }),
+        .tools = tools,
+        .triggers = &.{},
+        .goal_store = &goal_store,
+        .goal_tools = &goal_tools,
+        .goal_driver = .{ .store = &goal_store },
+        .goal_command = &goal_cmd,
+        .log_path = log_path,
+    };
+    try appendSessionDefaults(&driver);
+    try installLoop(&driver, allocator, null);
+    defer {
+        if (driver.loop) |loop| {
+            loop.deinit();
+            allocator.destroy(loop);
+        }
+    }
+
+    for (input.steps) |step| {
+        if (std.mem.eql(u8, step.op, "initialize")) continue;
+        if (std.mem.eql(u8, step.op, "newSession")) continue;
+        if (std.mem.eql(u8, step.op, "goal")) {
+            try runGoalCommand(&driver, step.text orelse return error.MissingPrompt);
+            try runGoalRounds(&driver, step.rounds);
+            continue;
+        }
+        if (std.mem.eql(u8, step.op, "prompt")) {
+            try runHumanTurn(&driver, step.text orelse return error.MissingPrompt, step.rounds);
+            continue;
+        }
+        if (std.mem.eql(u8, step.op, "resume")) {
+            try runGoalCommand(&driver, "resume");
+            try runGoalRounds(&driver, step.rounds);
+            continue;
+        }
+        if (std.mem.eql(u8, step.op, "restart")) {
+            try restartFixture(&driver, allocator);
+            continue;
+        }
+        if (std.mem.eql(u8, step.op, "reserve")) {
+            const reserved = (try driver.goal_driver.?.next(fixture_allocator)) orelse
+                return error.MissingGoalRound;
+            try logGoalRoundSplice(&driver, reserved);
+            continue;
+        }
+        return error.UnsupportedInput;
+    }
+
+    try std.testing.expectEqual(provider.callCount(), provider.recordedRequests().len);
+    for (provider.recordedRequests()) |recorded| {
+        try std.testing.expectEqualStrings(test_provider, recorded.provider);
+        try std.testing.expectEqualStrings(test_model, recorded.model);
+        try std.testing.expect(recorded.messages.len > 0);
+    }
+
+    try verifyLog(allocator, fixture_allocator, &log, log_path, expected_records, &declared, &ordinal, cwd);
+}
+
+/// Compare the closed session log with the fixture: normalized JSONL plus the
+/// typed surface fold, then replay any declared workspace effects.
+fn verifyLog(
+    allocator: Allocator,
+    fixture_allocator: Allocator,
+    log: *session_log.Log,
+    log_path: []const u8,
+    expected_records: []const Value,
+    declared: *const std.StringHashMapUnmanaged(void),
+    ordinal: *const std.StringHashMapUnmanaged(void),
+    cwd: []const u8,
+) !void {
     log.close();
     var read = try session_log.readLog(allocator, log_path);
     defer read.deinit();
@@ -954,8 +1302,8 @@ fn runFixture(scenario: []const u8) !void {
     const actual_records = try fixture_compare.parseJsonl(fixture_allocator, log_bytes);
     var normalizer = fixture_compare.Normalizer{
         .arena = fixture_allocator,
-        .declared = &declared,
-        .ordinal = &ordinal,
+        .declared = declared,
+        .ordinal = ordinal,
         .cwd = cwd,
     };
     try normalizer.expectLog(expected_records, actual_records);
@@ -1076,6 +1424,26 @@ test "dsh native max-tokens matches normalized v4 fixture" {
 
 test "dsh native parallel-barrier matches normalized v4 fixture" {
     try runFixture("parallel-barrier");
+}
+
+test "dsh native goal-multi-round matches normalized v4 fixture" {
+    try runGoalFixture("goal-multi-round");
+}
+
+test "dsh native goal-complete-wrapup matches normalized v4 fixture" {
+    try runGoalFixture("goal-complete-wrapup");
+}
+
+test "dsh native goal-blocked-wrapup matches normalized v4 fixture" {
+    try runGoalFixture("goal-blocked-wrapup");
+}
+
+test "dsh native goal-max-rounds-stop matches normalized v4 fixture" {
+    try runGoalFixture("goal-max-rounds-stop");
+}
+
+test "dsh native goal-restart-resume matches normalized v4 fixture" {
+    try runGoalFixture("goal-restart-resume");
 }
 
 test "hook abort cause serializes as kind hook and reason" {

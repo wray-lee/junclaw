@@ -1,0 +1,205 @@
+{
+  "scenario": "goal-multi-round",
+  "purpose": "Goal replay fixture: a /goal command arms the round driver; two automatic rounds run in the same session, the second round marks the goal complete, and the generated <goal_complete> wrap-up drives one closing message before turn/end completed.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "groundTruthV4": {
+      "path": "/mnt/f/Projects/junclaw/tmp/ref/dsh/snapshots/web/goal-multi-turn-actions/session.v4.jsonl",
+      "lines": "1-101",
+      "note": "Live web recording derived: command/run+goal/change create, two <goal_round> turns (round 1 tool turn + answer, round 2 answer then update_goal complete + <goal_complete> wrapping message). Bash tool steps that only inspected the dsh source tree are replaced with get_goal calls; goal/turn/step/event ordering and the generated prompts are unchanged."
+    },
+    "design": {
+      "path": "/mnt/f/Projects/junclaw/.scratch/dsh-zig-rewrite-design.md",
+      "lines": "386-397",
+      "note": "B32 goal projection, round driver, wrap-up contract."
+    },
+    "roundDriver": {
+      "path": "packages/goal/goal-round-driver/src/index.ts and prompt.ts",
+      "note": "renderGoalRoundPrompt text and next-turn followup placement."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "replay": "replay.json",
+    "expected": "expected.v4.jsonl",
+    "manifest": "manifest.json"
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Recorded workspace path; the fixture host substitutes its temp workspace."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl system/message",
+        "note": "System prompt text token; the prompt is pinned by the P1 plain-turn fixture."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Whole tool-schema array token; the nine schemas are pinned by the P1 fixtures."
+      },
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.provider."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.model."
+      },
+      {
+        "token": "{{command:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl command/run and command/done",
+        "note": "Goal command identity; generated as goal-cmd-1 by the fixture host."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Ordinal session identity."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-1."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to system-1."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-1."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-1."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-2."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-2."
+      },
+      {
+        "token": "{{message:7}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-2-1."
+      },
+      {
+        "token": "{{message:8}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-2."
+      },
+      {
+        "token": "{{message:9}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-2-2."
+      },
+      {
+        "token": "{{message:10}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-3."
+      },
+      {
+        "token": "{{message:11}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-wrapup-goal-1-2."
+      },
+      {
+        "token": "{{message:12}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-2-3."
+      }
+    ],
+    "comparisonMask": []
+  },
+  "volatile": [
+    {
+      "field": "event time/seq",
+      "note": "The fixture log uses time 0; expected rows omit both."
+    },
+    {
+      "field": "assistant usage",
+      "note": "Authored neutral token counts, not provider evidence."
+    },
+    {
+      "field": "session createdAt",
+      "note": "Fixture clock 200; the header comparator only checks integers."
+    },
+    {
+      "field": "goal/change createdAt/updatedAt",
+      "value": 300,
+      "note": "Pinned deterministic goal clock (fixture host now_ms=300); real recordings use wall time."
+    },
+    {
+      "field": "session/message/goal ids",
+      "note": "Deterministic fixture ids; declared as ordinal tokens."
+    }
+  ],
+  "openIssues": [
+    "The recording was produced by the web composition; permission/preset, sandbox/mode, approval/policy, command/* and agent/inbox/spliced rows are reproduced by the fixture host, while web-only UI rows do not exist in this flow.",
+    "The recorded round-1/round-2 bash commands inspected the dsh checkout; the fixture replaces them with get_goal calls so the workspace stays neutral. The assistant text is fixture-authored, not recording-derived.",
+    "The recording logs system/message once per session; the fixture host mirrors that (turn 1 step 1 only).",
+    "Recording rows excluded from alignment are listed in alignment.excludedRecordingRows; they are host-level or web-only and do not affect goal state."
+  ],
+  "origin": "real-recording-derived",
+  "validation": {
+    "eventSequence": "Goal-relevant skeleton matches the recording rows 1-101: command/run -> goal/change create -> command/done -> next-turn splice -> turn/start -> splice removal -> step/start -> system/message -> goal user/message -> request/header initial -> assistant/tool events -> turn/end completed -> next-turn splice round 2 -> turn/start -> user/message round 2 -> request/header series -> update_goal -> goal/change complete -> wrap-up splice -> user/message <goal_complete> -> closing assistant -> turn/end completed. Omitted recording rows: web-only runtime-context user messages, job/registered and job/settled, and the extra bash steps of the live recording."
+  },
+  "alignment": {
+    "recording": "/mnt/f/Projects/junclaw/tmp/ref/dsh/snapshots/web/goal-multi-turn-actions/session.v4.jsonl",
+    "matched": [
+      "session header + permission/sandbox/approval defaults",
+      "command/run -> goal/change create -> command/done",
+      "next-turn goal_round splice -> turn/start -> splice removal -> step/start",
+      "system/message once at turn 1 step 1",
+      "goal user/message source {kind:goal,goalId,revision,round}",
+      "request/header reason initial then series",
+      "update_goal complete -> goal/change complete -> tool/result -> next-step wrap-up splice",
+      "wrap-up user/message -> closing assistant message -> turn/end completed"
+    ],
+    "excludedRecordingRows": [
+      "runtime-context user/message (time/timezone)",
+      "job/registered",
+      "job/settled",
+      "extra bash tool steps and reasoning stream"
+    ],
+    "notes": [
+      "The recording initial header carries startsSeries:true; the native fixture host does not log that flag (P1 convention).",
+      "The goal_relevant skeleton is byte-aligned on the generated <goal_round>/<goal_complete> text; assistant prose is fixture-authored."
+    ]
+  }
+}

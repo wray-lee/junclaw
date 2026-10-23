@@ -1,0 +1,154 @@
+{
+  "scenario": "goal-restart-resume",
+  "purpose": "Goal restart fixture: round 1 completes, a round-2 followup is reserved but never admitted (process gap), then the session log is reopened. Rebuild recovers the goal projection disarmed and roundsStarted=1; /goal resume re-arms it and the next round is round 2 (no double count).",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "dshSource": {
+      "path": "packages/goal/goal/src/index.ts and goal-round-driver/src/index.ts",
+      "note": "Constructed from goal projection rebuild, process-local activation, and round admission from user/message kind=goal."
+    },
+    "resumeRecording": {
+      "path": "/mnt/f/Projects/junclaw/tmp/ref/dsh/snapshots/sdk/session-resume/session.v4.jsonl",
+      "lines": "18-27",
+      "note": "Resumed sessions continue turn numbering and log request/header reason resume."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "replay": "replay.json",
+    "expected": "expected.v4.jsonl",
+    "manifest": "manifest.json"
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Recorded workspace path; the fixture host substitutes its temp workspace."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl system/message",
+        "note": "System prompt text token; the prompt is pinned by the P1 plain-turn fixture."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Whole tool-schema array token; the nine schemas are pinned by the P1 fixtures."
+      },
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.provider."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.model."
+      },
+      {
+        "token": "{{command:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl command/run and command/done",
+        "note": "Goal command identity; generated as goal-cmd-1 by the fixture host."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Ordinal session identity."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-1."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to system-1."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-1."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-2."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-2-2."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-2-1."
+      },
+      {
+        "token": "{{message:7}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-1."
+      },
+      {
+        "token": "{{message:8}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-wrapup-goal-1-3."
+      },
+      {
+        "token": "{{message:9}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-2-2."
+      }
+    ],
+    "comparisonMask": []
+  },
+  "volatile": [
+    {
+      "field": "event time/seq",
+      "note": "time 0; expected rows omit both."
+    },
+    {
+      "field": "assistant usage",
+      "note": "Authored neutral token counts."
+    },
+    {
+      "field": "goal/change createdAt/updatedAt",
+      "value": 300,
+      "note": "Pinned deterministic goal clock (fixture host now_ms=300); real recordings use wall time."
+    },
+    {
+      "field": "session/message/goal ids",
+      "note": "Deterministic fixture ids; ordinal tokens."
+    },
+    {
+      "field": "dangling round-2 splice",
+      "note": "Host-level row retained by the log but never admitted."
+    }
+  ],
+  "openIssues": [
+    "Constructed scenario: no goal restart recording exists. The reserve op models a durable next-turn splice whose process queue died before admission; rebuild ignores the splice and counts only logged goal user/messages.",
+    "The fixture host continues the turn counter across restart to match the session-resume recording (turn 2). The native adapter resets its loop counter on restore; noted as an implementation divergence."
+  ],
+  "origin": "constructed-from-dsh-source"
+}

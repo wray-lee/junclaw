@@ -1,0 +1,132 @@
+{
+  "scenario": "goal-complete-wrapup",
+  "purpose": "Goal wrap-up fixture: an autonomous round marks the goal complete; the tool result carries the generated <goal_complete> additional context, the loop splices it into the next step, the model writes the closing message, and the turn ends completed.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "recordingDerived": {
+      "path": "/mnt/f/Projects/junclaw/tmp/ref/dsh/snapshots/web/goal-multi-turn-actions/session.v4.jsonl",
+      "lines": "90-101",
+      "note": "The complete sequence (update_goal call, goal/change complete, tool/result, next-step splice, wrap-up user/message, closing assistant message, turn/end completed) is derived from this recording. The fixture shortens it to the first round."
+    },
+    "wrapup": {
+      "path": "packages/goal/tool-goal/src/wrapup.ts",
+      "note": "renderWrapupContext text and tool-goal notice source."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "replay": "replay.json",
+    "expected": "expected.v4.jsonl",
+    "manifest": "manifest.json"
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Recorded workspace path; the fixture host substitutes its temp workspace."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl system/message",
+        "note": "System prompt text token; the prompt is pinned by the P1 plain-turn fixture."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Whole tool-schema array token; the nine schemas are pinned by the P1 fixtures."
+      },
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.provider."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.model."
+      },
+      {
+        "token": "{{command:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl command/run and command/done",
+        "note": "Goal command identity; generated as goal-cmd-1 by the fixture host."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Ordinal session identity."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-1."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to system-1."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-1."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-1."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-wrapup-goal-1-2."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-2."
+      }
+    ],
+    "comparisonMask": []
+  },
+  "volatile": [
+    {
+      "field": "event time/seq",
+      "note": "time 0; expected rows omit both."
+    },
+    {
+      "field": "assistant usage",
+      "note": "Authored neutral token counts."
+    },
+    {
+      "field": "goal/change createdAt/updatedAt",
+      "value": 300,
+      "note": "Pinned deterministic goal clock (fixture host now_ms=300); real recordings use wall time."
+    },
+    {
+      "field": "session/message/goal ids",
+      "note": "Deterministic fixture ids; ordinal tokens."
+    }
+  ],
+  "openIssues": [
+    "The recorded wrap-up source carries a UI-only summary (complete: <objective>); the native wrap-up omits it because it is not model-visible. This is a known divergence.",
+    "The recording logs an agent/inbox/spliced next-step insertion for the wrap-up; the fixture host logs it from the tool result, matching the recorded order."
+  ],
+  "origin": "real-recording-derived"
+}
