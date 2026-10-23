@@ -172,6 +172,13 @@ pub const DshNativeHarness = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
+    /// Mirrors the sidecar handle: the host leaves a pre-turn `/stop` to
+    /// `runTurn` (which closes through the kernel's abort path) instead of
+    /// answering it as a local command.
+    pub fn interruptPending(self: *const Self) bool {
+        return self.interrupt;
+    }
+
     fn workspace(self: *const Self) []const u8 {
         return if (self.opts.workspace_dir.len == 0) "." else self.opts.workspace_dir;
     }
@@ -870,6 +877,23 @@ pub const DshNativeHarness = struct {
         try self.addSurfaceSnapshot(arena, try cloneMessage(arena, settlement.message));
         if (settlement.usage) |usage| {
             self.total_tokens += usage.input_tokens + usage.output_tokens;
+            // The host's ledger wants one record per model call, like the
+            // native engine's `usage_record_callback`. The engine never calls
+            // that callback, so this is the only source (no double count).
+            if (self.sink) |sink| {
+                const total = usage.total_tokens orelse (usage.input_tokens +| usage.output_tokens);
+                sink.send(.{ .usage = .{
+                    .ts = compat.time.timestamp(),
+                    .provider = self.opts.provider_name,
+                    .model = self.opts.model,
+                    .usage = .{
+                        .prompt_tokens = clampU32(usage.input_tokens),
+                        .completion_tokens = clampU32(usage.output_tokens),
+                        .total_tokens = clampU32(total),
+                    },
+                    .success = true,
+                } });
+            }
         }
         return seq;
     }
@@ -1328,6 +1352,11 @@ pub const DshNativeHarness = struct {
             .other => |value| return value,
         }
         return .{ .object = object };
+    }
+
+    /// The kernel counts u64 tokens; the host's provider type is u32.
+    fn clampU32(value: u64) u32 {
+        return @intCast(@min(value, std.math.maxInt(u32)));
     }
 
     fn usageValue(allocator: Allocator, usage: types.Usage) !Value {
