@@ -341,6 +341,36 @@ test "dsh-native adapter: requestInterrupt ends the turn aborted" {
     try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
 }
 
+test "dsh-native adapter: clearInterrupt drops a stop that landed after the turn" {
+    // Regression: a /stop delivered while the reply was being delivered set
+    // the kernel abort flag after `runTurn` had reset it; `clearInterrupt`
+    // only cleared the adapter flag, so the next turn returned `.aborted`
+    // without ever calling the provider.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "first" }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    try testing.expectEqual(port.EndReason.completed, first.end_reason);
+
+    // Arrives only after the turn ended, while the host is delivering it.
+    h.requestInterrupt();
+    h.clearInterrupt();
+    try testing.expect(!engine.interruptPending());
+
+    const second = try h.runTurn(turnInput("again"));
+    defer allocator.free(second.reply);
+    defer if (second.@"error") |text| allocator.free(text);
+    try testing.expectEqual(port.EndReason.@"error", second.end_reason);
+    try testing.expectEqualStrings("UnscriptedCall", second.error_code.?);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+}
+
 test "dsh-native adapter: reset mints a new id, log and mapping" {
     const allocator = testing.allocator;
     var fx = try Fixture.init(allocator, &.{

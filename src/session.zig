@@ -3076,11 +3076,9 @@ pub const SessionManager = struct {
         // into the turn. A message still pending here arrived after the final
         // step, so it runs as a new turn (dsh followup semantics), with its own
         // persisted transcript row, instead of being merged into the primary
-        // turn. The native-only live "\n\n" separator is not emitted: there is
-        // no merged assistant message to join in the stream. This host returns
-        // one reply per inbound message, so the transport string still carries
-        // both replies (see the combine below).
-        const owns_inbox = session.turnHarness().info().owns_inbox;
+        // turn. This host returns one reply per inbound message, so the
+        // transport string joins both replies with "\n\n" (see the combine
+        // below) for every engine, and the preview must carry the same join.
         // Regression: the combined reply joins the two turns with "\n\n" but
         // nothing streamed that separator, so the preview (primary followed by
         // the follow-up's own stream) was not a prefix of the reply. Emit it
@@ -3088,7 +3086,7 @@ pub const SessionManager = struct {
         // agent callback after every turn, so writing to agent.stream_callback
         // here would be dropped; go through the host's suppressing sink so the
         // live-draft rule applies to the separator exactly as before the port.
-        if (live_stream and !owns_inbox) {
+        if (live_stream) {
             if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta("\n\n") });
         }
         const follow_up_response = self.runTurnWithSteerSink(session, &refs, steer_sink, .{
@@ -3980,12 +3978,17 @@ pub const SessionManager = struct {
             if (session.owned_memory_session_id == null) {
                 session.agent.memory_session_id = session.session_key;
             }
+            // Regression: the dsh-native harness borrowed this slice, so
+            // freeing `old_key` below left it dangling and the next mapping
+            // write hashed freed memory.
+            if (session.dsh_native) |*d| d.harness.rebindSessionKey(new_key);
 
             self.sessions.put(self.allocator, session.session_key, session) catch {
                 session.session_key = old_key;
                 if (session.owned_memory_session_id == null) {
                     session.agent.memory_session_id = session.session_key;
                 }
+                if (session.dsh_native) |*d| d.harness.rebindSessionKey(old_key);
                 self.sessions.put(self.allocator, old_key, session) catch {
                     log.err("failed to restore live session after canonical key migration rollback", .{});
                 };
@@ -7630,6 +7633,46 @@ test "dsh-native: /new rotates the engine session and rewrites the mapping" {
     try testing.expectEqualStrings(expected, mapping);
 }
 
+test "dsh-native: canonical key migration keeps the engine mapping on the new key" {
+    // Regression: the engine borrowed `session.session_key`; migration freed
+    // that slice, so `/new` hashed freed memory and wrote the mapping under
+    // the legacy key.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "ok" }});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const legacy = "agent:main:telegram:group:-100123#topic:77";
+    const canonical = "agent:main:telegram:group:-100123:thread:77";
+    const session = try sm.getOrCreate(legacy);
+    try testing.expect(session.dsh_native != null);
+
+    // Session creation wrote the legacy mapping; drop it so a stale file
+    // cannot mask a write to the wrong (freed-key) path.
+    const legacy_mapping = try fixture.mappingPath(testing.allocator, legacy);
+    defer testing.allocator.free(legacy_mapping);
+    std_compat.fs.deleteFileAbsolute(legacy_mapping) catch {};
+
+    sm.migrateLegacySessionKey(canonical, legacy);
+    try testing.expectEqualStrings(canonical, session.session_key);
+
+    session.dsh_native.?.harness.harness().reset();
+    try testing.expect(session.dsh_native.?.harness.reset_error == null);
+
+    const canonical_mapping = try fixture.mappingPath(testing.allocator, canonical);
+    defer testing.allocator.free(canonical_mapping);
+    const raw = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, canonical_mapping, 4096);
+    defer testing.allocator.free(raw);
+    const expected = try std.fmt.allocPrint(testing.allocator, "{{\"sessionId\":\"{s}\"}}", .{
+        session.dsh_native.?.harness.session_id,
+    });
+    defer testing.allocator.free(expected);
+    try testing.expectEqualStrings(expected, raw);
+}
+
 test "dsh-native: a message the engine never claimed runs as a new turn" {
     var fixture = try DshNativeFixture.init();
     defer fixture.deinit();
@@ -7667,7 +7710,7 @@ test "dsh-native: a message the engine never claimed runs as a new turn" {
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, log_bytes, "\"turn/start\""));
 }
 
-test "dsh-native: owns_inbox skips the native follow-up reply separator" {
+test "dsh-native: the follow-up separator streams for the combined reply" {
     const Probe = struct {
         separator_seen: bool = false,
         fn emit(ctx: *anyopaque, event: harness_port.Event) void {
@@ -7706,10 +7749,10 @@ test "dsh-native: owns_inbox skips the native follow-up reply separator" {
     var completed: u64 = 0;
     var probe = Probe{};
     try testing.expect(try sm.drainLateInjection(session, key, &response, &completed, null, true, probe.sink()));
-    // The late message is a separate dsh turn, so the native-only live
-    // separator that joins two merged replies is not emitted.
-    try testing.expect(!probe.separator_seen);
-    try testing.expect(std.mem.indexOf(u8, response, "late answer") != null);
+    // Regression: the combined reply joins the turns with "\n\n"; the preview
+    // must stream the same separator, or it is not a prefix of the reply.
+    try testing.expect(probe.separator_seen);
+    try testing.expectEqualStrings("first answer\n\nlate answer", response);
 }
 
 test "dsh-native: usage accumulates across turns and writes one ledger row each" {

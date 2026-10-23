@@ -56,9 +56,11 @@ const Value = std.json.Value;
 const Writer = std.Io.Writer;
 
 /// Borrowed for the harness lifetime (same contract as the sidecar's
-/// `Options`); the owner keeps every slice alive until `deinit`.
+/// `Options`); the owner keeps every slice alive until `deinit`, except
+/// `session_key`, which `rebindSessionKey` may re-point.
 pub const Options = struct {
-    /// Host session identity; the mapping file is keyed by it.
+    /// Host session identity; the mapping file is keyed by it. Borrowed, and
+    /// re-pointed by `rebindSessionKey` when the host canonicalizes the key.
     session_key: []const u8,
     /// dsh home: `sessions/<project>/<id>/session.v4.jsonl` lives under it.
     dsh_home: []const u8,
@@ -177,6 +179,12 @@ pub const DshNativeHarness = struct {
     /// answering it as a local command.
     pub fn interruptPending(self: *const Self) bool {
         return self.interrupt;
+    }
+
+    /// Follow a host key canonicalization. The harness borrows the key, so the
+    /// owner must call this before freeing the old slice.
+    pub fn rebindSessionKey(self: *Self, session_key: []const u8) void {
+        self.opts.session_key = session_key;
     }
 
     fn workspace(self: *const Self) []const u8 {
@@ -637,6 +645,9 @@ pub const DshNativeHarness = struct {
     fn clearInterrupt(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.interrupt = false;
+        // A /stop that arrives after the turn ended sets the kernel flag below
+        // the adapter; drop it too, or the next turn aborts before the model.
+        if (!self.in_turn) if (self.loop) |*loop| loop.clearAbort();
     }
 
     fn activeToolName(ptr: *anyopaque, allocator: Allocator) anyerror!?[]u8 {

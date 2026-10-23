@@ -308,6 +308,14 @@ pub const Loop = struct {
         return self.abort_flag.load(.acquire);
     }
 
+    /// Drop an abort that no turn consumed (a /stop delivered after the turn
+    /// ended). Refuses while running or paused: those turns own the flag.
+    pub fn clearAbort(self: *Loop) void {
+        if (self.phase != .idle) return;
+        self.abort_flag.store(false, .release);
+        self.abort_cause = null;
+    }
+
     /// Checkpoint of the most recent request attempt (B22).
     pub fn lastCheckpoint(self: *const Loop) request.Checkpoint {
         return self.checkpoint;
