@@ -22,6 +22,9 @@ pub const tools_scheduler = @import("tools/scheduler.zig");
 pub const tools_execute = @import("tools/execute.zig");
 pub const tools_builtins = @import("tools/builtins.zig");
 pub const tools_bash = @import("tools/bash.zig");
+pub const tools_goal = @import("tools/goal.zig");
+pub const goal = @import("goal.zig");
+pub const goal_command = @import("goal_command.zig");
 pub const generated = @import("generated/root.zig");
 pub const harness = @import("harness.zig");
 
@@ -47,6 +50,9 @@ test {
     _ = @import("tools/execute.zig");
     _ = @import("tools/builtins.zig");
     _ = @import("tools/bash.zig");
+    _ = @import("tools/goal.zig");
+    _ = @import("goal.zig");
+    _ = @import("goal_command.zig");
     _ = @import("generated/root.zig");
     _ = @import("fixture_compare.zig");
     _ = @import("plain_turn_test.zig");

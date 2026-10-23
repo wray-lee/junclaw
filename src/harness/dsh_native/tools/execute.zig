@@ -76,9 +76,10 @@ fn collectViolations(
 
 /// Walk one value against one raw JSON Schema node. Only the keywords the
 /// generated core schemas (and dsh's parameter root) use are enforced:
-/// `type`, `properties`, `required`, `additionalProperties:false` and `items`.
-/// shortcut: enum/const/oneOf are not evaluated; extend before registering a
-/// schema that relies on them.
+/// `type`, `properties`, `required`, `additionalProperties:false`, `items` and
+/// a flat `enum` of scalars.
+/// shortcut: const/oneOf are not evaluated; extend before registering a schema
+/// that relies on them.
 fn collect(
     allocator: Allocator,
     out: *Violations,
@@ -92,6 +93,20 @@ fn collect(
     };
     const type_name = try optionalString(node, "type") orelse return;
     if (!try checkType(allocator, out, type_name, value, path)) return;
+
+    if (try optionalArray(node, "enum")) |allowed| {
+        var matched = false;
+        for (allowed.items) |candidate| {
+            if (jsonEqual(candidate, value)) {
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            const rendered = try std.json.Stringify.valueAlloc(allocator, Value{ .array = allowed }, .{});
+            try addViolation(allocator, out, "\"{s}\" must be one of {s}", .{ path, rendered });
+        }
+    }
 
     if (std.mem.eql(u8, type_name, "object")) {
         const object = value.object;
@@ -160,6 +175,18 @@ fn collect(
             );
         }
     }
+}
+
+fn jsonEqual(a: Value, b: Value) bool {
+    if (std.meta.activeTag(a) != std.meta.activeTag(b)) return false;
+    return switch (a) {
+        .string => |text| std.mem.eql(u8, text, b.string),
+        .integer => |number| number == b.integer,
+        .float => |number| number == b.float,
+        .bool => |flag| flag == b.bool,
+        .null => true,
+        else => false,
+    };
 }
 
 fn checkType(
@@ -359,6 +386,9 @@ fn handlers(handler: registry.Handler) registry.CoreHandlers {
         .bash = handler,
         .grep = handler,
         .glob = handler,
+        .get_goal = handler,
+        .create_goal = handler,
+        .update_goal = handler,
     };
 }
 
@@ -455,6 +485,36 @@ test "execute validates required fields and types before calling the handler" {
     const valid = try execute(&reg, arena, expectCall("call-4", "write", "{\"file_path\":\"a.txt\",\"content\":\"x\"}"));
     try testing.expect(!valid.isError());
     try testing.expectEqual(@as(usize, 1), ctx.calls);
+}
+
+test "execute enforces a flat enum before the handler runs" {
+    const core = handlers(.{ .call = noopHandler });
+    var reg = try setupRegistry(core);
+    defer reg.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const call = expectCall(
+        "call-1",
+        "update_goal",
+        "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"explode\"}",
+    );
+    const result = try execute(&reg, arena.allocator(), call);
+    try testing.expect(result == .failure);
+    try testing.expectEqualStrings("INVALID_ARGS", result.failure.error_info.code);
+    const text = switch (result.failure.content[0]) {
+        .text => |body| body,
+        else => unreachable,
+    };
+    try testing.expect(std.mem.indexOf(u8, text, "must be one of [\"edit\",\"pause\",\"resume\",\"complete\",\"blocked\"]") != null);
+
+    const accepted = expectCall(
+        "call-2",
+        "update_goal",
+        "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"pause\"}",
+    );
+    const ok = try execute(&reg, arena.allocator(), accepted);
+    try testing.expect(ok == .success);
 }
 
 test "execute maps malformed arguments and non-object roots to INVALID_ARGS" {

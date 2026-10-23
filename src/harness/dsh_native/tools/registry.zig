@@ -120,7 +120,7 @@ pub const Schema = struct {
     input_schema_json: []const u8,
 };
 
-/// The six P1 core tools, in dsh order, referencing the generated constants.
+/// Core tools in dsh order, referencing the generated constants.
 pub const core_schemas = [_]Schema{
     .{ .name = generated.read.name, .description = generated.read.description, .input_schema_json = generated.read.input_schema_json },
     .{ .name = generated.write.name, .description = generated.write.description, .input_schema_json = generated.write.input_schema_json },
@@ -128,6 +128,9 @@ pub const core_schemas = [_]Schema{
     .{ .name = generated.bash.name, .description = generated.bash.description, .input_schema_json = generated.bash.input_schema_json },
     .{ .name = generated.grep.name, .description = generated.grep.description, .input_schema_json = generated.grep.input_schema_json },
     .{ .name = generated.glob.name, .description = generated.glob.description, .input_schema_json = generated.glob.input_schema_json },
+    .{ .name = generated.get_goal.name, .description = generated.get_goal.description, .input_schema_json = generated.get_goal.input_schema_json },
+    .{ .name = generated.create_goal.name, .description = generated.create_goal.description, .input_schema_json = generated.create_goal.input_schema_json },
+    .{ .name = generated.update_goal.name, .description = generated.update_goal.description, .input_schema_json = generated.update_goal.input_schema_json },
 };
 
 /// dsh tool names are exact schema keys: byte-equal, case-sensitive, no aliases.
@@ -160,6 +163,9 @@ pub const CoreHandlers = struct {
     bash: Handler,
     grep: Handler,
     glob: Handler,
+    get_goal: Handler,
+    create_goal: Handler,
+    update_goal: Handler,
 };
 
 pub const Registry = struct {
@@ -185,7 +191,7 @@ pub const Registry = struct {
         try self.tools.put(allocator, canonical, registered);
     }
 
-    /// Register the six P1 core tools. Only handlers vary per deployment; names,
+    /// Register the core tools. Only handlers vary per deployment; names,
     /// descriptions and schemas are the generated dsh strings.
     pub fn registerCore(self: *Registry, allocator: Allocator, handlers: CoreHandlers) !void {
         try self.register(allocator, .{ .name = generated.read.name, .description = generated.read.description, .input_schema_json = generated.read.input_schema_json, .handler = handlers.read });
@@ -194,6 +200,9 @@ pub const Registry = struct {
         try self.register(allocator, .{ .name = generated.bash.name, .description = generated.bash.description, .input_schema_json = generated.bash.input_schema_json, .handler = handlers.bash });
         try self.register(allocator, .{ .name = generated.grep.name, .description = generated.grep.description, .input_schema_json = generated.grep.input_schema_json, .handler = handlers.grep });
         try self.register(allocator, .{ .name = generated.glob.name, .description = generated.glob.description, .input_schema_json = generated.glob.input_schema_json, .handler = handlers.glob });
+        try self.register(allocator, .{ .name = generated.get_goal.name, .description = generated.get_goal.description, .input_schema_json = generated.get_goal.input_schema_json, .handler = handlers.get_goal });
+        try self.register(allocator, .{ .name = generated.create_goal.name, .description = generated.create_goal.description, .input_schema_json = generated.create_goal.input_schema_json, .handler = handlers.create_goal });
+        try self.register(allocator, .{ .name = generated.update_goal.name, .description = generated.update_goal.description, .input_schema_json = generated.update_goal.input_schema_json, .handler = handlers.update_goal });
     }
 
     pub fn get(self: *const Registry, name: []const u8) ?*const Tool {
@@ -233,17 +242,22 @@ fn defaultHandlers(handler: Handler) CoreHandlers {
         .bash = handler,
         .grep = handler,
         .glob = handler,
+        .get_goal = handler,
+        .create_goal = handler,
+        .update_goal = handler,
     };
 }
 
-test "registerCore keeps the six generated schemas verbatim" {
+test "registerCore keeps the nine generated schemas verbatim" {
     var registry = Registry.init();
     defer registry.deinit(testing.allocator);
 
     try registry.registerCore(testing.allocator, defaultHandlers(.{ .call = fakeHandler }));
 
-    try testing.expectEqual(@as(usize, 6), registry.tools.count());
-    const expected_names = [_][]const u8{ "read", "write", "edit", "bash", "grep", "glob" };
+    try testing.expectEqual(@as(usize, 9), registry.tools.count());
+    const expected_names = [_][]const u8{
+        "read", "write", "edit", "bash", "grep", "glob", "get_goal", "create_goal", "update_goal",
+    };
     for (expected_names, core_schemas) |expected, schema| {
         try testing.expectEqualStrings(expected, schema.name);
         const tool = registry.get(expected).?;

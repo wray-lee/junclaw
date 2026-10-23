@@ -43,6 +43,8 @@ const request = @import("request.zig");
 const registry = @import("tools/registry.zig");
 const builtins_mod = @import("tools/builtins.zig");
 const bash_mod = @import("tools/bash.zig");
+const goal_mod = @import("goal.zig");
+const goal_tools = @import("tools/goal.zig");
 const execute = @import("tools/execute.zig");
 const scheduler = @import("tools/scheduler.zig");
 const session_log = @import("session_log.zig");
@@ -115,6 +117,8 @@ pub const DshNativeHarness = struct {
     registry: registry.Registry = .{},
     builtins: ?*builtins_mod.Builtins = null,
     bash: ?*bash_mod.Context = null,
+    goal_store: ?*goal_mod.Store = null,
+    goal_tools: ?*goal_tools.Context = null,
     system_prompt: []const u8 = "",
     spill_dir: []const u8 = "",
 
@@ -165,6 +169,11 @@ pub const DshNativeHarness = struct {
         self.registry.deinit(self.allocator);
         if (self.builtins) |value| self.allocator.destroy(value);
         if (self.bash) |value| self.allocator.destroy(value);
+        if (self.goal_tools) |value| self.allocator.destroy(value);
+        if (self.goal_store) |value| {
+            value.deinit();
+            self.allocator.destroy(value);
+        }
         self.call_arena.deinit();
         self.arena.deinit();
         self.perm.deinit();
@@ -231,6 +240,16 @@ pub const DshNativeHarness = struct {
         self.builtins = builtins;
         self.bash = bash;
 
+        const goal_store = try self.allocator.create(goal_mod.Store);
+        errdefer self.allocator.destroy(goal_store);
+        goal_store.* = goal_mod.Store.init(self.allocator);
+        const goal_context = try self.allocator.create(goal_tools.Context);
+        errdefer self.allocator.destroy(goal_context);
+        goal_context.* = .{ .store = goal_store };
+        try goal_context.register(&self.registry, self.allocator);
+        self.goal_store = goal_store;
+        self.goal_tools = goal_context;
+
         const names = try perm.alloc([]const u8, registry.core_schemas.len);
         for (registry.core_schemas, 0..) |schema, index| names[index] = schema.name;
         const ordered = try prompt.orderTools(perm, names, null);
@@ -296,6 +315,10 @@ pub const DshNativeHarness = struct {
             l.deinit();
             self.loop = null;
         }
+        if (self.goal_store) |store| {
+            store.reset();
+            store.attachLog(null);
+        }
         if (self.log) |*log| {
             log.close();
             self.log = null;
@@ -335,6 +358,7 @@ pub const DshNativeHarness = struct {
             .delegation_depth = 0,
         };
         self.log = try session_store.createLog(self.allocator, self.opts.dsh_home, self.workspace(), id, header);
+        if (self.goal_store) |store| store.attachLog(&self.log.?);
         self.buildLoop();
     }
 
@@ -344,6 +368,7 @@ pub const DshNativeHarness = struct {
         const arena = self.arena.allocator();
         self.session_id = try arena.dupe(u8, session_id);
         self.log = try session_store.openLog(self.allocator, self.opts.dsh_home, self.workspace(), self.session_id);
+        if (self.goal_store) |store| store.attachLog(&self.log.?);
 
         var read = session_log.readLog(self.allocator, self.log.?.path) catch |err| {
             if (self.opts.on_corrupt != .native) return err;
@@ -362,6 +387,7 @@ pub const DshNativeHarness = struct {
             if (std.mem.eql(u8, event.event_type, "permission/preset")) self.context_written = true;
         }
         try self.rebuildSurface(read.events, arena);
+        if (self.goal_store) |store| try store.rebuild(read.events);
         self.buildLoop();
         if (baseline) |header| {
             const loop = &self.loop.?;

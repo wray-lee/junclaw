@@ -39,3 +39,21 @@ pub const glob = struct {
     pub const description = "Find files, not directories, whose paths match a glob pattern, including hidden and ignored files. Returns up to 100 paths in modification-time order; a larger result keeps the first paths and reports where the complete list was saved.";
     pub const input_schema_json = "{\"type\":\"object\",\"properties\":{\"pattern\":{\"type\":\"string\",\"description\":\"Glob pattern to match file paths against (e.g. \\\"**/*.ts\\\", \\\"src/**/*.test.js\\\"). A pattern with no \\\"/\\\" matches the basename at any depth, so \\\"*\\\" and \\\"*.ts\\\" both search the whole tree; include a separator to anchor the depth.\"},\"path\":{\"type\":\"string\",\"description\":\"Directory to search in. Defaults to the session workspace; a relative path resolves against it.\"}},\"required\":[\"pattern\"]}";
 };
+
+pub const get_goal = struct {
+    pub const name = "get_goal";
+    pub const description = "Read the current session goal, including the id and revision that update_goal requires.";
+    pub const input_schema_json = "{\"type\":\"object\",\"properties\":{}}";
+};
+
+pub const create_goal = struct {
+    pub const name = "create_goal";
+    pub const description = "Create a persisted goal that keeps this session working across automatic continuation rounds. Use it when the direct human request is a long-running objective, even if the user did not say \"goal\"; not for single-turn work.";
+    pub const input_schema_json = "{\"type\":\"object\",\"properties\":{\"objective\":{\"type\":\"string\",\"description\":\"The concrete completion objective inferred from the direct human request.\"},\"max_goal_rounds\":{\"type\":\"number\",\"description\":\"Optional positive safe-integer limit on automatic continuation rounds.\"}},\"required\":[\"objective\"]}";
+};
+
+pub const update_goal = struct {
+    pub const name = "update_goal";
+    pub const description = "Update the current goal.";
+    pub const input_schema_json = "{\"type\":\"object\",\"properties\":{\"goal_id\":{\"type\":\"string\",\"description\":\"Exact id returned by get_goal.\"},\"revision\":{\"type\":\"number\",\"description\":\"Exact positive revision returned by get_goal.\"},\"action\":{\"type\":\"string\",\"description\":\"edit, pause, and resume require a direct top-level human request. complete and blocked are also allowed during an automatic continuation of this goal; blocked is rejected before the configured minimum round count.\",\"enum\":[\"edit\",\"pause\",\"resume\",\"complete\",\"blocked\"]},\"objective\":{\"type\":\"string\",\"description\":\"Replacement objective; valid only with action edit.\"},\"max_goal_rounds\":{\"type\":\"number\",\"description\":\"Replacement cap; valid only with action edit.\"},\"blocked_reason\":{\"type\":\"string\",\"description\":\"Required only with action blocked: the concrete condition that persisted across rounds and blocks progress.\"}},\"required\":[\"goal_id\",\"revision\",\"action\"]}";
+};

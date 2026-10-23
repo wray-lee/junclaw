@@ -41,6 +41,9 @@ const BASH_RENDER = 'packages/shell/tool-bash/src/render.ts'
 const GREP = 'packages/fs/tool-fs-search/src/grep.ts'
 const GLOB = 'packages/fs/tool-fs-search/src/glob.ts'
 const SPILL_LOCAL = 'packages/spill/spill-local/src/index.ts'
+const GOAL_TOOL = 'packages/goal/tool-goal/src/index.ts'
+const GOAL_ROUND_PROMPT = 'packages/goal/goal-round-driver/src/prompt.ts'
+const GOAL_WRAPUP = 'packages/goal/tool-goal/src/wrapup.ts'
 
 // Files whose semantics or defaults shape the generated text without yielding a
 // string constant of their own. Their hashes still gate --check.
@@ -80,6 +83,13 @@ function sha256hex(data) {
 // (without `${}`) to their generated value.
 function E(id, file, start, end, opts = {}) {
   return { id, file, start, end, ...opts }
+}
+
+// Entry whose value is composed from several anchored literals; the recorded
+// range covers every contributing line and CONTENT_SHA256 hashes the result.
+function C(id, file, start, end, value) {
+  const source = readSource(file)
+  return { id, file, start, end, value, source_sha256: source.sha, content_sha256: sha256hex(Buffer.from(value, 'utf8')) }
 }
 
 function zigLiteral(value) {
@@ -247,6 +257,7 @@ function scanLiterals(text, subs, where) {
 }
 
 function extract(entry) {
+  if (entry.value !== undefined) return entry
   const source = readSource(entry.file)
   if (!Number.isInteger(entry.start) || !Number.isInteger(entry.end)
     || entry.start < 1 || entry.end < entry.start || entry.end > source.lines.length) {
@@ -408,7 +419,79 @@ const tools = [
       { name: 'path', type: 'string', required: false, desc: E('glob.path.description', GLOB, 318, 318, { pick: [1] }) },
     ],
   },
+  {
+    module: 'get_goal',
+    file: GOAL_TOOL,
+    name: E('get_goal.name', GOAL_TOOL, 196, 196),
+    description: E('get_goal.description', GOAL_TOOL, 56, 56),
+    schemaRange: [198, 198],
+    params: [],
+  },
+  {
+    module: 'create_goal',
+    file: GOAL_TOOL,
+    name: E('create_goal.name', GOAL_TOOL, 208, 208),
+    description: E('create_goal.description', GOAL_TOOL, 51, 54),
+    schemaRange: [210, 220],
+    params: [
+      { name: 'objective', type: 'string', required: true, desc: E('create_goal.objective.description', GOAL_TOOL, 211, 214, { pick: [1] }) },
+      { name: 'max_goal_rounds', type: 'number', required: false, desc: E('create_goal.max_goal_rounds.description', GOAL_TOOL, 216, 219, { pick: [1] }) },
+    ],
+  },
+  {
+    module: 'update_goal',
+    file: GOAL_TOOL,
+    name: E('update_goal.name', GOAL_TOOL, 235, 235),
+    description: E('update_goal.description', GOAL_TOOL, 236, 236),
+    schemaRange: [237, 253],
+    params: [
+      { name: 'goal_id', type: 'string', required: true, desc: E('update_goal.goal_id.description', GOAL_TOOL, 238, 238, { pick: [1] }) },
+      { name: 'revision', type: 'number', required: true, desc: E('update_goal.revision.description', GOAL_TOOL, 239, 239, { pick: [1] }) },
+      {
+        name: 'action',
+        type: 'string',
+        required: true,
+        enum: ['edit', 'pause', 'resume', 'complete', 'blocked'],
+        desc: E('update_goal.action.description', GOAL_TOOL, 240, 246, { pick: [1, 2] }),
+      },
+      { name: 'objective', type: 'string', required: false, desc: E('update_goal.objective.description', GOAL_TOOL, 247, 247, { pick: [1] }) },
+      { name: 'max_goal_rounds', type: 'number', required: false, desc: E('update_goal.max_goal_rounds.description', GOAL_TOOL, 248, 248, { pick: [1] }) },
+      { name: 'blocked_reason', type: 'string', required: false, desc: E('update_goal.blocked_reason.description', GOAL_TOOL, 249, 252, { pick: [1] }) },
+    ],
+  },
 ]
+
+// Goal prompt/wrap-up text: <goal_round> is one template literal; wrap-up uses
+// JS string concatenation, so its exact final text is composed from anchored
+// pieces plus the shared heading and grounding constants.
+function goalRenderEntries() {
+  const heading = extract(E('goal.wrapup_heading', GOAL_WRAPUP, 18, 18, {
+    subs: { 'JSON.stringify(objective)': '{s}' },
+  })).value
+  const grounding = extract(E('goal.wrapup_grounding', GOAL_WRAPUP, 5, 7)).value
+  const complete = extract(E('goal.complete_open', GOAL_WRAPUP, 20, 20)).value
+    + heading
+    + extract(E('goal.complete_body', GOAL_WRAPUP, 22, 24)).value
+    + grounding
+    + extract(E('goal.complete_tail', GOAL_WRAPUP, 26, 27)).value
+    + extract(E('goal.complete_close', GOAL_WRAPUP, 28, 28)).value
+  const blocked = extract(E('goal.blocked_open', GOAL_WRAPUP, 29, 29)).value
+    + heading
+    + extract(E('goal.blocked_reason', GOAL_WRAPUP, 31, 31, {
+      subs: { 'JSON.stringify(blockedReason)': '{s}' },
+    })).value
+    + extract(E('goal.blocked_body', GOAL_WRAPUP, 32, 35)).value
+    + grounding
+    + extract(E('goal.blocked_tail', GOAL_WRAPUP, 37, 38)).value
+    + extract(E('goal.blocked_close', GOAL_WRAPUP, 39, 39)).value
+  return [
+    E('goal.round_prompt', GOAL_ROUND_PROMPT, 15, 24, {
+      subs: { 'JSON.stringify(goal.objective)': '{s}', 'round': '{d}', 'goal.maxGoalRounds': '{d}' },
+    }),
+    C('goal.complete_wrapup', GOAL_WRAPUP, 18, 28, complete),
+    C('goal.blocked_wrapup', GOAL_WRAPUP, 18, 39, blocked),
+  ]
+}
 
 const renderGroups = [
   {
@@ -511,6 +594,10 @@ const renderGroups = [
       E('spill.retrieval_hint', SPILL_LOCAL, 159, 159),
     ],
   },
+  {
+    name: 'goal',
+    consts: goalRenderEntries,
+  },
 ]
 
 // ---------------------------------------------------------------------------
@@ -534,6 +621,7 @@ function buildInputSchema(tool) {
   for (const param of tool.params) {
     const ext = extract(param.desc)
     properties[param.name] = { type: param.type, description: ext.value }
+    if (param.enum !== undefined) properties[param.name].enum = param.enum
     if (param.required) required.push(param.name)
   }
   const schema = { type: 'object', properties }
@@ -594,7 +682,7 @@ function generateToolRender() {
   let out = header('tool result rendering templates and edit failure text')
   for (const group of renderGroups) {
     out += `\npub const ${group.name} = struct {\n`
-    for (const entry of group.consts) {
+    for (const entry of typeof group.consts === 'function' ? group.consts() : group.consts) {
       out += structConst('tool_render', group.name, entry.id.slice(group.name.length + 1), extract(entry))
     }
     out += '};\n'
