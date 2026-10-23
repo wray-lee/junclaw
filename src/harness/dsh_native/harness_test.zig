@@ -124,6 +124,46 @@ const FakeProvider = struct {
     fn deinitFn(_: *anyopaque) void {}
 };
 
+/// Wraps a child allocator (here the testing allocator) and fills every freed
+/// allocation with 0xAA. A use-after-free then reads poison instead of
+/// whatever the still-mapped page happens to hold, so the assertion after the
+/// read fails on every host, not only where the freed page is unmapped.
+const PoisonAllocator = struct {
+    child: Allocator,
+
+    fn allocator(self: *PoisonAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawAlloc(len, alignment, ret_addr);
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawResize(memory, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
+        return self.child.rawRemap(memory, alignment, new_len, ret_addr);
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
+        @memset(memory, 0xAA);
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
 /// Shared fixture: a temp workspace, a dsh home under it, and a harness.
 const Fixture = struct {
     tmp: std.testing.TmpDir,
@@ -420,7 +460,12 @@ test "dsh-native adapter: reset mints a new id, log and mapping" {
 }
 
 test "dsh-native adapter: restore reopens the same JSONL and replays the surface" {
-    const allocator = testing.allocator;
+    // Regression: restore handed the arena-owned mapped id to
+    // openExistingSession, whose closeSession freed that arena before
+    // arena.dupe read it (Linux/macOS CI: SIGABRT in memcpy). Poisoning freed
+    // bytes makes that read produce a garbage id here.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
     var fx = try Fixture.init(allocator, &.{
         .{ .text = "answer one" },
         .{ .text = "answer two" },
@@ -567,6 +612,11 @@ test "dsh-native adapter: a 64KB+ prompt round-trips without leaking" {
         } else run = 0;
     }
     try testing.expectEqual(big.len, best);
+
+    // The lifecycle copies the id before closeSession frees its source; the
+    // leak checker must still see every byte of that temporary returned.
+    h.reset();
+    try h.restore(.{ .messages = &.{} });
 }
 
 test "dsh-native adapter: session paths are built with the native separator" {
@@ -769,7 +819,11 @@ test "dsh-native adapter: a restored session keeps the goal and runs the next ro
 }
 
 test "dsh-native adapter: an unreplayable goal projection follows on_corrupt" {
-    const allocator = testing.allocator;
+    // Regression: the same restore use-after-free; where the freed page stayed
+    // mapped the garbage id silently turned the corrupt log into a
+    // FileNotFound fallback instead of following on_corrupt.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
     var fx = try Fixture.init(allocator, &.{
         .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":1}" }} },
         .{ .text = "goal created" },

@@ -346,10 +346,14 @@ pub const DshNativeHarness = struct {
     /// Create a fresh session id + JSONL, take its write lease and start the
     /// kernel loop.
     fn openNewSession(self: *Self, session_id: ?[]const u8) !void {
+        // Copy before closeSession: the caller may pass an id that lives in
+        // this harness session arena, which closeSession frees.
+        const id_copy = if (session_id) |value| try self.allocator.dupe(u8, value) else null;
+        defer if (id_copy) |copy| self.allocator.free(copy);
         self.closeSession();
         const arena = self.arena.allocator();
 
-        const id = if (session_id) |value|
+        const id = if (id_copy) |value|
             try arena.dupe(u8, value)
         else
             try newSessionId(arena);
@@ -369,9 +373,13 @@ pub const DshNativeHarness = struct {
 
     /// Reopen the JSONL for `session_id` and rebuild the surface from it.
     fn openExistingSession(self: *Self, session_id: []const u8) !void {
+        // Copy before closeSession: restore passes the id loadMappedId
+        // allocated in the session arena, which closeSession frees.
+        const id_copy = try self.allocator.dupe(u8, session_id);
+        defer self.allocator.free(id_copy);
         self.closeSession();
         const arena = self.arena.allocator();
-        self.session_id = try arena.dupe(u8, session_id);
+        self.session_id = try arena.dupe(u8, id_copy);
         self.log = try session_store.openLog(self.allocator, self.opts.dsh_home, self.workspace(), self.session_id);
         if (self.goal_store) |store| store.attachLog(&self.log.?);
 
