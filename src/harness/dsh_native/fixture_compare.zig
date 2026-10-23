@@ -3,6 +3,13 @@
 //!
 //! Comparison layers (design §4.2): event type sequence, event data minus the
 //! manifest's declared tokens/volatile fields, and the typed surface fold.
+//!
+//! Path convention: fixture paths are always written with '/' separators.
+//! Implementations emit native separators (dsh/node `path.relative`), so this
+//! Normalizer is the only place that reconciles them: path values (`cwd`,
+//! `meta.path`) map every separator to '/', and text maps separators only
+//! inside `<path>...</path>` segments. All other text is compared
+//! byte-for-byte, so a '\\' there still fails.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -125,6 +132,34 @@ fn looksLikeToken(text: []const u8) bool {
     return text.len >= 4 and std.mem.startsWith(u8, text, "{{") and std.mem.endsWith(u8, text, "}}");
 }
 
+/// Map every separator in a path value to '/'. Fixtures store paths with '/';
+/// implementations emit the platform separator.
+fn normalizePath(allocator: Allocator, text: []const u8) ![]const u8 {
+    const out = try allocator.dupe(u8, text);
+    for (out) |*byte| {
+        if (byte.* == '\\') byte.* = '/';
+    }
+    return out;
+}
+
+/// Map separators to '/' inside `<path>...</path>` segments only. The
+/// surrounding text keeps its separators significant.
+fn normalizePathMarkers(allocator: Allocator, text: []const u8) ![]const u8 {
+    const out = try allocator.dupe(u8, text);
+    const open = "<path>";
+    const close = "</path>";
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, out, index, open)) |start| {
+        const body_start = start + open.len;
+        const body_end = std.mem.indexOfPos(u8, out, body_start, close) orelse break;
+        for (out[body_start..body_end]) |*byte| {
+            if (byte.* == '\\') byte.* = '/';
+        }
+        index = body_end + close.len;
+    }
+    return out;
+}
+
 fn isWholeValueToken(declared: *const std.StringHashMapUnmanaged(void), value: Value) bool {
     if (value != .string) return false;
     return std.mem.eql(u8, value.string, "{{tools}}") and declared.contains(value.string);
@@ -163,6 +198,10 @@ pub const Normalizer = struct {
         stream_array: bool = false,
         /// Comparing one packed stream record.
         stream_item: bool = false,
+        /// Comparing the `meta` object of a tool result.
+        meta: bool = false,
+        /// Comparing a filesystem path value; separators normalize to '/'.
+        path_value: bool = false,
     };
 
     /// Compare a decoded actual log against the expected JSONL records.
@@ -206,7 +245,9 @@ pub const Normalizer = struct {
                 if (actual_value != .integer or entry.value_ptr.* != .integer) return error.FixtureMismatch;
                 continue;
             }
-            try self.compareValue(entry.value_ptr.*, actual_value, .{});
+            try self.compareValue(entry.value_ptr.*, actual_value, .{
+                .path_value = is_header and std.mem.eql(u8, key, "cwd"),
+            });
         }
 
         var actual_iterator = actual_object.iterator();
@@ -234,15 +275,24 @@ pub const Normalizer = struct {
                     }
                     return;
                 }
-                if (std.mem.indexOf(u8, expected_string, "{{cwd}}") != null) {
+                const actual_string = try asString(actual);
+                if (context.path_value) {
+                    const substituted = if (std.mem.indexOf(u8, expected_string, "{{cwd}}") != null)
+                        try self.substituteCwd(actual_string)
+                    else
+                        actual_string;
                     try std.testing.expectEqualStrings(
-                        expected_string,
-                        try self.substituteCwd(try asString(actual)),
+                        try normalizePath(self.arena, expected_string),
+                        try normalizePath(self.arena, substituted),
                     );
                     return;
                 }
+                if (std.mem.indexOf(u8, expected_string, "{{cwd}}") != null) {
+                    try self.expectTextMatch(expected_string, actual_string);
+                    return;
+                }
                 if (looksLikeToken(expected_string)) return error.UndeclaredToken;
-                try std.testing.expectEqualStrings(expected_string, try asString(actual));
+                try std.testing.expectEqualStrings(expected_string, actual_string);
             },
             .object => |expected_object| {
                 const actual_object = switch (actual) {
@@ -309,6 +359,10 @@ pub const Normalizer = struct {
                 }
                 const child_context: Context = if (context.stream_owner and std.mem.eql(u8, key, "stream"))
                     .{ .stream_array = true }
+                else if (std.mem.eql(u8, key, "meta"))
+                    .{ .meta = true }
+                else if (context.meta and std.mem.eql(u8, key, "path"))
+                    .{ .path_value = true }
                 else
                     .{};
                 try self.compareValue(expected_value, actual_value, child_context);
@@ -354,9 +408,23 @@ pub const Normalizer = struct {
         try std.testing.expectEqualStrings(expected, actual);
     }
 
-    /// Rewrite the workspace path to `{{cwd}}`. Only the substituted path
-    /// fragment is tokenized; separators in the rest of the string stay
-    /// significant so a Windows display-path bug is still reported.
+    /// Compare text containing `{{cwd}}`: the workspace prefix is tokenized and
+    /// separators normalize only inside `<path>` segments; the rest of the text
+    /// stays byte-exact.
+    fn expectTextMatch(self: *Normalizer, expected: []const u8, actual: []const u8) !void {
+        const substituted = if (std.mem.indexOf(u8, expected, "{{cwd}}") != null)
+            try self.substituteCwd(actual)
+        else
+            actual;
+        try std.testing.expectEqualStrings(
+            try normalizePathMarkers(self.arena, expected),
+            try normalizePathMarkers(self.arena, substituted),
+        );
+    }
+
+    /// Rewrite the workspace path to `{{cwd}}`. Separator normalization is
+    /// separate: `normalizePath` for path values, `normalizePathMarkers` for
+    /// text.
     fn substituteCwd(self: *Normalizer, text: []const u8) ![]const u8 {
         std.debug.assert(self.cwd.len > 0);
         return std.mem.replaceOwned(u8, self.arena, text, self.cwd, "{{cwd}}");
@@ -374,8 +442,8 @@ pub const Normalizer = struct {
                         .text => |value| value,
                         else => return error.FixtureMismatch,
                     };
-                    if (std.mem.indexOf(u8, text, "{{cwd}}") != null) {
-                        try std.testing.expectEqualStrings(text, try self.substituteCwd(actual_text));
+                    if (std.mem.indexOf(u8, text, "{{cwd}}") != null or std.mem.indexOf(u8, text, "<path>") != null) {
+                        try self.expectTextMatch(text, actual_text);
                     } else {
                         try self.expectTokenOrString(text, actual_text);
                     }
@@ -437,7 +505,7 @@ pub const Normalizer = struct {
     }
 };
 
-test "cwd substitution keeps separators outside the token significant" {
+test "path values normalize separators but other text keeps them significant" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -450,16 +518,68 @@ test "cwd substitution keeps separators outside the token significant" {
         .cwd = "C:\\work\\project",
     };
 
+    // Path values: native separators match the fixture's '/' form.
     try normalizer.compareValue(
         .{ .string = "{{cwd}}/src/main.zig" },
-        .{ .string = "C:\\work\\project/src/main.zig" },
-        .{},
+        .{ .string = "C:\\work\\project\\src\\main.zig" },
+        .{ .path_value = true },
     );
-    // Regression: normalizing the whole replaced string hid Windows separators
-    // outside the workspace prefix.
+    try normalizer.compareValue(
+        .{ .string = "a/b" },
+        .{ .string = "a\\b" },
+        .{ .path_value = true },
+    );
+
+    // Path values still compare the file name.
+    try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
+        .{ .string = "{{cwd}}/src/main.zig" },
+        .{ .string = "C:\\work\\project\\src\\other.zig" },
+        .{ .path_value = true },
+    ));
+
+    // Non-path text keeps separators significant.
     try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
         .{ .string = "{{cwd}}/src/main.zig" },
         .{ .string = "C:\\work\\project\\src\\main.zig" },
         .{},
     ));
+
+    // Only `<path>` segments normalize; the surrounding text stays exact.
+    try normalizer.compareValue(
+        .{ .string = "<path>{{cwd}}/a.txt</path>\na/b" },
+        .{ .string = "<path>C:\\work\\project\\a.txt</path>\na/b" },
+        .{},
+    );
+    try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
+        .{ .string = "<path>{{cwd}}/a.txt</path>\na/b" },
+        .{ .string = "<path>C:\\work\\project\\a.txt</path>\na\\b" },
+        .{},
+    ));
+    try std.testing.expectError(error.TestExpectedEqual, normalizer.compareValue(
+        .{ .string = "<path>{{cwd}}/a.txt</path>" },
+        .{ .string = "<path>C:\\work\\project\\b.txt</path>" },
+        .{},
+    ));
+}
+
+test "path normalization helpers accept 64 KiB inputs without leaking" {
+    const allocator = std.testing.allocator;
+    const size = 64 * 1024;
+    const text = try allocator.alloc(u8, size);
+    defer allocator.free(text);
+    @memset(text, '\\');
+    @memcpy(text[0.."<path>".len], "<path>");
+    @memcpy(text[size - "</path>".len ..], "</path>");
+
+    const path = try normalizePath(allocator, text);
+    defer allocator.free(path);
+    for (path) |byte| try std.testing.expect(byte != '\\');
+
+    const marked = try normalizePathMarkers(allocator, text);
+    defer allocator.free(marked);
+    try std.testing.expectEqualStrings("<path>", marked[0.."<path>".len]);
+    for (marked["<path>".len .. size - "</path>".len]) |byte| {
+        try std.testing.expectEqual(@as(u8, '/'), byte);
+    }
+    try std.testing.expectEqualStrings("</path>", marked[size - "</path>".len ..]);
 }

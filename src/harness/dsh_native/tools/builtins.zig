@@ -885,6 +885,8 @@ fn lessThanEntry(_: void, a: GlobEntry, b: GlobEntry) bool {
     return std.mem.lessThan(u8, a.display, b.display);
 }
 
+/// Glob and grep patterns are written with '/' on every platform (dsh and
+/// ripgrep semantics); map the native display separator to '/' before matching.
 fn toMatchPath(allocator: Allocator, path: []const u8) ![]const u8 {
     const out = try allocator.dupe(u8, path);
     for (out) |*byte| {
@@ -1070,7 +1072,9 @@ const TestTools = struct {
 
     fn setMtime(self: *TestTools, relative: []const u8, nanos: i128) !void {
         const path = try std.fs.path.join(self.allocator, &.{ self.base, relative });
-        const file = try fs_compat.openPath(path, .{});
+        // Windows needs FILE_WRITE_ATTRIBUTES for setTimestamps; GENERIC_WRITE
+        // grants it, a read-only handle fails with ACCESS_DENIED.
+        const file = try fs_compat.openPath(path, .{ .mode = .write_only });
         defer file.close();
         try file.updateTimes(nanos, nanos);
     }
@@ -1157,7 +1161,8 @@ test "read returns a numbered window with continuation and end-of-file footers" 
     defer tmp.cleanup();
     var tools = try TestTools.init(arena, &tmp);
 
-    const path = try tools.writeFile("dir with space/file name.txt", "alpha\nbeta\ngamma\n");
+    _ = try tools.writeFile("dir with space/file name.txt", "alpha\nbeta\ngamma\n");
+    const path = try std.fs.path.join(arena, &.{ tools.base, "dir with space", "file name.txt" });
 
     const full = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, "dir with space/file name.txt")));
     const expected_full = try std.fmt.allocPrint(arena, render.read.envelope, .{
@@ -1232,7 +1237,7 @@ test "write creates parents, reports Created/Updated, and rejects escapes" {
         .{ "file_path", .{ .string = relative } },
         .{ "content", .{ .string = "first" } },
     })));
-    const created_path = try std.fs.path.join(arena, &.{ tools.base, relative });
+    const created_path = try std.fs.path.join(arena, &.{ tools.base, "nested dir with space", "deeper", "file name.txt" });
     try testing.expectEqualStrings(try std.fmt.allocPrint(arena, render.write.output_envelope, .{ created_path, render.write.created_verb }), created);
     try testing.expectEqualStrings("first", try tools.readFile(relative));
 
@@ -1339,8 +1344,9 @@ test "grep groups matches by file, honors include, and reports no matches" {
     const found = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
         .{ "pattern", .{ .string = "needle" } },
     })));
+    const one_path = try std.fs.path.join(arena, &.{ "a dir", "one.txt" });
     try testing.expectEqualStrings(
-        "Found 3 matches\n\na dir/one.txt\nLine 1: needle here\nLine 3: needle again\n\ntwo.log\nLine 1: needle",
+        try std.fmt.allocPrint(arena, "Found 3 matches\n\n{s}\nLine 1: needle here\nLine 3: needle again\n\ntwo.log\nLine 1: needle", .{one_path}),
         found,
     );
 
@@ -1413,12 +1419,17 @@ test "glob matches basenames at any depth and sorts newest first" {
     const found = try expectSuccess(try callGlob(&tools.builtins, arena, try objectWith(arena, &.{
         .{ "pattern", .{ .string = "*.zig" } },
     })));
-    try testing.expectEqualStrings("src/deep/new.zig\nmiddle.zig\nsrc/old.zig", found);
+    const new_path = try std.fs.path.join(arena, &.{ "src", "deep", "new.zig" });
+    const old_path = try std.fs.path.join(arena, &.{ "src", "old.zig" });
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "{s}\nmiddle.zig\n{s}", .{ new_path, old_path }),
+        found,
+    );
 
     const anchored = try expectSuccess(try callGlob(&tools.builtins, arena, try objectWith(arena, &.{
         .{ "pattern", .{ .string = "src/*.zig" } },
     })));
-    try testing.expectEqualStrings("src/old.zig", anchored);
+    try testing.expectEqualStrings(old_path, anchored);
 
     const none = try expectSuccess(try callGlob(&tools.builtins, arena, try objectWith(arena, &.{
         .{ "pattern", .{ .string = "*.rs" } },
@@ -1490,11 +1501,15 @@ test "a path argument anchors grep and glob to a subtree" {
         .{ "pattern", .{ .string = "needle" } },
         .{ "path", .{ .string = "sub" } },
     })));
-    try testing.expectEqualStrings("Found 1 match\n\nsub/inside.txt\nLine 1: needle", grep);
+    const inside_path = try std.fs.path.join(arena, &.{ "sub", "inside.txt" });
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "Found 1 match\n\n{s}\nLine 1: needle", .{inside_path}),
+        grep,
+    );
 
     const glob = try expectSuccess(try callGlob(&tools.builtins, arena, try objectWith(arena, &.{
         .{ "pattern", .{ .string = "*.txt" } },
         .{ "path", .{ .string = "sub" } },
     })));
-    try testing.expectEqualStrings("sub/inside.txt", glob);
+    try testing.expectEqualStrings(inside_path, glob);
 }
