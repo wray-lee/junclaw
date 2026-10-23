@@ -240,7 +240,7 @@ Example:
 - `dsh` requires a binary built with `-Dharness_dsh=true`. A default build ignores the value, logs one warning, and keeps running the native engine; it never starts a dsh sidecar.
 - In a dsh build, one dsh sidecar is shared by the whole process and starts lazily on the first dsh turn, outside the session-table lock. Session creation therefore stays fast, and all dsh sessions use the same sidecar.
 - `NULLCLAW_DSH_BIN` must point at dsh's `lib/bin.js`. If it is unset or the sidecar fails to boot, that turn returns an error (shown to the user) and the next turn retries the boot. The sidecar uses the configured agent workspace, keeps its profile in `<config dir>/.dsh`, and persists each session's dsh id in `<config dir>/dsh-sessions/`.
-- P1 dsh mode covers chat turns, streamed replies, and routing host-side `/stop` and `/new` to the dsh session. Steer injection, approvals, and user questions are not wired yet; junclaw still keeps its own transcript for channel history.
+- P1 dsh mode covers chat turns, streamed replies, and routing host-side `/stop` and `/new` to the dsh session. It does not include steer injection, approvals, or user questions; junclaw still keeps its own transcript for channel history.
 
 Example:
 
@@ -256,15 +256,15 @@ Example:
 
 These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` and the `dsh` sidecar ignore them.
 
-- `agent.dsh_home` (string, default `<config dir>/.dsh`): dsh home root. Session JSONL logs and the session-key mapping live under it.
+- `agent.dsh_home` (string, default `<config dir>/.dsh`): dsh home root. Session JSONL logs live under it; the session-key mapping lives under `agent.dsh_session_dir`.
 - `agent.dsh_session_dir` (string, default `<config dir>/dsh-sessions`): where each host session key's dsh session id is persisted.
-- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): what a tool call that needs approval does. `ask` routes the request to the host and denies when no interactive UI is attached; `never` denies every approval request without prompting. Turns that run for non-interactive channels (cron, heartbeat, webhooks, A2A) always behave as `never`, whatever the configured value, so a background turn can never block on a human.
-- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): file policy for the dsh-native tools and the policy sentence the model sees. The values are exactly dsh's `SandboxMode` names.
+- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): the approval policy recorded for the session. P1b has no approval prompt (that is P2 scope): any request that needs approval is rejected: a `sandbox_permissions` escalation is validated and recorded as `sandboxRequest` in the tool result, but it is never granted (the command still runs at the current level). The configured value currently only changes the approval-policy sentence in the model-visible context and the `approval/policy` event in the session JSONL. The rule that turns for non-interactive channels (cron, heartbeat, webhooks, A2A) behave as `never` regardless of the configured value is part of the P2 approval work and is not enforced in P1b.
+- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): the sandbox policy sentence the model sees, also recorded as a `sandbox/mode` event in the session JSONL. The values are exactly dsh's `SandboxMode` names. P1b does not enforce the mode: mutating file tools always refuse paths outside the session workspace whatever the configured value, and `danger-full-access` does not widen them yet; enforcement is P2.
 - `agent.dsh_max_parallel_tools` (integer > 0, default `10`): size of the parallel tool pool. dsh's own default is 10; large values raise provider-side concurrency and timeout risk.
 - `agent.dsh_persona` (string, default unset): extra persona text appended to dsh's system prompt. Unset keeps dsh's built-in identity.
-- `agent.dsh_on_corrupt` (`"fail"` | `"native"`, default `"fail"`): what a session does when its dsh JSONL log cannot be read or repaired. `fail` refuses the turn and reports the parse error; `native` starts a fresh dsh session and carries on with the native history.
+- `agent.dsh_on_corrupt` (`"fail"` | `"native"`, default `"fail"`): what a session does when its dsh JSONL log cannot be read or repaired. `fail` refuses the turn and reports the parse error; `native` starts a new, empty dsh session and continues in it. dsh-native creation does not replay junclaw's stored native history, so the conversation context restarts from zero.
 
-P1b status: the `dsh-native` engine is being ported in stages. The keys above are parsed and validated now, but the adapter is not wired yet, so a session that selects `dsh-native` still runs the native engine. Approval prompts, user questions, plan mode, goal, compaction commands and the six dsh slash commands are not implemented yet either.
+P1b status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P1b covers text and tool turns, steer, `/new`, and resume over the dsh JSONL log. It does not provide approval prompts, user questions, plan mode, goal, compaction commands or the six dsh slash commands; those are P2 scope.
 
 Example:
 

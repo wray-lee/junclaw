@@ -220,7 +220,7 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 - `dsh` 需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。
 - 在 dsh 构建中，整个进程共用一个 dsh sidecar，并在第一个 dsh 回合惰性启动，启动过程不在会话表锁内。因此会话创建保持很快，所有 dsh 会话共用同一个 sidecar。
 - `NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。未设置或 sidecar 启动失败时，该回合返回错误（呈现给用户），下一个回合会重试启动。sidecar 使用配置的 agent 工作目录，profile 保存在 `<配置目录>/.dsh`，每个会话的 dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
-- P1 的 dsh 模式覆盖聊天回合、流式回复，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话。steer 注入、审批和用户提问尚未接入；junclaw 仍会为自己的通道历史保留一份对话记录。
+- P1 的 dsh 模式覆盖聊天回合、流式回复，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话。它不包含 steer 注入、审批和用户提问；junclaw 仍会为自己的通道历史保留一份对话记录。
 
 示例：
 
@@ -236,15 +236,15 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 以下键只对 `agent.harness` 为 `dsh-native` 的会话生效；`native` 和 `dsh` sidecar 会忽略它们。
 
-- `agent.dsh_home`（字符串，默认 `<配置目录>/.dsh`）：dsh home 根目录。会话 JSONL 日志与会话键映射都放在它下面。
+- `agent.dsh_home`（字符串，默认 `<配置目录>/.dsh`）：dsh home 根目录。会话 JSONL 日志放在它下面；会话键映射放在 `agent.dsh_session_dir` 下。
 - `agent.dsh_session_dir`（字符串，默认 `<配置目录>/dsh-sessions`）：每个宿主会话键对应的 dsh 会话 id 的持久化目录。
-- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：需要审批的工具调用如何处理。`ask` 把请求交给宿主，没有可用交互界面时按拒绝处理；`never` 不提示，直接拒绝所有审批请求。非交互渠道（cron、heartbeat、webhook、A2A）的回合无论配置什么值都按 `never` 运行，后台回合绝不会卡在等人上。
-- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：dsh-native 工具的文件策略，也是模型看到的策略句子。取值与 dsh 的 `SandboxMode` 名称完全一致。
+- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：会话记录的审批策略。P1b 没有审批提示（属 P2）：任何需要审批的请求都会被拒绝：`sandbox_permissions` 升级请求会被校验并作为 `sandboxRequest` 记录在工具结果里，但永远不会获批（命令仍按当前级别执行）。配置值目前只影响模型可见 context 中的审批策略文案与会话 JSONL 里的 `approval/policy` 事件。“非交互渠道（cron、heartbeat、webhook、A2A）的回合无论配置什么值都按 `never` 处理”的规则属于 P2 审批工作，P1b 不执行。
+- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的沙箱策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。P1b 不按该模式执行限制：写入类文件工具始终拒绝会话工作区之外的路径，与配置值无关，`danger-full-access` 目前也不会放宽；按模式强制执行属 P2。
 - `agent.dsh_max_parallel_tools`（大于 0 的整数，默认 `10`）：并行工具池大小。dsh 自身的默认值就是 10；设得过大将提高 provider 侧并发与超时风险。
 - `agent.dsh_persona`（字符串，默认未设置）：追加到 dsh 系统提示的 persona 文本。未设置时保留 dsh 内置身份。
-- `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个 dsh 会话，沿用 native 历史继续。
+- `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个空的 dsh 会话并在其中继续。dsh-native 创建时不会回填 junclaw 存储的 native 历史，因此上下文从零开始。
 
-P1b 状态：`dsh-native` 引擎分阶段移植中。上述键已经可以解析和校验，但适配器尚未接好，因此选择 `dsh-native` 的会话目前仍运行 native 引擎。审批提示、用户提问、plan 模式、goal、压缩命令和六个 dsh 斜杠命令也尚未实现。
+P1b 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harness` 设为 `dsh-native` 的会话才会使用它；省略该键仍保持 `native`，`dsh` sidecar 与 `-Dharness_dsh` 构建的行为不变。P1b 覆盖文本与工具回合、steer、`/new` 以及基于 dsh JSONL 日志的 resume。它不提供审批提示、用户提问、plan 模式、goal、压缩命令和六个 dsh 斜杠命令；这些属于 P2 范围。
 
 示例：
 
