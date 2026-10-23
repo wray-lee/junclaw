@@ -3978,17 +3978,12 @@ pub const SessionManager = struct {
             if (session.owned_memory_session_id == null) {
                 session.agent.memory_session_id = session.session_key;
             }
-            // Regression: the dsh-native harness borrowed this slice, so
-            // freeing `old_key` below left it dangling and the next mapping
-            // write hashed freed memory.
-            if (session.dsh_native) |*d| d.harness.rebindSessionKey(new_key);
 
             self.sessions.put(self.allocator, session.session_key, session) catch {
                 session.session_key = old_key;
                 if (session.owned_memory_session_id == null) {
                     session.agent.memory_session_id = session.session_key;
                 }
-                if (session.dsh_native) |*d| d.harness.rebindSessionKey(old_key);
                 self.sessions.put(self.allocator, old_key, session) catch {
                     log.err("failed to restore live session after canonical key migration rollback", .{});
                 };
@@ -3996,6 +3991,11 @@ pub const SessionManager = struct {
                 return;
             };
 
+            // Regression: the dsh-native harness borrowed this slice, so
+            // freeing `old_key` below left it dangling and the next mapping
+            // write hashed freed memory (or a restart under the canonical key
+            // found no mapping at all).
+            if (session.dsh_native) |*d| d.harness.rebindSessionKey(new_key);
             self.allocator.free(old_key);
         } else {
             self.allocator.free(new_key);
@@ -7655,15 +7655,24 @@ test "dsh-native: canonical key migration keeps the engine mapping on the new ke
     const legacy_mapping = try fixture.mappingPath(testing.allocator, legacy);
     defer testing.allocator.free(legacy_mapping);
     std_compat.fs.deleteFileAbsolute(legacy_mapping) catch {};
+    const first_id = try testing.allocator.dupe(u8, session.dsh_native.?.harness.session_id);
+    defer testing.allocator.free(first_id);
 
     sm.migrateLegacySessionKey(canonical, legacy);
     try testing.expectEqualStrings(canonical, session.session_key);
 
-    session.dsh_native.?.harness.harness().reset();
-    try testing.expect(session.dsh_native.?.harness.reset_error == null);
-
+    // A restart under the canonical key must find the same JSONL.
     const canonical_mapping = try fixture.mappingPath(testing.allocator, canonical);
     defer testing.allocator.free(canonical_mapping);
+    const migrated = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, canonical_mapping, 4096);
+    defer testing.allocator.free(migrated);
+    const expected_migrated = try std.fmt.allocPrint(testing.allocator, "{{\"sessionId\":\"{s}\"}}", .{first_id});
+    defer testing.allocator.free(expected_migrated);
+    try testing.expectEqualStrings(expected_migrated, migrated);
+
+    // `/new` after the migration also writes under the canonical key.
+    session.dsh_native.?.harness.harness().reset();
+    try testing.expect(session.dsh_native.?.harness.reset_error == null);
     const raw = try fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, canonical_mapping, 4096);
     defer testing.allocator.free(raw);
     const expected = try std.fmt.allocPrint(testing.allocator, "{{\"sessionId\":\"{s}\"}}", .{

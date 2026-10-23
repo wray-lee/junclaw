@@ -185,6 +185,9 @@ pub const DshNativeHarness = struct {
     /// owner must call this before freeing the old slice.
     pub fn rebindSessionKey(self: *Self, session_key: []const u8) void {
         self.opts.session_key = session_key;
+        // Best effort: a restart under the canonical key must find the same
+        // JSONL. A failed write keeps the stale mapping; turns still run.
+        if (self.session_id.len != 0) self.writeMapping() catch {};
     }
 
     fn workspace(self: *const Self) []const u8 {
