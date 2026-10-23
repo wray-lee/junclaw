@@ -238,13 +238,28 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 - `agent.dsh_home`（字符串，默认 `<配置目录>/.dsh`）：dsh home 根目录。会话 JSONL 日志放在它下面；会话键映射放在 `agent.dsh_session_dir` 下。
 - `agent.dsh_session_dir`（字符串，默认 `<配置目录>/dsh-sessions`）：每个宿主会话键对应的 dsh 会话 id 的持久化目录。
-- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：会话记录的审批策略。P1b 没有审批提示（属 P2）：任何需要审批的请求都会被拒绝：`sandbox_permissions` 升级请求会被校验并作为 `sandboxRequest` 记录在工具结果里，但永远不会获批（命令仍按当前级别执行）。配置值目前只影响模型可见 context 中的审批策略文案与会话 JSONL 里的 `approval/policy` 事件。“非交互渠道（cron、heartbeat、webhook、A2A）的回合无论配置什么值都按 `never` 处理”的规则属于 P2 审批工作，P1b 不执行。
-- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的沙箱策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。P1b 不按该模式执行限制：写入类文件工具始终拒绝会话工作区之外的路径，与配置值无关，`danger-full-access` 目前也不会放宽；按模式强制执行属 P2。
+- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：控制执行前的审批门禁。只有请求 `sandbox_permissions` 升级的调用会在参数校验之后请求审批；普通工具调用不会询问。`"ask"` 向宿主通道发起询问；`"never"` 不询问直接拒绝。所有分支都是 fail-closed：没有可用通道、通道报错、用户取消或明确拒绝都会拒绝该调用，并把拒绝原因返回给模型；每次请求恰好写入一对 `approval/asked` + `approval/decided` 事件。即使升级获批，命令仍按当前沙箱级别执行：dsh-native 会记录 `sandboxRequest`，但尚未放宽权限。非交互回合（cron、heartbeat、webhook、A2A）尚未强制按 `"never"` 处理；该规则尚未执行。
+- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的沙箱策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。dsh-native 尚未按该模式执行限制：写入类文件工具始终拒绝会话工作区之外的路径，与配置值无关，`danger-full-access` 目前也不会放宽；按模式强制执行尚未接通。
 - `agent.dsh_max_parallel_tools`（大于 0 的整数，默认 `10`）：并行工具池大小。dsh 自身的默认值就是 10；设得过大将提高 provider 侧并发与超时风险。
 - `agent.dsh_persona`（字符串，默认未设置）：追加到 dsh 系统提示的 persona 文本。未设置时保留 dsh 内置身份。
 - `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个空的 dsh 会话并在其中继续。dsh-native 创建时不会回填 junclaw 存储的 native 历史，因此上下文从零开始。
+- `agent.dsh_compaction_context_window`（大于等于 0 的整数，默认 `0`）：路由模型的 context window（token 数），用于推导压缩预算。`0` 会关闭 pre-step 压力探测；provider 确认的 context 溢出仍会触发一次压缩并重试。
+- `agent.dsh_compaction_threshold_ratio`（`(0, 1]` 内的数字，默认 `0.8`，未设置时沿用 dsh 默认值）：自动压力压缩的触发比例。阈值为 `floor(min(contextWindow * thresholdRatio, contextWindow - maxTokens - headroomTokens))`，其中 `maxTokens` 是路由的补全预算，`messageBudget = contextWindow - maxTokens`。
+- `agent.dsh_compaction_retain_ratio`（`[0, 1]` 内的数字，默认 `0.16`，未设置时沿用 dsh 默认值）：压缩后保留的消息预算比例（`retainTokens = floor(messageBudget * retainRatio)`），必须小于阈值比例。
+- `agent.dsh_compaction_headroom_tokens`（大于等于 0 的整数，默认 `65536`，未设置时沿用 dsh 默认值）：在比较阈值前从消息预算中扣除的 token 数；context window 非零时必须小于该窗口。
+- `agent.dsh_question_timeout`（整数秒，默认 `120`）：`ask_user_question` 等待回答的时长。`-1` 表示不设截止时间。非整数、`0` 和小于 `-1` 的值在加载配置时报错；工具接受 `-1` 或 1–2147483 秒。
 
-P1b 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harness` 设为 `dsh-native` 的会话才会使用它；省略该键仍保持 `native`，`dsh` sidecar 与 `-Dharness_dsh` 构建的行为不变。P1b 覆盖文本与工具回合、steer、`/new` 以及基于 dsh JSONL 日志的 resume。它不提供审批提示、用户提问、plan 模式、goal、压缩命令和六个 dsh 斜杠命令；这些属于 P2 范围。
+比例不是数字或越界、`retain_ratio >= threshold_ratio`，以及非零 context window 下 `headroom_tokens >= context_window` 也会在加载配置时报错。
+
+P2a 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harness` 设为 `dsh-native` 的会话才会使用它；省略该键仍保持 `native`，`dsh` sidecar 与 `-Dharness_dsh` 构建的行为不变。P2a 增加了审批门禁、用户提问、自动压缩和四个 dsh 斜杠命令：
+
+- `ask_user_question` 已暴露给模型。它最多等待 `agent.dsh_question_timeout`；超时仍无回答时，工具结果是 `pending`（不是拒绝），模型可以继续。通道没有回答者时，调用返回 `NO_PROVIDER` 结果。
+- `/compact`（无参数）：对手头较旧的历史执行一次手动压缩；没有可压缩历史时结算为 `No compactable history yet.`，不写领域事件。
+- `/permission [preset]`：不带参数时报告当前 preset 和可选值；`read-only`、`workspace-write`、`danger-full-access` 会记录会话的沙箱模式与审批策略（`read-only`/`workspace-write` 用 `ask`，`danger-full-access` 用 `never`），且只写入发生变化的 knob。
+- `/feedback <text>`：写入 `feedback/record` 事件；空文本报错。
+- `/export`（无参数）：请求下载会话日志，并写入命令生命周期事件。
+- 自动压缩在 agent pre-step 阶段、测得 token 数达到阈值时运行；请求开始时的 provider context 溢出错误会触发一次压缩并重试一次。`/compact` 是手动入口。
+- 其余斜杠命令（包括 `/goal`、`/plan`）留给宿主处理；plan 模式与这两个命令属于 P2b。
 
 示例：
 
@@ -256,7 +271,12 @@ P1b 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harn
     "dsh_approval_policy": "never",
     "dsh_sandbox": "workspace-write",
     "dsh_max_parallel_tools": 10,
-    "dsh_on_corrupt": "fail"
+    "dsh_on_corrupt": "fail",
+    "dsh_compaction_context_window": 262144,
+    "dsh_compaction_threshold_ratio": 0.8,
+    "dsh_compaction_retain_ratio": 0.16,
+    "dsh_compaction_headroom_tokens": 65536,
+    "dsh_question_timeout": 120
   }
 }
 ```
