@@ -1,0 +1,120 @@
+{
+  "calls": [
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_question",
+          "name": "ask_user_question",
+          "args": [
+            "{\"questions\":[{\"id\":\"color\",\"question\":\"Which color do you prefer?\",\"header\":\"Pick one\",\"multi_select\":false,\"options\":[{\"label\":\"Blue\",\"description\":\"A cool recessive hue.\"},{\"label\":\"Green\",\"description\":\"A restful mid-spectrum hue.\"}]}]}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_question",
+              "name": "ask_user_question",
+              "arguments": "{\"questions\":[{\"id\":\"color\",\"question\":\"Which color do you prefer?\",\"header\":\"Pick one\",\"multi_select\":false,\"options\":[{\"label\":\"Blue\",\"description\":\"A cool recessive hue.\"},{\"label\":\"Green\",\"description\":\"A restful mid-spectrum hue.\"}]}]}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 50,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "No answer arrived yet."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "No answer arrived yet."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 30,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

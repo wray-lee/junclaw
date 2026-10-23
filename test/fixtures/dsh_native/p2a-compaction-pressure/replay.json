@@ -1,0 +1,228 @@
+{
+  "calls": [
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "First reply."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "First reply."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 40,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Second reply."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Second reply."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 900,
+              "outputTokens": 10
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "The earlier turns asked for alpha and beta."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "The earlier turns asked for alpha and beta."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 20,
+              "outputTokens": 4
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Third reply."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Third reply."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 120,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,19 @@
+{
+  "config": {},
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Ready for export."
+    },
+    {
+      "op": "command",
+      "text": "/export"
+    }
+  ]
+}

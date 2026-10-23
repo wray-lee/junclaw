@@ -1,0 +1,21 @@
+{
+  "config": {
+    "questionTimeout": 120
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Ask the user which color to use.",
+      "questions": {
+        "answers": [],
+        "advanceMs": 120001
+      }
+    }
+  ]
+}

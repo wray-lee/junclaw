@@ -1,0 +1,23 @@
+{
+  "config": {},
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Ask the user which color to use.",
+      "questions": {
+        "answers": [
+          {
+            "id": "color",
+            "text": "Blue"
+          }
+        ]
+      }
+    }
+  ]
+}
