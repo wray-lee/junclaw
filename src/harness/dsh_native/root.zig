@@ -23,6 +23,7 @@ pub const tools_execute = @import("tools/execute.zig");
 pub const tools_builtins = @import("tools/builtins.zig");
 pub const tools_bash = @import("tools/bash.zig");
 pub const generated = @import("generated/root.zig");
+pub const harness = @import("harness.zig");
 
 /// Session format generation written and read by this build.
 pub const SESSION_FORMAT_VERSION: u32 = types.SESSION_FORMAT_VERSION;
