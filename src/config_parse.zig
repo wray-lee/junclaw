@@ -37,6 +37,15 @@ pub fn parseStringArray(allocator: std.mem.Allocator, arr: std.json.Array) ![]co
     return try list.toOwnedSlice(allocator);
 }
 
+/// JSON numbers arrive as `.integer` or `.float`; both spell a ratio.
+fn jsonRatio(value: std.json.Value) ?f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => null,
+    };
+}
+
 fn freeToolCustomization(allocator: std.mem.Allocator, item: types.ToolCustomization) void {
     allocator.free(item.name);
     if (item.system_prompt) |p| allocator.free(p);
@@ -1950,6 +1959,45 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v != .string) return error.InvalidDshOnCorrupt;
                 self.agent.dsh_on_corrupt = types.DshOnCorrupt.fromSlice(v.string) orelse
                     return error.InvalidDshOnCorrupt;
+            }
+            // Compaction knobs follow the P1b dsh_* style. Null (written by
+            // `save()`) means "keep the default".
+            if (ag.object.get("dsh_compaction_context_window")) |v| {
+                if (v == .null) {
+                    self.agent.dsh_compaction_context_window = 0;
+                } else {
+                    if (v != .integer or v.integer < 0) return error.InvalidDshCompactionContextWindow;
+                    self.agent.dsh_compaction_context_window = std.math.cast(u64, v.integer) orelse
+                        return error.InvalidDshCompactionContextWindow;
+                }
+            }
+            if (ag.object.get("dsh_compaction_threshold_ratio")) |v| {
+                if (v != .null) {
+                    const ratio = jsonRatio(v) orelse return error.InvalidDshCompactionThresholdRatio;
+                    if (!(ratio > 0 and ratio <= 1)) return error.InvalidDshCompactionThresholdRatio;
+                    self.agent.dsh_compaction_threshold_ratio = ratio;
+                }
+            }
+            if (ag.object.get("dsh_compaction_retain_ratio")) |v| {
+                if (v != .null) {
+                    const ratio = jsonRatio(v) orelse return error.InvalidDshCompactionRetainRatio;
+                    if (!(ratio >= 0 and ratio <= 1)) return error.InvalidDshCompactionRetainRatio;
+                    self.agent.dsh_compaction_retain_ratio = ratio;
+                }
+            }
+            if (ag.object.get("dsh_compaction_headroom_tokens")) |v| {
+                if (v != .null) {
+                    if (v != .integer or v.integer < 0) return error.InvalidDshCompactionHeadroomTokens;
+                    self.agent.dsh_compaction_headroom_tokens = std.math.cast(u64, v.integer) orelse
+                        return error.InvalidDshCompactionHeadroomTokens;
+                }
+            }
+            if (ag.object.get("dsh_question_timeout")) |v| {
+                if (v != .integer) return error.InvalidDshQuestionTimeout;
+                const timeout = std.math.cast(i32, v.integer) orelse
+                    return error.InvalidDshQuestionTimeout;
+                if (timeout == 0 or timeout < -1) return error.InvalidDshQuestionTimeout;
+                self.agent.dsh_question_timeout = timeout;
             }
             // tool_filter_groups: array of { mode, tools, keywords? }
             if (ag.object.get("tool_filter_groups")) |fg_val| {

@@ -556,6 +556,9 @@ pub const DshOnCorrupt = enum {
 /// dsh `maxParallelToolCalls` default (`tools/scheduler.zig`).
 pub const DEFAULT_DSH_MAX_PARALLEL_TOOLS: usize = 10;
 
+/// dsh `ask_user_question` foreground wait default (120 s; -1 = no deadline).
+pub const DEFAULT_DSH_QUESTION_TIMEOUT: i32 = 120;
+
 pub const AgentConfig = struct {
     /// When true (default), history is auto-compacted once it crosses the
     /// token / message thresholds. Set to false to skip proactive LLM
@@ -625,6 +628,15 @@ pub const AgentConfig = struct {
     dsh_persona: ?[]const u8 = null,
     /// What a corrupt dsh session log does.
     dsh_on_corrupt: DshOnCorrupt = .fail,
+    /// `agent.dsh_compaction_*`: dsh compaction policy overrides. Zero/null
+    /// means "keep dsh's default"; a zero context window disables proactive
+    /// pressure (provider-confirmed overflow still compacts).
+    dsh_compaction_context_window: u64 = 0,
+    dsh_compaction_threshold_ratio: ?f64 = null,
+    dsh_compaction_retain_ratio: ?f64 = null,
+    dsh_compaction_headroom_tokens: ?u64 = null,
+    /// `agent.dsh_question_timeout`: ask_user_question wait in seconds.
+    dsh_question_timeout: i32 = DEFAULT_DSH_QUESTION_TIMEOUT,
 
     pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
         if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;

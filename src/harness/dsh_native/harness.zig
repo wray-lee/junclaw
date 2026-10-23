@@ -34,8 +34,15 @@ const dispatcher = @import("../../agent/dispatcher.zig");
 const providers = @import("../../providers/root.zig");
 const config_types = @import("../../config_types.zig");
 const port = @import("../port.zig");
+const approval_mod = @import("approval.zig");
+const commands_mod = @import("commands.zig");
+const compaction_mod = @import("compaction.zig");
 const context = @import("context.zig");
 const generated = @import("generated/tool_schemas.zig");
+const generated_interaction = @import("generated/interaction.zig");
+const questions_mod = @import("questions.zig");
+const token_meter = @import("token_meter.zig");
+const tools_ask_user = @import("tools/ask_user.zig");
 const inbox = @import("inbox.zig");
 const loop_mod = @import("loop.zig");
 const prompt = @import("prompt.zig");
@@ -78,6 +85,14 @@ pub const Options = struct {
     sandbox: config_types.DshSandbox = .workspace_write,
     max_parallel_tools: usize = config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS,
     on_corrupt: config_types.DshOnCorrupt = .fail,
+    /// Routed model capacity for dsh proactive compaction. Zero disables the
+    /// pre-step pressure probe; provider-confirmed overflow still compacts.
+    context_window: u64 = 0,
+    compaction_threshold_ratio: ?f64 = null,
+    compaction_retain_ratio: ?f64 = null,
+    compaction_headroom_tokens: ?u64 = null,
+    /// `agent.dsh_question_timeout`: ask_user_question wait in seconds.
+    question_timeout_s: i32 = 120,
     temperature: f64 = 0.7,
     /// Deterministic clock for tests; null uses the wall clock.
     now_ms: ?*const fn (clock_context: ?*anyopaque) i64 = null,
@@ -115,6 +130,16 @@ pub const DshNativeHarness = struct {
     registry: registry.Registry = .{},
     builtins: ?*builtins_mod.Builtins = null,
     bash: ?*bash_mod.Context = null,
+    ask_user: ?*tools_ask_user.Context = null,
+    approval: approval_mod.Service = .{ .options = .{} },
+    /// Current turn's blocking host channel (null fails closed).
+    interaction: ?port.Interaction = null,
+    permission_state: commands_mod.PermissionState = .{},
+    compaction_lock: compaction_mod.LockState = .{},
+    /// Provider usage from the latest successful request; compaction's anchor.
+    last_usage: ?types.Usage = null,
+    /// Log seq of each surface node, parallel to `messages`.
+    surface_seqs: std.ArrayListUnmanaged(u64) = .empty,
     system_prompt: []const u8 = "",
     spill_dir: []const u8 = "",
 
@@ -151,6 +176,7 @@ pub const DshNativeHarness = struct {
             .registry = registry.Registry.init(),
         };
         errdefer self.deinit(allocator);
+        self.approval = approval_mod.Service.init(.{ .policy = opts.approval_policy });
         try self.buildTools();
         try self.buildPrompt();
         return self;
@@ -165,6 +191,7 @@ pub const DshNativeHarness = struct {
         self.registry.deinit(self.allocator);
         if (self.builtins) |value| self.allocator.destroy(value);
         if (self.bash) |value| self.allocator.destroy(value);
+        if (self.ask_user) |value| self.allocator.destroy(value);
         self.call_arena.deinit();
         self.arena.deinit();
         self.perm.deinit();
@@ -228,11 +255,18 @@ pub const DshNativeHarness = struct {
             .handler = bash.handler(),
         });
 
+        const ask_user = try self.allocator.create(tools_ask_user.Context);
+        errdefer self.allocator.destroy(ask_user);
+        ask_user.* = .{ .options = self.questionOptions() };
+        try tools_ask_user.register(ask_user, &self.registry, self.allocator);
+
         self.builtins = builtins;
         self.bash = bash;
+        self.ask_user = ask_user;
 
-        const names = try perm.alloc([]const u8, registry.core_schemas.len);
+        const names = try perm.alloc([]const u8, registry.core_schemas.len + 1);
         for (registry.core_schemas, 0..) |schema, index| names[index] = schema.name;
+        names[registry.core_schemas.len] = generated_interaction.ask_user_question.name;
         const ordered = try prompt.orderTools(perm, names, null);
 
         const schemas = try perm.alloc(request.ToolSchema, ordered.len);
@@ -257,6 +291,10 @@ pub const DshNativeHarness = struct {
     fn findSchema(name: []const u8) ?registry.Schema {
         for (registry.core_schemas) |schema| {
             if (std.mem.eql(u8, schema.name, name)) return schema;
+        }
+        const ask = generated_interaction.ask_user_question;
+        if (std.mem.eql(u8, ask.name, name)) {
+            return .{ .name = ask.name, .description = ask.description, .input_schema_json = ask.input_schema_json };
         }
         return null;
     }
@@ -305,8 +343,12 @@ pub const DshNativeHarness = struct {
         self.turn_text.clearRetainingCapacity();
         self.arena.deinit();
         self.arena = std.heap.ArenaAllocator.init(self.allocator);
-        // The list itself lived in the arena that was just released.
+        // The lists themselves lived in the arena that was just released.
         self.messages = .empty;
+        self.surface_seqs = .empty;
+        self.permission_state = .{};
+        self.compaction_lock = .{};
+        self.last_usage = null;
         self.session_id = "";
         self.last_assistant_text = null;
         self.total_tokens = 0;
@@ -401,6 +443,11 @@ pub const DshNativeHarness = struct {
         var fold = try surface_mod.fold(self.allocator, events);
         defer fold.deinit();
 
+        self.permission_state = commands_mod.PermissionState.fold(events);
+        self.compaction_lock = compaction_mod.scanLock(events);
+        self.surface_seqs.clearRetainingCapacity();
+        for (fold.nodes) |node| try self.surface_seqs.append(arena, node.seq);
+
         const messages = try arena.alloc(types.Message, fold.nodes.len);
         for (fold.nodes, 0..) |node, index| {
             messages[index] = try cloneMessage(arena, node.message);
@@ -427,6 +474,12 @@ pub const DshNativeHarness = struct {
             .system_messages = hostSystemMessages,
             .pre_step = hostPreStep,
             .serialize_message = hostSerializeMessage,
+            .compaction = .{
+                .context = @ptrCast(self),
+                .pressure = compactionPressure,
+                .overflow = compactionOverflow,
+                .max_overflow_retries = 1,
+            },
             .provider = .{
                 .context = @ptrCast(self),
                 .begin = providerBegin,
@@ -542,6 +595,7 @@ pub const DshNativeHarness = struct {
         .reset = reset,
         .invalidatePrompt = invalidatePrompt,
         .info = info,
+        .handleLocalCommand = handleLocalCommand,
         .deinit = deinitVtable,
     };
 
@@ -567,10 +621,12 @@ pub const DshNativeHarness = struct {
         self.live_stream = input.live_stream;
         self.drain = input.drain;
         self.drain_ctx = input.drain_ctx;
+        self.interaction = input.interaction;
         defer {
             self.sink = null;
             self.drain = null;
             self.drain_ctx = null;
+            self.interaction = null;
         }
 
         self.turn_text.clearRetainingCapacity();
@@ -826,7 +882,7 @@ pub const DshNativeHarness = struct {
         const text = try arena.dupe(u8, message.text);
         try data.put(arena, "message", try systemMessageValue(arena, id, text));
         const seq = try self.appendEvent("system/message", .{ .object = data }, .append, null);
-        try self.addSurfaceSnapshot(arena, .{
+        try self.addSurfaceSnapshot(arena, seq, .{
             .id = id,
             .role = .system,
             .content = try arena.dupe(types.ContentBlock, &.{.{ .text = text }}),
@@ -842,7 +898,7 @@ pub const DshNativeHarness = struct {
         // `data` (no inner `message` key); `surface.fold` reads it that way.
         const data = try parseValue(arena, message.json);
         const seq = try self.appendEvent("user/message", data, .append, message.source_event_seqs);
-        try self.addSurfaceSnapshot(arena, try surface_mod.messageFromEvent(arena, .{
+        try self.addSurfaceSnapshot(arena, seq, try surface_mod.messageFromEvent(arena, .{
             .event_type = "user/message",
             .seq = seq,
             .time_ms = 0,
@@ -888,7 +944,7 @@ pub const DshNativeHarness = struct {
             if (text.len > 0) sink.send(.{ .assistant_message = .{ .text = text } });
         }
         // The kernel's accumulator arena dies at step end: copy first.
-        try self.addSurfaceSnapshot(arena, try cloneMessage(arena, settlement.message));
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, settlement.message));
         if (settlement.usage) |usage| {
             self.total_tokens += usage.input_tokens + usage.output_tokens;
             // The host's ledger wants one record per model call, like the
@@ -976,7 +1032,7 @@ pub const DshNativeHarness = struct {
         }
         const seqs = [1]u64{call.seq};
         const seq = try self.appendEvent("tool/result", .{ .object = data }, .append, &seqs);
-        try self.addSurfaceSnapshot(arena, try cloneMessage(arena, message));
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, message));
         if (self.sink) |sink| sink.send(.{ .tool_result = .{
             .call_id = call.call.id,
             .name = call.call.name,
@@ -988,8 +1044,9 @@ pub const DshNativeHarness = struct {
 
     /// Record one surface message in request order. The caller passes an
     /// arena-owned message; it is adopted, not copied.
-    fn addSurfaceSnapshot(self: *Self, arena: Allocator, message: types.Message) !void {
+    fn addSurfaceSnapshot(self: *Self, arena: Allocator, seq: u64, message: types.Message) !void {
         try self.messages.append(arena, message);
+        try self.surface_seqs.append(arena, seq);
     }
 
     fn forwardDelta(self: *Self, event: stream.Event) void {
@@ -1112,6 +1169,7 @@ pub const DshNativeHarness = struct {
             .completion_tokens = response.usage.completion_tokens,
             .total_tokens = response.usage.total_tokens,
         };
+        self.last_usage = stream.normalizeUsage(usage);
         const finish: stream.Finish = if (response.tool_calls.len > 0)
             .tool_calls
         else if (response.truncated)
@@ -1138,7 +1196,9 @@ pub const DshNativeHarness = struct {
     }
 
     fn cancelCall(self: *Self) void {
-        self.pending.clearRetainingCapacity();
+        // The buffer lives in `call_arena`; drop it before the arena resets
+        // (clearRetainingCapacity would keep a dangling capacity).
+        self.pending = .empty;
         self.pending_index = 0;
         _ = self.call_arena.reset(.retain_capacity);
     }
@@ -1280,7 +1340,591 @@ pub const DshNativeHarness = struct {
         const self = selfOf(context_ptr);
         if (signal.isAborted()) return error.Aborted;
         if (self.interrupt) return error.Aborted;
-        return execute.execute(&self.registry, allocator, call);
+        return execute.executeWithGate(&self.registry, allocator, call, self.gate());
+    }
+
+    // ── approval / questions / commands / compaction wiring ────────────────
+
+    fn questionOptions(self: *const Self) questions_mod.Options {
+        return .{
+            .timeout_s = self.opts.question_timeout_s,
+            .now_ms = self.opts.now_ms,
+            .clock_context = self.opts.clock_context,
+        };
+    }
+
+    fn sandboxMode(self: *const Self) context.SandboxMode {
+        return switch (self.opts.sandbox) {
+            .read_only => .read_only,
+            .workspace_write => .workspace_write,
+            .danger_full_access => .danger_full_access,
+        };
+    }
+
+    fn approvalPolicy(self: *const Self) context.ApprovalPolicy {
+        return switch (self.approval.options.policy) {
+            .ask => .ask,
+            .never => .never,
+        };
+    }
+
+    fn gate(self: *Self) execute.Gate {
+        return .{ .context = @ptrCast(self), .decide = gateDecide };
+    }
+
+    /// dsh `tools/pre-execute` ask (B24): only a sandbox-escalation call is
+    /// gated, so ordinary P1 tool calls keep their fixture behaviour. The same
+    /// hook binds the current call identity into `ask_user_question`.
+    fn gateDecide(
+        context_ptr: *anyopaque,
+        allocator: Allocator,
+        call: types.ToolCall,
+        args: Value,
+    ) anyerror!?[]const u8 {
+        const self = selfOf(context_ptr);
+        if (self.ask_user) |ask| {
+            ask.call_id = call.id;
+            ask.interaction = self.interaction;
+            ask.options = self.questionOptions();
+        }
+        const object = switch (args) {
+            .object => |value| value,
+            else => return null,
+        };
+        const escalation = object.get("sandbox_permissions") orelse return null;
+        switch (escalation) {
+            .string => |mode| if (mode.len == 0) return null,
+            else => return null,
+        }
+        const reason = switch (object.get("justification") orelse Value{ .null = {} }) {
+            .string => |text| text,
+            else => "",
+        };
+        var decision = try self.approval.request(allocator, self.interaction, .{
+            .tool_name = call.name,
+            .call_id = call.id,
+            .reason = if (reason.len == 0) null else reason,
+        });
+        defer decision.deinit();
+        try approval_mod.assertPaired(&decision.events);
+        for (decision.events) |event| {
+            const json = try approval_mod.dataJsonAlloc(event, allocator);
+            const data = try parseValue(allocator, json);
+            _ = try self.appendEvent(switch (event) {
+                .asked => "approval/asked",
+                .decided => "approval/decided",
+            }, data, null, null);
+        }
+        const denial = decision.denial_reason orelse return null;
+        return try allocator.dupe(u8, denial);
+    }
+
+    /// Claim a builtin command (`commands.zig`) and append its events; null
+    /// lets the host run its own slash commands.
+    fn handleLocalCommand(ptr: *anyopaque, content: []const u8) anyerror!?[]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const log = if (self.log) |*value| value else return null;
+        const arena = self.arena.allocator();
+        const command_id = try std.fmt.allocPrint(arena, "command-{d}", .{self.next_id});
+        self.next_id += 1;
+        var result = try commands_mod.handleLocalCommand(arena, content, .{
+            .command_id = command_id,
+            .next_seq = log.next_seq,
+            .session_id = self.session_id,
+            .permissions = self.permission_state,
+            .permission_defaults = .{
+                .sandbox = self.sandboxMode(),
+                .approval = self.approvalPolicy(),
+            },
+            .compaction = .{ .context = @ptrCast(self), .call = compactSeam },
+        }) orelse return null;
+        defer result.deinit();
+
+        const seqs = try arena.alloc(u64, result.events.len);
+        for (result.events, 0..) |event, index| {
+            seqs[index] = try self.appendEvent(event.event_type, event.data, event.surface_op, event.source_event_seqs);
+        }
+        self.applyPermissionEvents(result.events);
+        try self.applyManualCompaction(result.events, seqs);
+        return try arena.dupe(u8, result.text);
+    }
+
+    fn applyPermissionEvents(self: *Self, events: []const types.Event) void {
+        const delta = commands_mod.PermissionState.fold(events);
+        if (delta.preset) |preset| self.permission_state.preset = preset;
+        if (delta.sandbox) |sandbox| self.permission_state.sandbox = sandbox;
+        if (delta.approval) |approval| {
+            self.permission_state.approval = approval;
+            self.approval.options.policy = switch (approval) {
+                .ask => .ask,
+                .never => .never,
+            };
+        }
+    }
+
+    /// Apply the four events a `/compact` seam returned after the command
+    /// module's lifecycle has been appended (`command/run` prepends the
+    /// transaction, so locate it by type rather than a fixed offset).
+    fn applyManualCompaction(self: *Self, events: []const types.Event, seqs: []const u64) !void {
+        if (seqs.len != events.len) return error.InvalidCompactionEvents;
+        var start: usize = 0;
+        while (start + 3 < events.len) : (start += 1) {
+            if (std.mem.eql(u8, events[start].event_type, "compaction/start")) break;
+        }
+        if (start + 3 >= events.len) return;
+        if (!std.mem.eql(u8, events[start + 1].event_type, "compaction/summary") or
+            !std.mem.eql(u8, events[start + 2].event_type, "user/message") or
+            !std.mem.eql(u8, events[start + 3].event_type, "compaction/end")) return;
+
+        const arena = self.arena.allocator();
+        const summary_data = switch (events[start + 1].data) {
+            .object => |value| value,
+            else => return error.InvalidCompactionEvents,
+        };
+        const range = switch (summary_data.get("shadowedRange") orelse return error.InvalidCompactionEvents) {
+            .object => |value| value,
+            else => return error.InvalidCompactionEvents,
+        };
+        const start_seq = switch (range.get("start") orelse return error.InvalidCompactionEvents) {
+            .integer => |value| @as(u64, @intCast(value)),
+            else => return error.InvalidCompactionEvents,
+        };
+        const shadowed = switch (summary_data.get("shadowedSeqs") orelse return error.InvalidCompactionEvents) {
+            .array => |value| value,
+            else => return error.InvalidCompactionEvents,
+        };
+        const first_idx = indexOfSeq(self.surface_seqs.items, start_seq) orelse
+            return error.SurfaceSeqMismatch;
+        if (shadowed.items.len > self.messages.items.len - first_idx)
+            return error.InvalidCompactionEvents;
+
+        const message = try surface_mod.messageFromEvent(arena, events[start + 2]);
+        const new_len = self.messages.items.len - shadowed.items.len;
+        std.mem.copyForwards(
+            types.Message,
+            self.messages.items[first_idx..new_len],
+            self.messages.items[first_idx + shadowed.items.len ..],
+        );
+        self.messages.shrinkRetainingCapacity(new_len);
+        try self.messages.insert(arena, first_idx, message);
+
+        std.mem.copyForwards(
+            u64,
+            self.surface_seqs.items[first_idx..new_len],
+            self.surface_seqs.items[first_idx + shadowed.items.len ..],
+        );
+        self.surface_seqs.shrinkRetainingCapacity(new_len);
+        try self.surface_seqs.insert(arena, first_idx, seqs[start + 2]);
+        self.last_usage = null;
+        self.compaction_lock = .{};
+    }
+
+    fn compactionPolicy(self: *const Self) compaction_mod.Options {
+        var options = compaction_mod.Options{};
+        if (self.opts.compaction_threshold_ratio) |value| options.threshold_ratio = value;
+        if (self.opts.compaction_retain_ratio) |value| options.retain_ratio = value;
+        if (self.opts.compaction_headroom_tokens) |value| options.headroom_tokens = value;
+        return options;
+    }
+
+    fn surfaceNodes(self: *const Self, allocator: Allocator) ![]compaction_mod.Node {
+        if (self.messages.items.len != self.surface_seqs.items.len) return error.SurfaceSeqMismatch;
+        const nodes = try allocator.alloc(compaction_mod.Node, self.messages.items.len);
+        for (self.messages.items, self.surface_seqs.items, 0..) |message, seq, index| {
+            nodes[index] = .{ .seq = seq, .message = message };
+        }
+        return nodes;
+    }
+
+    fn reservedCompletionTokens(self: *const Self) u64 {
+        return self.opts.max_tokens orelse 0;
+    }
+
+    /// Fixed kernel hook (`agent/pre-step`): measure, then compact at or above
+    /// dsh's threshold. Misconfigured pressure specs leave the turn running;
+    /// config validation rejects them at load.
+    fn compactionPressure(context_ptr: *anyopaque, allocator: Allocator, position: loop_mod.Position) anyerror!bool {
+        const self = selfOf(context_ptr);
+        if (self.opts.context_window == 0) return false;
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        const nodes = self.surfaceNodes(tmp.allocator()) catch |err| switch (err) {
+            error.SurfaceSeqMismatch => return false,
+            else => return err,
+        };
+        const probe = compaction_mod.check(
+            tmp.allocator(),
+            nodes,
+            self.compactionPolicy(),
+            self.opts.context_window,
+            self.reservedCompletionTokens(),
+            self.last_usage,
+        ) catch |err| switch (err) {
+            error.InvalidContextWindow,
+            error.NoMessageBudget,
+            error.NoPressureBudget,
+            error.InvalidThresholdRatio,
+            error.InvalidRetainRatio,
+            error.RetainNotBelowThreshold,
+            => return false,
+            else => return err,
+        };
+        if (!probe.pressured) return false;
+        return self.compactAuto(allocator, .pressure, position.turn);
+    }
+
+    /// Fixed kernel hook (`agent/request-error`): one forced compaction so the
+    /// kernel can retry the overflowed request.
+    fn compactionOverflow(context_ptr: *anyopaque, allocator: Allocator, position: loop_mod.Position) anyerror!bool {
+        const self = selfOf(context_ptr);
+        return self.compactAuto(allocator, .context_overflow, position.turn);
+    }
+
+    fn compactAuto(self: *Self, allocator: Allocator, trigger: compaction_mod.Trigger, turn: u64) anyerror!bool {
+        var result = self.compactRun(allocator, trigger, turn) catch |err| switch (err) {
+            error.CompactionLocked => return false,
+            else => return err,
+        };
+        defer result.deinit();
+        if (result.events.len == 0 and result.pruned.len == 0) return false;
+        try self.commitCompaction(result, null);
+        return true;
+    }
+
+    fn compactRun(
+        self: *Self,
+        allocator: Allocator,
+        trigger: compaction_mod.Trigger,
+        turn: ?u64,
+    ) !compaction_mod.Result {
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        const nodes = try self.surfaceNodes(tmp.allocator());
+        const compaction_id = try std.fmt.allocPrint(allocator, "compaction-{d}", .{self.next_id});
+        self.next_id += 1;
+        const replacement_id = try std.fmt.allocPrint(allocator, "compaction-checkpoint-{d}", .{self.next_id});
+        self.next_id += 1;
+        return compaction_mod.run(allocator, nodes, .{
+            .context_window = self.opts.context_window,
+            .policy = self.compactionPolicy(),
+            .reserved_completion_tokens = self.reservedCompletionTokens(),
+            .provider_usage = self.last_usage,
+            .trigger = trigger,
+            .recovery = self.compaction_lock,
+            .compaction_id = compaction_id,
+            .replacement_message_id = replacement_id,
+            .turn = turn,
+            .tools = self.tool_schemas,
+        }, .{ .context = @ptrCast(self), .call = summarizeCompaction });
+    }
+
+    /// dsh's cache-reusing auxiliary call (`summarizer.ts:120-170`): replay the
+    /// selected prefix plus the instruction, with the routed model's tools.
+    fn summarizeCompaction(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        input: compaction_mod.SummaryInput,
+    ) anyerror!compaction_mod.SummaryOutput {
+        const self = selfOf(context_ptr.?);
+        const messages = try requestsFromMessages(allocator, input.messages);
+        const chat = providers.ChatRequest{
+            .messages = messages,
+            .model = self.opts.model,
+            .temperature = self.opts.temperature,
+            .max_tokens = self.opts.max_tokens,
+            .tools = self.tool_specs,
+            .reasoning_effort = self.opts.reasoning_effort,
+            .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
+        };
+        const response = try self.opts.provider.chatWithTools(allocator, chat);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = try allocator.dupe(u8, response.content orelse "") };
+        const usage: ?types.Usage = if (response.usage.prompt_tokens == 0 and
+            response.usage.completion_tokens == 0 and response.usage.total_tokens == 0)
+            null
+        else
+            stream.normalizeUsage(.{
+                .prompt_tokens = response.usage.prompt_tokens,
+                .completion_tokens = response.usage.completion_tokens,
+                .total_tokens = response.usage.total_tokens,
+            });
+        return .{
+            .blocks = blocks,
+            .provider = self.opts.provider_name,
+            .model = self.opts.model,
+            .max_tokens = self.opts.max_tokens,
+            .usage = usage,
+        };
+    }
+
+    /// Log the prune pass and the four adjacent compaction events, then rewrite
+    /// the in-memory surface (and drop the usage anchor).
+    fn commitCompaction(self: *Self, result: compaction_mod.Result, command_id: ?[]const u8) !void {
+        const arena = self.arena.allocator();
+        // dsh appends the pruner's replacements before selecting the summary
+        // range, so a node shadowed by both keeps the replacement's seq in the
+        // summary and checkpoint records.
+        var remap: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer remap.deinit(arena);
+
+        for (result.pruned) |pruned| {
+            const index = indexOfSeq(self.surface_seqs.items, pruned.seq) orelse continue;
+            const tokens = token_meter.estimateMessage(arena, self.messages.items[index]) catch 0;
+            var prune_data: std.json.ObjectMap = .empty;
+            var range: std.json.ObjectMap = .empty;
+            try range.put(arena, "start", .{ .integer = @intCast(pruned.seq) });
+            try range.put(arena, "end", .{ .integer = @intCast(pruned.seq) });
+            try prune_data.put(arena, "shadowedRange", .{ .object = range });
+            try prune_data.put(arena, "shadowedSeqs", try seqArrayValue(arena, &.{pruned.seq}));
+            try prune_data.put(arena, "shadowedTokenCount", .{ .integer = @intCast(tokens) });
+            _ = try self.appendEvent("compaction/prune", .{ .object = prune_data }, null, null);
+
+            var data: std.json.ObjectMap = .empty;
+            const replacement = try cloneMessage(arena, pruned.message);
+            try data.put(arena, "message", try messageValue(arena, replacement));
+            const seq = try self.appendEvent("tool/result", .{ .object = data }, .{
+                .replace = .{ .start_seq = pruned.seq, .end_seq = pruned.seq },
+            }, try arena.dupe(u64, &.{pruned.seq}));
+            try remap.put(arena, pruned.seq, seq);
+            self.messages.items[index] = replacement;
+            self.surface_seqs.items[index] = seq;
+        }
+
+        if (result.events.len == 4) {
+            try compaction_mod.assertAdjacent(result.events);
+            const summary = switch (result.events[1]) {
+                .summary => |value| value,
+                else => return error.CompactionEventsNotAdjacent,
+            };
+            const mapped_seqs = try arena.alloc(u64, summary.shadowed_seqs.len);
+            for (summary.shadowed_seqs, 0..) |seq, index| {
+                mapped_seqs[index] = remap.get(seq) orelse seq;
+            }
+            const shadowed = CompactionShadowed{
+                .start_seq = remap.get(summary.shadowed_start_seq) orelse summary.shadowed_start_seq,
+                .end_seq = remap.get(summary.shadowed_end_seq) orelse summary.shadowed_end_seq,
+                .seqs = mapped_seqs,
+            };
+            const first_idx = indexOfSeq(self.surface_seqs.items, shadowed.start_seq) orelse
+                return error.SurfaceSeqMismatch;
+
+            const events = try self.buildCompactionEvents(arena, result, command_id, shadowed, null);
+            const start_seq = try self.appendEvent(events[0].event_type, events[0].data, events[0].surface_op, events[0].source_event_seqs);
+            const summary_seq = try self.appendEvent(events[1].event_type, events[1].data, events[1].surface_op, events[1].source_event_seqs);
+            // dsh records `[startEvent.seq, summaryEvent.seq, ...shadowedSeqs]`.
+            const source_seqs = try arena.alloc(u64, 2 + shadowed.seqs.len);
+            source_seqs[0] = start_seq;
+            source_seqs[1] = summary_seq;
+            @memcpy(source_seqs[2..], shadowed.seqs);
+            events[2].source_event_seqs = source_seqs;
+            const replacement_seq = try self.appendEvent(events[2].event_type, events[2].data, events[2].surface_op, events[2].source_event_seqs);
+            _ = try self.appendEvent(events[3].event_type, events[3].data, events[3].surface_op, events[3].source_event_seqs);
+
+            const replacement = switch (result.events[2]) {
+                .replacement => |value| value,
+                else => return error.CompactionEventsNotAdjacent,
+            };
+            var message = try cloneMessage(arena, replacement.message);
+            message = try compactionReplacementMessage(arena, message, command_id);
+            const idx = first_idx;
+            const new_len = self.messages.items.len - shadowed.seqs.len;
+            std.mem.copyForwards(
+                types.Message,
+                self.messages.items[idx..new_len],
+                self.messages.items[idx + shadowed.seqs.len ..],
+            );
+            self.messages.shrinkRetainingCapacity(new_len);
+            try self.messages.insert(arena, idx, message);
+
+            std.mem.copyForwards(
+                u64,
+                self.surface_seqs.items[idx..new_len],
+                self.surface_seqs.items[idx + shadowed.seqs.len ..],
+            );
+            self.surface_seqs.shrinkRetainingCapacity(new_len);
+            try self.surface_seqs.insert(arena, idx, replacement_seq);
+        }
+        self.last_usage = null;
+        self.compaction_lock = .{};
+    }
+
+    /// Surface seqs used by the summary and checkpoint records. They differ
+    /// from `result.events` when the pruner replaced a shadowed node first.
+    const CompactionShadowed = struct {
+        start_seq: u64,
+        end_seq: u64,
+        seqs: []const u64,
+    };
+
+    fn buildCompactionEvents(
+        self: *Self,
+        allocator: Allocator,
+        result: compaction_mod.Result,
+        command_id: ?[]const u8,
+        shadowed: CompactionShadowed,
+        source_prefix: ?[]const u64,
+    ) ![]types.Event {
+        _ = self;
+        const start = switch (result.events[0]) {
+            .start => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const summary = switch (result.events[1]) {
+            .summary => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const replacement = switch (result.events[2]) {
+            .replacement => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const end = switch (result.events[3]) {
+            .end => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+
+        const events = try allocator.alloc(types.Event, 4);
+        events[0] = .{
+            .event_type = "compaction/start",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, start.compaction_id, start.turn, command_id),
+        };
+        events[1] = .{
+            .event_type = "compaction/summary",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionSummaryData(allocator, summary, command_id, shadowed),
+        };
+        const message = try compactionReplacementMessage(allocator, replacement.message, command_id);
+        var source_seqs: []const u64 = shadowed.seqs;
+        if (source_prefix) |prefix| {
+            const combined = try allocator.alloc(u64, prefix.len + shadowed.seqs.len);
+            @memcpy(combined[0..prefix.len], prefix);
+            @memcpy(combined[prefix.len..], shadowed.seqs);
+            source_seqs = combined;
+        }
+        events[2] = .{
+            .event_type = "user/message",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try messageValue(allocator, message),
+            .surface_op = .{ .replace = .{
+                .start_seq = shadowed.start_seq,
+                .end_seq = shadowed.end_seq,
+            } },
+            .source_event_seqs = source_seqs,
+        };
+        events[3] = .{
+            .event_type = "compaction/end",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, end.compaction_id, end.turn, command_id),
+        };
+        return events;
+    }
+
+    fn compactionEdgeData(
+        allocator: Allocator,
+        compaction_id: []const u8,
+        turn: ?u64,
+        command_id: ?[]const u8,
+    ) !Value {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(allocator, "compactionId", .{ .string = compaction_id });
+        if (command_id) |value| try object.put(allocator, "sourceCommandId", .{ .string = value });
+        try object.put(allocator, "turn", if (turn) |value|
+            Value{ .integer = @intCast(value) }
+        else
+            Value{ .null = {} });
+        return .{ .object = object };
+    }
+
+    fn compactionSummaryData(
+        allocator: Allocator,
+        summary: compaction_mod.SummaryEvent,
+        command_id: ?[]const u8,
+        shadowed: CompactionShadowed,
+    ) !Value {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(allocator, "compactionId", .{ .string = summary.compaction_id });
+        if (command_id) |value| try object.put(allocator, "sourceCommandId", .{ .string = value });
+        try object.put(allocator, "summary", try contentValue(allocator, summary.summary));
+        try object.put(allocator, "rawOutput", try contentValue(allocator, summary.raw_output));
+        try object.put(allocator, "llmStreamCall", .{ .bool = true });
+        var range: std.json.ObjectMap = .empty;
+        try range.put(allocator, "start", .{ .integer = @intCast(shadowed.start_seq) });
+        try range.put(allocator, "end", .{ .integer = @intCast(shadowed.end_seq) });
+        try object.put(allocator, "shadowedRange", .{ .object = range });
+        try object.put(allocator, "shadowedSeqs", try seqArrayValue(allocator, shadowed.seqs));
+        try object.put(allocator, "shadowedTokenCount", .{ .integer = @intCast(summary.shadowed_token_count) });
+        try object.put(allocator, "provider", .{ .string = summary.provider });
+        try object.put(allocator, "model", .{ .string = summary.model });
+        if (summary.max_tokens) |value| try object.put(allocator, "maxTokens", .{ .integer = @intCast(value) });
+        if (summary.usage) |usage| try object.put(allocator, "usage", try usageValue(allocator, usage));
+        return .{ .object = object };
+    }
+
+    fn compactionReplacementMessage(
+        allocator: Allocator,
+        message: types.Message,
+        command_id: ?[]const u8,
+    ) !types.Message {
+        var out = message;
+        if (command_id) |id| switch (out.source) {
+            .other => |*value| switch (value.*) {
+                .object => |*object| try object.put(allocator, "sourceCommandId", .{ .string = id }),
+                else => {},
+            },
+            else => {},
+        };
+        return out;
+    }
+
+    fn seqArrayValue(allocator: Allocator, seqs: []const u64) !Value {
+        var array = std.json.Array.init(allocator);
+        try array.ensureTotalCapacity(seqs.len);
+        for (seqs) |seq| array.appendAssumeCapacity(.{ .integer = @intCast(seq) });
+        return .{ .array = array };
+    }
+
+    fn compactSeam(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        command: commands_mod.CompactRequest,
+    ) anyerror!commands_mod.CompactOutcome {
+        const self = selfOf(context_ptr.?);
+        var result = self.compactRun(allocator, .manual, null) catch |err| switch (err) {
+            error.CompactionLocked => return .{ .failed = .busy },
+            error.OutOfMemory => return err,
+            else => return .{ .failed = .summary },
+        };
+        defer result.deinit();
+        if (result.events.len == 0) return .no_history;
+        try compaction_mod.assertAdjacent(result.events);
+        const summary = switch (result.events[1]) {
+            .summary => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        // Domain events follow `command/run`; dsh's checkpoint records the
+        // start and summary seqs before the shadowed range.
+        const prefix: ?[]const u64 = if (command.next_seq) |first| blk: {
+            const head = try allocator.alloc(u64, 2);
+            head[0] = first + 1;
+            head[1] = first + 2;
+            break :blk head;
+        } else null;
+        const events = try self.buildCompactionEvents(allocator, result, command.command_id, .{
+            .start_seq = summary.shadowed_start_seq,
+            .end_seq = summary.shadowed_end_seq,
+            .seqs = summary.shadowed_seqs,
+        }, prefix);
+        for (events) |*event| event.data = try cloneValue(allocator, event.data);
+        return .{ .compacted = .{
+            .events = events,
+            .shadowed_item_count = summary.shadowed_seqs.len,
+            .shadowed_token_count = summary.shadowed_token_count,
+            .summary_event_index = 1,
+        } };
     }
 
     fn toolOutputText(allocator: Allocator, result: registry.ToolResult) ![]const u8 {
@@ -1551,6 +2195,13 @@ pub const DshNativeHarness = struct {
         return .{ .array = array };
     }
 };
+
+fn indexOfSeq(seqs: []const u64, seq: u64) ?usize {
+    for (seqs, 0..) |value, index| {
+        if (value == seq) return index;
+    }
+    return null;
+}
 
 /// A v4 session id: 32 lowercase hex characters from a CSPRNG.
 fn newSessionId(allocator: Allocator) ![]u8 {
