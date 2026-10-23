@@ -28,7 +28,8 @@ pub const max_output_bytes: usize = 64_000;
 pub const max_spill_bytes: u64 = 64 * 1024 * 1024;
 
 /// Per-deployment handler state. `cwd` is the session working directory;
-/// `spill_dir` overrides TMPDIR for truncated-output recovery files.
+/// `spill_dir` selects where truncated-output recovery files go (dsh spills
+/// under the OS tmpdir; set this when /tmp is not writable).
 pub const Context = struct {
     cwd: ?[]const u8 = null,
     spill_dir: ?[]const u8 = null,
@@ -234,6 +235,9 @@ fn createTempFile(allocator: Allocator, context: *const Context, label: []const 
     const hex = std.fmt.bytesToHex(random, .lower);
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "dsh-bash-{s}-{s}.log", .{ &hex, label });
+    // shortcut: POSIX-only fallback (the executor already refuses Windows);
+    // dsh spills under os.tmpdir() (subprocess-local/src/output.ts:32-36).
+    // Upgrade to a TMPDIR lookup when a sandboxed deployment needs it.
     const dir = context.spill_dir orelse "/tmp";
     const path = try std.fs.path.join(allocator, &.{ dir, name });
     const file = compat.fs.createFileAbsolute(path, .{

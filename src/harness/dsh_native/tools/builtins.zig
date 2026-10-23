@@ -13,6 +13,7 @@
 //! defaults.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
 const fs_compat = @import("../../../fs_compat.zig");
 const generated = @import("../generated/tool_schemas.zig");
@@ -220,13 +221,24 @@ fn resolvePath(allocator: Allocator, cwd: []const u8, input: []const u8) ![]u8 {
     return std.fs.path.resolve(allocator, &.{ cwd, input });
 }
 
+/// Windows paths compare case-insensitively; POSIX paths stay byte-exact.
+/// shortcut: ASCII folding only — non-ASCII case pairs wait for the
+/// realpath-based P2 confinement layer.
+fn pathPrefixEqual(a: []const u8, b: []const u8) bool {
+    if (comptime builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(a, b);
+    return std.mem.eql(u8, a, b);
+}
+
 /// Lexical containment: the resolved path must sit inside the session cwd.
+/// A cwd that is a filesystem root already ends in a separator, so everything
+/// with that root is contained.
 /// shortcut: symlinks inside the cwd can still point outside; realpath-based
 /// confinement belongs to the P2 sandbox/approval layer.
 fn insideCwd(cwd: []const u8, path: []const u8) bool {
-    if (std.mem.eql(u8, cwd, path)) return true;
-    if (!std.mem.startsWith(u8, path, cwd)) return false;
-    if (path.len <= cwd.len) return false;
+    if (cwd.len == 0 or path.len < cwd.len) return false;
+    if (!pathPrefixEqual(path[0..cwd.len], cwd)) return false;
+    if (path.len == cwd.len) return true;
+    if (std.fs.path.isSep(cwd[cwd.len - 1])) return true;
     return std.fs.path.isSep(path[cwd.len]);
 }
 
@@ -469,7 +481,7 @@ fn runEdit(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
         return fsFailure(allocator, "FS_NOT_TEXT", try std.fmt.allocPrint(allocator, "cannot edit \"{s}\": file is not valid UTF-8 text", .{absolute}));
     }
 
-    const crlf = std.mem.indexOf(u8, raw, "\r\n") != null;
+    const crlf = usesCrlfLineEndings(raw);
     const content = try normalizeCrlf(allocator, raw);
     const old_norm = try normalizeCrlf(allocator, old_string);
     const new_norm = try normalizeCrlf(allocator, new_string);
@@ -495,6 +507,21 @@ fn runEdit(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     else
         try std.fmt.allocPrint(allocator, render.edit.success_single, .{absolute});
     return successText(allocator, text);
+}
+
+/// dsh `detectLineEndings` (packages/fs/fs-local/src/fsio.ts:687-691): the
+/// first 4096 bytes decide, and CRLF wins only when CRLF pairs outnumber lone
+/// LF bytes. Using "any CRLF" instead would rewrite mixed-EOL files wholesale.
+fn usesCrlfLineEndings(raw: []const u8) bool {
+    const sample = raw[0..@min(raw.len, 4096)];
+    var total_lf: usize = 0;
+    var crlf: usize = 0;
+    for (sample, 0..) |byte, index| {
+        if (byte != '\n') continue;
+        total_lf += 1;
+        if (index > 0 and sample[index - 1] == '\r') crlf += 1;
+    }
+    return crlf > total_lf - crlf;
 }
 
 fn normalizeCrlf(allocator: Allocator, text: []const u8) ![]const u8 {
@@ -689,6 +716,8 @@ fn previewLine(allocator: Allocator, line: []const u8, max_bytes: usize) ![]cons
     return std.fmt.allocPrint(allocator, "{s} (line truncated)", .{line[0..end]});
 }
 
+/// dsh grep passes `include` to ripgrep's `--glob` (grep.ts:113), so the same
+/// rule as glob applies: no '/' means basename at any depth (glob.ts:316).
 fn includeMatches(allocator: Allocator, patterns: []const []const u8, display: []const u8) !bool {
     for (patterns) |pattern| {
         const target = if (std.mem.indexOfScalar(u8, pattern, '/') != null)
@@ -787,6 +816,8 @@ fn runGlob(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
         .cwd = cwd,
         .root = root,
         .patterns = patterns.items,
+        // dsh glob.ts:316 anchors depth on '/'; '\\' is also counted so a
+        // Windows-style pattern still selects the relative-path target.
         .pattern_has_separator = std.mem.indexOfAny(u8, pattern, "/\\") != null,
         .entries = &entries,
     };
@@ -887,6 +918,8 @@ fn lessThanEntry(_: void, a: GlobEntry, b: GlobEntry) bool {
 
 /// Glob and grep patterns are written with '/' on every platform (dsh and
 /// ripgrep semantics); map the native display separator to '/' before matching.
+/// dsh glob.ts:316: a pattern with no "/" matches the basename at any depth,
+/// so only the presence of '/' in the pattern selects a relative-path target.
 fn toMatchPath(allocator: Allocator, path: []const u8) ![]const u8 {
     const out = try allocator.dupe(u8, path);
     for (out) |*byte| {
@@ -1224,6 +1257,21 @@ test "read caps long lines and the 50 KiB output budget" {
     try testing.expect(std.mem.indexOf(u8, invalid_limit, "limit must be less than or equal to 2000") != null);
 }
 
+test "read strips the CR of a CRLF terminator from every line" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    _ = try tools.writeFile("win.txt", "one\r\ntwo\r\n");
+    const text = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, "win.txt")));
+    try testing.expect(std.mem.indexOf(u8, text, "1: one\n2: two") != null);
+    try testing.expect(std.mem.indexOfScalar(u8, text, '\r') == null);
+    try testing.expect(std.mem.indexOf(u8, text, "(End of file - total 2 lines)") != null);
+}
+
 test "write creates parents, reports Created/Updated, and rejects escapes" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1329,6 +1377,35 @@ test "edit replace_all rewrites every occurrence and preserves CRLF" {
     try testing.expectEqualStrings("two\r\ntwo\r\n", try tools.readFile("win.txt"));
 }
 
+test "edit picks the majority line ending on mixed-EOL files like dsh" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    // dsh readForEdit detects the majority style (fs-local/src/fsio.ts:687-691):
+    // one CRLF against three lone LF bytes keeps the file LF, and a CRLF
+    // old_string still matches across the normalization.
+    _ = try tools.writeFile("mixed.txt", "alpha\r\nbeta\nmiddle\ngamma\nbeta");
+    _ = try expectSuccess(try callEdit(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "mixed.txt" } },
+        .{ "old_string", .{ .string = "alpha\r\nbeta" } },
+        .{ "new_string", .{ .string = "replaced" } },
+    })));
+    try testing.expectEqualStrings("replaced\nmiddle\ngamma\nbeta", try tools.readFile("mixed.txt"));
+
+    // A CRLF majority keeps CRLF for every line, including the edited one.
+    _ = try tools.writeFile("mostly-crlf.txt", "one\r\ntwo\r\nthree\n");
+    _ = try expectSuccess(try callEdit(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "mostly-crlf.txt" } },
+        .{ "old_string", .{ .string = "three" } },
+        .{ "new_string", .{ .string = "four" } },
+    })));
+    try testing.expectEqualStrings("one\r\ntwo\r\nfour\r\n", try tools.readFile("mostly-crlf.txt"));
+}
+
 test "grep groups matches by file, honors include, and reports no matches" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1360,6 +1437,22 @@ test "grep groups matches by file, honors include, and reports no matches" {
         .{ "pattern", .{ .string = "missing-token" } },
     })));
     try testing.expectEqualStrings(render.grep.no_matches, none);
+}
+
+test "grep strips the CR of a CRLF terminator from matched lines" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    _ = try tools.writeFile("win.txt", "first\r\nneedle here\r\n");
+    const found = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+    })));
+    try testing.expectEqualStrings("Found 1 match\n\nwin.txt\nLine 2: needle here", found);
+    try testing.expect(std.mem.indexOfScalar(u8, found, '\r') == null);
 }
 
 test "grep caps at 250 matches, previews 2000-byte lines, and spills the complete result" {
@@ -1512,4 +1605,20 @@ test "a path argument anchors grep and glob to a subtree" {
         .{ "path", .{ .string = "sub" } },
     })));
     try testing.expectEqualStrings(inside_path, glob);
+}
+
+test "insideCwd accepts roots and folds case only on Windows" {
+    try testing.expect(insideCwd("/work/proj", "/work/proj"));
+    try testing.expect(insideCwd("/work/proj", "/work/proj/file.txt"));
+    try testing.expect(!insideCwd("/work/proj", "/work/proj2/file.txt"));
+    try testing.expect(!insideCwd("", "/work/proj/file.txt"));
+    // A root cwd already ends in a separator; everything under it is contained.
+    try testing.expect(insideCwd("/", "/tmp/file.txt"));
+    if (comptime builtin.os.tag == .windows) {
+        try testing.expect(insideCwd("C:\\Work\\Proj", "c:\\work\\proj\\file.txt"));
+        try testing.expect(insideCwd("C:\\", "C:\\tmp\\file.txt"));
+        try testing.expect(!insideCwd("C:\\Work\\Proj", "c:\\work\\proj2\\file.txt"));
+    } else {
+        try testing.expect(!insideCwd("/work/proj", "/Work/proj/file.txt"));
+    }
 }

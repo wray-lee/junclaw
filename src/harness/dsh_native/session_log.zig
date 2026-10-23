@@ -318,6 +318,8 @@ fn scan(allocator: Allocator, bytes: []const u8) !Scan {
         const line = bytes[position .. position + relative_end];
         position += relative_end + 1;
         if (line.len == 0) return error.CorruptLog;
+        // A CRLF file leaves a trailing '\r' on the line; JSON treats it as
+        // trailing whitespace, so the record parses unchanged.
         const value = try parseJson(allocator, line);
         try events.append(allocator, try parseEvent(allocator, value, @intCast(events.items.len)));
     }
@@ -889,4 +891,26 @@ test "a second writer is refused by the session lock" {
     var first = try Log.create(std.testing.allocator, paths.log, testHeader());
     defer first.close();
     try std.testing.expectError(error.SessionLocked, Log.create(std.testing.allocator, paths.log, testHeader()));
+}
+
+test "readLog accepts CRLF line endings" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var paths = try TestPaths.init(std.testing.allocator, &tmp);
+    defer paths.deinit();
+
+    const header = "{\"type\":\"session\",\"version\":4,\"id\":\"session-1\",\"createdAt\":1,\"isSeeded\":false,\"delegationDepth\":0}\n";
+    const event = "{\"type\":\"turn/start\",\"seq\":0,\"time\":1,\"data\":{}}\n";
+    const lf = try std.mem.concat(std.testing.allocator, u8, &.{ header, event });
+    defer std.testing.allocator.free(lf);
+    const crlf = try std.mem.replaceOwned(u8, std.testing.allocator, lf, "\n", "\r\n");
+    defer std.testing.allocator.free(crlf);
+    try writeRaw(paths.log, crlf);
+
+    var result = try readLog(std.testing.allocator, paths.log);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("session-1", result.header.id);
+    try std.testing.expectEqual(@as(usize, 1), result.events.len);
+    try std.testing.expectEqualStrings("turn/start", result.events[0].event_type);
+    try std.testing.expect(result.torn_truncate_to == null);
 }

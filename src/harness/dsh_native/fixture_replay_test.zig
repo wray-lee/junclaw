@@ -25,7 +25,13 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const Obj = std.json.ObjectMap;
 
-const fixture_root = "test/fixtures/dsh_native";
+/// Repository-relative fixture directory, built from components so the path
+/// uses the native separator on every platform (tests run with the build root
+/// as cwd).
+fn fixtureDirAlloc(allocator: Allocator, scenario: []const u8) ![]u8 {
+    return std.fs.path.join(allocator, &.{ "test", "fixtures", "dsh_native", scenario });
+}
+
 const test_provider = "fake";
 const test_model = "fake";
 /// Headless persona used by the recording (manifest openIssues).
@@ -777,7 +783,7 @@ fn endReasonValue(allocator: Allocator, reason: types.EndReason) !Value {
 
 fn runFixture(scenario: []const u8) !void {
     const allocator = std.testing.allocator;
-    const dir = try std.fs.path.join(allocator, &.{ fixture_root, scenario });
+    const dir = try fixtureDirAlloc(allocator, scenario);
     defer allocator.free(dir);
 
     var fixture_arena_state = std.heap.ArenaAllocator.init(allocator);

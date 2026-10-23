@@ -22,7 +22,6 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const Obj = std.json.ObjectMap;
 
-const fixture_dir = "test/fixtures/dsh_native/plain-turn";
 /// P0 replay route identity. The fixture is a fake route, so its expected
 /// request/context and assistant source carry the same neutral values.
 const test_provider = "fake";
@@ -247,7 +246,9 @@ fn parseJsonl(allocator: Allocator, bytes: []const u8) ![]Value {
 }
 
 fn readFixture(allocator: Allocator, name: []const u8) ![]u8 {
-    const path = try std.fs.path.join(allocator, &.{ fixture_dir, name });
+    // Components keep the path native on every platform; tests run with the
+    // build root as cwd.
+    const path = try std.fs.path.join(allocator, &.{ "test", "fixtures", "dsh_native", "plain-turn", name });
     defer allocator.free(path);
     return fs_compat.readFileAlloc(compat.fs.cwd(), allocator, path, 1 << 20);
 }

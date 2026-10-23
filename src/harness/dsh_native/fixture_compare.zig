@@ -583,3 +583,14 @@ test "path normalization helpers accept 64 KiB inputs without leaking" {
     }
     try std.testing.expectEqualStrings("</path>", marked[size - "</path>".len ..]);
 }
+
+test "parseJsonl accepts CRLF and a missing final newline" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const records = try parseJsonl(arena, "{\"a\":1}\r\n{\"b\":2}\r\n{\"c\":3}");
+    try std.testing.expectEqual(@as(usize, 3), records.len);
+    try std.testing.expectEqual(@as(i64, 2), records[1].object.get("b").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), records[2].object.get("c").?.integer);
+}
