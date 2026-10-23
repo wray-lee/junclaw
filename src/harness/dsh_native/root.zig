@@ -50,5 +50,7 @@ test {
     _ = @import("generated/root.zig");
     _ = @import("fixture_compare.zig");
     _ = @import("plain_turn_test.zig");
+    _ = @import("harness.zig");
+    _ = @import("harness_test.zig");
     _ = @import("fixture_replay_test.zig");
 }
