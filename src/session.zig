@@ -175,6 +175,11 @@ const DshNativeState = struct {
             .persona = config.agent.dsh_persona orelse "",
             .approval_policy = config.agent.dsh_approval_policy,
             .sandbox = config.agent.dsh_sandbox,
+            // The dsh tools must never be wider than the native ones: same
+            // autonomy/rate gate, workspace/allowed_paths boundary and bash
+            // command-risk policy.
+            .policy = session.agent.policy,
+            .allowed_paths = session.agent.allowed_paths,
             .max_parallel_tools = config.agent.dsh_max_parallel_tools,
             .on_corrupt = config.agent.dsh_on_corrupt,
             .context_window = config.agent.dsh_compaction_context_window,

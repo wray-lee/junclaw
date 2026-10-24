@@ -23,7 +23,7 @@ const DEFAULT_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
 /// Default maximum output size in bytes (1MB).
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1_048_576;
 /// Environment variables safe to pass to shell commands.
-const SAFE_ENV_VARS: []const []const u8 = if (builtin.os.tag == .windows)
+pub const SAFE_ENV_VARS: []const []const u8 = if (builtin.os.tag == .windows)
     &.{
         "PATH",
         "HOME",

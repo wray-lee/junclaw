@@ -13,7 +13,10 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
+const platform = @import("../../../platform.zig");
+const shell_mod = @import("../../../tools/shell.zig");
 const registry = @import("registry.zig");
+const security_mod = @import("security.zig");
 const types = @import("../types.zig");
 const generated = @import("../generated/tool_render.zig");
 
@@ -33,6 +36,8 @@ pub const max_spill_bytes: u64 = 64 * 1024 * 1024;
 pub const Context = struct {
     cwd: ?[]const u8 = null,
     spill_dir: ?[]const u8 = null,
+    /// `autonomy.allowed_paths`: extra roots a model-supplied workdir may use.
+    allowed_paths: []const []const u8 = &.{},
 
     pub fn handler(self: *Context) registry.Handler {
         return .{ .context = self, .call = call };
@@ -176,6 +181,27 @@ fn failure(allocator: Allocator, code: []const u8, message: []const u8) !registr
 fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry.ToolResult {
     const io = compat.io();
     const workdir = try resolveWorkdir(allocator, context, args.workdir);
+    if (args.workdir != null) {
+        const scope: security_mod.Scope = .{
+            .cwd = context.cwd orelse "",
+            .allowed_paths = context.allowed_paths,
+        };
+        if (!try security_mod.pathAllowed(allocator, scope, workdir orelse "")) {
+            return failure(allocator, "WORKDIR_NOT_ALLOWED", "workdir is outside the session workspace");
+        }
+    }
+
+    // Clear the environment like the native shell tool (CWE-200): provider
+    // keys and channel tokens must not reach the child. Only the functional
+    // variables listed in `shell.SAFE_ENV_VARS` are restored.
+    var env = compat.process.EnvMap.init(allocator);
+    defer env.deinit();
+    for (shell_mod.SAFE_ENV_VARS) |key| {
+        if (platform.getEnvOrNull(allocator, key)) |value| {
+            defer allocator.free(value);
+            try env.put(key, value);
+        }
+    }
 
     const stdout_temp = try createTempFile(allocator, context, "stdout");
     defer stdout_temp.file.close();
@@ -187,6 +213,7 @@ fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry
     const child = std.process.spawn(io, .{
         .argv = &.{ "sh", "-c", args.command },
         .cwd = if (workdir) |dir| .{ .path = dir } else .inherit,
+        .environ_map = &env,
         .stdout = .{ .file = stdout_temp.file.toInner() },
         .stderr = .{ .file = stderr_temp.file.toInner() },
     }) catch |err| {
@@ -672,7 +699,7 @@ test "bash reports a spawn failure as a structured error" {
     const tmp_dir = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     const missing = try std.fs.path.join(allocator, &.{ tmp_dir, "missing" });
 
-    var context: Context = .{};
+    var context: Context = .{ .cwd = tmp_dir };
     const json = try std.fmt.allocPrint(allocator, "{{\"description\":\"Run in a missing directory\",\"command\":\"true\",\"workdir\":\"{s}\"}}", .{missing});
     var parsed = try parse(allocator, json);
     defer parsed.deinit();
@@ -682,4 +709,57 @@ test "bash reports a spawn failure as a structured error" {
         .failure => |failure_result| try testing.expectEqualStrings("SPAWN_FAILED", failure_result.error_info.code),
         .success => return error.ExpectedFailure,
     }
+}
+
+test "bash refuses a workdir outside the workspace unless allowed_paths names it" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // POSIX sh -c execution
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_dir = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    try compat.fs.Dir.wrap(tmp.dir).makeDir("workspace");
+    try compat.fs.Dir.wrap(tmp.dir).makeDir("elsewhere");
+    const workspace = try std.fs.path.join(allocator, &.{ tmp_dir, "workspace" });
+    const elsewhere = try std.fs.path.join(allocator, &.{ tmp_dir, "elsewhere" });
+
+    // Regression: before the policy bridge, bash ran in any model-supplied
+    // directory, including one outside the session workspace.
+    var denied_context: Context = .{ .cwd = workspace };
+    const denied_json = try std.fmt.allocPrint(allocator, "{{\"description\":\"Run elsewhere\",\"command\":\"pwd\",\"workdir\":\"{s}\"}}", .{elsewhere});
+    var denied_args = try parse(allocator, denied_json);
+    defer denied_args.deinit();
+    const denied = try invoke(&denied_context, allocator, denied_args.value);
+    try expectFailureContent(denied, "outside the session workspace");
+    switch (denied) {
+        .failure => |failure_result| try testing.expectEqualStrings("WORKDIR_NOT_ALLOWED", failure_result.error_info.code),
+        .success => return error.ExpectedFailure,
+    }
+
+    var allowed_context: Context = .{ .cwd = workspace, .allowed_paths = &.{elsewhere} };
+    const allowed_json = try std.fmt.allocPrint(allocator, "{{\"description\":\"Run elsewhere\",\"command\":\"pwd\",\"workdir\":\"{s}\"}}", .{elsewhere});
+    var allowed_args = try parse(allocator, allowed_json);
+    defer allowed_args.deinit();
+    const expected = try std.fmt.allocPrint(allocator, "{s}\n", .{elsewhere});
+    try testing.expectEqualStrings(expected, try expectText(try invoke(&allowed_context, allocator, allowed_args.value)));
+}
+
+test "bash scrubs the environment before spawning" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // POSIX sh -c execution
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const name = "DSH_NATIVE_TEST_SECRET";
+    try platform.setProcessEnv(allocator, name, "leaked-secret");
+    defer platform.setProcessEnv(allocator, name, null) catch {};
+
+    var context: Context = .{};
+    var parsed = try parse(allocator, "{\"description\":\"Read the secret\",\"command\":\"echo \\\"${DSH_NATIVE_TEST_SECRET:-unset}\\\"\"}");
+    defer parsed.deinit();
+    // Regression: the dsh bash inherited the host environment, so a model
+    // command could print provider keys and channel tokens.
+    try testing.expectEqualStrings("unset\n", try expectText(try invoke(&context, allocator, parsed.value)));
 }

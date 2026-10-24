@@ -3,9 +3,9 @@
 //!
 //! Model-visible names, descriptions and input schemas come from
 //! `generated/tool_schemas.zig`; result text comes from
-//! `generated/tool_render.zig`. Paths resolve against the session cwd; the
-//! mutating tools additionally refuse a resolved path outside it (approval is
-//! P2, but the containment check is not optional).
+//! `generated/tool_render.zig`. Paths resolve against the session cwd; every
+//! tool refuses a resolved path outside the workspace/allowed_paths boundary
+//! (see `security.zig`), and `dsh_sandbox = read-only` refuses mutations.
 //!
 //! Bounded deviations from dsh, all documented at their sites: `grep` matches
 //! literal text instead of a regex/ripgrep process, file reads buffer the whole
@@ -13,12 +13,13 @@
 //! defaults.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const compat = @import("compat");
 const fs_compat = @import("../../../fs_compat.zig");
+const context_mod = @import("../context.zig");
 const generated = @import("../generated/tool_schemas.zig");
 const render = @import("../generated/tool_render.zig");
 const registry = @import("registry.zig");
+const security_mod = @import("security.zig");
 const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -45,7 +46,15 @@ const vcs_dir_names = [_][]const u8{ ".git", ".svn", ".hg", ".bzr", ".jj", ".sl"
 pub const Builtins = struct {
     cwd: []const u8,
     spill_dir: []const u8,
+    /// `autonomy.allowed_paths`: extra directories the agent may touch.
+    allowed_paths: []const []const u8 = &.{},
+    /// `dsh_sandbox`; `read-only` refuses write/edit.
+    sandbox: context_mod.SandboxMode = .workspace_write,
     spill_seq: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn scope(self: *const Builtins) security_mod.Scope {
+        return .{ .cwd = self.cwd, .allowed_paths = self.allowed_paths, .read_root = self.spill_dir };
+    }
 
     pub const Handlers = struct {
         read: registry.Handler,
@@ -174,6 +183,16 @@ fn fsCodeFor(err: anyerror) []const u8 {
     };
 }
 
+fn outsideDenial(allocator: Allocator, verb: []const u8, path: []const u8) !registry.ToolResult {
+    const text = try std.fmt.allocPrint(allocator, "cannot {s} \"{s}\": resolved path is outside the session working directory", .{ verb, path });
+    return fsFailure(allocator, "FS_SANDBOX_DENIED", text);
+}
+
+fn readOnlyDenial(allocator: Allocator, verb: []const u8, path: []const u8) !registry.ToolResult {
+    const text = try std.fmt.allocPrint(allocator, "cannot {s} \"{s}\": sandbox policy is read-only", .{ verb, path });
+    return fsFailure(allocator, "FS_SANDBOX_DENIED", text);
+}
+
 fn field(args: Value, name: []const u8) ?Value {
     return switch (args) {
         .object => |object| object.get(name),
@@ -221,27 +240,6 @@ fn resolvePath(allocator: Allocator, cwd: []const u8, input: []const u8) ![]u8 {
     return std.fs.path.resolve(allocator, &.{ cwd, input });
 }
 
-/// Windows paths compare case-insensitively; POSIX paths stay byte-exact.
-/// shortcut: ASCII folding only — non-ASCII case pairs wait for the
-/// realpath-based P2 confinement layer.
-fn pathPrefixEqual(a: []const u8, b: []const u8) bool {
-    if (comptime builtin.os.tag == .windows) return std.ascii.eqlIgnoreCase(a, b);
-    return std.mem.eql(u8, a, b);
-}
-
-/// Lexical containment: the resolved path must sit inside the session cwd.
-/// A cwd that is a filesystem root already ends in a separator, so everything
-/// with that root is contained.
-/// shortcut: symlinks inside the cwd can still point outside; realpath-based
-/// confinement belongs to the P2 sandbox/approval layer.
-fn insideCwd(cwd: []const u8, path: []const u8) bool {
-    if (cwd.len == 0 or path.len < cwd.len) return false;
-    if (!pathPrefixEqual(path[0..cwd.len], cwd)) return false;
-    if (path.len == cwd.len) return true;
-    if (std.fs.path.isSep(cwd[cwd.len - 1])) return true;
-    return std.fs.path.isSep(path[cwd.len]);
-}
-
 fn relativeDisplay(allocator: Allocator, cwd: []const u8, absolute: []const u8) ![]const u8 {
     const rel = compat.fs.path.relative(allocator, cwd, absolute) catch return absolute;
     if (rel.len == 0) return ".";
@@ -283,6 +281,9 @@ fn runRead(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const absolute = try resolvePath(allocator, cwd, file_path);
+    if (!try security_mod.readPathAllowed(allocator, self.scope(), file_path)) {
+        return outsideDenial(allocator, "read", absolute);
+    }
     const kind = fileKind(absolute) catch |err| return fsFailureFor(allocator, "read", absolute, err);
     if (kind == null) {
         return fsFailure(allocator, "FS_NOT_FOUND", try std.fmt.allocPrint(allocator, "cannot read \"{s}\": not found", .{absolute}));
@@ -407,8 +408,9 @@ fn runWrite(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRe
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const absolute = try resolvePath(allocator, cwd, file_path);
-    if (!insideCwd(cwd, absolute)) {
-        return fsFailure(allocator, "FS_SANDBOX_DENIED", try std.fmt.allocPrint(allocator, "cannot write \"{s}\": resolved path is outside the session working directory", .{absolute}));
+    if (self.sandbox == .read_only) return readOnlyDenial(allocator, "write", file_path);
+    if (!try security_mod.pathAllowed(allocator, self.scope(), file_path)) {
+        return outsideDenial(allocator, "write", absolute);
     }
 
     const existed = blk: {
@@ -460,8 +462,9 @@ fn runEdit(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const absolute = try resolvePath(allocator, cwd, file_path);
-    if (!insideCwd(cwd, absolute)) {
-        return fsFailure(allocator, "FS_SANDBOX_DENIED", try std.fmt.allocPrint(allocator, "cannot edit \"{s}\": resolved path is outside the session working directory", .{absolute}));
+    if (self.sandbox == .read_only) return readOnlyDenial(allocator, "edit", file_path);
+    if (!try security_mod.pathAllowed(allocator, self.scope(), file_path)) {
+        return outsideDenial(allocator, "edit", absolute);
     }
 
     const file = fs_compat.openPath(absolute, .{}) catch |err| switch (err) {
@@ -631,6 +634,9 @@ fn runGrep(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const root = try resolvePath(allocator, cwd, path_arg orelse ".");
+    if (!try security_mod.readPathAllowed(allocator, self.scope(), root)) {
+        return outsideDenial(allocator, "search", root);
+    }
     const root_kind = fileKind(root) catch |err| return fsFailureFor(allocator, "search", root, err);
     if (root_kind == null) {
         return fsFailure(allocator, "FS_NOT_FOUND", try std.fmt.allocPrint(allocator, "cannot search \"{s}\": not found", .{root}));
@@ -799,6 +805,9 @@ fn runGlob(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const root = try resolvePath(allocator, cwd, path_arg orelse ".");
+    if (!try security_mod.readPathAllowed(allocator, self.scope(), root)) {
+        return outsideDenial(allocator, "search", root);
+    }
     const root_kind = fileKind(root) catch |err| return fsFailureFor(allocator, "search", root, err);
     if (root_kind == null) {
         return fsFailure(allocator, "FS_NOT_FOUND", try std.fmt.allocPrint(allocator, "cannot search \"{s}\": not found", .{root}));
@@ -1303,6 +1312,77 @@ test "write creates parents, reports Created/Updated, and rejects escapes" {
     try testing.expect(std.mem.indexOf(u8, escaped, "outside the session working directory") != null);
 }
 
+test "every builtin refuses paths outside the workspace and allowed_paths" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    const outside_base = try compat.fs.Dir.wrap(outside_tmp.dir).realpathAlloc(arena, ".");
+    const outside_file = try std.fs.path.join(arena, &.{ outside_base, "secret.txt" });
+    const outside_new = try std.fs.path.join(arena, &.{ outside_base, "created.txt" });
+    {
+        const file = try fs_compat.createPath(outside_file, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("needle\n");
+    }
+    _ = try tools.writeFile("inside.txt", "needle\n");
+
+    // Regression: read/grep/glob used to walk any path the model named, and
+    // write/edit only rejected lexical escapes.
+    const read_text = try expectFailure(try callRead(&tools.builtins, arena, try argsFilePath(arena, outside_file)), "FS_SANDBOX_DENIED");
+    try testing.expect(std.mem.indexOf(u8, read_text, "outside the session working directory") != null);
+    _ = try expectFailure(try callWrite(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = outside_new } },
+        .{ "content", .{ .string = "nope" } },
+    })), "FS_SANDBOX_DENIED");
+    try testing.expectError(error.FileNotFound, fs_compat.openPath(outside_new, .{}));
+    _ = try expectFailure(try callEdit(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = outside_file } },
+        .{ "old_string", .{ .string = "needle" } },
+        .{ "new_string", .{ .string = "changed" } },
+    })), "FS_SANDBOX_DENIED");
+    _ = try expectFailure(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "path", .{ .string = outside_base } },
+    })), "FS_SANDBOX_DENIED");
+    _ = try expectFailure(try callGlob(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "*.txt" } },
+        .{ "path", .{ .string = outside_base } },
+    })), "FS_SANDBOX_DENIED");
+    // The workspace itself stays readable/searchable.
+    _ = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, "inside.txt")));
+    _ = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+    })));
+
+    // allowed_paths widens exactly that root.
+    tools.builtins.allowed_paths = &.{outside_base};
+    _ = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, outside_file)));
+    _ = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "path", .{ .string = outside_base } },
+    })));
+
+    // dsh_sandbox = read-only refuses mutations but keeps reads.
+    tools.builtins.sandbox = .read_only;
+    const read_only_text = try expectFailure(try callWrite(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "new.txt" } },
+        .{ "content", .{ .string = "nope" } },
+    })), "FS_SANDBOX_DENIED");
+    try testing.expect(std.mem.indexOf(u8, read_only_text, "read-only") != null);
+    _ = try expectFailure(try callEdit(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "inside.txt" } },
+        .{ "old_string", .{ .string = "needle" } },
+        .{ "new_string", .{ .string = "changed" } },
+    })), "FS_SANDBOX_DENIED");
+    _ = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, "inside.txt")));
+}
+
 test "edit replaces one exact match, reports ambiguity, and rejects bad arguments" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1605,20 +1685,4 @@ test "a path argument anchors grep and glob to a subtree" {
         .{ "path", .{ .string = "sub" } },
     })));
     try testing.expectEqualStrings(inside_path, glob);
-}
-
-test "insideCwd accepts roots and folds case only on Windows" {
-    try testing.expect(insideCwd("/work/proj", "/work/proj"));
-    try testing.expect(insideCwd("/work/proj", "/work/proj/file.txt"));
-    try testing.expect(!insideCwd("/work/proj", "/work/proj2/file.txt"));
-    try testing.expect(!insideCwd("", "/work/proj/file.txt"));
-    // A root cwd already ends in a separator; everything under it is contained.
-    try testing.expect(insideCwd("/", "/tmp/file.txt"));
-    if (comptime builtin.os.tag == .windows) {
-        try testing.expect(insideCwd("C:\\Work\\Proj", "c:\\work\\proj\\file.txt"));
-        try testing.expect(insideCwd("C:\\", "C:\\tmp\\file.txt"));
-        try testing.expect(!insideCwd("C:\\Work\\Proj", "c:\\work\\proj2\\file.txt"));
-    } else {
-        try testing.expect(!insideCwd("/work/proj", "/Work/proj/file.txt"));
-    }
 }

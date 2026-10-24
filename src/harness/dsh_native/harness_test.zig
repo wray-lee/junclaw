@@ -17,6 +17,7 @@ const goal_mod = @import("goal.zig");
 const session_log = @import("session_log.zig");
 const session_store = @import("session_store.zig");
 const types = @import("types.zig");
+const SecurityPolicy = @import("../../security/policy.zig").SecurityPolicy;
 const generated = @import("generated/interaction.zig");
 const generated_system_prompt = @import("generated/system_prompt.zig");
 const tool_schemas = @import("generated/tool_schemas.zig");
@@ -206,6 +207,8 @@ const Fixture = struct {
     question_timeout_s: i32 = 120,
     host_tools: []const bridge.HostTool = &.{},
     host_executor: ?bridge.HostExecutor = null,
+    policy: ?*const SecurityPolicy = null,
+    allowed_paths: []const []const u8 = &.{},
 
     fn init(allocator: Allocator, replies: []const Reply) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -261,6 +264,8 @@ const Fixture = struct {
             .question_timeout_s = self.question_timeout_s,
             .host_tools = self.host_tools,
             .host_executor = self.host_executor,
+            .policy = self.policy,
+            .allowed_paths = self.allowed_paths,
         };
     }
 
@@ -2271,4 +2276,90 @@ test "dsh-native adapter: bridged tool fails closed without an interaction chann
         saw_result = true;
     }
     try testing.expect(saw_result);
+}
+
+test "dsh-native adapter: junclaw policy denies out-of-workspace reads and high-risk commands" {
+    const allocator = testing.allocator;
+    // The allowlist is checked before the risk tier, so `rm` must be allowed
+    // explicitly for the high-risk branch to be the one under test.
+    const policy = SecurityPolicy{ .allowed_commands = &.{ "rm", "ls", "cat" } };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{
+            .{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"../outside.txt\"}" },
+            .{ .id = "call-2", .name = "bash", .arguments = "{\"description\":\"remove\",\"command\":\"rm -rf /tmp/dsh-p3-policy-nope\"}" },
+        } },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.policy = &policy;
+    // Fixture.workspace is `<root>/workspace`, so this file is outside it.
+    const outside = try std.fs.path.join(allocator, &.{ fx.root, "outside.txt" });
+    defer allocator.free(outside);
+    {
+        const file = try fs_compat.createPath(outside, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("secret\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("probe"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    // Regression: before the policy bridge, dsh read could open any path and
+    // dsh bash ran any command the model asked for.
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    const feedback = fx.provider.requests.items[1];
+    try testing.expect(requestContains(feedback, "outside the session working directory"));
+    try testing.expect(requestContains(feedback, "High-risk command blocked by security policy"));
+}
+
+test "dsh-native adapter: read-only autonomy denies dsh tool calls" {
+    const allocator = testing.allocator;
+    const policy = SecurityPolicy{ .autonomy = .read_only };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"note.txt\"}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.policy = &policy;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("probe"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    // Regression: dsh tool calls used to bypass junclaw autonomy entirely, so
+    // a read_only agent could still run tools through the dsh engine.
+    try testing.expect(requestContains(fx.provider.requests.items[1], "read-only mode"));
+}
+
+test "dsh-native adapter: /permission read-only reaches the file tools" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "ready" },
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "write", .arguments = "{\"file_path\":\"blocked.txt\",\"content\":\"x\"}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    // Regression: `/permission` only rewrote the prompt and the JSONL; the
+    // file tools kept accepting writes.
+    _ = (try h.handleLocalCommand("/permission read-only")) orelse return error.CommandNotClaimed;
+    const result = try h.runTurn(turnInput("write"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(@as(usize, 3), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[2], "sandbox policy is read-only"));
+
+    const written = try std.fs.path.join(allocator, &.{ fx.workspace, "blocked.txt" });
+    defer allocator.free(written);
+    try testing.expectError(error.FileNotFound, fs_compat.openPath(written, .{}));
 }

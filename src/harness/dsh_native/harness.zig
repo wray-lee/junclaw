@@ -54,6 +54,8 @@ const registry = @import("tools/registry.zig");
 const bridge = @import("tools/bridge.zig");
 const builtins_mod = @import("tools/builtins.zig");
 const bash_mod = @import("tools/bash.zig");
+const security_mod = @import("tools/security.zig");
+const SecurityPolicy = @import("../../security/policy.zig").SecurityPolicy;
 const goal_mod = @import("goal.zig");
 const goal_command_mod = @import("goal_command.zig");
 const goal_rounds = @import("goal_rounds.zig");
@@ -94,6 +96,11 @@ pub const Options = struct {
     persona: []const u8 = "",
     approval_policy: config_types.DshApprovalPolicy = .ask,
     sandbox: config_types.DshSandbox = .workspace_write,
+    /// junclaw SecurityPolicy: autonomy (read-only), the per-call rate limit,
+    /// and bash command risk. Null keeps the engine's own behavior.
+    policy: ?*const SecurityPolicy = null,
+    /// `autonomy.allowed_paths`: extra roots for the file and bash tools.
+    allowed_paths: []const []const u8 = &.{},
     max_parallel_tools: usize = config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS,
     on_corrupt: config_types.DshOnCorrupt = .fail,
     /// Routed model capacity for dsh proactive compaction. Zero disables the
@@ -306,12 +313,21 @@ pub const DshNativeHarness = struct {
 
         const builtins = try self.allocator.create(builtins_mod.Builtins);
         errdefer self.allocator.destroy(builtins);
-        builtins.* = .{ .cwd = dir, .spill_dir = self.spill_dir };
+        builtins.* = .{
+            .cwd = dir,
+            .spill_dir = self.spill_dir,
+            .allowed_paths = self.opts.allowed_paths,
+            .sandbox = self.sandboxMode(),
+        };
         try builtins.register(&self.registry, self.allocator);
 
         const bash = try self.allocator.create(bash_mod.Context);
         errdefer self.allocator.destroy(bash);
-        bash.* = .{ .cwd = dir, .spill_dir = self.spill_dir };
+        bash.* = .{
+            .cwd = dir,
+            .spill_dir = self.spill_dir,
+            .allowed_paths = self.opts.allowed_paths,
+        };
         try self.registry.register(self.allocator, .{
             .name = generated.bash.name,
             .description = generated.bash.description,
@@ -500,6 +516,7 @@ pub const DshNativeHarness = struct {
         self.plan_session.* = .{};
         if (self.todo) |ctx| ctx.log = null;
         self.applyApprovalPolicy(null);
+        self.syncToolSandbox();
         self.compaction_lock = .{};
         self.last_usage = null;
         // A fresh or reopened session starts its counters at 1; `restore`
@@ -697,6 +714,7 @@ pub const DshNativeHarness = struct {
         }
         self.permission_state = commands_mod.PermissionState.fold(events);
         self.applyApprovalPolicy(self.permission_state.approval);
+        self.syncToolSandbox();
         try self.buildPrompt();
         self.compaction_lock = compaction_mod.scanLock(events);
         self.surface_seqs.clearRetainingCapacity();
@@ -1748,6 +1766,12 @@ pub const DshNativeHarness = struct {
         };
     }
 
+    /// Push the folded sandbox mode into the file tools, so `/permission` and
+    /// resume change enforcement rather than only the prompt sentence.
+    fn syncToolSandbox(self: *Self) void {
+        if (self.builtins) |builtins| builtins.sandbox = self.sandboxMode();
+    }
+
     fn approvalPolicy(self: *const Self) context.ApprovalPolicy {
         return switch (self.approval.options.policy) {
             .ask => .ask,
@@ -1783,6 +1807,26 @@ pub const DshNativeHarness = struct {
         args: Value,
     ) anyerror!?[]const u8 {
         const self = selfOf(context_ptr);
+        // junclaw policy parity with `Agent.executeTool` + `ShellTool.execute`:
+        // every dsh tool call is inside the autonomy/rate boundary, and bash
+        // commands additionally pass the native command-risk policy.
+        if (self.opts.policy) |policy| {
+            if (security_mod.autonomyDenial(policy)) |reason| return reason;
+            if (security_mod.rateLimitDenial(policy)) |reason| return reason;
+            if (std.mem.eql(u8, call.name, generated.bash.name)) {
+                switch (args) {
+                    .object => |object| {
+                        if (object.get("command")) |command| switch (command) {
+                            .string => |text| {
+                                if (security_mod.commandDenial(policy, text)) |reason| return reason;
+                            },
+                            else => {},
+                        };
+                    },
+                    else => {},
+                }
+            }
+        }
         if (self.ask_user) |ask| {
             ask.call_id = call.id;
             ask.interaction = self.interaction;
@@ -1935,6 +1979,7 @@ pub const DshNativeHarness = struct {
         if (delta.approval) |approval| self.permission_state.approval = approval;
         if (delta.sandbox == null and delta.approval == null) return;
         self.applyApprovalPolicy(self.permission_state.approval);
+        self.syncToolSandbox();
         try self.buildPrompt();
     }
 
