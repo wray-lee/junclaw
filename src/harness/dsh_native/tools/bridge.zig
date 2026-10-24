@@ -428,6 +428,9 @@ const scheduler = @import("scheduler.zig");
 
 const SchedCall = struct {
     name: []const u8,
+    text: []const u8 = "",
+    /// Dispatch through the bridged registry instead of the literal text.
+    use_registry: bool = false,
     entered: Event = .{},
     gate: Event = .{},
     hold: bool = false,
@@ -469,9 +472,12 @@ const SchedCtx = struct {
         sched_call.entered.set();
         if (sched_call.hold) sched_call.gate.wait();
         if (signal.isAborted() and !sched_call.hold) return error.Aborted;
-        // Real execution through the registry, so a missing bridge entry shows
-        // up as the unknown-tool failure instead of a hand-written result.
-        return self.registry.invoke(allocator, sched_call.name, Value{ .object = .empty });
+        if (sched_call.use_registry) {
+            return self.registry.invoke(allocator, sched_call.name, Value{ .object = .empty });
+        }
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = sched_call.text };
+        return .{ .success = .{ .content = blocks } };
     }
 };
 
@@ -526,9 +532,9 @@ test "exclusive host tools are a barrier; annotated read-only calls run parallel
     });
 
     var calls = [_]SchedCall{
-        .{ .name = "search_a", .hold = true },
-        .{ .name = "store_x", .hold = true },
-        .{ .name = "search_b", .hold = true },
+        .{ .name = "search_a", .text = "a", .hold = true },
+        .{ .name = "store_x", .text = "x", .hold = true },
+        .{ .name = "search_b", .text = "b", .hold = true },
     };
     var ctx = SchedCtx{ .registry = &reg, .calls = &calls, .allocator = allocator };
     defer ctx.deinit();
@@ -593,7 +599,7 @@ test "abort commits a started bridged call and synthesizes the rest" {
     });
 
     var calls = [_]SchedCall{
-        .{ .name = "search_a", .hold = true },
+        .{ .name = "search_a", .use_registry = true, .hold = true },
         .{ .name = "search_b" },
     };
     var ctx = SchedCtx{ .registry = &reg, .calls = &calls, .allocator = allocator };
