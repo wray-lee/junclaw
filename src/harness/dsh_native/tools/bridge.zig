@@ -396,12 +396,14 @@ test "bridge truncates long output to the dsh cap with a spill file" {
     const result = try @import("execute.zig").execute(&reg, arena.allocator(), callNamed("web_fetch"));
     try testing.expect(!result.isError());
     const text = textOf(result.content()[0]);
-    try testing.expect(text.len <= bash.max_output_bytes + 120);
     const marker = "[output truncated; full output: ";
     try testing.expect(std.mem.indexOf(u8, text, marker) != null);
 
     const from = std.mem.indexOf(u8, text, marker).? + marker.len;
     const to = std.mem.indexOfScalarPos(u8, text, from, ']').?;
+    // Exact notice length: tail + newline + marker + real spill path + "]".
+    // Regression: a fixed +120 slack failed when the checkout path got longer.
+    try testing.expectEqual(bash.max_output_bytes + marker.len + 2 + (to - from), text.len);
     const spill = try compat.fs.openFileAbsolute(text[from..to], .{});
     defer spill.close();
     try testing.expectEqual(@as(u64, bash.max_output_bytes + 4096), (try spill.stat()).size);
