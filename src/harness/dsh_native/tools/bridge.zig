@@ -291,6 +291,7 @@ test "bridge shadows dsh tools and junclaw equivalents" {
     const specs = [_]HostTool{
         .{ .name = "web_search", .description = "search", .input_schema_json = "{\"type\":\"object\"}" },
         .{ .name = "read", .description = "shadowed", .input_schema_json = "{}" },
+        .{ .name = "bash", .description = "shadowed", .input_schema_json = "{}" },
         .{ .name = "file_read", .description = "equivalent", .input_schema_json = "{}" },
         .{ .name = "shell", .description = "equivalent", .input_schema_json = "{}" },
         .{ .name = "web_search", .description = "duplicate", .input_schema_json = "{}" },
@@ -305,8 +306,9 @@ test "bridge shadows dsh tools and junclaw equivalents" {
     try testing.expect(reg.get("web_search") != null);
     try testing.expect(reg.get("file_read") == null);
     try testing.expect(reg.get("shell") == null);
-    // dsh's own name still resolves to the dsh entry.
+    // dsh's own names still resolve to the dsh entries.
     try testing.expect(reg.get("read").?.handler.call == fakeHandler);
+    try testing.expect(reg.get("bash").?.handler.call == fakeHandler);
 }
 
 test "bridge executes host success and failure through the registry" {

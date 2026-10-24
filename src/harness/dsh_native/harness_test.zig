@@ -2178,7 +2178,12 @@ test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
         .{ .text = "done" },
     });
     defer fx.deinit();
-    fx.host_tools = &.{.{ .name = "web_search", .description = "Search the web for pages", .input_schema_json = search_schema, .concurrency_safe = true }};
+    fx.host_tools = &.{
+        .{ .name = "web_search", .description = "Search the web for pages", .input_schema_json = search_schema, .concurrency_safe = true },
+        // A host tool may not shadow a dsh tool, even one registered later in
+        // buildTools (the bridge registers after all dsh tools for this).
+        .{ .name = "bash", .description = "shadowed bash", .input_schema_json = "{}" },
+    };
     fx.host_executor = fake.executor();
 
     var engine = try fx.harness();
@@ -2194,6 +2199,12 @@ test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
         try testing.expectEqualStrings(search_schema, schema.parameters_json);
     }
     try testing.expect(found);
+    // Regression: the bridge used to register before dsh's bash, so a host
+    // "bash" shadowed the dsh tool in the model-visible catalog.
+    for (engine.tool_schemas) |schema| {
+        if (!std.mem.eql(u8, schema.name, tool_schemas.bash.name)) continue;
+        try testing.expectEqualStrings(tool_schemas.bash.description, schema.description);
+    }
 
     const result = try h.runTurn(turnInput("search"));
     defer allocator.free(result.reply);

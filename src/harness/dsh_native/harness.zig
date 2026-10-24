@@ -308,12 +308,6 @@ pub const DshNativeHarness = struct {
         builtins.* = .{ .cwd = dir, .spill_dir = self.spill_dir };
         try builtins.register(&self.registry, self.allocator);
 
-        const host_names = try bridge.register(perm, self.allocator, &self.registry, .{
-            .tools = self.opts.host_tools,
-            .executor = self.opts.host_executor,
-            .spill_dir = self.spill_dir,
-        });
-
         const bash = try self.allocator.create(bash_mod.Context);
         errdefer self.allocator.destroy(bash);
         bash.* = .{ .cwd = dir, .spill_dir = self.spill_dir };
@@ -355,6 +349,13 @@ pub const DshNativeHarness = struct {
         self.goal_store = goal_store;
         self.goal_tools = goal_context;
         self.goal_driver = .{ .store = goal_store };
+
+        // Register after every dsh tool so the dedupe check sees them all.
+        const host_names = try bridge.register(perm, self.allocator, &self.registry, .{
+            .tools = self.opts.host_tools,
+            .executor = self.opts.host_executor,
+            .spill_dir = self.spill_dir,
+        });
 
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
         for (registry.core_schemas) |schema| try names.append(perm, schema.name);
