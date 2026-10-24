@@ -247,11 +247,19 @@ pub const Compacted = struct {
 /// Expected manual-compaction failures (`ManualCompactionErrorCode`).
 pub const CompactFailure = enum { busy, cancelled, changed, summary, commit, persistence };
 
+/// A failure plus the failed transaction already written for it. `events` is
+/// the `compaction/start` + `compaction/end{error}` pair when summarization
+/// began; it is empty when nothing was recorded (`busy`).
+pub const CompactFailureOutcome = struct {
+    failure: CompactFailure,
+    events: []const types.Event = &.{},
+};
+
 pub const CompactOutcome = union(enum) {
     /// No safe useful range exists; append nothing.
     no_history,
     compacted: Compacted,
-    failed: CompactFailure,
+    failed: CompactFailureOutcome,
 };
 
 pub const Compaction = struct {
@@ -418,7 +426,11 @@ fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Se
 
     return switch (outcome) {
         .no_history => .{ .kind = .success, .text = "No compactable history yet." },
-        .failed => |failure| .{ .kind = .@"error", .text = failureText(failure) },
+        .failed => |failure| .{
+            .kind = .@"error",
+            .text = failureText(failure.failure, failure.events.len != 0),
+            .domain = failure.events,
+        },
         .compacted => |compacted| {
             if (compacted.events.len == 0 or compacted.summary_event_index >= compacted.events.len or
                 !std.mem.eql(u8, compacted.events[compacted.summary_event_index].event_type, "compaction/summary"))
@@ -444,12 +456,18 @@ fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Se
     };
 }
 
-fn failureText(failure: CompactFailure) []const u8 {
+fn failureText(failure: CompactFailure, recorded: bool) []const u8 {
     return switch (failure) {
         .busy => "Compaction is unavailable because this process has an active compaction, or the agent is not idle.",
         .cancelled => "Compaction cancelled.",
-        .changed => "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log.",
-        .summary => "Compaction could not produce a useful summary. The attempt is recorded in the session log.",
+        .changed => if (recorded)
+            "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log."
+        else
+            "The history selected for compaction changed before it could be replaced.",
+        .summary => if (recorded)
+            "Compaction could not produce a useful summary. The attempt is recorded in the session log."
+        else
+            "Compaction could not produce a useful summary.",
         .commit => "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying.",
         .persistence => "Compaction finished, but the session could not be saved.",
     };
@@ -641,7 +659,7 @@ fn expectUnclaimed(line: []const u8) !void {
 const CompactStub = struct {
     calls: usize = 0,
     seen_command_id: ?[]const u8 = null,
-    scenario: enum { history, no_history, failed, thrown, malformed } = .history,
+    scenario: enum { history, no_history, failed, failed_recorded, thrown, malformed } = .history,
     failure: CompactFailure = .busy,
 
     fn seam(self: *CompactStub) Compaction {
@@ -655,12 +673,30 @@ const CompactStub = struct {
         return switch (self.scenario) {
             .history => .{ .compacted = try transaction(allocator, 1) },
             .no_history => .no_history,
-            .failed => .{ .failed = self.failure },
+            .failed => .{ .failed = .{ .failure = self.failure } },
+            .failed_recorded => .{ .failed = .{
+                .failure = .summary,
+                .events = try failureTransaction(allocator),
+            } },
             .thrown => error.HostFailure,
             .malformed => .{ .compacted = try transaction(allocator, 9) },
         };
     }
 };
+
+fn failureTransaction(allocator: Allocator) ![]const types.Event {
+    const event_types = [_][]const u8{ "compaction/start", "compaction/end" };
+    const events = try allocator.alloc(types.Event, event_types.len);
+    for (events, 0..) |*event, index| {
+        event.* = .{
+            .event_type = event_types[index],
+            .seq = 0,
+            .time_ms = 0,
+            .data = .{ .integer = @intCast(index) },
+        };
+    }
+    return events;
+}
 
 fn transaction(allocator: Allocator, summary_index: usize) !Compacted {
     const event_types = [_][]const u8{
@@ -747,11 +783,11 @@ test "/compact renders every expected manual-compaction failure" {
         .{ .failure = .cancelled, .text = "Compaction cancelled." },
         .{
             .failure = .changed,
-            .text = "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log.",
+            .text = "The history selected for compaction changed before it could be replaced.",
         },
         .{
             .failure = .summary,
-            .text = "Compaction could not produce a useful summary. The attempt is recorded in the session log.",
+            .text = "Compaction could not produce a useful summary.",
         },
         .{
             .failure = .commit,
@@ -771,6 +807,22 @@ test "/compact renders every expected manual-compaction failure" {
         try std.testing.expectEqual(Kind.@"error", result.kind);
         try std.testing.expectEqualStrings(case.text, result.text);
     }
+}
+
+test "/compact settles a recorded failure between the lifecycle pair" {
+    var stub = CompactStub{ .scenario = .failed_recorded };
+    var result = try claimed("/compact", .{ .command_id = "cmd-4b", .compaction = stub.seam() });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{
+        "command/run",
+        "compaction/start",
+        "compaction/end",
+        "command/done",
+    });
+    try assertLifecycle(result.events);
+    try std.testing.expectEqual(Kind.@"error", result.kind);
+    try std.testing.expectEqualStrings(failureText(.summary, true), result.text);
 }
 
 test "/compact keeps the lifecycle pair when the seam throws" {

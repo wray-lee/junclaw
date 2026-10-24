@@ -466,6 +466,10 @@ pub const DshNativeHarness = struct {
         self.applyApprovalPolicy(null);
         self.compaction_lock = .{};
         self.last_usage = null;
+        // A fresh or reopened session starts its counters at 1; `restore`
+        // then seeds them past the ids already in the log.
+        self.next_id = 1;
+        self.approval.next_id = 1;
         self.session_id = "";
         self.last_assistant_text = null;
         self.total_tokens = 0;
@@ -534,6 +538,7 @@ pub const DshNativeHarness = struct {
         for (read.events) |event| {
             if (std.mem.eql(u8, event.event_type, "permission/preset")) self.context_written = true;
         }
+        self.seedIds(read.events);
         try self.rebuildSurface(read.events, arena);
         if (self.goal_store) |store| store.rebuild(read.events) catch |err| {
             // Same policy as a corrupt log: a projection the log cannot
@@ -684,6 +689,51 @@ pub const DshNativeHarness = struct {
         const loaded = try session_store.loadMapping(self.allocator, path) orelse return null;
         defer self.allocator.free(loaded);
         return try arena.dupe(u8, loaded);
+    }
+
+    /// Move the in-process counters past every id the restored log already
+    /// used, so a resumed session never mints a duplicate command, message,
+    /// compaction or approval id.
+    fn seedIds(self: *Self, events: []const types.Event) void {
+        for (events) |event| self.seedIdsFromValue(event.data);
+    }
+
+    fn seedIdsFromValue(self: *Self, value: std.json.Value) void {
+        switch (value) {
+            .object => |object| {
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "id") or
+                        std.mem.eql(u8, key, "commandId") or
+                        std.mem.eql(u8, key, "compactionId") or
+                        std.mem.eql(u8, key, "sourceCommandId"))
+                    {
+                        if (entry.value_ptr.* == .string) self.seedId(entry.value_ptr.string);
+                    }
+                    self.seedIdsFromValue(entry.value_ptr.*);
+                }
+            },
+            .array => |array| for (array.items) |item| self.seedIdsFromValue(item),
+            else => {},
+        }
+    }
+
+    fn seedId(self: *Self, id: []const u8) void {
+        const counters = [_]struct { prefix: []const u8, next: *u64 }{
+            .{ .prefix = "msg-", .next = &self.next_id },
+            .{ .prefix = "command-", .next = &self.next_id },
+            .{ .prefix = "compaction-checkpoint-", .next = &self.next_id },
+            .{ .prefix = "compaction-", .next = &self.next_id },
+            .{ .prefix = "approval-", .next = &self.approval.next_id },
+        };
+        for (counters) |counter| {
+            if (!std.mem.startsWith(u8, id, counter.prefix)) continue;
+            const number = std.fmt.parseInt(u64, id[counter.prefix.len..], 10) catch continue;
+            if (number == std.math.maxInt(u64)) return;
+            if (number >= counter.next.*) counter.next.* = number + 1;
+            return;
+        }
     }
 
     /// `{session_dir}/{Wyhash(session_key)}.json`, the sidecar's format.
@@ -1890,15 +1940,33 @@ pub const DshNativeHarness = struct {
         return self.compactAuto(allocator, .context_overflow, position.turn);
     }
 
+    const CompactRun = union(enum) {
+        result: compaction_mod.Result,
+        /// Summarization began (dsh's `compaction/start` would be durable) and
+        /// failed; `events` is the start/end{error} pair to record.
+        failed: struct {
+            events: []const compaction_mod.Event,
+            err: anyerror,
+        },
+    };
+
     fn compactAuto(self: *Self, allocator: Allocator, trigger: compaction_mod.Trigger, turn: u64) anyerror!bool {
-        var result = self.compactRun(allocator, trigger, turn) catch |err| switch (err) {
+        var run = self.compactRun(allocator, trigger, turn) catch |err| switch (err) {
             error.CompactionLocked => return false,
             else => return err,
         };
-        defer result.deinit();
-        if (result.events.len == 0 and result.pruned.len == 0) return false;
-        try self.commitCompaction(result, null);
-        return true;
+        switch (run) {
+            .failed => |failure| {
+                try self.appendCompactionFailure(self.arena.allocator(), failure.events, null);
+                return failure.err;
+            },
+            .result => |*result| {
+                defer result.deinit();
+                if (result.events.len == 0 and result.pruned.len == 0) return false;
+                try self.commitCompaction(result.*, null);
+                return true;
+            },
+        }
     }
 
     fn compactRun(
@@ -1906,7 +1974,7 @@ pub const DshNativeHarness = struct {
         allocator: Allocator,
         trigger: compaction_mod.Trigger,
         turn: ?u64,
-    ) !compaction_mod.Result {
+    ) !CompactRun {
         var tmp = std.heap.ArenaAllocator.init(allocator);
         defer tmp.deinit();
         const nodes = try self.surfaceNodes(tmp.allocator());
@@ -1914,7 +1982,8 @@ pub const DshNativeHarness = struct {
         self.next_id += 1;
         const replacement_id = try std.fmt.allocPrint(allocator, "compaction-checkpoint-{d}", .{self.next_id});
         self.next_id += 1;
-        return compaction_mod.run(allocator, nodes, .{
+        var started = false;
+        const result = compaction_mod.run(allocator, nodes, .{
             .context_window = self.opts.context_window,
             .policy = self.compactionPolicy(),
             .reserved_completion_tokens = self.reservedCompletionTokens(),
@@ -1925,7 +1994,14 @@ pub const DshNativeHarness = struct {
             .replacement_message_id = replacement_id,
             .turn = turn,
             .tools = self.tool_schemas,
-        }, .{ .context = @ptrCast(self), .call = summarizeCompaction });
+            .started = &started,
+        }, .{ .context = @ptrCast(self), .call = summarizeCompaction }) catch |err| {
+            // Before the summarizer ran dsh has written no `compaction/start`.
+            if (!started or err == error.OutOfMemory) return err;
+            const events = try compaction_mod.failureEvents(allocator, compaction_id, turn, @errorName(err));
+            return .{ .failed = .{ .events = events, .err = err } };
+        };
+        return .{ .result = result };
     }
 
     /// dsh's cache-reusing auxiliary call (`summarizer.ts:120-170`): replay the
@@ -2097,7 +2173,7 @@ pub const DshNativeHarness = struct {
             .event_type = "compaction/start",
             .seq = 0,
             .time_ms = 0,
-            .data = try compactionEdgeData(allocator, start.compaction_id, start.turn, command_id),
+            .data = try compactionEdgeData(allocator, start.compaction_id, start.turn, command_id, null),
         };
         events[1] = .{
             .event_type = "compaction/summary",
@@ -2128,9 +2204,52 @@ pub const DshNativeHarness = struct {
             .event_type = "compaction/end",
             .seq = 0,
             .time_ms = 0,
-            .data = try compactionEdgeData(allocator, end.compaction_id, end.turn, command_id),
+            .data = try compactionEdgeData(allocator, end.compaction_id, end.turn, command_id, end.failure),
         };
         return events;
+    }
+
+    /// The two log rows of a failed transaction, in log order.
+    fn buildCompactionFailureEvents(
+        self: *Self,
+        allocator: Allocator,
+        events: []const compaction_mod.Event,
+        command_id: ?[]const u8,
+    ) ![]types.Event {
+        _ = self;
+        if (events.len != 2) return error.CompactionEventsNotAdjacent;
+        const start = switch (events[0]) {
+            .start => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const end = switch (events[1]) {
+            .end => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const out = try allocator.alloc(types.Event, 2);
+        out[0] = .{
+            .event_type = "compaction/start",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, start.compaction_id, start.turn, command_id, null),
+        };
+        out[1] = .{
+            .event_type = "compaction/end",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, end.compaction_id, end.turn, command_id, end.failure),
+        };
+        return out;
+    }
+
+    fn appendCompactionFailure(
+        self: *Self,
+        allocator: Allocator,
+        events: []const compaction_mod.Event,
+        command_id: ?[]const u8,
+    ) !void {
+        const rows = try self.buildCompactionFailureEvents(allocator, events, command_id);
+        for (rows) |row| _ = try self.appendEvent(row.event_type, row.data, null, null);
     }
 
     fn compactionEdgeData(
@@ -2138,10 +2257,12 @@ pub const DshNativeHarness = struct {
         compaction_id: []const u8,
         turn: ?u64,
         command_id: ?[]const u8,
+        failure: ?[]const u8,
     ) !Value {
         var object: std.json.ObjectMap = .empty;
         try object.put(allocator, "compactionId", .{ .string = compaction_id });
         if (command_id) |value| try object.put(allocator, "sourceCommandId", .{ .string = value });
+        if (failure) |value| try object.put(allocator, "error", .{ .string = value });
         try object.put(allocator, "turn", if (turn) |value|
             Value{ .integer = @intCast(value) }
         else
@@ -2203,38 +2324,46 @@ pub const DshNativeHarness = struct {
         command: commands_mod.CompactRequest,
     ) anyerror!commands_mod.CompactOutcome {
         const self = selfOf(context_ptr.?);
-        var result = self.compactRun(allocator, .manual, null) catch |err| switch (err) {
-            error.CompactionLocked => return .{ .failed = .busy },
+        var run = self.compactRun(allocator, .manual, null) catch |err| switch (err) {
+            error.CompactionLocked => return .{ .failed = .{ .failure = .busy } },
             error.OutOfMemory => return err,
-            else => return .{ .failed = .summary },
+            else => return .{ .failed = .{ .failure = .summary } },
         };
-        defer result.deinit();
-        if (result.events.len == 0) return .no_history;
-        try compaction_mod.assertAdjacent(result.events);
-        const summary = switch (result.events[1]) {
-            .summary => |value| value,
-            else => return error.CompactionEventsNotAdjacent,
-        };
-        // Domain events follow `command/run`; dsh's checkpoint records the
-        // start and summary seqs before the shadowed range.
-        const prefix: ?[]const u64 = if (command.next_seq) |first| blk: {
-            const head = try allocator.alloc(u64, 2);
-            head[0] = first + 1;
-            head[1] = first + 2;
-            break :blk head;
-        } else null;
-        const events = try self.buildCompactionEvents(allocator, result, command.command_id, .{
-            .start_seq = summary.shadowed_start_seq,
-            .end_seq = summary.shadowed_end_seq,
-            .seqs = summary.shadowed_seqs,
-        }, prefix);
-        for (events) |*event| event.data = try cloneValue(allocator, event.data);
-        return .{ .compacted = .{
-            .events = events,
-            .shadowed_item_count = summary.shadowed_seqs.len,
-            .shadowed_token_count = summary.shadowed_token_count,
-            .summary_event_index = 1,
-        } };
+        switch (run) {
+            .failed => |failure| return .{ .failed = .{
+                .failure = .summary,
+                .events = try self.buildCompactionFailureEvents(allocator, failure.events, command.command_id),
+            } },
+            .result => |*result| {
+                defer result.deinit();
+                if (result.events.len == 0) return .no_history;
+                try compaction_mod.assertAdjacent(result.events);
+                const summary = switch (result.events[1]) {
+                    .summary => |value| value,
+                    else => return error.CompactionEventsNotAdjacent,
+                };
+                // Domain events follow `command/run`; dsh's checkpoint records the
+                // start and summary seqs before the shadowed range.
+                const prefix: ?[]const u64 = if (command.next_seq) |first| blk: {
+                    const head = try allocator.alloc(u64, 2);
+                    head[0] = first + 1;
+                    head[1] = first + 2;
+                    break :blk head;
+                } else null;
+                const events = try self.buildCompactionEvents(allocator, result.*, command.command_id, .{
+                    .start_seq = summary.shadowed_start_seq,
+                    .end_seq = summary.shadowed_end_seq,
+                    .seqs = summary.shadowed_seqs,
+                }, prefix);
+                for (events) |*event| event.data = try cloneValue(allocator, event.data);
+                return .{ .compacted = .{
+                    .events = events,
+                    .shadowed_item_count = summary.shadowed_seqs.len,
+                    .shadowed_token_count = summary.shadowed_token_count,
+                    .summary_event_index = 1,
+                } };
+            },
+        }
     }
 
     fn toolOutputText(allocator: Allocator, result: registry.ToolResult) ![]const u8 {

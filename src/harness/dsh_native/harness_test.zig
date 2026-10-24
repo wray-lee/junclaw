@@ -33,6 +33,10 @@ const Reply = struct {
     /// The provider aborts the running turn from inside `chat`, which is how a
     /// `/stop` reaches a blocking provider.
     abort: bool = false,
+    /// The call fails; compaction's summarizer propagates this.
+    fail: bool = false,
+    /// The call reports provider-confirmed context overflow.
+    overflow: bool = false,
 };
 
 const FakeProvider = struct {
@@ -98,6 +102,8 @@ const FakeProvider = struct {
         const reply = self.replies[self.next];
         self.next += 1;
         if (self.on_call) |hook| hook(self.call_context.?);
+        if (reply.fail) return error.ScriptedFailure;
+        if (reply.overflow) return error.ContextLengthExceeded;
         if (reply.abort) {
             // The adapter aborts its own loop; this test seam reaches it
             // through the provider the same way a `/stop` would.
@@ -1387,6 +1393,171 @@ test "dsh-native adapter: restore folds a compacted surface" {
     const checkpoint = restored.messages.items[1];
     try testing.expectEqual(types.MessageRole.user, checkpoint.role);
     try testing.expect(messageContains(checkpoint, "condensed history"));
+}
+
+test "dsh-native adapter: a failed manual summary records the failure transaction" {
+    // Regression: a summarize failure returned before any compaction event was
+    // written, while the /compact settlement said the attempt was recorded.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "first" },
+        .{ .fail = true },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("first"));
+    defer allocator.free(first.reply);
+    const settlement = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+    try testing.expect(std.mem.indexOf(u8, settlement, "attempt is recorded in the session log") != null);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.arena.deinit();
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/start"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/end"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "compaction/summary"));
+    const start_index = eventIndex(read.events, "compaction/start", 0) orelse return error.TestUnexpectedResult;
+    const end_index = eventIndex(read.events, "compaction/end", start_index + 1) orelse return error.TestUnexpectedResult;
+    const run_index = eventIndex(read.events, "command/run", 0) orelse return error.TestUnexpectedResult;
+    const done_index = eventIndex(read.events, "command/done", end_index + 1) orelse return error.TestUnexpectedResult;
+    try testing.expect(run_index < start_index);
+    try testing.expect(end_index < done_index);
+    const start_data = read.events[start_index].data.object;
+    const end_data = read.events[end_index].data.object;
+    try testing.expectEqualStrings(
+        start_data.get("compactionId").?.string,
+        end_data.get("compactionId").?.string,
+    );
+    try testing.expectEqualStrings("ScriptedFailure", end_data.get("error").?.string);
+    try testing.expect(end_data.get("sourceCommandId") != null);
+}
+
+test "dsh-native adapter: a failed automatic summary records the failure transaction" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "a" },
+        // The request overflows, the forced compaction's summary then fails.
+        .{ .overflow = true },
+        .{ .fail = true },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("first"));
+    defer allocator.free(first.reply);
+    try testing.expectError(error.ScriptedFailure, h.runTurn(turnInput("second")));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.arena.deinit();
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/start"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/end"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "compaction/summary"));
+    const end_index = eventIndex(read.events, "compaction/end", 0) orelse return error.TestUnexpectedResult;
+    const end_data = read.events[end_index].data.object;
+    try testing.expectEqualStrings("ScriptedFailure", end_data.get("error").?.string);
+    try testing.expectEqual(@as(i64, 2), end_data.get("turn").?.integer);
+    try testing.expect(end_data.get("sourceCommandId") == null);
+}
+
+/// Highest `prefix<digits>` counter anywhere in the raw log text.
+fn maxCounterSuffix(text: []const u8, prefix: []const u8) !u64 {
+    var max: u64 = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, prefix)) |found| {
+        var end = found + prefix.len;
+        while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
+        if (end > found + prefix.len) {
+            const value = std.fmt.parseInt(u64, text[found + prefix.len .. end], 10) catch 0;
+            if (value > max) max = value;
+        }
+        index = @max(end, found + 1);
+    }
+    return max;
+}
+
+test "dsh-native adapter: restore seeds ids past the session log" {
+    // Regression: ids are process-local counters, so a resumed session minted
+    // command-1, compaction-1 and approval-1 again instead of continuing past
+    // the ids already in the log.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    const big = try allocator.alloc(u8, 2_000);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    const first_text = try std.fmt.allocPrint(allocator, "marker {s}", .{big});
+    defer allocator.free(first_text);
+    const bash_args =
+        "{\"description\":\"d\",\"command\":\"echo hi\"," ++
+        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "condensed history" },
+        .{ .text = "", .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = bash_args }} },
+        .{ .text = "done" },
+        // The restored session continues with these replies.
+        .{ .text = "condensed again" },
+        .{ .text = "", .tool_calls = &.{.{ .id = "call-2", .name = "bash", .arguments = bash_args }} },
+        .{ .text = "done again" },
+    });
+    defer fx.deinit();
+
+    var before_command: u64 = 0;
+    var before_compaction: u64 = 0;
+    var before_approval: u64 = 0;
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        try h.restore(.{ .messages = &.{} });
+        const first = try h.runTurn(turnInput(first_text));
+        defer allocator.free(first.reply);
+        const compact = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+        try testing.expect(std.mem.startsWith(u8, compact, "Compacted"));
+        const escalation = try h.runTurn(turnInput("escalate"));
+        defer allocator.free(escalation.reply);
+        _ = (try h.handleLocalCommand("/feedback seed")) orelse return error.CommandNotClaimed;
+
+        const path = try fx.logPath(allocator, engine.session_id);
+        defer allocator.free(path);
+        const text = try readLogText(allocator, path);
+        defer allocator.free(text);
+        before_command = try maxCounterSuffix(text, "command-");
+        before_compaction = try maxCounterSuffix(text, "compaction-");
+        before_approval = try maxCounterSuffix(text, "approval-");
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+    try testing.expect(before_command > 0);
+    try testing.expect(before_compaction > 0);
+    try testing.expect(before_approval > 0);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    const h = restored.harness();
+    try h.restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+
+    const compact = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+    try testing.expect(std.mem.startsWith(u8, compact, "Compacted"));
+    const escalation = try h.runTurn(turnInput("escalate again"));
+    defer allocator.free(escalation.reply);
+    _ = (try h.handleLocalCommand("/feedback restored")) orelse return error.CommandNotClaimed;
+
+    const path = try fx.logPath(allocator, session_id);
+    defer allocator.free(path);
+    const text = try readLogText(allocator, path);
+    defer allocator.free(text);
+    try testing.expect(try maxCounterSuffix(text, "command-") > before_command);
+    try testing.expect(try maxCounterSuffix(text, "compaction-") > before_compaction);
+    try testing.expect(try maxCounterSuffix(text, "approval-") > before_approval);
 }
 
 test "dsh-native adapter: restore reapplies the logged approval policy" {
