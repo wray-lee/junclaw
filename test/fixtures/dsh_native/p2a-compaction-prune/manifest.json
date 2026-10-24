@@ -152,9 +152,7 @@
       }
     ]
   },
-  "comparison": {
-    "skipSurfaceFold": true
-  },
+  "comparison": {},
   "modelVisible": {},
   "provenance": {
     "kind": "synthetic",

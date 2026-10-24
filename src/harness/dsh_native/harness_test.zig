@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const compat = @import("compat");
+const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
 const port = @import("../port.zig");
@@ -173,6 +174,8 @@ const Fixture = struct {
     session_dir: []const u8,
     allocator: Allocator,
     provider: FakeProvider,
+    approval_policy: config_types.DshApprovalPolicy = .ask,
+    sandbox: config_types.DshSandbox = .workspace_write,
     context_window: u64 = 0,
     compaction_threshold_ratio: ?f64 = null,
     compaction_retain_ratio: ?f64 = null,
@@ -223,6 +226,8 @@ const Fixture = struct {
             .provider_name = "scripted",
             .model = "test-model",
             .persona = "",
+            .approval_policy = self.approval_policy,
+            .sandbox = self.sandbox,
             .now_ms = fixedClock,
             .context_window = self.context_window,
             .compaction_threshold_ratio = self.compaction_threshold_ratio,
@@ -266,6 +271,14 @@ fn requestContains(request: FakeProvider.Request, needle: []const u8) bool {
     for (request.contents) |content| {
         if (std.mem.indexOf(u8, content, needle) != null) return true;
     }
+    return false;
+}
+
+fn messageContains(message: types.Message, needle: []const u8) bool {
+    for (message.content) |block| switch (block) {
+        .text => |text| if (std.mem.indexOf(u8, text, needle) != null) return true,
+        else => {},
+    };
     return false;
 }
 
@@ -1255,4 +1268,137 @@ test "dsh-native adapter: a pruned result shadowed by the summary keeps the repl
         try testing.expectEqual(@as(u64, @intCast(seq.integer)), source[2 + index]);
     }
     try testing.expect(seqListContains(shadowed, new_seq));
+}
+
+test "dsh-native adapter: restore folds a compacted surface" {
+    // Regression: /compact writes a `surfaceOp: replace` checkpoint row, and
+    // reopening the session aborted the fold with error.UnsupportedSurfaceOp,
+    // so a compacted session could never be resumed. Poisoning freed bytes
+    // makes a stale arena read after restore fail here, not only on hosts
+    // where the page is unmapped.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    const big = try allocator.alloc(u8, 2_000);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    const first_text = try std.fmt.allocPrint(allocator, "marker {s}", .{big});
+    defer allocator.free(first_text);
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "First reply." },
+        .{ .text = "condensed history" },
+    });
+    defer fx.deinit();
+
+    var before_seqs: []u64 = &.{};
+    defer allocator.free(before_seqs);
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        const first = try h.runTurn(turnInput(first_text));
+        defer allocator.free(first.reply);
+        _ = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+        before_seqs = try allocator.dupe(u64, engine.surface_seqs.items);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+    try testing.expectEqualSlices(u64, before_seqs, restored.surface_seqs.items);
+    // System prompt, the checkpoint that replaced the user message, and the
+    // retained assistant reply.
+    try testing.expectEqual(@as(usize, 3), restored.messages.items.len);
+    const checkpoint = restored.messages.items[1];
+    try testing.expectEqual(types.MessageRole.user, checkpoint.role);
+    try testing.expect(messageContains(checkpoint, "condensed history"));
+}
+
+test "dsh-native adapter: restore reapplies the logged approval policy" {
+    // Regression: after `/permission` switched the policy to ask, a restart
+    // kept the configured never policy, so an escalation was rejected without
+    // an approval prompt instead of failing closed for a missing channel.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    const bash_args =
+        "{\"description\":\"d\",\"command\":\"echo hi\"," ++
+        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "ready" },
+        .{ .text = "", .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = bash_args }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.approval_policy = .never;
+
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        const first = try h.runTurn(turnInput("hello"));
+        defer allocator.free(first.reply);
+        _ = (try h.handleLocalCommand("/permission workspace-write")) orelse return error.CommandNotClaimed;
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    const h = restored.harness();
+    try h.restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+    const result = try h.runTurn(turnInput("escalate"));
+    defer allocator.free(result.reply);
+
+    const path = try fx.logPath(allocator, session_id);
+    defer allocator.free(path);
+    const log_text = try readLogText(allocator, path);
+    defer allocator.free(log_text);
+    try testing.expect(std.mem.indexOf(u8, log_text, "no approval channel is available") != null);
+}
+
+test "dsh-native adapter: /permission sandbox mode reaches the runtime context" {
+    // Regression: sandboxMode() and the runtime-context sentence read only
+    // the configured value, so `/permission workspace-write` and a restored
+    // `sandbox/mode` never became visible to the model.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    var fx = try Fixture.init(allocator, &.{.{ .text = "ready" }});
+    defer fx.deinit();
+    fx.sandbox = .read_only;
+
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        const first = try h.runTurn(turnInput("hello"));
+        defer allocator.free(first.reply);
+        const notice = (try h.handleLocalCommand("/permission workspace-write")) orelse
+            return error.CommandNotClaimed;
+        try testing.expect(std.mem.indexOf(u8, notice, "preset workspace-write") != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            engine.system_prompt,
+            "Current DSH file policy: workspace-write",
+        ) != null);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        restored.system_prompt,
+        "Current DSH file policy: workspace-write",
+    ) != null);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        restored.system_prompt,
+        "Current DSH file policy: read-only",
+    ) == null);
 }

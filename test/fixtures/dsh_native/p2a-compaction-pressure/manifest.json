@@ -152,9 +152,7 @@
       }
     ]
   },
-  "comparison": {
-    "skipSurfaceFold": true
-  },
+  "comparison": {},
   "modelVisible": {
     "compactionInstruction": true
   },

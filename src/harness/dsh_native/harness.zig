@@ -113,8 +113,11 @@ pub const DshNativeHarness = struct {
     };
 
     allocator: Allocator,
-    /// Permanent: tool schemas and the system prompt.
+    /// Permanent: tool schemas.
     perm: std.heap.ArenaAllocator,
+    /// The system prompt, rebuilt when the folded permission state or the
+    /// session changes; reset first so repeated renders stay bounded.
+    prompt_arena: std.heap.ArenaAllocator,
     /// Session: ids and the surface. Freed on reset/restore.
     arena: std.heap.ArenaAllocator,
     opts: Options,
@@ -178,6 +181,7 @@ pub const DshNativeHarness = struct {
         var self = Self{
             .allocator = allocator,
             .perm = std.heap.ArenaAllocator.init(allocator),
+            .prompt_arena = std.heap.ArenaAllocator.init(allocator),
             .arena = std.heap.ArenaAllocator.init(allocator),
             .opts = opts,
             .call_arena = std.heap.ArenaAllocator.init(allocator),
@@ -207,6 +211,7 @@ pub const DshNativeHarness = struct {
         if (self.ask_user) |value| self.allocator.destroy(value);
         self.call_arena.deinit();
         self.arena.deinit();
+        self.prompt_arena.deinit();
         self.perm.deinit();
     }
 
@@ -324,22 +329,27 @@ pub const DshNativeHarness = struct {
     }
 
     /// System prompt plus the runtime-context block (working directory, file
-    /// and approval policy), rendered once per harness.
+    /// and approval policy) for the current folded permission state. Rebuilt
+    /// after `/permission` and on restore so the model sees the live policy.
     fn buildPrompt(self: *Self) !void {
-        const perm = self.perm.allocator();
+        _ = self.prompt_arena.reset(.retain_capacity);
+        self.system_prompt = "";
+        const perm = self.prompt_arena.allocator();
         const built = try prompt.buildSystemPrompt(perm, .{
             .persona_prefix = self.opts.persona,
         });
 
-        const sandbox: context.SandboxMode = switch (self.opts.sandbox) {
-            .read_only => .read_only,
-            .workspace_write => .workspace_write,
-            .danger_full_access => .danger_full_access,
-        };
-        const approval: context.ApprovalPolicy = switch (self.opts.approval_policy) {
-            .ask => .ask,
-            .never => .never,
-        };
+        const sandbox: context.SandboxMode = self.permission_state.sandbox orelse
+            switch (self.opts.sandbox) {
+                .read_only => .read_only,
+                .workspace_write => .workspace_write,
+                .danger_full_access => .danger_full_access,
+            };
+        const approval: context.ApprovalPolicy = self.permission_state.approval orelse
+            switch (self.opts.approval_policy) {
+                .ask => .ask,
+                .never => .never,
+            };
         const sections = [_]context.Section{
             try context.workingDirectorySection(perm, self.workspace()),
             try context.sandboxPolicySection(perm, sandbox, self.workspace()),
@@ -376,6 +386,7 @@ pub const DshNativeHarness = struct {
         self.messages = .empty;
         self.surface_seqs = .empty;
         self.permission_state = .{};
+        self.applyApprovalPolicy(null);
         self.compaction_lock = .{};
         self.last_usage = null;
         self.session_id = "";
@@ -412,6 +423,8 @@ pub const DshNativeHarness = struct {
         self.log = try session_store.createLog(self.allocator, self.opts.dsh_home, self.workspace(), id, header);
         if (self.goal_store) |store| store.attachLog(&self.log.?);
         self.buildLoop();
+        // A new session starts from the composition defaults again.
+        try self.buildPrompt();
     }
 
     /// Reopen the JSONL for `session_id` and rebuild the surface from it.
@@ -490,6 +503,8 @@ pub const DshNativeHarness = struct {
         defer fold.deinit();
 
         self.permission_state = commands_mod.PermissionState.fold(events);
+        self.applyApprovalPolicy(self.permission_state.approval);
+        try self.buildPrompt();
         self.compaction_lock = compaction_mod.scanLock(events);
         self.surface_seqs.clearRetainingCapacity();
         for (fold.nodes) |node| try self.surface_seqs.append(arena, node.seq);
@@ -1448,7 +1463,7 @@ pub const DshNativeHarness = struct {
     }
 
     fn sandboxMode(self: *const Self) context.SandboxMode {
-        return switch (self.opts.sandbox) {
+        return self.permission_state.sandbox orelse switch (self.opts.sandbox) {
             .read_only => .read_only,
             .workspace_write => .workspace_write,
             .danger_full_access => .danger_full_access,
@@ -1457,6 +1472,20 @@ pub const DshNativeHarness = struct {
 
     fn approvalPolicy(self: *const Self) context.ApprovalPolicy {
         return switch (self.approval.options.policy) {
+            .ask => .ask,
+            .never => .never,
+        };
+    }
+
+    /// Point the approval service at the folded policy (else the composition
+    /// default); `gateDecide` reads the service, not the log.
+    fn applyApprovalPolicy(self: *Self, folded: ?commands_mod.ApprovalPolicy) void {
+        self.approval.options.policy = if (folded) |value|
+            switch (value) {
+                .ask => .ask,
+                .never => .never,
+            }
+        else switch (self.opts.approval_policy) {
             .ask => .ask,
             .never => .never,
         };
@@ -1539,7 +1568,7 @@ pub const DshNativeHarness = struct {
         for (result.events, 0..) |event, index| {
             seqs[index] = try self.appendEvent(event.event_type, event.data, event.surface_op, event.source_event_seqs);
         }
-        self.applyPermissionEvents(result.events);
+        try self.applyPermissionEvents(result.events);
         try self.applyManualCompaction(result.events, seqs);
         return try arena.dupe(u8, result.text);
     }
@@ -1567,17 +1596,16 @@ pub const DshNativeHarness = struct {
         };
     }
 
-    fn applyPermissionEvents(self: *Self, events: []const types.Event) void {
+    /// Fold one command's permission events into the live knobs and re-render
+    /// the prompt when the model-visible context changed.
+    fn applyPermissionEvents(self: *Self, events: []const types.Event) !void {
         const delta = commands_mod.PermissionState.fold(events);
         if (delta.preset) |preset| self.permission_state.preset = preset;
         if (delta.sandbox) |sandbox| self.permission_state.sandbox = sandbox;
-        if (delta.approval) |approval| {
-            self.permission_state.approval = approval;
-            self.approval.options.policy = switch (approval) {
-                .ask => .ask,
-                .never => .never,
-            };
-        }
+        if (delta.approval) |approval| self.permission_state.approval = approval;
+        if (delta.sandbox == null and delta.approval == null) return;
+        self.applyApprovalPolicy(self.permission_state.approval);
+        try self.buildPrompt();
     }
 
     /// Apply the four events a `/compact` seam returned after the command
