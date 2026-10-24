@@ -51,6 +51,8 @@ const native_harness = @import("harness/native.zig");
 /// gates it, so the import is unconditional.
 const dsh_native_mod = @import("harness/dsh_native/harness.zig");
 const dsh_bridge = @import("harness/dsh_native/tools/bridge.zig");
+const dsh_native_session_log = @import("harness/dsh_native/session_log.zig");
+const dsh_native_types = @import("harness/dsh_native/types.zig");
 const build_options = @import("build_options");
 const dsh_enabled = build_options.enable_harness_dsh;
 const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
@@ -2414,14 +2416,6 @@ pub const SessionManager = struct {
 
         if (selected_config.agent.harness == .dsh_native) {
             session.dsh_native = try DshNativeState.init(self.allocator, selected_config, session);
-            // The mapping is the resume source, exactly like the sidecar: a
-            // restarted host with the same key reopens the same JSONL.
-            try session.dsh_native.?.harness.harness().restore(.{
-                .messages = &.{},
-                .session_key = owned_key,
-                .workspace_dir = session.agent.workspace_dir,
-                .dsh_home = session.dsh_native.?.dsh_home,
-            });
         }
         if (comptime dsh_enabled) {
             if (selected_config.agent.harness == .dsh) {
@@ -2439,6 +2433,7 @@ pub const SessionManager = struct {
         // Restore persisted conversation history from session store.
         // Bound the restored window so a long-lived session cannot re-inflate the
         // per-request context beyond max_history_messages on restore.
+        var dsh_native_restored = false;
         if (selected_session_store) |store| {
             const maybe_entries = store.loadMessages(self.allocator, session_key) catch null;
             if (maybe_entries) |entries| {
@@ -2446,10 +2441,20 @@ pub const SessionManager = struct {
                 const restored = dropRowsBeforeLastCompactionSummary(
                     recentHistoryWindow(entries, session.agent.max_history_messages),
                 );
-                // The in-process engine resumes its own JSONL; replaying store
-                // rows into the agent would give it a second, stale context and
-                // persist the previous reply as the next turn's.
-                if (restored.len > 0 and selected_config.agent.harness != .dsh_native) {
+                if (selected_config.agent.harness == .dsh_native) {
+                    // First open imports this window as the seeded JSONL prefix;
+                    // later opens resume the JSONL and ignore the store copy, so
+                    // the import neither repeats nor loses rows.
+                    try session.dsh_native.?.harness.harness().restore(.{
+                        .messages = restored,
+                        .session_key = owned_key,
+                        .workspace_dir = session.agent.workspace_dir,
+                        .dsh_home = session.dsh_native.?.dsh_home,
+                    });
+                    dsh_native_restored = true;
+                } else if (restored.len > 0) {
+                    // The native engine has no JSONL of its own; replaying store
+                    // rows rebuilds its history.
                     restorePersistedSessionState(session, restored);
                 }
                 if (try store.loadUsage(session_key)) |total_tokens| {
@@ -2461,6 +2466,16 @@ pub const SessionManager = struct {
             if (try store.loadCompactionCount(session_key)) |count| {
                 session.agent.compaction_count = count;
             }
+        }
+        if (selected_config.agent.harness == .dsh_native and !dsh_native_restored) {
+            // No readable store: still resume the engine's own JSONL. The
+            // mapping is the resume source, exactly like the sidecar.
+            try session.dsh_native.?.harness.harness().restore(.{
+                .messages = &.{},
+                .session_key = owned_key,
+                .workspace_dir = session.agent.workspace_dir,
+                .dsh_home = session.dsh_native.?.dsh_home,
+            });
         }
 
         try self.sessions.put(self.allocator, owned_key, session);
@@ -11316,4 +11331,102 @@ fn failClaimedTurn(sm: *SessionManager, session_key: []const u8) !void {
     errdefer sm.abandonTurn(session);
     // Simulated failure exit of the caller.
     return error.ProviderError;
+}
+
+fn dshNativeLogEventText(event: dsh_native_types.Event) ![]const u8 {
+    const object = switch (event.data) {
+        .object => |value| value,
+        else => return error.InvalidMessage,
+    };
+    const message_value = if (std.mem.eql(u8, event.event_type, "user/message"))
+        event.data
+    else
+        object.get("message") orelse return error.InvalidMessage;
+    const message = switch (message_value) {
+        .object => |value| value,
+        else => return error.InvalidMessage,
+    };
+    const content = switch (message.get("content") orelse return error.InvalidMessage) {
+        .array => |value| value,
+        else => return error.InvalidMessage,
+    };
+    if (content.items.len == 0) return error.InvalidMessage;
+    const block = switch (content.items[0]) {
+        .object => |value| value,
+        else => return error.InvalidMessage,
+    };
+    return switch (block.get("text") orelse return error.InvalidMessage) {
+        .string => |value| value,
+        else => return error.InvalidMessage,
+    };
+}
+
+test "dsh-native: store history seeds the JSONL once, windowed, and leaves the store intact" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.agent.max_history_messages = 3;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const key = "telegram:main:dsh-native-seed";
+    const rows = [_]struct { role: []const u8, content: []const u8 }{
+        .{ .role = "user", .content = "q1" },
+        .{ .role = "assistant", .content = "a1" },
+        .{ .role = "user", .content = "q2" },
+        .{ .role = "assistant", .content = "a2" },
+        .{ .role = "user", .content = "q3" },
+        .{ .role = "assistant", .content = "a3" },
+    };
+    for (rows) |row| try store.saveMessage(key, row.role, row.content);
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "next reply" }});
+    defer provider.deinit();
+    var sm = fixture.managerWithStore(&provider, store);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate(key);
+    const log_path = try testing.allocator.dupe(u8, session.dsh_native.?.harness.log.?.path);
+    defer testing.allocator.free(log_path);
+
+    var read = try dsh_native_session_log.readLog(testing.allocator, log_path);
+    defer read.deinit();
+    try testing.expect(read.header.is_seeded);
+    // max_history_messages=3 keeps only the newest rows, in native order.
+    try testing.expectEqual(@as(usize, 4), read.events.len);
+    try testing.expectEqualStrings("assistant/message", read.events[0].event_type);
+    try testing.expectEqualStrings("a2", try dshNativeLogEventText(read.events[0]));
+    try testing.expectEqualStrings("user/message", read.events[1].event_type);
+    try testing.expectEqualStrings("q3", try dshNativeLogEventText(read.events[1]));
+    try testing.expectEqualStrings("assistant/message", read.events[2].event_type);
+    try testing.expectEqualStrings("a3", try dshNativeLogEventText(read.events[2]));
+    try testing.expectEqualStrings("session/end-seed", read.events[3].event_type);
+
+    // Import is read-only for the host store.
+    const stored = try store.loadMessages(testing.allocator, key);
+    defer memory_mod.freeMessages(testing.allocator, stored);
+    try testing.expectEqual(@as(usize, 6), stored.len);
+    for (rows, stored) |row, entry| {
+        try testing.expectEqualStrings(row.role, entry.role);
+        try testing.expectEqualStrings(row.content, entry.content);
+    }
+
+    // A cache eviction recreates the session: the JSONL is resumed, not reseeded.
+    session.last_active = 0;
+    try testing.expectEqual(@as(usize, 1), sm.evictIdle(1));
+    _ = try sm.getOrCreate(key);
+    var reread = try dsh_native_session_log.readLog(testing.allocator, log_path);
+    defer reread.deinit();
+    try testing.expectEqual(@as(usize, 4), reread.events.len);
+
+    // Mirroring after the restore still writes to the same store path.
+    const reply = try sm.processMessage(key, "next question", null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("next reply", reply);
+    const after = try store.loadMessages(testing.allocator, key);
+    defer memory_mod.freeMessages(testing.allocator, after);
+    try testing.expectEqual(@as(usize, 8), after.len);
+    try testing.expectEqualStrings("next question", after[6].content);
+    try testing.expectEqualStrings("next reply", after[7].content);
 }
