@@ -52,6 +52,7 @@ const registry = @import("tools/registry.zig");
 const builtins_mod = @import("tools/builtins.zig");
 const bash_mod = @import("tools/bash.zig");
 const goal_mod = @import("goal.zig");
+const goal_command_mod = @import("goal_command.zig");
 const goal_rounds = @import("goal_rounds.zig");
 const goal_tools = @import("tools/goal.zig");
 const execute = @import("tools/execute.zig");
@@ -1530,6 +1531,7 @@ pub const DshNativeHarness = struct {
                 .approval = self.approvalPolicy(),
             },
             .compaction = .{ .context = @ptrCast(self), .call = compactSeam },
+            .goal = .{ .context = @ptrCast(self), .call = goalSeam },
         }) orelse return null;
         defer result.deinit();
 
@@ -1540,6 +1542,29 @@ pub const DshNativeHarness = struct {
         self.applyPermissionEvents(result.events);
         try self.applyManualCompaction(result.events, seqs);
         return try arena.dupe(u8, result.text);
+    }
+
+    /// Run the human `/goal` command on the live goal projection; the
+    /// command module owns the lifecycle and appends the returned
+    /// `goal/change` events between `command/run` and `command/done`.
+    fn goalSeam(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        raw_input: []const u8,
+    ) anyerror!commands_mod.GoalOutcome {
+        const self = selfOf(context_ptr.?);
+        const store = self.goal_store orelse
+            return .{ .kind = .@"error", .text = "The /goal command is unavailable." };
+        var command = goal_command_mod.Goal{ .store = store };
+        const outcome = try command.executeCaptured(allocator, raw_input);
+        return .{
+            .kind = switch (outcome.result.kind) {
+                .success => .success,
+                .failure => .@"error",
+            },
+            .text = outcome.result.text,
+            .events = outcome.events,
+        };
     }
 
     fn applyPermissionEvents(self: *Self, events: []const types.Event) void {

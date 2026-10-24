@@ -271,15 +271,16 @@ These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` 
 
 Non-numeric or out-of-range ratios, `retain_ratio >= threshold_ratio`, and `headroom_tokens >= context_window` are also rejected at load time.
 
-P2a status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P2a adds the approval gate, user questions, automatic compaction, and four dsh slash commands:
+P2a status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P2a adds the approval gate, user questions, automatic compaction, and five dsh slash commands:
 
 - `ask_user_question` is exposed to the model. It waits up to `agent.dsh_question_timeout` for an answer; when the deadline passes with no answer, the tool result is `pending` (not a denial) and the model may continue. With no answerer on the channel the call returns a `NO_PROVIDER` result.
 - `/compact` (no arguments): runs one manual compaction of older history; with nothing to compact it settles `No compactable history yet.` and writes no domain events.
 - `/permission [preset]`: with no argument reports the current preset and the available ones; `read-only`, `workspace-write`, and `danger-full-access` record the session's sandbox mode and approval policy (`read-only`/`workspace-write` use `ask`, `danger-full-access` uses `never`), writing only the knobs that changed.
 - `/feedback <text>`: records a `feedback/record` event; empty text is an error.
 - `/export` (no arguments): requests a session-log download and appends the command lifecycle events.
+- `/goal [<objective>|clear|edit <objective>|pause|resume]`: shows the current goal, creates one from an objective, edits, pauses, resumes, or clears it; each invocation writes the command lifecycle with its `goal/change` events in between.
 - Automatic compaction runs on the agent pre-step once the measured token count reaches the threshold, and a provider context-overflow error at request start triggers one compaction and one retry. `/compact` is the manual entry point.
-- Other slash commands, including `/goal` and `/plan`, are left to the host; plan mode and those commands are P2b.
+- Other slash commands, including `/plan`, are left to the host; plan mode is P2b.
 
 Example:
 

@@ -14,8 +14,10 @@
 //! Pure module: it owns no log. `handleLocalCommand` returns the ordered
 //! events (`command/run`, domain events, `command/done`) with `seq`/`time_ms`
 //! left at zero for the caller to stamp while appending, plus the settlement
-//! text. `null` means the line belongs to the host: unknown names plus the P2b
-//! `goal`/`plan` commands are never claimed.
+//! text. `null` means the line belongs to the host: unknown names and `/plan`
+//! are never claimed. `/goal` is claimed through the wired goal seam; its
+//! `goal/change` events come from the goal domain and its lifecycle payloads
+//! are `recordInput:false`, so neither event carries `args`.
 //!
 //! `/compact` delegates the transaction to an injected seam; the harness plugs
 //! in `compaction.zig`. When the seam reports no useful range, the command
@@ -63,6 +65,12 @@ pub const builtins = [_]Definition{
         .record_input = false,
     },
     .{ .name = "export", .description = "Download this Session log as a ZIP archive" },
+    .{
+        .name = "goal",
+        .description = "Set or view the goal for a long-running task",
+        .input_hint = "[<objective>|clear|edit <objective>|pause|resume]",
+        .record_input = false,
+    },
 };
 
 pub fn findDefinition(name: []const u8) ?Definition {
@@ -241,6 +249,21 @@ pub const Compaction = struct {
     call: ?*const fn (?*anyopaque, Allocator, CompactRequest) anyerror!CompactOutcome = null,
 };
 
+// ── goal seam ───────────────────────────────────────────────────────────────
+
+/// The goal domain's settlement plus the `goal/change` events it recorded, in
+/// order. An empty list is normal (`/goal` show, a no-op clear, a failure).
+pub const GoalOutcome = struct {
+    kind: Kind,
+    text: []const u8,
+    events: []const types.Event = &.{},
+};
+
+pub const Goal = struct {
+    context: ?*anyopaque = null,
+    call: ?*const fn (?*anyopaque, Allocator, []const u8) anyerror!GoalOutcome = null,
+};
+
 // ── execution ───────────────────────────────────────────────────────────────
 
 pub const Kind = enum { success, @"error" };
@@ -258,6 +281,7 @@ pub const Context = struct {
     permissions: PermissionState = .{},
     permission_defaults: PermissionDefaults = .{},
     compaction: Compaction = .{},
+    goal: Goal = .{},
 };
 
 pub const Result = struct {
@@ -275,8 +299,8 @@ pub const Result = struct {
 };
 
 /// Claim and execute one builtin. Returns null when the line is not a builtin
-/// command line (unknown name, `goal`, `plan`, or a non-command line), so the
-/// harness can fall back to the host's own slash commands.
+/// command line (unknown name, `plan`, or a non-command line), so the harness
+/// can fall back to the host's own slash commands.
 pub fn handleLocalCommand(allocator: Allocator, line: []const u8, ctx: Context) !?Result {
     const parsed = parseCommand(line) orelse return null;
     const definition = findDefinition(parsed.name) orelse return null;
@@ -316,7 +340,19 @@ fn execute(allocator: Allocator, ctx: Context, definition: Definition, parsed: P
     if (std.mem.eql(u8, definition.name, "compact")) return executeCompact(allocator, ctx, parsed.raw_input);
     if (std.mem.eql(u8, definition.name, "permission")) return executePermission(allocator, ctx, parsed.raw_input);
     if (std.mem.eql(u8, definition.name, "feedback")) return executeFeedback(allocator, ctx, parsed.raw_input);
+    if (std.mem.eql(u8, definition.name, "goal")) return executeGoal(allocator, ctx, parsed.raw_input);
     return executeExport(parsed.raw_input);
+}
+
+fn executeGoal(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settlement {
+    const call = ctx.goal.call orelse
+        return .{ .kind = .@"error", .text = "The /goal command is unavailable." };
+    const outcome = call(ctx.goal.context, allocator, raw_input) catch |err| {
+        // Same settlement `Goal.dispatch` writes for a failed invocation.
+        const text = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+        return .{ .kind = .@"error", .text = text };
+    };
+    return .{ .kind = outcome.kind, .text = outcome.text, .domain = outcome.events };
 }
 
 fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settlement {
@@ -866,20 +902,23 @@ test "/export rejects a path without domain events" {
     try std.testing.expectEqualStrings(" /tmp/log.zip", stringField(result.events[0], "args"));
 }
 
-test "the registry exposes exactly the four P2a builtins" {
-    try std.testing.expectEqual(@as(usize, 4), builtins.len);
-    for ([_][]const u8{ "compact", "permission", "feedback", "export" }) |name| {
+test "the registry exposes the four P2a builtins plus goal" {
+    try std.testing.expectEqual(@as(usize, 5), builtins.len);
+    for ([_][]const u8{ "compact", "permission", "feedback", "export", "goal" }) |name| {
         try std.testing.expect(findDefinition(name) != null);
     }
-    try std.testing.expect(findDefinition("goal") == null);
     try std.testing.expect(findDefinition("plan") == null);
     try std.testing.expect(!findDefinition("feedback").?.record_input);
+    try std.testing.expect(!findDefinition("goal").?.record_input);
+    try std.testing.expectEqualStrings(
+        "[<objective>|clear|edit <objective>|pause|resume]",
+        findDefinition("goal").?.input_hint.?,
+    );
     try std.testing.expectEqualStrings("<preset>", findDefinition("permission").?.input_hint.?);
 }
 
-test "unknown, goal, and plan command lines are not claimed" {
+test "unknown and plan command lines are not claimed" {
     const lines = [_][]const u8{
-        "/goal fix it",
         "/plan off",
         "/help",
         "/compactx",
@@ -888,6 +927,70 @@ test "unknown, goal, and plan command lines are not claimed" {
         "/Compact",
     };
     for (lines) |line| try expectUnclaimed(line);
+}
+
+const GoalStub = struct {
+    raw_input: []const u8 = "",
+    calls: usize = 0,
+    kind: Kind = .success,
+    text: []const u8 = "Goal created",
+
+    fn seam(self: *GoalStub) Goal {
+        return .{ .context = self, .call = call };
+    }
+
+    fn call(context_ptr: ?*anyopaque, allocator: Allocator, raw_input: []const u8) anyerror!GoalOutcome {
+        const self: *GoalStub = @ptrCast(@alignCast(context_ptr.?));
+        self.calls += 1;
+        self.raw_input = raw_input;
+        if (self.kind == .@"error") return .{ .kind = self.kind, .text = self.text };
+        var object: std.json.ObjectMap = .empty;
+        try object.put(allocator, "kind", .{ .string = "goal/change" });
+        return .{
+            .kind = self.kind,
+            .text = self.text,
+            .events = try allocator.dupe(types.Event, &.{.{
+                .event_type = "goal/change",
+                .seq = 0,
+                .time_ms = 0,
+                .data = .{ .object = object },
+            }}),
+        };
+    }
+};
+
+test "/goal delegates to the goal seam with a recordInput:false lifecycle" {
+    var stub = GoalStub{};
+    var result = try claimed("/goal ship it", .{ .command_id = "cmd-20", .goal = stub.seam() });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "goal/change", "command/done" });
+    try assertLifecycle(result.events);
+    try std.testing.expectEqualStrings("Goal created", result.text);
+    try std.testing.expectEqual(@as(usize, 1), stub.calls);
+    try std.testing.expectEqualStrings(" ship it", stub.raw_input);
+    try std.testing.expect(eventString(result.events[0], "args") == null);
+    try std.testing.expect(eventString(result.events[2], "args") == null);
+}
+
+test "/goal settles a domain failure without inventing domain events" {
+    var stub = GoalStub{ .kind = .@"error", .text = "GoalInvalidTransition" };
+    var result = try claimed("/goal pause", .{ .command_id = "cmd-21", .goal = stub.seam() });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "command/done" });
+    try assertLifecycle(result.events);
+    try std.testing.expectEqual(Kind.@"error", result.kind);
+    try std.testing.expectEqualStrings("GoalInvalidTransition", result.text);
+}
+
+test "/goal without a wired seam settles as unavailable" {
+    var result = try claimed("/goal", .{ .command_id = "cmd-22" });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "command/done" });
+    try std.testing.expectEqual(Kind.@"error", result.kind);
+    try std.testing.expectEqualStrings("The /goal command is unavailable.", result.text);
 }
 
 test "parseCommand preserves separator whitespace and enforces the name grammar" {

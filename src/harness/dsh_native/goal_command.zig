@@ -2,9 +2,10 @@
 //! (design §1.7 B32, B36; dsh `command-goal/src/index.ts`).
 //!
 //! `dispatch` owns the B36 lifecycle: `command/run` -> optional `goal/change`
-//! (written by the domain) -> `command/done`. `register`/`find`/`run` are the
-//! registration surface a future `commands.zig` registry can call without this
-//! module owning a global registry.
+//! (written by the domain) -> `command/done`. `executeCaptured` runs the same
+//! business logic for `commands.zig`, which owns the lifecycle instead.
+//! `register`/`find`/`run` are the registration surface a future `commands.zig`
+//! registry can call without this module owning a global registry.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -22,6 +23,14 @@ pub const Kind = enum { success, failure };
 pub const Result = struct {
     kind: Kind,
     text: []const u8,
+};
+
+/// One `execute` outcome plus the `goal/change` events it recorded, for a
+/// command framework that owns the surrounding `command/run`/`command/done`.
+/// Payloads borrow the store's arena, so consume them before it is reset.
+pub const Outcome = struct {
+    result: Result,
+    events: []const types.Event,
 };
 
 /// One slash command as registered by a future command registry.
@@ -153,6 +162,17 @@ pub const Goal = struct {
                 return .{ .kind = .success, .text = "Goal cleared." };
             },
         }
+    }
+
+    /// `commands.zig` seam: execute without owning the lifecycle. The
+    /// domain's durable mutations are returned as events for the caller to
+    /// append between its own `command/run` and `command/done`.
+    pub fn executeCaptured(self: *Goal, allocator: Allocator, raw_input: []const u8) !Outcome {
+        var events: std.ArrayListUnmanaged(types.Event) = .empty;
+        self.store.capture = .{ .allocator = allocator, .events = &events };
+        defer self.store.capture = null;
+        const result = try self.execute(allocator, raw_input);
+        return .{ .result = result, .events = try events.toOwnedSlice(allocator) };
     }
 };
 

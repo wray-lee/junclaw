@@ -67,6 +67,13 @@ fn wallClock(_: ?*anyopaque) i64 {
     return compat.time.milliTimestamp();
 }
 
+/// When set, durable mutations record their events here instead of appending
+/// to the log; the caller appends them inside its own command lifecycle.
+pub const EventCapture = struct {
+    allocator: Allocator,
+    events: *std.ArrayListUnmanaged(types.Event),
+};
+
 /// Live goal state plus the append-only log it mutates.
 ///
 /// All state strings are arena-owned; moving the Store value is safe because
@@ -79,6 +86,7 @@ pub const Store = struct {
     updated_at: i64 = 0,
     activation: Activation = .disarmed,
     log: ?*session_log.Log = null,
+    capture: ?EventCapture = null,
     default_max_goal_rounds: u32 = default_max_goal_rounds,
     clock: Clock = .{},
     seen: std.ArrayListUnmanaged([]const u8) = .empty,
@@ -253,6 +261,15 @@ pub const Store = struct {
     }
 
     fn append(self: *Store, event_type: []const u8, data: Value) Error!void {
+        if (self.capture) |capture| {
+            capture.events.append(capture.allocator, .{
+                .event_type = event_type,
+                .seq = 0,
+                .time_ms = 0,
+                .data = data,
+            }) catch return error.GoalLogWriteFailed;
+            return;
+        }
         if (self.log) |log| {
             _ = log.append(event_type, data, .{}) catch return error.GoalLogWriteFailed;
         }

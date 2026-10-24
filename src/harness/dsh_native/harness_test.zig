@@ -943,8 +943,14 @@ test "dsh-native adapter: builtin commands are claimed and other lines fall back
 
     // Not command lines / commands this engine does not own: host fallback.
     try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("hello"));
-    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/goal ship it"));
+    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/plan ship it"));
     try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/not-a-command"));
+    // `/goal` is claimed; showing the empty projection creates nothing.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        (try h.handleLocalCommand("/goal")).?,
+        "No goal is currently set.",
+    ) != null);
     try testing.expectEqualStrings("No compactable history yet.", (try h.handleLocalCommand("/compact")).?);
 
     const first = try h.runTurn(turnInput("hi"));
@@ -971,6 +977,105 @@ test "dsh-native adapter: builtin commands are claimed and other lines fall back
     try testing.expect(std.mem.indexOf(u8, log_text, "\"command/run\"") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "\"feedback/record\"") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "\"command/done\"") != null);
+}
+
+test "dsh-native adapter: /goal commands change the projection and survive restart" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{});
+    defer fx.deinit();
+
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        try h.restore(.{ .messages = &.{} });
+
+        try testing.expect(std.mem.indexOf(
+            u8,
+            (try h.handleLocalCommand("/goal ship the release")).?,
+            "Goal created",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            (try h.handleLocalCommand("/goal edit ship the release safely")).?,
+            "Goal updated",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            (try h.handleLocalCommand("/goal pause")).?,
+            "Goal paused",
+        ) != null);
+        try testing.expect(std.mem.indexOf(
+            u8,
+            (try h.handleLocalCommand("/goal resume")).?,
+            "Goal resumed",
+        ) != null);
+        const live = engine.goal_store.?.find().?;
+        try testing.expectEqualStrings("ship the release safely", live.objective);
+        try testing.expectEqual(goal_mod.Phase.active, live.phase);
+
+        // Each invocation is command/run -> goal/change -> command/done, and
+        // recordInput:false leaves both lifecycle payloads without `args`.
+        const path = try fx.logPath(allocator, engine.session_id);
+        defer allocator.free(path);
+        var read = try session_log.readLog(allocator, path);
+        defer read.deinit();
+        var goal_runs: usize = 0;
+        for (read.events, 0..) |event, index| {
+            if (!std.mem.eql(u8, event.event_type, "command/run")) continue;
+            const run = switch (event.data) {
+                .object => |object| object,
+                else => continue,
+            };
+            const name = switch (run.get("name") orelse continue) {
+                .string => |text| text,
+                else => continue,
+            };
+            if (!std.mem.eql(u8, name, "goal")) continue;
+            try testing.expect(run.get("args") == null);
+            try testing.expect(index + 2 < read.events.len);
+            try testing.expectEqualStrings("goal/change", read.events[index + 1].event_type);
+            try testing.expectEqualStrings("command/done", read.events[index + 2].event_type);
+            const done = switch (read.events[index + 2].data) {
+                .object => |object| object,
+                else => return error.TestUnexpectedResult,
+            };
+            try testing.expect(done.get("args") == null);
+            goal_runs += 1;
+        }
+        try testing.expectEqual(@as(usize, 4), goal_runs);
+
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    // A new harness restores the projection from the log alone.
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+    const rebuilt = restored.goal_store.?.find() orelse return error.TestUnexpectedResult;
+    try testing.expectEqualStrings("ship the release safely", rebuilt.objective);
+    try testing.expectEqual(goal_mod.Phase.active, rebuilt.phase);
+
+    try testing.expectEqualStrings(
+        "Goal cleared.",
+        (try restored.harness().handleLocalCommand("/goal clear")).?,
+    );
+    try testing.expect(restored.goal_store.?.find() == null);
+
+    // 64KB+ objective: the suite allocator catches a leak on this path.
+    const big = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big);
+    @memset(big, 'g');
+    const line = try std.fmt.allocPrint(allocator, "/goal {s}", .{big});
+    defer allocator.free(line);
+    try testing.expect(std.mem.indexOf(
+        u8,
+        (try restored.harness().handleLocalCommand(line)).?,
+        "Goal created",
+    ) != null);
+    _ = (try restored.harness().handleLocalCommand("/goal clear")).?;
 }
 
 test "dsh-native adapter: sandbox escalation fails closed without an approval channel" {

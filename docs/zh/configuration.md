@@ -251,15 +251,16 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 比例不是数字或越界、`retain_ratio >= threshold_ratio`，以及非零 context window 下 `headroom_tokens >= context_window` 也会在加载配置时报错。
 
-P2a 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harness` 设为 `dsh-native` 的会话才会使用它；省略该键仍保持 `native`，`dsh` sidecar 与 `-Dharness_dsh` 构建的行为不变。P2a 增加了审批门禁、用户提问、自动压缩和四个 dsh 斜杠命令：
+P2a 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harness` 设为 `dsh-native` 的会话才会使用它；省略该键仍保持 `native`，`dsh` sidecar 与 `-Dharness_dsh` 构建的行为不变。P2a 增加了审批门禁、用户提问、自动压缩和五个 dsh 斜杠命令：
 
 - `ask_user_question` 已暴露给模型。它最多等待 `agent.dsh_question_timeout`；超时仍无回答时，工具结果是 `pending`（不是拒绝），模型可以继续。通道没有回答者时，调用返回 `NO_PROVIDER` 结果。
 - `/compact`（无参数）：对手头较旧的历史执行一次手动压缩；没有可压缩历史时结算为 `No compactable history yet.`，不写领域事件。
 - `/permission [preset]`：不带参数时报告当前 preset 和可选值；`read-only`、`workspace-write`、`danger-full-access` 会记录会话的沙箱模式与审批策略（`read-only`/`workspace-write` 用 `ask`，`danger-full-access` 用 `never`），且只写入发生变化的 knob。
 - `/feedback <text>`：写入 `feedback/record` 事件；空文本报错。
 - `/export`（无参数）：请求下载会话日志，并写入命令生命周期事件。
+- `/goal [<objective>|clear|edit <objective>|pause|resume]`：查看当前目标，或用 objective 创建目标，以及编辑、暂停、恢复、清除；每次调用写入命令生命周期，中间夹 `goal/change` 事件。
 - 自动压缩在 agent pre-step 阶段、测得 token 数达到阈值时运行；请求开始时的 provider context 溢出错误会触发一次压缩并重试一次。`/compact` 是手动入口。
-- 其余斜杠命令（包括 `/goal`、`/plan`）留给宿主处理；plan 模式与这两个命令属于 P2b。
+- 其余斜杠命令（包括 `/plan`）留给宿主处理；plan 模式属于 P2b。
 
 示例：
 
