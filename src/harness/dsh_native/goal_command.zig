@@ -166,12 +166,20 @@ pub const Goal = struct {
 
     /// `commands.zig` seam: execute without owning the lifecycle. The
     /// domain's durable mutations are returned as events for the caller to
-    /// append between its own `command/run` and `command/done`.
+    /// append between its own `command/run` and `command/done`. Events
+    /// recorded before a late failure are still returned, so the log never
+    /// falls behind the projection.
     pub fn executeCaptured(self: *Goal, allocator: Allocator, raw_input: []const u8) !Outcome {
         var events: std.ArrayListUnmanaged(types.Event) = .empty;
         self.store.capture = .{ .allocator = allocator, .events = &events };
         defer self.store.capture = null;
-        const result = try self.execute(allocator, raw_input);
+        const result = self.execute(allocator, raw_input) catch |err| {
+            const text = try std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)});
+            return .{
+                .result = .{ .kind = .failure, .text = text },
+                .events = try events.toOwnedSlice(allocator),
+            };
+        };
         return .{ .result = result, .events = try events.toOwnedSlice(allocator) };
     }
 };
