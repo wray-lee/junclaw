@@ -438,15 +438,23 @@ pub const Loop = struct {
             }
 
             var claim: inbox.Claim = undefined;
+            var claim_owned = false;
+            // Regression: a pressure/pre-step hook error returned before the
+            // claim was settled, leaking the claimed inbox batch.
+            errdefer {
+                if (claim_owned) claim.deinit(self.backing);
+            }
             var extras: std.ArrayListUnmanaged(UserMessage) = .empty;
             var decision = PreStepDecision{};
             if (carried) |held| {
                 claim = held;
+                claim_owned = true;
                 carried = null;
                 extras = carried_extras;
                 carried_extras = .empty;
             } else {
                 claim = try self.claimFor(target);
+                claim_owned = true;
                 // Pressure runs before the host's pre-step gate, like dsh's
                 // `agent/pre-step` compaction hook (index.ts:319-341).
                 const compacted = if (self.host.compaction) |hook|
@@ -470,15 +478,18 @@ pub const Loop = struct {
                 .pause => {
                     if (self.isAborted()) {
                         claim.deinit(self.backing);
+                        claim_owned = false;
                         return self.abortTurn(false);
                     }
                     self.paused_claim = claim;
+                    claim_owned = false;
                     self.paused_extras = extras;
                     self.phase = .paused;
                     return .paused;
                 },
                 .reject => {
                     claim.deinit(self.backing);
+                    claim_owned = false;
                     return self.endTurn(.blocked);
                 },
                 .enter => {},
@@ -486,16 +497,19 @@ pub const Loop = struct {
 
             if (self.isAborted()) {
                 claim.deinit(self.backing);
+                claim_owned = false;
                 return self.abortTurn(false);
             }
 
             const count = claim.count() + extras.items.len;
             if (self.turn_ends != null and count == 0) {
                 claim.deinit(self.backing);
+                claim_owned = false;
                 break;
             }
             if (self.step == 0 and count == 0) {
                 claim.deinit(self.backing);
+                claim_owned = false;
                 return self.endTurn(.completed);
             }
 
@@ -531,6 +545,7 @@ pub const Loop = struct {
             // partial assistant message (B22).
             if (self.isAborted()) {
                 claim.deinit(self.backing);
+                claim_owned = false;
                 return self.abortTurn(true);
             }
 
@@ -542,6 +557,7 @@ pub const Loop = struct {
                 });
             }
             claim.deinit(self.backing);
+            claim_owned = false;
 
             if (self.isAborted()) return self.abortTurn(true);
 
@@ -961,6 +977,8 @@ const Harness = struct {
     pressure_calls: usize = 0,
     overflow_calls: usize = 0,
     pressure_compacts: bool = false,
+    pressure_error: ?anyerror = null,
+    pre_error: ?anyerror = null,
     overflow_compacts: bool = false,
     last_hook: HookOrder = .none,
     dispatches: usize = 0,
@@ -1174,6 +1192,7 @@ fn preStep(
     const h = harnessOf(context);
     h.pre_calls += 1;
     h.last_hook = .pre_step;
+    if (h.pre_error) |err| return err;
     if (h.pre_hook) |hook| hook(h);
     const decision = h.pre_kind;
     if (h.pre_kind_once) h.pre_kind = .enter;
@@ -1203,6 +1222,7 @@ fn compactionPressure(context: *anyopaque, allocator: Allocator, position: Posit
     const h = harnessOf(context);
     h.pressure_calls += 1;
     h.last_hook = .pressure;
+    if (h.pressure_error) |err| return err;
     return h.pressure_compacts;
 }
 
@@ -2089,6 +2109,30 @@ test "pre-step pressure hook runs before the host gate and starts a new series" 
     const request_start = h.find(.request_start).?;
     try testing.expect(request_start.header_starts_series);
     try testing.expect(isTag(reasonOf(outcome), .completed));
+}
+
+test "a failing pressure or pre-step hook releases the claimed inbox batch" {
+    // Regression: a hook error returned before the claim was settled, so the
+    // claimed entries leaked instead of being released.
+    const failures = [_]enum { pressure, pre_step }{ .pressure, .pre_step };
+    for (failures) |failure| {
+        var h = Harness.init(std.testing.allocator);
+        defer h.deinit();
+        var loop = try newLoop(&h, testConfig());
+        h.loop = &loop;
+        defer loop.deinit();
+
+        switch (failure) {
+            .pressure => h.pressure_error = error.PressureBroken,
+            .pre_step => h.pre_error = error.PreStepBroken,
+        }
+        try steerText(&h, &loop, "m1", "hi");
+        try testing.expectError(
+            if (failure == .pressure) error.PressureBroken else error.PreStepBroken,
+            loop.runTurn(),
+        );
+        try testing.expectEqual(@as(usize, 0), h.started);
+    }
 }
 
 test "context overflow compacts once and retries the request exactly once" {

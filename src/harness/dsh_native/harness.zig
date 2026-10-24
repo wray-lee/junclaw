@@ -576,6 +576,11 @@ pub const DshNativeHarness = struct {
         self.log = try session_store.createLog(self.allocator, self.opts.dsh_home, self.workspace(), id, header);
         if (self.goal_store) |store| store.attachLog(&self.log.?);
         if (self.todo) |ctx| ctx.log = &self.log.?;
+        // dsh pins the missing permission facts before the session is
+        // published (`pinInitialPermission`), so a `/permission` issued before
+        // the first turn stays the last permission event in the log.
+        try self.writeSessionDefaults(arena);
+        self.context_written = true;
         if (seeded) {
             // Fold the seed through the same surface path a resumed log uses,
             // so the first turn already sees the imported history.
@@ -703,11 +708,33 @@ pub const DshNativeHarness = struct {
             return;
         };
         self.buildLoop();
+        // dsh restores `turnBoundary.lastTurn` from the log; a resumed kernel
+        // continues numbering instead of reusing turn 1 (and its
+        // `system-1` id) in the same session.
+        self.loop.?.turn = lastTurn(read.events);
         if (baseline) |header| {
             const loop = &self.loop.?;
             loop.last_header = header;
             loop.tracker.logged = true;
         }
+    }
+
+    fn lastTurn(events: []const types.Event) u64 {
+        var last: u64 = 0;
+        for (events) |event| {
+            if (!std.mem.eql(u8, event.event_type, "turn/start")) continue;
+            const object = switch (event.data) {
+                .object => |value| value,
+                else => continue,
+            };
+            const value = object.get("turn") orelse continue;
+            const turn: u64 = switch (value) {
+                .integer => |number| if (number > 0) @intCast(number) else continue,
+                else => continue,
+            };
+            if (turn > last) last = turn;
+        }
+        return last;
     }
 
     fn cloneLastHeader(allocator: Allocator, event: types.Event) !?request.Header {
@@ -748,6 +775,11 @@ pub const DshNativeHarness = struct {
             running.command_id = try arena.dupe(u8, running.command_id);
         }
         self.permission_state = commands_mod.PermissionState.fold(events);
+        // Regression: the folded preset aliased the read arena, so `/permission`
+        // after a resume read freed memory and crashed.
+        if (self.permission_state.preset) |preset| {
+            self.permission_state.preset = try arena.dupe(u8, preset);
+        }
         self.applyApprovalPolicy(self.permission_state.approval);
         self.syncToolSandbox();
         try self.buildPrompt();
@@ -3423,8 +3455,11 @@ test "dsh-native harness: first open imports store history as a seeded prefix" {
     var read = try session_log.readLog(allocator, engine.log.?.path);
     defer read.deinit();
     try std.testing.expect(read.header.is_seeded);
-    try std.testing.expectEqual(@as(usize, 5), read.events.len);
+    try std.testing.expectEqual(@as(usize, 8), read.events.len);
     const expected_types = [_][]const u8{
+        "permission/preset",
+        "sandbox/mode",
+        "approval/policy",
         "user/message",
         "assistant/message",
         "user/message",
@@ -3434,11 +3469,11 @@ test "dsh-native harness: first open imports store history as a seeded prefix" {
     for (read.events, expected_types) |event, expected| {
         try std.testing.expectEqualStrings(expected, event.event_type);
     }
-    try std.testing.expectEqualStrings("first question", try seedEventText(read.events[0]));
-    try std.testing.expectEqualStrings("first answer", try seedEventText(read.events[1]));
-    try std.testing.expectEqualStrings("second question", try seedEventText(read.events[2]));
-    try std.testing.expectEqualStrings("second answer", try seedEventText(read.events[3]));
-    const marker = switch (read.events[4].data) {
+    try std.testing.expectEqualStrings("first question", try seedEventText(read.events[3]));
+    try std.testing.expectEqualStrings("first answer", try seedEventText(read.events[4]));
+    try std.testing.expectEqualStrings("second question", try seedEventText(read.events[5]));
+    try std.testing.expectEqualStrings("second answer", try seedEventText(read.events[6]));
+    const marker = switch (read.events[7].data) {
         .object => |value| value,
         else => return error.InvalidMessage,
     };
@@ -3476,15 +3511,15 @@ test "dsh-native harness: reopening a seeded session never imports twice" {
 
     var read = try session_log.readLog(allocator, log_path);
     defer read.deinit();
-    try std.testing.expectEqual(@as(usize, 3), read.events.len);
-    try std.testing.expectEqualStrings("keep me", try seedEventText(read.events[0]));
-    try std.testing.expectEqualStrings("kept", try seedEventText(read.events[1]));
+    try std.testing.expectEqual(@as(usize, 6), read.events.len);
+    try std.testing.expectEqualStrings("keep me", try seedEventText(read.events[3]));
+    try std.testing.expectEqualStrings("kept", try seedEventText(read.events[4]));
 
     // A second restore in the same process resumes the same log.
     try second.harness().restore(.{ .messages = &entries });
     var reread = try session_log.readLog(allocator, log_path);
     defer reread.deinit();
-    try std.testing.expectEqual(@as(usize, 3), reread.events.len);
+    try std.testing.expectEqual(@as(usize, 6), reread.events.len);
 }
 
 test "dsh-native harness: unusable store rows are skipped and empty history is not seeded" {
@@ -3505,10 +3540,10 @@ test "dsh-native harness: unusable store rows are skipped and empty history is n
     var read = try session_log.readLog(allocator, engine.log.?.path);
     defer read.deinit();
     try std.testing.expect(read.header.is_seeded);
-    try std.testing.expectEqual(@as(usize, 2), read.events.len);
-    try std.testing.expectEqualStrings("user/message", read.events[0].event_type);
-    try std.testing.expectEqualStrings("kept", try seedEventText(read.events[0]));
-    try std.testing.expectEqualStrings("session/end-seed", read.events[1].event_type);
+    try std.testing.expectEqual(@as(usize, 5), read.events.len);
+    try std.testing.expectEqualStrings("user/message", read.events[3].event_type);
+    try std.testing.expectEqualStrings("kept", try seedEventText(read.events[3]));
+    try std.testing.expectEqualStrings("session/end-seed", read.events[4].event_type);
 
     // Empty history opens an ordinary, unseeded session.
     var empty = try env.engine("seed-empty");
@@ -3517,7 +3552,8 @@ test "dsh-native harness: unusable store rows are skipped and empty history is n
     var empty_read = try session_log.readLog(allocator, empty.log.?.path);
     defer empty_read.deinit();
     try std.testing.expect(!empty_read.header.is_seeded);
-    try std.testing.expectEqual(@as(usize, 0), empty_read.events.len);
+    // Only the three pinned permission facts; no imported messages.
+    try std.testing.expectEqual(@as(usize, 3), empty_read.events.len);
     try std.testing.expect(empty.messages.items.len == 0);
 }
 
@@ -3550,9 +3586,9 @@ test "dsh-native harness: a torn tail on the seeded log resumes intact" {
     var read = try session_log.readLog(allocator, log_path);
     defer read.deinit();
     try std.testing.expect(read.torn_truncate_to == null);
-    try std.testing.expectEqual(@as(usize, 3), read.events.len);
-    try std.testing.expectEqualStrings("before the crash", try seedEventText(read.events[0]));
-    try std.testing.expectEqualStrings("answer before the crash", try seedEventText(read.events[1]));
+    try std.testing.expectEqual(@as(usize, 6), read.events.len);
+    try std.testing.expectEqualStrings("before the crash", try seedEventText(read.events[3]));
+    try std.testing.expectEqualStrings("answer before the crash", try seedEventText(read.events[4]));
     try std.testing.expectEqual(@as(usize, 2), resumed.messages.items.len);
 }
 

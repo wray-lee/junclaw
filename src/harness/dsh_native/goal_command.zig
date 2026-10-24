@@ -65,6 +65,43 @@ pub const Goal = struct {
     store: *goal.Store,
     next_command_id: u64 = 1,
 
+    /// A Goal over an already-rebuilt store. The counter continues past the
+    /// ids in the restored log, so a restart never re-mints `goal-cmd-1`.
+    pub fn restored(store: *goal.Store, events: []const types.Event) Goal {
+        var self = Goal{ .store = store };
+        self.seedIds(events);
+        return self;
+    }
+
+    fn seedIds(self: *Goal, events: []const types.Event) void {
+        for (events) |event| self.seedIdsFromValue(event.data);
+    }
+
+    fn seedIdsFromValue(self: *Goal, value: std.json.Value) void {
+        switch (value) {
+            .object => |object| {
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "commandId") and
+                        entry.value_ptr.* == .string)
+                    {
+                        self.seedId(entry.value_ptr.string);
+                    }
+                    self.seedIdsFromValue(entry.value_ptr.*);
+                }
+            },
+            .array => |array| for (array.items) |item| self.seedIdsFromValue(item),
+            else => {},
+        }
+    }
+
+    fn seedId(self: *Goal, id: []const u8) void {
+        const prefix = "goal-cmd-";
+        if (!std.mem.startsWith(u8, id, prefix)) return;
+        const number = std.fmt.parseInt(u64, id[prefix.len..], 10) catch return;
+        if (number >= self.next_command_id) self.next_command_id = number + 1;
+    }
+
     pub fn command(self: *Goal) Command {
         return .{
             .name = "goal",
@@ -333,6 +370,47 @@ test "goal command writes command/run, goal/change, command/done in order" {
     try testing.expectEqualStrings("command/run", types_seen[0]);
     try testing.expectEqualStrings("goal/change", types_seen[1]);
     try testing.expectEqualStrings("command/done", types_seen[2]);
+}
+
+test "a restored goal command continues past logged command ids" {
+    // Regression: a fresh Goal after a restart minted `goal-cmd-1` again.
+    var session = try TestSession.init(testing.allocator);
+    defer session.deinit(testing.allocator);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    {
+        var store = goal.Store.init(testing.allocator);
+        defer store.deinit();
+        store.attachLog(&session.log);
+        var command = Goal{ .store = &store };
+        _ = try command.dispatch(a, "ship it");
+    }
+
+    var read = try session_log.readLog(testing.allocator, session.path);
+    defer read.deinit();
+    var restored_store = goal.Store.init(testing.allocator);
+    defer restored_store.deinit();
+    restored_store.attachLog(&session.log);
+    try restored_store.rebuild(read.events);
+    var command = Goal.restored(&restored_store, read.events);
+    _ = try command.dispatch(a, "");
+
+    var after = try session_log.readLog(testing.allocator, session.path);
+    defer after.deinit();
+    var last_run_id: ?[]const u8 = null;
+    for (after.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "command/run")) continue;
+        last_run_id = switch (event.data) {
+            .object => |object| switch (object.get("commandId") orelse continue) {
+                .string => |text| text,
+                else => continue,
+            },
+            else => continue,
+        };
+    }
+    try testing.expectEqualStrings("goal-cmd-2", last_run_id orelse return error.TestUnexpectedResult);
 }
 
 test "goal command event payloads carry args, outcome, and goal ref" {

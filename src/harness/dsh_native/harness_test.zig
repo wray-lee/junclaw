@@ -1075,6 +1075,82 @@ test "dsh-native adapter: a restored session keeps the goal and runs the next ro
     try testing.expectEqual(@as(u32, 4), done.revision);
 }
 
+test "dsh-native adapter: a first-turn /permission stays the logged permission" {
+    // Regression: the session defaults were written at the first turn, after
+    // an earlier `/permission`, so a restore replayed the configured preset
+    // instead of the one the user had chosen.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "hello" }});
+    defer fx.deinit();
+
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        try h.restore(.{ .messages = &.{} });
+        _ = (try h.handleLocalCommand("/permission danger-full-access")) orelse
+            return error.CommandNotClaimed;
+        const first = try h.runTurn(turnInput("hello"));
+        defer allocator.free(first.reply);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+    const status = (try restored.harness().handleLocalCommand("/permission")) orelse
+        return error.CommandNotClaimed;
+    try testing.expect(std.mem.indexOf(u8, status, "current preset danger-full-access") != null);
+}
+
+test "dsh-native adapter: a resumed session continues turn numbering" {
+    // Regression: restore rebuilt the kernel at turn 0, so the next turn
+    // reused turn 1 and the `system-1` message id inside the same log.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{ .{ .text = "one" }, .{ .text = "two" } });
+    defer fx.deinit();
+
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const first = try engine.harness().runTurn(turnInput("one"));
+        defer allocator.free(first.reply);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    try restored.harness().restore(.{ .messages = &.{} });
+    const second = try restored.harness().runTurn(turnInput("two"));
+    defer allocator.free(second.reply);
+
+    const path = try fx.logPath(allocator, session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var last_turn: u64 = 0;
+    var system_ids: [2][]const u8 = undefined;
+    var systems: usize = 0;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "turn/start")) {
+            const turn = event.data.object.get("turn") orelse return error.TestUnexpectedResult;
+            last_turn = @intCast(turn.integer);
+        } else if (std.mem.eql(u8, event.event_type, "system/message")) {
+            const message = event.data.object.get("message") orelse return error.TestUnexpectedResult;
+            const id = message.object.get("id") orelse return error.TestUnexpectedResult;
+            if (systems < system_ids.len) system_ids[systems] = id.string;
+            systems += 1;
+        }
+    }
+    try testing.expectEqual(@as(u64, 2), last_turn);
+    try testing.expectEqual(@as(usize, 2), systems);
+    try testing.expectEqualStrings("system-1", system_ids[0]);
+    try testing.expectEqualStrings("system-2", system_ids[1]);
+}
+
 test "dsh-native adapter: an unreplayable goal projection follows on_corrupt" {
     // Regression: the same restore use-after-free; where the freed page stayed
     // mapped the garbage id silently turned the corrupt log into a

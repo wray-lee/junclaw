@@ -11574,14 +11574,14 @@ test "dsh-native: store history seeds the JSONL once, windowed, and leaves the s
     defer read.deinit();
     try testing.expect(read.header.is_seeded);
     // max_history_messages=3 keeps only the newest rows, in native order.
-    try testing.expectEqual(@as(usize, 4), read.events.len);
-    try testing.expectEqualStrings("assistant/message", read.events[0].event_type);
-    try testing.expectEqualStrings("a2", try dshNativeLogEventText(read.events[0]));
-    try testing.expectEqualStrings("user/message", read.events[1].event_type);
-    try testing.expectEqualStrings("q3", try dshNativeLogEventText(read.events[1]));
-    try testing.expectEqualStrings("assistant/message", read.events[2].event_type);
-    try testing.expectEqualStrings("a3", try dshNativeLogEventText(read.events[2]));
-    try testing.expectEqualStrings("session/end-seed", read.events[3].event_type);
+    try testing.expectEqual(@as(usize, 7), read.events.len);
+    try testing.expectEqualStrings("assistant/message", read.events[3].event_type);
+    try testing.expectEqualStrings("a2", try dshNativeLogEventText(read.events[3]));
+    try testing.expectEqualStrings("user/message", read.events[4].event_type);
+    try testing.expectEqualStrings("q3", try dshNativeLogEventText(read.events[4]));
+    try testing.expectEqualStrings("assistant/message", read.events[5].event_type);
+    try testing.expectEqualStrings("a3", try dshNativeLogEventText(read.events[5]));
+    try testing.expectEqualStrings("session/end-seed", read.events[6].event_type);
 
     // Import is read-only for the host store.
     const stored = try store.loadMessages(testing.allocator, key);
@@ -11598,7 +11598,7 @@ test "dsh-native: store history seeds the JSONL once, windowed, and leaves the s
     _ = try sm.getOrCreate(key);
     var reread = try dsh_native_session_log.readLog(testing.allocator, log_path);
     defer reread.deinit();
-    try testing.expectEqual(@as(usize, 4), reread.events.len);
+    try testing.expectEqual(@as(usize, 7), reread.events.len);
 
     // Mirroring after the restore still writes to the same store path.
     const reply = try sm.processMessage(key, "next question", null);

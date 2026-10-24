@@ -1117,6 +1117,9 @@ fn restartFixture(d: *Driver, allocator: Allocator) !void {
     var read = try session_log.readLog(allocator, d.log_path);
     defer read.deinit();
     try d.goal_store.?.rebuild(read.events);
+    // A process restart builds a new command object; seed its id counter from
+    // the reopened log so `/goal` after `restart` continues the numbering.
+    if (d.goal_command) |command| command.* = goal_command.Goal.restored(d.goal_store.?, read.events);
     if (d.goal_driver) |*driver| driver.pending = null;
 
     d.surface_messages.clearRetainingCapacity();
