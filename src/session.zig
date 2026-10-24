@@ -50,6 +50,7 @@ const native_harness = @import("harness/native.zig");
 /// The in-process dsh engine (`agent.harness = "dsh-native"`). No build flag
 /// gates it, so the import is unconditional.
 const dsh_native_mod = @import("harness/dsh_native/harness.zig");
+const dsh_bridge = @import("harness/dsh_native/tools/bridge.zig");
 const build_options = @import("build_options");
 const dsh_enabled = build_options.enable_harness_dsh;
 const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
@@ -124,6 +125,9 @@ const DshNativeState = struct {
     /// `Event.usage` count. A turn that emitted none falls back to the
     /// `total_tokens` delta, so the ledger never double counts.
     usage_events: u64 = 0,
+    /// Owned descriptors for the session's bridged junclaw tools (the string
+    /// slices inside are borrowed from the live tools).
+    host_tools: []const dsh_bridge.HostTool = &.{},
 
     fn init(allocator: Allocator, config: *const Config, session: *Session) !DshNativeState {
         const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
@@ -141,6 +145,20 @@ const DshNativeState = struct {
         errdefer allocator.free(session_dir);
         const model = try allocator.dupe(u8, session.agent.model_name);
         errdefer allocator.free(model);
+        // The session's live junclaw tool list, bridged for the model. Names,
+        // descriptions and schemas are the tools' own strings (copied into the
+        // harness arena during init), so they never reach the model rewritten.
+        const host_tools = try allocator.alloc(dsh_bridge.HostTool, session.agent.tools.len);
+        errdefer allocator.free(host_tools);
+        for (session.agent.tools, 0..) |tool, index| {
+            const spec = tool.spec();
+            host_tools[index] = .{
+                .name = spec.name,
+                .description = spec.description,
+                .input_schema_json = spec.parameters_json,
+                .concurrency_safe = dsh_bridge.isReadOnlyHostTool(spec.name),
+            };
+        }
 
         var harness = try dsh_native_mod.DshNativeHarness.init(allocator, .{
             .session_key = session.session_key,
@@ -163,18 +181,41 @@ const DshNativeState = struct {
             .compaction_headroom_tokens = config.agent.dsh_compaction_headroom_tokens,
             .question_timeout_s = config.agent.dsh_question_timeout,
             .temperature = session.agent.temperature,
+            .host_tools = host_tools,
+            .host_executor = .{ .context = @ptrCast(&session.agent), .call = hostToolCall },
         });
         errdefer harness.deinit(allocator);
-        return .{ .harness = harness, .dsh_home = dsh_home, .session_dir = session_dir, .model = model };
+        return .{
+            .harness = harness,
+            .dsh_home = dsh_home,
+            .session_dir = session_dir,
+            .model = model,
+            .host_tools = host_tools,
+        };
     }
 
     fn deinit(self: *DshNativeState, allocator: Allocator) void {
         self.harness.deinit(allocator);
+        if (self.host_tools.len != 0) allocator.free(self.host_tools);
         allocator.free(self.dsh_home);
         allocator.free(self.session_dir);
         allocator.free(self.model);
     }
 };
+
+/// Bridge executor: arguments are re-serialized because the junclaw executor
+/// takes raw JSON (the same shape the native loop passes).
+fn hostToolCall(
+    context: *anyopaque,
+    allocator: Allocator,
+    name: []const u8,
+    args: std.json.Value,
+) anyerror!dsh_bridge.HostResult {
+    const agent: *Agent = @ptrCast(@alignCast(context));
+    const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
+    const outcome = agent.executeHostTool(allocator, name, args_json);
+    return .{ .success = outcome.success, .output = outcome.output };
+}
 
 /// Test seam: point session-created dsh harnesses at an in-process mock
 /// instead of spawning a sidecar. Production never sets it.

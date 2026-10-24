@@ -105,14 +105,28 @@ pub const Wrap = struct {
     render: *const fn (context: ?*anyopaque, allocator: Allocator, args: Value, result: *const ToolResult) anyerror![]const types.ContentBlock,
 };
 
+/// Metadata for a host (junclaw) bridged tool. Kept separate from core tools
+/// so dsh's generated schemas and aliases stay the only resolvable names.
+pub const HostMeta = struct {
+    /// Only an explicit `true` joins a parallel pool; everything else is an
+    /// exclusive barrier (dsh's fail-closed classifier).
+    concurrency_safe: bool = false,
+    /// A tool that must reach the user fails closed when the turn has no
+    /// interaction channel, mirroring `port.Interaction == null`.
+    requires_interaction: bool = false,
+};
+
 /// A registered core tool: the generated schema plus its handler.
 pub const Tool = struct {
     name: []const u8,
     description: []const u8,
-    /// Raw inputSchema JSON, verbatim from `generated/tool_schemas.zig`.
+    /// Raw inputSchema JSON, verbatim from `generated/tool_schemas.zig`, or the
+    /// host tool's own schema for bridged entries.
     input_schema_json: []const u8,
     handler: Handler,
     wrap: ?Wrap = null,
+    /// Set for bridged host tools; null for dsh core tools.
+    host: ?HostMeta = null,
 };
 
 pub const Schema = struct {
@@ -183,12 +197,16 @@ pub const CoreHandlers = struct {
 
 pub const Registry = struct {
     tools: std.StringHashMapUnmanaged(Tool) = .empty,
+    /// Host-bridged tools keyed by their exact junclaw name. They never enter
+    /// `tools`, so `resolveName` still rejects every non-dsh spelling.
+    host_tools: std.StringHashMapUnmanaged(Tool) = .empty,
 
     pub fn init() Registry {
         return .{};
     }
 
     pub fn deinit(self: *Registry, allocator: Allocator) void {
+        self.host_tools.deinit(allocator);
         self.tools.deinit(allocator);
     }
 
@@ -221,9 +239,26 @@ pub const Registry = struct {
         }
     }
 
+    /// Register a host-bridged tool under its exact junclaw name. Core names
+    /// and their aliases stay reserved: a host tool may not shadow a dsh tool.
+    pub fn registerHost(self: *Registry, allocator: Allocator, tool: Tool) !void {
+        if (tool.name.len == 0) return error.InvalidToolName;
+        if (tool.host == null) return error.NotAHostTool;
+        if (self.get(tool.name) != null) return error.DuplicateTool;
+        try self.host_tools.put(allocator, tool.name, tool);
+    }
+
     pub fn get(self: *const Registry, name: []const u8) ?*const Tool {
+        // Host names are exact: no case folding, no `dev__` alias.
+        if (self.host_tools.getPtr(name)) |tool| return tool;
         const canonical = resolveName(name) orelse return null;
         return self.tools.getPtr(canonical);
+    }
+
+    /// Host metadata for `name`, or null when `name` is not a bridged tool.
+    pub fn hostMeta(self: *const Registry, name: []const u8) ?HostMeta {
+        const tool = self.host_tools.getPtr(name) orelse return null;
+        return tool.host;
     }
 
     /// Run one call and apply its rendering wrap. Unknown names, aliases

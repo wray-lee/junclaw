@@ -23,6 +23,7 @@ pub const questions = @import("questions.zig");
 pub const commands = @import("commands.zig");
 pub const loop = @import("loop.zig");
 pub const tools_registry = @import("tools/registry.zig");
+pub const tools_bridge = @import("tools/bridge.zig");
 pub const tools_scheduler = @import("tools/scheduler.zig");
 pub const tools_execute = @import("tools/execute.zig");
 pub const tools_builtins = @import("tools/builtins.zig");
