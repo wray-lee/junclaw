@@ -87,6 +87,10 @@ pub const TurnInput = struct {
     conversation_context: ?prompt.ConversationContext = null,
     /// Memory scope key; borrowed (owned by the Session).
     memory_session_id: ?[]const u8 = null,
+    /// Native-compatible long-term memory recall block for this turn
+    /// (`[Memory context]...`); borrowed. The host computes it from the same
+    /// store and parameters the native engine uses.
+    memory_context: ?[]const u8 = null,
     /// Mirrors today's `stream_callback != null`: the host has a live draft to
     /// feed, so the engine may run the provider in streaming mode. False keeps
     /// the blocking provider path.

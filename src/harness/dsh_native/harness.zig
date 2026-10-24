@@ -32,6 +32,8 @@ const compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const agent_mod = @import("../../agent/root.zig");
 const dispatcher = @import("../../agent/dispatcher.zig");
+const native_prompt = @import("../../agent/prompt.zig");
+const bootstrap_mod = @import("../../bootstrap/root.zig");
 const providers = @import("../../providers/root.zig");
 const config_types = @import("../../config_types.zig");
 const memory_mod = @import("../../memory/root.zig");
@@ -94,6 +96,18 @@ pub const Options = struct {
     reasoning_effort: ?[]const u8 = null,
     max_tokens: ?u32 = null,
     persona: []const u8 = "",
+    /// `agent.timezone`, rendered into the runtime-context date/time section.
+    timezone: []const u8 = "UTC",
+    /// `agent.reasoning_mode`: provider reasoning hint and `port.Info` parity.
+    reasoning_mode: config_types.ReasoningMode = .off,
+    /// Native workspace bootstrap provider; null falls back to direct reads.
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
+    /// Native identity config (AIEOS); disabled by default like native.
+    identity_config: ?config_types.IdentityConfig = null,
+    /// Test seam: the captured dsh fixtures ran without the runtime-context
+    /// and agent-instructions plugins, so replaying them must not inject the
+    /// pre-step context messages that a production session carries.
+    inject_model_context: bool = true,
     approval_policy: config_types.DshApprovalPolicy = .ask,
     sandbox: config_types.DshSandbox = .workspace_write,
     /// junclaw SecurityPolicy: autonomy (read-only), the per-call rate limit,
@@ -155,6 +169,14 @@ pub const DshNativeHarness = struct {
     reset_error: ?anyerror = null,
     context_written: bool = false,
 
+    /// Retained runtime-context snapshot. dsh logs a snapshot only when the
+    /// rendered text changes (runtime-context.ts tracker).
+    runtime_tracker: context.SnapshotTracker = .{},
+    /// dsh agent-instructions discovery state for this session.
+    instructions_tracker: context.BaselineTracker = .{},
+    /// Seq of the visible agent-instructions baseline message, or null.
+    instructions_seq: ?u64 = null,
+
     /// The model-visible surface (arena-owned), in request order.
     messages: std.ArrayListUnmanaged(types.Message) = .empty,
 
@@ -207,6 +229,10 @@ pub const DshNativeHarness = struct {
     live_stream: bool = false,
     drain: ?agent_mod.DrainCallback = null,
     drain_ctx: ?*anyopaque = null,
+    /// Host-computed native memory recall block for this turn; borrowed.
+    turn_memory_context: []const u8 = "",
+    /// Native workspace guide block for this turn (owned when non-empty).
+    turn_guides: ?[]u8 = null,
 
     /// Tool calls logged but not yet answered, in model order.
     pending_calls: std.ArrayListUnmanaged(PendingCall) = .empty,
@@ -451,41 +477,18 @@ pub const DshNativeHarness = struct {
         return null;
     }
 
-    /// System prompt plus the runtime-context block (working directory, file
-    /// and approval policy) for the current folded permission state. Rebuilt
-    /// after `/permission` and on restore so the model sees the live policy.
+    /// The verbatim dsh system prompt (persona slot, tool guidance, plan
+    /// policy). Runtime context is a per-step `user/message`, never mixed in:
+    /// dsh re-renders it on every pre-step (design B15/B16).
     fn buildPrompt(self: *Self) !void {
         _ = self.prompt_arena.reset(.retain_capacity);
         self.prompt_generation += 1;
-        self.system_prompt = "";
         const perm = self.prompt_arena.allocator();
         const plan_active = self.planActive();
-        const built = try prompt.buildSystemPrompt(perm, .{
+        self.system_prompt = try prompt.buildSystemPrompt(perm, .{
             .persona_prefix = self.opts.persona,
             .plan_policy = if (plan_active) generated_system_prompt.plan_policy_text else "",
         });
-
-        const sandbox: context.SandboxMode = self.permission_state.sandbox orelse
-            switch (self.opts.sandbox) {
-                .read_only => .read_only,
-                .workspace_write => .workspace_write,
-                .danger_full_access => .danger_full_access,
-            };
-        const approval: context.ApprovalPolicy = self.permission_state.approval orelse
-            switch (self.opts.approval_policy) {
-                .ask => .ask,
-                .never => .never,
-            };
-        const sections = [_]context.Section{
-            try context.workingDirectorySection(perm, self.workspace()),
-            try context.sandboxPolicySection(perm, sandbox, self.workspace()),
-            context.approvalPolicySection(approval),
-        };
-        const rendered = try context.renderContextSnapshot(perm, &sections);
-        self.system_prompt = if (rendered.len == 0)
-            built
-        else
-            try std.fmt.allocPrint(perm, "{s}\n\n{s}", .{ built, rendered });
         self.prompt_plan_active = plan_active;
     }
 
@@ -527,6 +530,16 @@ pub const DshNativeHarness = struct {
         self.last_assistant_text = null;
         self.total_tokens = 0;
         self.context_written = false;
+        self.runtime_tracker.deinit(self.allocator);
+        self.instructions_tracker = .{};
+        self.instructions_seq = null;
+        self.freeTurnGuides();
+        self.turn_memory_context = "";
+    }
+
+    fn freeTurnGuides(self: *Self) void {
+        if (self.turn_guides) |text| self.allocator.free(text);
+        self.turn_guides = null;
     }
 
     // ── session lifecycle ────────────────────────────────────────────────────
@@ -725,6 +738,42 @@ pub const DshNativeHarness = struct {
             messages[index] = try cloneMessage(arena, node.message);
         }
         try self.messages.appendSlice(arena, messages);
+        try self.restoreContextTrackerState(fold.nodes);
+    }
+
+    /// Resume the dsh context projectors from the folded surface: the last
+    /// runtime-context snapshot stays retained (no duplicate on the next
+    /// pre-step) and the agent-instructions baseline keeps its identity so an
+    /// unchanged file set emits nothing.
+    fn restoreContextTrackerState(self: *Self, nodes: []const surface_mod.Node) !void {
+        self.runtime_tracker.deinit(self.allocator);
+        self.instructions_tracker = .{};
+        self.instructions_seq = null;
+        for (nodes) |node| {
+            const source = switch (node.message.source) {
+                .other => |value| value,
+                else => continue,
+            };
+            const kind = sourceKindValue(source);
+            if (std.mem.eql(u8, kind, "runtime-context")) {
+                const text = try textOf(self.allocator, node.message.content);
+                defer self.allocator.free(text);
+                self.runtime_tracker.deinit(self.allocator);
+                self.runtime_tracker.retained = try self.allocator.dupe(u8, text);
+            } else if (std.mem.eql(u8, kind, "agent-instructions")) {
+                self.instructions_seq = node.seq;
+                const object = switch (source) {
+                    .object => |value| value,
+                    else => continue,
+                };
+                if (object.get("baselineIdentity")) |value| switch (value) {
+                    .string => |text| if (identityFromHex(text)) |identity| {
+                        self.instructions_tracker.identity = identity;
+                    },
+                    else => {},
+                };
+            }
+        }
     }
 
     fn buildLoop(self: *Self) void {
@@ -957,6 +1006,22 @@ pub const DshNativeHarness = struct {
             self.interaction = null;
         }
 
+        // Native re-reads the workspace guides once per turn; the runtime
+        // context renders them on every pre-step, so they must live that long.
+        self.freeTurnGuides();
+        self.turn_memory_context = input.memory_context orelse "";
+        if (self.opts.inject_model_context) {
+            self.turn_guides = try native_prompt.buildWorkspaceGuides(self.allocator, .{
+                .workspace_dir = self.workspace(),
+                .bootstrap_provider = self.opts.bootstrap_provider,
+                .identity_config = self.opts.identity_config,
+            });
+        }
+        defer {
+            self.freeTurnGuides();
+            self.turn_memory_context = "";
+        }
+
         self.turn_text.clearRetainingCapacity();
         self.last_assistant_text = null;
         const calls_before = self.turn_model_calls;
@@ -1075,13 +1140,31 @@ pub const DshNativeHarness = struct {
             .allowed_paths = &.{},
             .has_own_autonomy = false,
             .queue_mode = .steer,
-            .reasoning_mode = .off,
+            .reasoning_mode = self.opts.reasoning_mode,
             .redactor = null,
             .harness_kind = .dsh_native,
             .owns_inbox = true,
             .supports_commands = false,
             .dsh_session_id = if (self.session_id.len == 0) null else self.session_id,
         };
+    }
+
+    /// Host seam for `/model`, `/think` and `/reasoning`: the session's agent
+    /// owns the live selection, the engine mirrors it into the next request
+    /// header (provider routing included, so `provider/model` refs work).
+    pub fn setCallConfig(
+        self: *Self,
+        model: []const u8,
+        reasoning_effort: ?[]const u8,
+        reasoning_mode: config_types.ReasoningMode,
+    ) void {
+        self.opts.model = model;
+        self.opts.reasoning_effort = reasoning_effort;
+        self.opts.reasoning_mode = reasoning_mode;
+        if (self.loop) |*l| {
+            l.config.model = model;
+            l.config.reasoning_effort = reasoning_effort;
+        }
     }
 
     fn nextMessageId(self: *Self) ![]const u8 {
@@ -1269,15 +1352,49 @@ pub const DshNativeHarness = struct {
                 tools.authority = .{};
             }
         }
-        const seq = try self.appendEvent("user/message", data, .append, message.source_event_seqs);
-        try self.addSurfaceSnapshot(arena, seq, try surface_mod.messageFromEvent(arena, .{
+        const surface_op = message.surface_op orelse .append;
+        const seq = try self.appendEvent("user/message", data, surface_op, message.source_event_seqs);
+        const projected = try surface_mod.messageFromEvent(arena, .{
             .event_type = "user/message",
             .seq = seq,
             .time_ms = 0,
             .data = data,
-            .surface_op = .append,
-        }));
+            .surface_op = surface_op,
+        });
+        switch (surface_op) {
+            .append => try self.addSurfaceSnapshot(arena, seq, projected),
+            .replace => |range| try self.replaceSurfaceSnapshot(arena, range.start_seq, range.end_seq, seq, projected),
+        }
+        if (std.mem.eql(u8, messageSourceKind(data), "agent-instructions")) {
+            self.instructions_seq = seq;
+        }
         return seq;
+    }
+
+    /// Mirror a surface replacement in the in-memory request surface: the new
+    /// node takes the position of the range it shadows (surface.ts:63-105).
+    fn replaceSurfaceSnapshot(
+        self: *Self,
+        arena: Allocator,
+        start_seq: u64,
+        end_seq: u64,
+        seq: u64,
+        message: types.Message,
+    ) !void {
+        var start: ?usize = null;
+        var end: ?usize = null;
+        for (self.surface_seqs.items, 0..) |node_seq, index| {
+            if (start == null and node_seq == start_seq) start = index;
+            if (node_seq == end_seq) {
+                end = index;
+                break;
+            }
+        }
+        const first = start orelse return error.UnknownSurfaceRange;
+        const last = end orelse return error.UnknownSurfaceRange;
+        if (first > last) return error.UnknownSurfaceRange;
+        try self.surface_seqs.replaceRange(arena, first, last - first + 1, &.{seq});
+        try self.messages.replaceRange(arena, first, last - first + 1, &.{message});
     }
 
     fn appendRequestStart(self: *Self, decision: request.HeaderDecision) !u64 {
@@ -1516,7 +1633,81 @@ pub const DshNativeHarness = struct {
             const json = try planNarrationJson(allocator, id, text);
             try out.append(allocator, .{ .json = json });
         }
+        try self.appendModelContext(allocator, out);
         return .{};
+    }
+
+    /// Pre-step context dsh appends after the claimed user messages: the
+    /// agent-instructions baseline (B16) and the runtime-context snapshot
+    /// (B15). Both stay out of the system prompt.
+    fn appendModelContext(self: *Self, allocator: Allocator, out: *std.ArrayListUnmanaged(loop_mod.UserMessage)) !void {
+        if (!self.opts.inject_model_context) return;
+        try self.appendInstructionsBaseline(allocator, out);
+        try self.appendRuntimeContext(allocator, out);
+    }
+
+    fn appendInstructionsBaseline(self: *Self, allocator: Allocator, out: *std.ArrayListUnmanaged(loop_mod.UserMessage)) !void {
+        const baseline = try self.instructions_tracker.update(allocator, self.instructionsOptions(), self.instructions_seq) orelse return;
+        try out.append(allocator, .{
+            .json = try instructionsMessageJson(allocator, try self.nextMessageId(), baseline.text, baseline.identity, baseline.replacement),
+            .surface_op = if (baseline.replace_seq) |old_seq|
+                .{ .replace = .{ .start_seq = old_seq, .end_seq = old_seq } }
+            else
+                null,
+            .source_event_seqs = if (baseline.replace_seq) |old_seq|
+                try allocator.dupe(u64, &.{old_seq})
+            else
+                null,
+        });
+    }
+
+    fn instructionsOptions(self: *const Self) context.Options {
+        return .{
+            .cwd = self.workspace(),
+            .dsh_home = self.opts.dsh_home,
+        };
+    }
+
+    fn appendRuntimeContext(self: *Self, allocator: Allocator, out: *std.ArrayListUnmanaged(loop_mod.UserMessage)) !void {
+        const sections = try self.runtimeSections(allocator);
+        var snapshot = (try self.runtime_tracker.project(self.allocator, sections)) orelse return;
+        defer snapshot.deinit(self.allocator);
+        try out.append(allocator, .{
+            .json = try runtimeContextMessageJson(allocator, try self.nextMessageId(), snapshot),
+        });
+    }
+
+    fn runtimeSections(self: *const Self, allocator: Allocator) ![]context.Section {
+        var sections: std.ArrayListUnmanaged(context.Section) = .empty;
+        errdefer sections.deinit(allocator);
+        const memory_text = std.mem.trimEnd(u8, self.turn_memory_context, "\n");
+        if (memory_text.len > 0) {
+            try sections.append(allocator, context.customSection(
+                "junclaw:memory",
+                context.ContextOrder.junclaw_memory,
+                memory_text,
+            ));
+        }
+        if (self.turn_guides) |guides| {
+            const guide_text = std.mem.trimEnd(u8, guides, "\n");
+            if (guide_text.len > 0) {
+                try sections.append(allocator, context.customSection(
+                    "junclaw:workspace-guides",
+                    context.ContextOrder.junclaw_guides,
+                    guide_text,
+                ));
+            }
+        }
+        try sections.append(allocator, try context.dateTimeSection(allocator, self.opts.timezone, self.nowSeconds()));
+        try sections.append(allocator, try context.workingDirectorySection(allocator, self.workspace()));
+        try sections.append(allocator, try context.sandboxPolicySection(allocator, self.sandboxMode(), self.workspace()));
+        try sections.append(allocator, context.approvalPolicySection(self.approvalPolicy()));
+        return sections.toOwnedSlice(allocator);
+    }
+
+    fn nowSeconds(self: *const Self) i64 {
+        if (self.opts.now_ms) |clock| return @divFloor(clock(self.opts.clock_context), 1000);
+        return compat.time.timestamp();
     }
 
     fn hostSerializeMessage(
@@ -1548,6 +1739,7 @@ pub const DshNativeHarness = struct {
             .max_tokens = self.opts.max_tokens,
             .tools = self.planCatalogSpecs(),
             .reasoning_effort = self.opts.reasoning_effort,
+            .include_reasoning = self.opts.reasoning_mode != .off,
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
         };
         _ = view;
@@ -1556,10 +1748,25 @@ pub const DshNativeHarness = struct {
         defer freeResponseFields(arena, &response);
 
         self.turn_model_calls += 1;
+        // Reasoning and text need distinct stream indexes: the accumulator
+        // keys one content block per index, so sharing index 0 would fold the
+        // answer into the reasoning block (and drop it from the reply).
+        var next_block_index: u32 = 0;
+        if (self.opts.reasoning_mode != .off) {
+            if (response.reasoning_content) |reasoning| {
+                if (reasoning.len > 0) {
+                    try self.pending.append(arena, .{ .chunk = .{ .reasoning_delta = .{
+                        .index = next_block_index,
+                        .text = try arena.dupe(u8, reasoning),
+                    } } });
+                    next_block_index += 1;
+                }
+            }
+        }
         const content: []const u8 = response.content orelse "";
         if (content.len > 0) {
             try self.pending.append(arena, .{ .chunk = .{ .text_delta = .{
-                .index = 0,
+                .index = next_block_index,
                 .text = try arena.dupe(u8, content),
             } } });
         }
@@ -1942,6 +2149,61 @@ pub const DshNativeHarness = struct {
         try w.writeAll("}],\"source\":{\"kind\":\"plan-mode\",\"form\":\"notice\",\"summary\":");
         try std.json.Stringify.value(text, .{}, w);
         try w.writeAll("},\"role\":\"user\",\"id\":");
+        try std.json.Stringify.value(id, .{}, w);
+        try w.writeByte('}');
+        return writer.toOwnedSlice();
+    }
+
+    /// One `user/message` carrying the runtime-context snapshot, with dsh's
+    /// `source={kind:"runtime-context", form:"snapshot", sections}` metadata.
+    fn runtimeContextMessageJson(allocator: Allocator, id: []const u8, snapshot: context.Snapshot) ![]u8 {
+        var writer: Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        const w = &writer.writer;
+        try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(snapshot.text, .{}, w);
+        try w.writeAll("}],\"source\":{\"kind\":\"runtime-context\"");
+        switch (snapshot.source) {
+            .cleared => {},
+            .snapshot => |sections| {
+                try w.writeAll(",\"form\":\"snapshot\",\"sections\":[");
+                for (sections, 0..) |section, index| {
+                    if (index > 0) try w.writeByte(',');
+                    try w.writeAll("{\"name\":");
+                    try std.json.Stringify.value(section.name, .{}, w);
+                    try w.writeAll(",\"text\":");
+                    try std.json.Stringify.value(section.text, .{}, w);
+                    try w.writeByte('}');
+                }
+                try w.writeByte(']');
+            },
+        }
+        try w.writeAll("},\"role\":\"user\",\"id\":");
+        try std.json.Stringify.value(id, .{}, w);
+        try w.writeByte('}');
+        return writer.toOwnedSlice();
+    }
+
+    /// One `user/message` carrying the agent-instructions baseline, with dsh's
+    /// `source={kind:"agent-instructions", form:"instructions"}` metadata.
+    fn instructionsMessageJson(
+        allocator: Allocator,
+        id: []const u8,
+        text: []const u8,
+        identity: [32]u8,
+        replacement: bool,
+    ) ![]u8 {
+        var writer: Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        const w = &writer.writer;
+        try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeAll("}],\"source\":{\"kind\":\"agent-instructions\",\"form\":\"instructions\"");
+        if (!replacement) try w.writeAll(",\"baseline\":true");
+        try w.writeAll(",\"baselineIdentity\":\"");
+        const identity_hex = identityHex(identity);
+        try w.writeAll(&identity_hex);
+        try w.writeAll("\"},\"role\":\"user\",\"id\":");
         try std.json.Stringify.value(id, .{}, w);
         try w.writeByte('}');
         return writer.toOwnedSlice();
@@ -2812,6 +3074,41 @@ pub const DshNativeHarness = struct {
         return .{ .array = array };
     }
 };
+
+/// Lowercase hex of an instruction-baseline identity, as dsh stores it in
+/// `source.baselineIdentity`.
+fn identityHex(identity: [32]u8) [64]u8 {
+    const digits = "0123456789abcdef";
+    var out: [64]u8 = undefined;
+    for (identity, 0..) |byte, index| {
+        out[index * 2] = digits[byte >> 4];
+        out[index * 2 + 1] = digits[byte & 0x0f];
+    }
+    return out;
+}
+
+fn identityFromHex(text: []const u8) ?[32]u8 {
+    if (text.len != 64) return null;
+    var out: [32]u8 = undefined;
+    for (0..32) |index| {
+        const hi = std.fmt.charToDigit(text[index * 2], 16) catch return null;
+        const lo = std.fmt.charToDigit(text[index * 2 + 1], 16) catch return null;
+        out[index] = (hi << 4) | lo;
+    }
+    return out;
+}
+
+/// `kind` of a raw dsh message `source` object, or "" when absent.
+fn sourceKindValue(source: Value) []const u8 {
+    const object = switch (source) {
+        .object => |value| value,
+        else => return "",
+    };
+    return switch (object.get("kind") orelse return "") {
+        .string => |value| value,
+        else => "",
+    };
+}
 
 /// `source.kind` of a logged message, or "" when absent.
 fn messageSourceKind(data: Value) []const u8 {

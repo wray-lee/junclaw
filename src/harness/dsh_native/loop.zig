@@ -42,6 +42,9 @@ pub const SystemMessage = struct {
 /// payload (id/role/content/source) so the log adapter can append it verbatim.
 pub const UserMessage = struct {
     json: []const u8,
+    /// Surface operation for the appended event; null keeps `append`. The
+    /// agent-instructions baseline uses `replace` when its file set changes.
+    surface_op: ?types.SurfaceOp = null,
     source_event_seqs: ?[]const u64 = null,
 };
 

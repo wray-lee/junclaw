@@ -39,6 +39,8 @@ const Reply = struct {
     fail: bool = false,
     /// The call reports provider-confirmed context overflow.
     overflow: bool = false,
+    /// Provider-returned reasoning/thinking text.
+    reasoning: ?[]const u8 = null,
 };
 
 const FakeProvider = struct {
@@ -60,6 +62,9 @@ const FakeProvider = struct {
     const Request = struct {
         contents: []const []const u8,
         roles: []const providers.Role,
+        model: []const u8,
+        reasoning_effort: ?[]const u8,
+        include_reasoning: ?bool,
     };
 
     fn init(allocator: Allocator, replies: []const Reply) FakeProvider {
@@ -71,6 +76,8 @@ const FakeProvider = struct {
             for (request.contents) |content| self.allocator.free(content);
             self.allocator.free(request.contents);
             self.allocator.free(request.roles);
+            self.allocator.free(request.model);
+            if (request.reasoning_effort) |effort| self.allocator.free(effort);
         }
         self.requests.deinit(self.allocator);
     }
@@ -99,7 +106,16 @@ const FakeProvider = struct {
             contents[index] = try self.allocator.dupe(u8, message.content);
             roles[index] = message.role;
         }
-        try self.requests.append(self.allocator, .{ .contents = contents, .roles = roles });
+        try self.requests.append(self.allocator, .{
+            .contents = contents,
+            .roles = roles,
+            .model = try self.allocator.dupe(u8, request.model),
+            .reasoning_effort = if (request.reasoning_effort) |effort|
+                try self.allocator.dupe(u8, effort)
+            else
+                null,
+            .include_reasoning = request.include_reasoning,
+        });
         if (self.next >= self.replies.len) return error.UnscriptedCall;
         const reply = self.replies[self.next];
         self.next += 1;
@@ -125,6 +141,10 @@ const FakeProvider = struct {
         }
         return .{
             .content = try allocator.dupe(u8, reply.text),
+            .reasoning_content = if (reply.reasoning) |reasoning|
+                try allocator.dupe(u8, reasoning)
+            else
+                null,
             .tool_calls = calls,
             .usage = .{
                 .prompt_tokens = reply.prompt_tokens,
@@ -209,6 +229,11 @@ const Fixture = struct {
     host_executor: ?bridge.HostExecutor = null,
     policy: ?*const SecurityPolicy = null,
     allowed_paths: []const []const u8 = &.{},
+    now_ms_fn: *const fn (?*anyopaque) i64 = fixedClock,
+    clock_context: ?*anyopaque = null,
+    /// Production sessions inject the pre-step context; compaction mechanics
+    /// tests can turn it off to keep their token budgets stable.
+    inject_model_context: bool = true,
 
     fn init(allocator: Allocator, replies: []const Reply) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -256,7 +281,9 @@ const Fixture = struct {
             .persona = "",
             .approval_policy = self.approval_policy,
             .sandbox = self.sandbox,
-            .now_ms = fixedClock,
+            .now_ms = self.now_ms_fn,
+            .clock_context = self.clock_context,
+            .inject_model_context = self.inject_model_context,
             .context_window = self.context_window,
             .compaction_threshold_ratio = self.compaction_threshold_ratio,
             .compaction_retain_ratio = self.compaction_retain_ratio,
@@ -288,6 +315,65 @@ const Fixture = struct {
 
 fn fixedClock(_: ?*anyopaque) i64 {
     return 1_700_000_000_000;
+}
+
+const MutableClock = struct {
+    now_ms: i64,
+
+    fn now(ctx: ?*anyopaque) i64 {
+        const self: *MutableClock = @ptrCast(@alignCast(ctx.?));
+        return self.now_ms;
+    }
+};
+
+fn writeWorkspaceFile(allocator: Allocator, workspace: []const u8, name: []const u8, content: []const u8) !void {
+    const path = try std.fs.path.join(allocator, &.{ workspace, name });
+    defer allocator.free(path);
+    const file = try fs_compat.createPath(path, .{});
+    defer file.close();
+    try file.writeAll(content);
+}
+
+/// Concatenated user-role contents of one recorded request.
+fn requestText(allocator: Allocator, request: FakeProvider.Request) ![]u8 {
+    var out: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer out.deinit(allocator);
+    for (request.roles, request.contents) |role, content| {
+        if (role != .user) continue;
+        if (out.items.len > 0) try out.appendSlice(allocator, "\n---\n");
+        try out.appendSlice(allocator, content);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
+    var count: usize = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, haystack, index, needle)) |found| {
+        count += 1;
+        index = found + needle.len;
+    }
+    return count;
+}
+
+/// Text of the last logged user message with the given `source.kind`.
+fn lastUserMessageText(events: []const types.Event, kind: []const u8) ?[]const u8 {
+    var found: ?[]const u8 = null;
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (!std.mem.eql(u8, userMessageKind(event), kind)) continue;
+        found = event.data.object.get("content").?.array.items[0].object.get("text").?.string;
+    }
+    return found;
+}
+
+fn countUserMessagesOfKind(events: []const types.Event, kind: []const u8) usize {
+    var count: usize = 0;
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (std.mem.eql(u8, userMessageKind(event), kind)) count += 1;
+    }
+    return count;
 }
 
 fn turnInput(message: []const u8) port.TurnInput {
@@ -1252,6 +1338,8 @@ test "dsh-native adapter: pre-step pressure compacts and rewrites the surface" {
     defer fx.deinit();
     fx.context_window = 1000;
     fx.compaction_headroom_tokens = 10;
+    // Keep the pressure math on the message payloads under test.
+    fx.inject_model_context = false;
 
     var engine = try fx.harness();
     defer engine.deinit(allocator);
@@ -1639,7 +1727,11 @@ test "dsh-native adapter: /permission sandbox mode reaches the runtime context" 
     // `sandbox/mode` never became visible to the model.
     var poison = PoisonAllocator{ .child = testing.allocator };
     const allocator = poison.allocator();
-    var fx = try Fixture.init(allocator, &.{.{ .text = "ready" }});
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "ready" },
+        .{ .text = "again" },
+        .{ .text = "escalated" },
+    });
     defer fx.deinit();
     fx.sandbox = .read_only;
 
@@ -1649,14 +1741,16 @@ test "dsh-native adapter: /permission sandbox mode reaches the runtime context" 
         const h = engine.harness();
         const first = try h.runTurn(turnInput("hello"));
         defer allocator.free(first.reply);
+        // The live policy is a pre-step runtime-context message, not part of
+        // the verbatim dsh system prompt (design B15).
+        try testing.expect(requestContains(fx.provider.requests.items[0], "Current DSH file policy: read-only"));
+        try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "Current DSH file policy") == null);
         const notice = (try h.handleLocalCommand("/permission workspace-write")) orelse
             return error.CommandNotClaimed;
         try testing.expect(std.mem.indexOf(u8, notice, "preset workspace-write") != null);
-        try testing.expect(std.mem.indexOf(
-            u8,
-            engine.system_prompt,
-            "Current DSH file policy: workspace-write",
-        ) != null);
+        const second = try h.runTurn(turnInput("again"));
+        defer allocator.free(second.reply);
+        try testing.expect(requestContains(fx.provider.requests.items[1], "Current DSH file policy: workspace-write"));
         break :blk try allocator.dupe(u8, engine.session_id);
     };
     defer allocator.free(session_id);
@@ -1665,16 +1759,25 @@ test "dsh-native adapter: /permission sandbox mode reaches the runtime context" 
     defer restored.deinit(allocator);
     try restored.harness().restore(.{ .messages = &.{} });
     try testing.expectEqualStrings(session_id, restored.session_id);
-    try testing.expect(std.mem.indexOf(
-        u8,
-        restored.system_prompt,
-        "Current DSH file policy: workspace-write",
-    ) != null);
-    try testing.expect(std.mem.indexOf(
-        u8,
-        restored.system_prompt,
-        "Current DSH file policy: read-only",
-    ) == null);
+    try testing.expect(std.mem.indexOf(u8, restored.system_prompt, "Current DSH file policy") == null);
+    const third = try restored.harness().runTurn(turnInput("escalate"));
+    defer allocator.free(third.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[2], "Current DSH file policy: workspace-write"));
+
+    // The latest retained snapshot is the workspace-write one; the earlier
+    // read-only snapshot stays in history, superseded by the newer text.
+    const path = try fx.logPath(allocator, session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var last_runtime_context: []const u8 = "";
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (!std.mem.eql(u8, userMessageKind(event), "runtime-context")) continue;
+        last_runtime_context = event.data.object.get("content").?.array.items[0].object.get("text").?.string;
+    }
+    try testing.expect(std.mem.indexOf(u8, last_runtime_context, "Current DSH file policy: workspace-write") != null);
+    try testing.expect(std.mem.indexOf(u8, last_runtime_context, "Current DSH file policy: read-only") == null);
 }
 
 // ── plan mode ───────────────────────────────────────────────────────────────
@@ -2362,4 +2465,239 @@ test "dsh-native adapter: /permission read-only reaches the file tools" {
     const written = try std.fs.path.join(allocator, &.{ fx.workspace, "blocked.txt" });
     defer allocator.free(written);
     try testing.expectError(error.FileNotFound, fs_compat.openPath(written, .{}));
+}
+
+// ── model-visible context (P3-D) ────────────────────────────────────────────
+
+test "dsh-native adapter: runtime context is a pre-step user message" {
+    // Regression: runtime context used to be appended to the system prompt,
+    // so the model saw a non-dsh system message and the context never
+    // refreshed per request.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "ready" }});
+    defer fx.deinit();
+    try writeWorkspaceFile(allocator, fx.workspace, "SOUL.md", "Persona baseline");
+    try writeWorkspaceFile(allocator, fx.workspace, "MEMORY.md", "Remembered fact");
+    try writeWorkspaceFile(allocator, fx.workspace, "AGENTS.md", "Operational rules");
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const result = try h.runTurn(turnInput("hello"));
+    defer allocator.free(result.reply);
+
+    // dsh's system prompt stays verbatim: no runtime-context or guide text.
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "Current runtime context") == null);
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "Current Date & Time") == null);
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "Persona baseline") == null);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const runtime = lastUserMessageText(read.events, "runtime-context") orelse
+        return error.MissingRuntimeContext;
+    try testing.expect(std.mem.indexOf(u8, runtime, "Current Date & Time") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "2023-11-14 22:13 UTC") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "Current working directory:") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "Current DSH file policy: workspace-write") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "### SOUL.md") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "Persona baseline") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "### MEMORY.md") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "Remembered fact") != null);
+    // AGENTS.md belongs to the instruction baseline, not the guide block.
+    try testing.expect(std.mem.indexOf(u8, runtime, "### AGENTS.md") == null);
+
+    var checked_source = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (!std.mem.eql(u8, userMessageKind(event), "runtime-context")) continue;
+        const source = event.data.object.get("source").?.object;
+        try testing.expectEqualStrings("snapshot", source.get("form").?.string);
+        var saw_datetime = false;
+        var saw_guides = false;
+        for (source.get("sections").?.array.items) |section| {
+            const name = section.object.get("name").?.string;
+            if (std.mem.eql(u8, name, "junclaw:date-time")) saw_datetime = true;
+            if (std.mem.eql(u8, name, "junclaw:workspace-guides")) saw_guides = true;
+        }
+        try testing.expect(saw_datetime);
+        try testing.expect(saw_guides);
+        checked_source = true;
+    }
+    try testing.expect(checked_source);
+
+    try testing.expect(requestContains(fx.provider.requests.items[0], "Persona baseline"));
+    try testing.expect(requestContains(fx.provider.requests.items[0], "Current Date & Time"));
+}
+
+test "dsh-native adapter: runtime context follows the clock and dedupes" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+        .{ .text = "three" },
+    });
+    defer fx.deinit();
+    var clock = MutableClock{ .now_ms = 1_700_000_000_000 };
+    fx.now_ms_fn = MutableClock.now;
+    fx.clock_context = &clock;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    clock.now_ms += 60_000;
+    const second = try h.runTurn(turnInput("again"));
+    defer allocator.free(second.reply);
+    const third = try h.runTurn(turnInput("same minute"));
+    defer allocator.free(third.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    // Two snapshots: 22:13 and 22:14. The third turn does not repeat 22:14.
+    try testing.expectEqual(@as(usize, 2), countUserMessagesOfKind(read.events, "runtime-context"));
+    const latest = lastUserMessageText(read.events, "runtime-context").?;
+    try testing.expect(std.mem.indexOf(u8, latest, "2023-11-14 22:14 UTC") != null);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "2023-11-14 22:14 UTC"));
+}
+
+test "dsh-native adapter: AGENTS.md follows dsh discovery and replaces on change" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+    });
+    defer fx.deinit();
+    try writeWorkspaceFile(allocator, fx.workspace, "AGENTS.md", "alpha rules");
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    try writeWorkspaceFile(allocator, fx.workspace, "AGENTS.md", "beta rules");
+    const second = try h.runTurn(turnInput("again"));
+    defer allocator.free(second.reply);
+
+    // The file body is not part of the verbatim system prompt.
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "alpha rules") == null);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "alpha rules"));
+    // The replacement shadows the first baseline; the old text is gone.
+    try testing.expect(requestContains(fx.provider.requests.items[1], "beta rules"));
+    try testing.expect(!requestContains(fx.provider.requests.items[1], "alpha rules"));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var baselines: usize = 0;
+    var first_seq: u64 = 0;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (!std.mem.eql(u8, userMessageKind(event), "agent-instructions")) continue;
+        if (baselines == 0) {
+            first_seq = event.seq;
+            const source = event.data.object.get("source").?.object;
+            try testing.expectEqualStrings("instructions", source.get("form").?.string);
+            try testing.expect(source.get("baseline").?.bool);
+            try testing.expectEqual(@as(usize, 64), source.get("baselineIdentity").?.string.len);
+        } else {
+            const replace = event.surface_op.?.replace;
+            try testing.expectEqual(first_seq, replace.start_seq);
+            try testing.expectEqual(first_seq, replace.end_seq);
+        }
+        baselines += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), baselines);
+}
+
+test "dsh-native adapter: host memory recall rides the turn's runtime context" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const memory_block = "[Memory context]\n- test-key: remembered value\n\n";
+    var with_memory = turnInput("hello");
+    with_memory.memory_context = memory_block;
+    const first = try h.runTurn(with_memory);
+    defer allocator.free(first.reply);
+    const second = try h.runTurn(turnInput("no memory this time"));
+    defer allocator.free(second.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 2), countUserMessagesOfKind(read.events, "runtime-context"));
+    var recalled: usize = 0;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (!std.mem.eql(u8, userMessageKind(event), "runtime-context")) continue;
+        const text = event.data.object.get("content").?.array.items[0].object.get("text").?.string;
+        recalled += countOccurrences(text, "[Memory context]");
+    }
+    try testing.expectEqual(@as(usize, 1), recalled);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "- test-key: remembered value"));
+    // The block stays in history for the next turn but is not recalled twice.
+    const second_request = try requestText(allocator, fx.provider.requests.items[1]);
+    defer allocator.free(second_request);
+    try testing.expectEqual(@as(usize, 1), countOccurrences(second_request, "[Memory context]"));
+}
+
+// Regression: reasoning and text shared stream index 0, so the accumulator
+// folded the answer into the reasoning block and the reply came back empty.
+test "dsh-native adapter: call config updates reach the request and Info" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "answer", .reasoning = "thinking trace" },
+        .{ .text = "second" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    engine.setCallConfig("armbian/sub", "high", .stream);
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    try testing.expectEqualStrings("answer", first.reply);
+    try testing.expectEqualStrings("armbian/sub", fx.provider.requests.items[0].model);
+    try testing.expectEqualStrings("high", fx.provider.requests.items[0].reasoning_effort.?);
+    try testing.expectEqual(true, fx.provider.requests.items[0].include_reasoning.?);
+    const info = h.info();
+    try testing.expectEqualStrings("armbian/sub", info.model_name);
+    try testing.expectEqual(config_types.ReasoningMode.stream, info.reasoning_mode);
+
+    // The reasoning trace is recorded as a reasoning block, not reply text.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_reasoning_block = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "assistant/message")) continue;
+        for (event.data.object.get("message").?.object.get("content").?.array.items) |block| {
+            if (std.mem.eql(u8, block.object.get("type").?.string, "reasoning")) {
+                try testing.expectEqualStrings("thinking trace", block.object.get("text").?.string);
+                saw_reasoning_block = true;
+            }
+        }
+    }
+    try testing.expect(saw_reasoning_block);
+
+    engine.setCallConfig("test-model", null, .off);
+    const second = try h.runTurn(turnInput("again"));
+    defer allocator.free(second.reply);
+    try testing.expectEqual(false, fx.provider.requests.items[1].include_reasoning.?);
+    try testing.expect(fx.provider.requests.items[1].reasoning_effort == null);
 }

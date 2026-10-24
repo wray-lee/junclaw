@@ -117,9 +117,7 @@ const DshNativeState = struct {
     dsh_home: []u8,
     session_dir: []u8,
     /// Owned because `/model` frees `agent.model_name`; the harness borrows
-    /// this slice for its lifetime.
-    // shortcut: /model switches the native agent only — the engine keeps the
-    // model it was created with until the session is recreated (P2).
+    /// this slice until `syncCallConfig` swaps in the next owned copy.
     model: []u8,
     /// The engine's cumulative `TurnResult.total_tokens` after the last turn.
     /// The counter restarts at 0 on /new, so `/new` resets this too.
@@ -170,9 +168,13 @@ const DshNativeState = struct {
             .provider = session.agent.provider,
             .provider_name = session.agent.provider.getName(),
             .model = model,
-            .reasoning_effort = config.reasoning_effort,
+            .reasoning_effort = session.agent.reasoning_effort,
+            .reasoning_mode = session.agent.reasoning_mode,
             .max_tokens = session.agent.max_tokens_override,
             .persona = config.agent.dsh_persona orelse "",
+            .timezone = config.agent.timezone,
+            .bootstrap_provider = session.agent.bootstrap,
+            .identity_config = config.identity,
             .approval_policy = config.agent.dsh_approval_policy,
             .sandbox = config.agent.dsh_sandbox,
             // The dsh tools must never be wider than the native ones: same
@@ -207,6 +209,21 @@ const DshNativeState = struct {
         allocator.free(self.dsh_home);
         allocator.free(self.session_dir);
         allocator.free(self.model);
+    }
+
+    /// `/model`, `/think` and `/reasoning` mutate the native agent; mirror the
+    /// live selection before the next engine turn so the engine's request
+    /// header and provider calls carry it (the `/model` shortcut is gone).
+    fn syncCallConfig(self: *DshNativeState, allocator: Allocator, agent: *Agent) !void {
+        if (!std.mem.eql(u8, self.model, agent.model_name)) {
+            const next = try allocator.dupe(u8, agent.model_name);
+            // Point the engine at the new copy before releasing the old one.
+            self.harness.setCallConfig(next, agent.reasoning_effort, agent.reasoning_mode);
+            allocator.free(self.model);
+            self.model = next;
+            return;
+        }
+        self.harness.setCallConfig(self.model, agent.reasoning_effort, agent.reasoning_mode);
     }
 };
 
@@ -656,7 +673,9 @@ pub const Session = struct {
                 d.harness.harness().reset();
                 d.reported_total_tokens = 0;
             }
-            return self.agent.handleSlashCommand(content);
+            const reply = try self.agent.handleSlashCommand(content);
+            try d.syncCallConfig(self.agent.allocator, &self.agent);
+            return reply;
         }
         if (comptime dsh_enabled) {
             if (self.dsh) |*d| {
@@ -2657,6 +2676,54 @@ pub const SessionManager = struct {
         self.appendUsageRecord(record);
     }
 
+    /// Native parity for `memory.auto_recall`: run the same retrieval pipeline
+    /// with the same parameters and return the `[Memory context]` block the
+    /// dsh runtime-context message should carry for this turn. The native
+    /// engine recalls against the redacted user message and redacts the block
+    /// before it reaches history; this does both. Null when recall is off or
+    /// has nothing to inject.
+    fn recallMemoryContext(self: *SessionManager, session: *Session, content: []const u8) !?[]const u8 {
+        const mem = session.agent.mem orelse return null;
+        if (!session.agent.auto_recall) return null;
+        const params = agent_mod.memory_loader.RecallParams{
+            .recall_limit = session.agent.recall_limit,
+            .max_context_bytes = session.agent.max_context_bytes,
+        };
+        const safe = if (session.agent.redactor) |r|
+            r.redact(self.allocator, content) catch null
+        else
+            null;
+        defer if (safe) |text| self.allocator.free(text);
+        const query = safe orelse content;
+        const block = if (session.agent.mem_rt) |rt|
+            agent_mod.memory_loader.loadContextWithRuntime(
+                self.allocator,
+                rt,
+                query,
+                session.agent.memory_session_id,
+                params,
+            ) catch return null
+        else
+            agent_mod.memory_loader.loadContext(
+                self.allocator,
+                mem,
+                query,
+                session.agent.memory_session_id,
+                params,
+            ) catch return null;
+        if (block.len == 0) {
+            self.allocator.free(block);
+            return null;
+        }
+        const redactor = session.agent.redactor orelse return block;
+        const redacted = redactor.redact(self.allocator, block) catch {
+            self.allocator.free(block);
+            return null;
+        };
+        self.allocator.free(block);
+        return redacted;
+    }
+
     /// dsh-native usage: the in-process engine never calls
     /// `usage_record_callback`, so its `Event.usage` goes through the same
     /// ledger path here. Native and sidecar sessions never take this branch.
@@ -3515,12 +3582,20 @@ pub const SessionManager = struct {
         var primary_failed = false;
         var primary_refs: std.ArrayListUnmanaged(ConsumedRef) = .empty;
         defer freeConsumedRefs(self.allocator, &primary_refs);
+        // dsh-native never runs Agent.turn, so the host performs the native
+        // memory recall and hands the block to the engine's runtime context.
+        const memory_context = if (session.dsh_native != null)
+            try self.recallMemoryContext(session, content)
+        else
+            null;
+        defer if (memory_context) |text| self.allocator.free(text);
         // The drain callback is installed (and restored) inside the adapter
         // around Agent.turn; the host only has to say "yes, drain this turn".
         const turn_input = harness_port.TurnInput{
             .user_message = content,
             .conversation_context = conversation_context,
             .memory_session_id = session.agent.memory_session_id,
+            .memory_context = memory_context,
             .live_stream = stream_sink != null,
             .sink = port_sink,
         };
@@ -7386,6 +7461,10 @@ const DshNativeScriptedProvider = struct {
     chat_calls: usize = 0,
     /// User-role text of the latest request, for history assertions.
     users: std.ArrayListUnmanaged(u8) = .empty,
+    /// Latest request call config, for `/model` and reasoning assertions.
+    last_model: ?[]u8 = null,
+    last_reasoning_effort: ?[]u8 = null,
+    last_include_reasoning: ?bool = null,
     /// Runs inside the blocking call, where a real /stop lands.
     on_chat: ?*const fn (ctx: *anyopaque) void = null,
     on_chat_ctx: ?*anyopaque = null,
@@ -7404,6 +7483,8 @@ const DshNativeScriptedProvider = struct {
 
     fn deinit(self: *DshNativeScriptedProvider) void {
         self.users.deinit(self.allocator);
+        if (self.last_model) |value| self.allocator.free(value);
+        if (self.last_reasoning_effort) |value| self.allocator.free(value);
     }
 
     fn provider(self: *DshNativeScriptedProvider) Provider {
@@ -7436,6 +7517,14 @@ const DshNativeScriptedProvider = struct {
             if (self.users.items.len > 0) try self.users.appendSlice(self.allocator, "\n---\n");
             try self.users.appendSlice(self.allocator, message.content);
         }
+        if (self.last_model) |value| self.allocator.free(value);
+        self.last_model = try self.allocator.dupe(u8, request.model);
+        if (self.last_reasoning_effort) |value| self.allocator.free(value);
+        self.last_reasoning_effort = if (request.reasoning_effort) |effort|
+            try self.allocator.dupe(u8, effort)
+        else
+            null;
+        self.last_include_reasoning = request.include_reasoning;
         if (self.on_chat) |hook| {
             if (self.on_chat_ctx) |ctx| hook(ctx);
         }
@@ -7520,6 +7609,24 @@ const DshNativeFixture = struct {
         );
     }
 
+    fn managerWithMemory(
+        self: *DshNativeFixture,
+        provider: *DshNativeScriptedProvider,
+        mem: ?Memory,
+    ) SessionManager {
+        var noop = observability.NoopObserver{};
+        return SessionManager.init(
+            testing.allocator,
+            &self.cfg,
+            provider.provider(),
+            &.{},
+            mem,
+            noop.observer(),
+            null,
+            null,
+        );
+    }
+
     fn mappingPath(self: *DshNativeFixture, allocator: Allocator, session_key: []const u8) ![]u8 {
         const name = try std.fmt.allocPrint(allocator, "{x}.json", .{std.hash.Wyhash.hash(0, session_key)});
         defer allocator.free(name);
@@ -7555,6 +7662,74 @@ test "dsh-native: compaction and question config reach the engine options" {
     try testing.expectEqual(@as(?f64, 0.25), opts.compaction_retain_ratio);
     try testing.expectEqual(@as(?u64, 1024), opts.compaction_headroom_tokens);
     try testing.expectEqual(@as(i32, 300), opts.question_timeout_s);
+}
+
+test "dsh-native: /model, /think and /reasoning reach the engine request" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.default_model = "example/sub";
+    fixture.cfg.reasoning_effort = "high";
+    fixture.cfg.agent.reasoning_mode = .off;
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+        .{ .text = "three" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-call-config";
+    const first = try sm.processMessage(key, "hello", null);
+    defer testing.allocator.free(first);
+    try testing.expectEqualStrings("example/sub", provider.last_model.?);
+    try testing.expectEqualStrings("high", provider.last_reasoning_effort.?);
+    try testing.expectEqual(false, provider.last_include_reasoning.?);
+
+    const mode_reply = try sm.processMessage(key, "/reasoning stream", null);
+    defer testing.allocator.free(mode_reply);
+    try testing.expect(std.mem.indexOf(u8, mode_reply, "stream") != null);
+
+    const think_reply = try sm.processMessage(key, "/think low", null);
+    defer testing.allocator.free(think_reply);
+    try testing.expect(std.mem.indexOf(u8, think_reply, "low") != null);
+
+    const model_reply = try sm.processMessage(key, "/model openai/gpt-5", null);
+    defer testing.allocator.free(model_reply);
+    try testing.expect(std.mem.indexOf(u8, model_reply, "openai/gpt-5") != null);
+
+    const second = try sm.processMessage(key, "again", null);
+    defer testing.allocator.free(second);
+    try testing.expectEqualStrings("openai/gpt-5", provider.last_model.?);
+    try testing.expectEqualStrings("low", provider.last_reasoning_effort.?);
+    try testing.expectEqual(true, provider.last_include_reasoning.?);
+
+    const session = try sm.getOrCreate(key);
+    const info = session.dsh_native.?.harness.harness().info();
+    try testing.expectEqualStrings("openai/gpt-5", info.model_name);
+    try testing.expectEqual(config_types.ReasoningMode.stream, info.reasoning_mode);
+}
+
+test "dsh-native: auto recall rides the engine's runtime context" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.memory.auto_recall = true;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+    try mem.store("test-key", "remembered value", .core, null);
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "ok" }});
+    defer provider.deinit();
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const reply = try sm.processMessage("cli:main:dsh-native-recall", "remembered", null);
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "[Memory context]") != null);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "- test-key: remembered value") != null);
 }
 
 test "dsh-native: plain turn runs in process, reports usage and selects the engine" {

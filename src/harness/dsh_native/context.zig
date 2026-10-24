@@ -21,6 +21,7 @@
 
 const std = @import("std");
 const compat = @import("compat");
+const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
 
 const Allocator = std.mem.Allocator;
@@ -31,6 +32,10 @@ const Allocator = std.mem.Allocator;
 
 /// dsh runtime-context positions (`CONTEXT_ORDERS`, system-prompt/src/index.ts:174-183).
 pub const ContextOrder = struct {
+    /// junclaw contributions injected ahead of dsh's own sentences.
+    pub const junclaw_memory: i32 = 70;
+    pub const junclaw_guides: i32 = 80;
+    pub const current_datetime: i32 = 90;
     pub const working_directory: i32 = 100;
     pub const sandbox_policy: i32 = 110;
     pub const approval_policy: i32 = 115;
@@ -73,6 +78,37 @@ pub fn workingDirectorySection(allocator: Allocator, cwd: []const u8) !Section {
         .name = "working-directory:current",
         .order = ContextOrder.working_directory,
         .text = try quotedLine(allocator, "Current working directory: ", cwd, "."),
+    };
+}
+
+/// Native's "## Current Date & Time" block as a runtime-context contribution.
+/// The caller recomputes it on every pre-step so the model sees the real
+/// request time; text matches `Agent.prompt.appendDateTimeSection` (trailing
+/// newlines dropped: the snapshot join supplies the separator).
+pub fn dateTimeSection(allocator: Allocator, timezone: []const u8, now_secs: i64) !Section {
+    const offset_secs_opt = config_types.AgentConfig.parseTimezoneOffsetSeconds(timezone);
+    const offset_secs = offset_secs_opt orelse 0;
+    const adjusted_ts = now_secs + offset_secs;
+    const safe_ts: u64 = if (adjusted_ts < 0) 0 else @intCast(adjusted_ts);
+
+    const tz_label = if (offset_secs_opt != null) timezone else "UTC";
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = safe_ts };
+    const epoch_day = epoch_seconds.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const day_seconds = epoch_seconds.getDaySeconds();
+
+    return .{
+        .name = "junclaw:date-time",
+        .order = ContextOrder.current_datetime,
+        .text = try std.fmt.allocPrint(allocator, "## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} {s}", .{
+            year_day.year,
+            @intFromEnum(month_day.month),
+            month_day.day_index + 1,
+            day_seconds.getHoursIntoDay(),
+            day_seconds.getMinutesIntoHour(),
+            tz_label,
+        }),
     };
 }
 
@@ -1169,6 +1205,14 @@ test "runtime context snapshot joins ordered sections with dsh framing" {
     const sandbox = try sandboxPolicySection(a, .workspace_write, "/work/a b");
     try std.testing.expectStringEndsWith(sandbox.text, "session workspace: \"/work/a b\". Some platform temporary areas may also be writable.");
     const approval = approvalPolicySection(.ask);
+
+    const utc = try dateTimeSection(a, "UTC", 1_700_000_000);
+    try std.testing.expectEqualStrings("## Current Date & Time\n\n2023-11-14 22:13 UTC", utc.text);
+    const shifted = try dateTimeSection(a, "UTC+08:00", 1_700_000_000);
+    try std.testing.expectEqualStrings("## Current Date & Time\n\n2023-11-15 06:13 UTC+08:00", shifted.text);
+    // A malformed timezone falls back to UTC, like the native prompt.
+    const invalid = try dateTimeSection(a, "Asia/Shanghai", 1_700_000_000);
+    try std.testing.expectEqualStrings("## Current Date & Time\n\n2023-11-14 22:13 UTC", invalid.text);
 
     // Deliberately out of order: cwd (100), sandbox (110), approval (115).
     var sections = [_]Section{ approval, sandbox, cwd, customSection("empty", 105, "") };

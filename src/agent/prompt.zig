@@ -296,7 +296,7 @@ pub fn buildSystemPrompt(
     const w = &buf_writer.writer;
 
     // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider, ctx.identity_config);
+    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider, ctx.identity_config, true);
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
@@ -450,6 +450,7 @@ fn buildIdentitySection(
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
     identity_config: ?config_types.IdentityConfig,
+    include_agents_md: bool,
 ) !void {
     var remaining_bootstrap_chars: usize = BOOTSTRAP_TOTAL_MAX_CHARS;
     var hit_total_bootstrap_limit = false;
@@ -480,6 +481,9 @@ fn buildIdentitySection(
     };
 
     for (identity_files) |filename| {
+        // dsh's instruction baseline owns AGENTS.md when the dsh-native engine
+        // renders this block as a context section.
+        if (!include_agents_md and std.mem.eql(u8, filename, "AGENTS.md")) continue;
         try injectWorkspaceFile(
             allocator,
             w,
@@ -507,6 +511,35 @@ fn buildIdentitySection(
             .{BOOTSTRAP_TOTAL_MAX_CHARS},
         );
     }
+}
+
+pub const WorkspaceGuidesOptions = struct {
+    workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider = null,
+    identity_config: ?config_types.IdentityConfig = null,
+};
+
+/// Render the native "Project Context" workspace guide block for an engine
+/// that keeps AGENTS.md on its own instruction path (the dsh-native runtime
+/// context). Content and file order match `buildSystemPrompt`; only the
+/// `### AGENTS.md` file body is left out. Caller owns the returned text.
+pub fn buildWorkspaceGuides(
+    allocator: std.mem.Allocator,
+    opts: WorkspaceGuidesOptions,
+) ![]u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+    try buildIdentitySection(
+        allocator,
+        &buf_writer.writer,
+        opts.workspace_dir,
+        opts.bootstrap_provider,
+        opts.identity_config,
+        false,
+    );
+    buf = buf_writer.toArrayList();
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn injectAieosIdentitySection(

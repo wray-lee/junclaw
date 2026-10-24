@@ -1943,6 +1943,9 @@ fn runEventFixture(scenario: []const u8) !void {
         .question_timeout_s = input.config.questionTimeout,
         .now_ms = clockNow,
         .clock_context = &clock,
+        // The captured dsh sessions had no runtime-context/instructions
+        // plugins, so the fixtures must replay without our pre-step context.
+        .inject_model_context = false,
     };
     const engine = try allocator.create(harness_mod.DshNativeHarness);
     engine.* = harness_mod.DshNativeHarness.init(allocator, engine_options) catch |err| {
