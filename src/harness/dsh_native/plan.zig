@@ -146,18 +146,22 @@ pub const Session = struct {
         self.pending = .{ .active = false, .narrate = false };
     }
 
-    /// Next accepted pre-step: report the selection to append. A target equal
-    /// to the logged mode needs no event and is dropped here.
+    /// Next accepted, non-aborted pre-step: report the selection to append. A
+    /// target equal to the logged mode needs no event and is dropped here.
     pub fn preStep(self: *Session) PreStep {
         const pending = self.pending orelse return .{};
+        // dsh narrates before onBoundary, so a cancelled pending selection can
+        // still carry a switch notice when the last header described the
+        // other mode.
+        const narration = if (pending.narrate)
+            narrationFor(self.state.active_at_last_header, pending.active)
+        else
+            null;
         if (pending.active == self.state.active) {
             self.pending = null;
-            return .{};
+            return .{ .narration = narration };
         }
-        return .{
-            .emit = pending.active,
-            .narration = if (pending.narrate) narrationFor(self.state.active_at_last_header, pending.active) else null,
-        };
+        return .{ .emit = pending.active, .narration = narration };
     }
 
     /// Clear the pending selection after its `plan/mode` event was appended.
@@ -362,6 +366,16 @@ test "plan pre-step drops a stale pending target" {
     session.pending = .{ .active = false, .narrate = true };
     const boundary = session.preStep();
     try testing.expectEqual(@as(?bool, null), boundary.emit);
+    try testing.expect(session.pending == null);
+}
+
+test "plan cancelled pending selection still narrates at the pre-step" {
+    var session = Session{};
+    session.state.active_at_last_header = true;
+    session.pending = .{ .active = false, .narrate = true };
+    const boundary = session.preStep();
+    try testing.expectEqual(@as(?bool, null), boundary.emit);
+    try testing.expectEqualStrings(generated.plan_mode.narration_off, boundary.narration.?);
     try testing.expect(session.pending == null);
 }
 
