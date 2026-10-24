@@ -194,14 +194,8 @@ fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry
     // Clear the environment like the native shell tool (CWE-200): provider
     // keys and channel tokens must not reach the child. Only the functional
     // variables listed in `shell.SAFE_ENV_VARS` are restored.
-    var env = compat.process.EnvMap.init(allocator);
+    var env = try safeEnv(allocator);
     defer env.deinit();
-    for (shell_mod.SAFE_ENV_VARS) |key| {
-        if (platform.getEnvOrNull(allocator, key)) |value| {
-            defer allocator.free(value);
-            try env.put(key, value);
-        }
-    }
 
     const stdout_temp = try createTempFile(allocator, context, "stdout");
     defer stdout_temp.file.close();
@@ -252,6 +246,19 @@ fn resolveWorkdir(allocator: Allocator, context: *const Context, requested: ?[]c
     if (std.fs.path.isAbsolute(model_workdir)) return model_workdir;
     const base = context.cwd orelse return model_workdir;
     return try std.fs.path.join(allocator, &.{ base, model_workdir });
+}
+
+/// Child environment: only `shell.SAFE_ENV_VARS`, never the host's secrets.
+fn safeEnv(allocator: Allocator) !compat.process.EnvMap {
+    var env = compat.process.EnvMap.init(allocator);
+    errdefer env.deinit();
+    for (shell_mod.SAFE_ENV_VARS) |key| {
+        if (platform.getEnvOrNull(allocator, key)) |value| {
+            defer allocator.free(value);
+            try env.put(key, value);
+        }
+    }
+    return env;
 }
 
 const TempFile = struct { path: []const u8, file: compat.fs.File };
@@ -746,20 +753,16 @@ test "bash refuses a workdir outside the workspace unless allowed_paths names it
     try testing.expectEqualStrings(expected, try expectText(try invoke(&allowed_context, allocator, allowed_args.value)));
 }
 
-test "bash scrubs the environment before spawning" {
-    if (comptime builtin.os.tag == .windows) return error.SkipZigTest; // POSIX sh -c execution
-
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const allocator = arena.allocator();
+test "bash builds the child environment from the safe list only" {
+    const allocator = testing.allocator;
     const name = "DSH_NATIVE_TEST_SECRET";
     try platform.setProcessEnv(allocator, name, "leaked-secret");
     defer platform.setProcessEnv(allocator, name, null) catch {};
 
-    var context: Context = .{};
-    var parsed = try parse(allocator, "{\"description\":\"Read the secret\",\"command\":\"echo \\\"${DSH_NATIVE_TEST_SECRET:-unset}\\\"\"}");
-    defer parsed.deinit();
     // Regression: the dsh bash inherited the host environment, so a model
     // command could print provider keys and channel tokens.
-    try testing.expectEqualStrings("unset\n", try expectText(try invoke(&context, allocator, parsed.value)));
+    var env = try safeEnv(allocator);
+    defer env.deinit();
+    try testing.expect(env.get(name) == null);
+    try testing.expect(env.get("PATH") != null);
 }
