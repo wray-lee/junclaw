@@ -271,7 +271,7 @@ These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` 
 
 Non-numeric or out-of-range ratios, `retain_ratio >= threshold_ratio`, and `headroom_tokens >= context_window` are also rejected at load time.
 
-P2a status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P2a adds the approval gate, user questions, automatic compaction, and five dsh slash commands:
+P2a status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P2a adds the approval gate, user questions, automatic compaction, and six dsh slash commands:
 
 - `ask_user_question` is exposed to the model. It waits up to `agent.dsh_question_timeout` for an answer; when the deadline passes with no answer, the tool result is `pending` (not a denial) and the model may continue. With no answerer on the channel the call returns a `NO_PROVIDER` result.
 - `/compact` (no arguments): runs one manual compaction of older history; with nothing to compact it settles `No compactable history yet.` and writes no domain events.
@@ -279,8 +279,9 @@ P2a status: `dsh-native` is wired and runs in-process. Only a session whose `age
 - `/feedback <text>`: records a `feedback/record` event; empty text is an error.
 - `/export` (no arguments): requests a session-log download and appends the command lifecycle events.
 - `/goal [<objective>|clear|edit <objective>|pause|resume]`: shows the current goal, creates one from an objective, edits, pauses, resumes, or clears it; each invocation writes the command lifecycle with its `goal/change` events in between.
+- `/plan [on|off]`: enters plan mode for `on` or an omitted argument (any argument other than `off` enters), and leaves it for `off`. While a turn is running, the switch is queued for the next accepted in-turn pre-step; otherwise it is written immediately. In plan mode the model can call `exit_plan_mode` to present a plan for review; approval exits plan mode, while rejection keeps it and returns a keep-planning tool result to the model.
 - Automatic compaction runs on the agent pre-step once the measured token count reaches the threshold, and a provider context-overflow error at request start triggers one compaction and one retry. `/compact` is the manual entry point.
-- Other slash commands, including `/plan`, are left to the host; plan mode is P2b.
+- Other slash commands are left to the host.
 
 Example:
 

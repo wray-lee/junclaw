@@ -129,10 +129,13 @@ const FakeProvider = struct {
 /// allocation with 0xAA. A use-after-free then reads poison instead of
 /// whatever the still-mapped page happens to hold, so the assertion after the
 /// read fails on every host, not only where the freed page is unmapped.
-const PoisonAllocator = struct {
+pub const PoisonAllocator = struct {
     child: Allocator,
+    /// Releases that passed through the poison hook; tests assert this to
+    /// prove an arena reset really poisoned its bytes.
+    free_calls: usize = 0,
 
-    fn allocator(self: *PoisonAllocator) Allocator {
+    pub fn allocator(self: *PoisonAllocator) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -161,6 +164,7 @@ const PoisonAllocator = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
         @memset(memory, 0xAA);
+        self.free_calls += 1;
         self.child.rawFree(memory, alignment, ret_addr);
     }
 };
@@ -956,7 +960,7 @@ test "dsh-native adapter: builtin commands are claimed and other lines fall back
 
     // Not command lines / commands this engine does not own: host fallback.
     try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("hello"));
-    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/plan ship it"));
+    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/new"));
     try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/not-a-command"));
     // `/goal` is claimed; showing the empty projection creates nothing.
     try testing.expect(std.mem.indexOf(

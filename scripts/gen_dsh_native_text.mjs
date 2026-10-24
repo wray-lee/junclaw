@@ -918,7 +918,7 @@ function buildAskUserQuestionSchema() {
 }
 
 function generateInteraction() {
-  let out = header('approval policy text, ask_user_question tool schema, and /plan command/narration text', 'B26, B27, B34')
+  let out = header('approval policy text, ask_user_question tool schema, /plan command/narration text, and exit_plan_mode result/error text', 'B26, B27, B34, B35')
   out += '\npub const approval = struct {\n'
   out += structConst('interaction', 'approval', 'never_sentence',
     extract(E('approval.never_sentence', USER_APPROVAL, 73, 73)))
@@ -974,10 +974,22 @@ function generateInteraction() {
     ['on_queued', 271],
     ['narration_on', 467],
     ['narration_off', 468],
+    // exit_plan_mode model-visible result and failure text (B35).
+    ['exit_approved_result', 294],
+    ['exit_dismissed_result', 295],
+    ['exit_requires_agent', 300, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_requires_plan_mode', 302, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_requires_heading', 305, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_no_channel', 309],
+    ['exit_reloaded', 345],
+    ['exit_keep_planning', 352],
   ]
-  for (const [name, line, pick] of planTexts) {
+  for (const [name, line, pick, subs] of planTexts) {
+    const opts = {}
+    if (pick !== undefined) opts.pick = pick
+    if (subs !== undefined) opts.subs = subs
     out += structConst('interaction', 'plan_mode', name,
-      extract(E(`plan_mode.${name}`, PLAN_MODE, line, line, pick === undefined ? {} : { pick })))
+      extract(E(`plan_mode.${name}`, PLAN_MODE, line, line, opts)))
   }
   out += '};\n'
   return out
