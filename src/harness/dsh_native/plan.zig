@@ -434,6 +434,22 @@ test "plan replay restores the logged projection" {
     try testing.expect(!session.projection().pending);
 }
 
+test "plan replay keeps an unsettled selection pending" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const events = [_]types.Event{
+        try commandRun(a, "cmd-1", " on"),
+        try commandDone(a, "cmd-1", "success"),
+    };
+    const session = try Session.replay(&events);
+    try testing.expect(!session.state.active);
+    try testing.expect(session.projection().pending);
+    // The pre-step queue is process-local and stays empty after a restart.
+    try testing.expect(session.pending == null);
+}
+
 test "plan fold rejects malformed payloads" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
