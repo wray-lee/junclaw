@@ -7086,6 +7086,10 @@ test "agent.dsh_compaction_* and dsh_question_timeout parse and reject invalid v
     try std.testing.expectError(error.InvalidDshQuestionTimeout, cfg.parseJson(
         \\{"agent":{"dsh_question_timeout":1.5}}
     ));
+    // ask_user_question accepts at most 2147483s; the loader matches it.
+    try std.testing.expectError(error.InvalidDshQuestionTimeout, cfg.parseJson(
+        \\{"agent":{"dsh_question_timeout":2147484}}
+    ));
 }
 
 test "validation rejects dsh compaction ratios that dsh rejects" {

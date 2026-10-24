@@ -1996,7 +1996,7 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                 if (v != .integer) return error.InvalidDshQuestionTimeout;
                 const timeout = std.math.cast(i32, v.integer) orelse
                     return error.InvalidDshQuestionTimeout;
-                if (timeout == 0 or timeout < -1) return error.InvalidDshQuestionTimeout;
+                if (timeout == 0 or timeout < -1 or timeout > 2_147_483) return error.InvalidDshQuestionTimeout;
                 self.agent.dsh_question_timeout = timeout;
             }
             // tool_filter_groups: array of { mode, tools, keywords? }
