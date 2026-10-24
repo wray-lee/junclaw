@@ -1681,8 +1681,10 @@ const ReviewChannel = struct {
 
 const PlanOffHook = struct {
     harness: port.Harness,
+    engine: *DshNativeHarness,
     calls: usize = 0,
     reply: ?[]const u8 = null,
+    projection_pending: bool = false,
 };
 
 fn planOffDuringCall(ctx: *anyopaque) void {
@@ -1690,6 +1692,7 @@ fn planOffDuringCall(ctx: *anyopaque) void {
     self.calls += 1;
     if (self.calls != 1) return;
     self.reply = self.harness.handleLocalCommand("/plan off") catch null;
+    self.projection_pending = self.engine.plan_session.projection().pending;
 }
 
 fn exitPlanArgs(allocator: Allocator, plan_text: []const u8) ![]u8 {
@@ -1790,7 +1793,7 @@ test "dsh-native adapter: a mid-turn /plan off commits at the next pre-step" {
     allocator.free(first.reply);
     try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
 
-    var hook = PlanOffHook{ .harness = h };
+    var hook = PlanOffHook{ .harness = h, .engine = &engine };
     fx.provider.on_call = planOffDuringCall;
     fx.provider.call_context = &hook;
 
@@ -1798,6 +1801,10 @@ test "dsh-native adapter: a mid-turn /plan off commits at the next pre-step" {
     allocator.free(second.reply);
     try testing.expectEqual(port.EndReason.completed, second.end_reason);
     try testing.expectEqualStrings(generated.plan_mode.off_queued, hook.reply.?);
+    // Regression: the live plan projection ignored the queued command's
+    // `command/run` and `command/done`, so it reported pending=false while the
+    // turn was open (dsh reports true until the pre-step commits).
+    try testing.expect(hook.projection_pending);
     try testing.expect(contains(
         lastSystemContent(fx.provider.requests.items[1]),
         generated_system_prompt.plan_policy_text,
@@ -1987,12 +1994,18 @@ test "dsh-native adapter: exit_plan_mode rejection keeps plan mode and returns t
     var read = try session_log.readLog(allocator, path);
     defer read.deinit();
 
+    const keep_planning = try std.fmt.allocPrint(
+        allocator,
+        "Error: {s}",
+        .{generated.plan_mode.exit_keep_planning},
+    );
+    defer allocator.free(keep_planning);
     var saw_result = false;
     for (read.events) |event| {
         if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
         saw_result = true;
         try testing.expect(toolResultFailed(event));
-        try testing.expectEqualStrings(generated.plan_mode.exit_keep_planning, toolResultText(event));
+        try testing.expectEqualStrings(keep_planning, toolResultText(event));
     }
     try testing.expect(saw_result);
     try testing.expectEqual(@as(usize, 1), eventCount(read.events, "plan/mode"));
@@ -2035,12 +2048,18 @@ test "dsh-native adapter: exit_plan_mode fails closed without an interaction cha
     var read = try session_log.readLog(allocator, path);
     defer read.deinit();
 
+    const no_channel = try std.fmt.allocPrint(
+        allocator,
+        "Error: {s}",
+        .{generated.plan_mode.exit_no_channel},
+    );
+    defer allocator.free(no_channel);
     var saw_result = false;
     for (read.events) |event| {
         if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
         saw_result = true;
         try testing.expect(toolResultFailed(event));
-        try testing.expectEqualStrings(generated.plan_mode.exit_no_channel, toolResultText(event));
+        try testing.expectEqualStrings(no_channel, toolResultText(event));
     }
     try testing.expect(saw_result);
     try testing.expectEqual(@as(usize, 1), eventCount(read.events, "plan/mode"));

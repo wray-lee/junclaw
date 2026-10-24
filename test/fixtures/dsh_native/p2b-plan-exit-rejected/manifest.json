@@ -86,7 +86,7 @@
     "dsh keeps exit_plan_mode in the request tool catalog in every mode; the adapter advertises it only while plan mode is active (packages/plan/plan-mode/tests/integration.spec.ts:130-180).",
     "Because the adapter appends system nodes and changes the tool catalog per mode, its request/header reason is change where dsh's replacement bumps the generation and logs series.",
     "dsh treats /plan <text> as a mode selection plus a user message, so /plan on also submits the word \"on\"; the port documents /plan [on|off] and drops the message, so this fixture uses on as a selection alias and the comparison recording used a bare /plan.",
-    "The port's planReview channel returns only a boolean, so a rejected review records dsh's no-feedback keep-planning sentence without the \"Error:\" prefix; dsh renders \"Error: The user chose to keep planning; their feedback: <text>\" when the reviewer typed custom text (packages/plan/plan-mode/src/index.ts:347-357)."
+    "The port's planReview channel returns only a boolean, so a rejected review cannot carry the reviewer's custom feedback text and records dsh's no-feedback keep-planning sentence; dsh renders \"Error: The user chose to keep planning; their feedback: <text>\" when the reviewer typed custom text (packages/plan/plan-mode/src/index.ts:347-357)."
   ],
   "files": [
     "input.json",

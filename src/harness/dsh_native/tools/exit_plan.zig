@@ -99,8 +99,13 @@ fn validHeading(plan_text: []const u8) bool {
 
 fn failureOwned(allocator: Allocator, code: []const u8, owned: []const u8) !registry.ToolResult {
     errdefer allocator.free(owned);
+    // dsh `toolErrorResult`: the model-visible content is `Error: <message>`;
+    // the structured error keeps the bare message.
+    const content_text = try std.fmt.allocPrint(allocator, "Error: {s}", .{owned});
+    errdefer allocator.free(content_text);
     const blocks = try allocator.alloc(types.ContentBlock, 1);
-    blocks[0] = .{ .text = owned };
+    errdefer allocator.free(blocks);
+    blocks[0] = .{ .text = content_text };
     return .{ .failure = .{
         .error_info = .{ .name = "Error", .code = code, .reason = owned },
         .content = blocks,
@@ -177,7 +182,8 @@ test "exit_plan_mode requires a level-one heading" {
     var channel = Channel{};
     var context = Context{ .plan = &plan_session, .interaction = interaction(&channel) };
 
-    const heading_error = try std.fmt.allocPrint(a, text.exit_requires_heading, .{schema.name});
+    const heading = try std.fmt.allocPrint(a, text.exit_requires_heading, .{schema.name});
+    const heading_error = try std.fmt.allocPrint(a, "Error: {s}", .{heading});
     for ([_][]const u8{ "no heading", "## Second level", "#", "# \n", "" }) |invalid| {
         var result = try handle(&context, a, try planArgs(a, invalid));
         defer freeResult(a, result);
@@ -190,6 +196,31 @@ test "exit_plan_mode requires a level-one heading" {
     defer freeResult(a, valid);
     try testing.expect(!valid.isError());
     try testing.expectEqual(@as(usize, 1), channel.calls);
+}
+
+test "exit_plan_mode failure content carries the dsh Error prefix" {
+    // Regression: failure results put the bare message in the model-visible
+    // content, so tool/result text diverged from dsh's `Error: <message>`.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var plan_session = plan.Session{};
+    plan_session.state.active = true;
+    var channel = Channel{};
+    var context = Context{ .plan = &plan_session, .interaction = interaction(&channel) };
+
+    const raw = try std.fmt.allocPrint(a, text.exit_requires_heading, .{schema.name});
+    const result = try handle(&context, a, try planArgs(a, "no heading"));
+    defer freeResult(a, result);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "Error: {s}", .{raw}),
+        result.content()[0].text,
+    );
+    switch (result) {
+        .failure => |failure| try testing.expectEqualStrings(raw, failure.error_info.reason.?),
+        .success => return error.TestUnexpectedResult,
+    }
 }
 
 test "exit_plan_mode approval queues the silent mode change" {
@@ -228,7 +259,10 @@ test "exit_plan_mode rejection keeps plan mode" {
     var result = try handle(&context, a, try planArgs(a, "# Ship it"));
     defer freeResult(a, result);
     try testing.expect(result.isError());
-    try testing.expectEqualStrings(text.exit_keep_planning, result.content()[0].text);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "Error: {s}", .{text.exit_keep_planning}),
+        result.content()[0].text,
+    );
     try testing.expect(plan_session.pending == null);
     try testing.expect(plan_session.state.active);
     try testing.expect(plan_session.projection().active);
@@ -246,7 +280,10 @@ test "exit_plan_mode fails closed without an interaction channel" {
     var result = try handle(&context, a, try planArgs(a, "# Ship it"));
     defer freeResult(a, result);
     try testing.expect(result.isError());
-    try testing.expectEqualStrings(text.exit_no_channel, result.content()[0].text);
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "Error: {s}", .{text.exit_no_channel}),
+        result.content()[0].text,
+    );
     try testing.expect(plan_session.pending == null);
 }
 
@@ -262,8 +299,9 @@ test "exit_plan_mode is unavailable outside plan mode" {
     var result = try handle(&context, a, try planArgs(a, "# Ship it"));
     defer freeResult(a, result);
     try testing.expect(result.isError());
+    const inactive = try std.fmt.allocPrint(a, text.exit_requires_plan_mode, .{schema.name});
     try testing.expectEqualStrings(
-        try std.fmt.allocPrint(a, text.exit_requires_plan_mode, .{schema.name}),
+        try std.fmt.allocPrint(a, "Error: {s}", .{inactive}),
         result.content()[0].text,
     );
     try testing.expectEqual(@as(usize, 0), channel.calls);
@@ -288,7 +326,7 @@ test "exit_plan_mode reports a review transport failure" {
     var result = try handle(&context, a, try planArgs(a, "# Ship it"));
     defer freeResult(a, result);
     try testing.expect(result.isError());
-    try testing.expect(std.mem.startsWith(u8, result.content()[0].text, "plan review failed: "));
+    try testing.expect(std.mem.startsWith(u8, result.content()[0].text, "Error: plan review failed: "));
     try testing.expect(plan_session.pending == null);
 }
 
@@ -298,23 +336,24 @@ fn failingReview(context: *anyopaque, plan_text: []const u8) anyerror!bool {
     return error.HostFailure;
 }
 
-test "exit_plan_mode accepts a 64 KiB plan without leaking" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-
+test "exit_plan_mode keeps a 64 KiB plan intact without leaking" {
+    // Caller-owned allocator: an arena here would hide a leaked intermediate
+    // buffer, which is what the "without leaking" claim must catch.
     var plan_session = plan.Session{};
     plan_session.state.active = true;
     var channel = Channel{};
     var context = Context{ .plan = &plan_session, .interaction = interaction(&channel) };
 
     const size = 64 * 1024;
-    const plan_text = try a.alloc(u8, size);
+    const plan_text = try testing.allocator.alloc(u8, size);
+    defer testing.allocator.free(plan_text);
     @memcpy(plan_text[0..2], "# ");
     @memset(plan_text[2..], 'x');
 
-    var result = try handle(&context, a, try planArgs(a, plan_text));
-    defer freeResult(a, result);
+    var args = try planArgs(testing.allocator, plan_text);
+    defer args.object.deinit(testing.allocator);
+    var result = try handle(&context, testing.allocator, args);
+    defer freeResult(testing.allocator, result);
     try testing.expect(!result.isError());
     try testing.expectEqualStrings(approved_json, result.content()[0].text);
     try testing.expectEqual(@as(usize, 1), channel.calls);

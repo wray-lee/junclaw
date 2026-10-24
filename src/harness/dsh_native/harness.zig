@@ -1362,6 +1362,12 @@ pub const DshNativeHarness = struct {
         _ = position;
         _ = claimed;
         const self = selfOf(context_ptr);
+        // dsh checks `signal.aborted` before committing a queued selection; the
+        // kernel's own check runs after this callback, so an abort that lands
+        // just before the step opens must not switch plan mode.
+        if (self.loop) |*loop| {
+            if (loop.isAborted()) return .{};
+        }
         const boundary = self.plan_session.preStep();
         if (boundary.emit) |active| {
             var data: std.json.ObjectMap = .empty;
@@ -1754,16 +1760,11 @@ pub const DshNativeHarness = struct {
         return if (self.planActive()) self.plan_tool_specs else self.tool_specs;
     }
 
-    /// `/plan` settlement: fold the mode, inject the narration the command
-    /// decided on, and republish the prompt and tool catalog.
+    /// `/plan` settlement: fold the command lifecycle and mode, inject the
+    /// narration the command decided on, and republish the prompt and catalog.
     fn applyPlanDecision(self: *Self, decision: plan_mod.Decision, events: []const types.Event) !void {
         self.plan_session.applyDecision(decision);
-        for (events) |event| {
-            if (std.mem.eql(u8, event.event_type, "plan/mode")) try self.plan_session.foldEvent(event);
-        }
-        if (self.plan_session.state.running) |*running| {
-            running.command_id = try self.arena.allocator().dupe(u8, running.command_id);
-        }
+        for (events) |event| try self.plan_session.foldEvent(event);
         if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
         if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
         const narration = decision.narration orelse return;
@@ -2737,4 +2738,47 @@ test "dsh-native harness: a rejected goal round never reaches the log" {
     };
     _ = try engine.appendUserMessage(.{ .turn = 3, .step = 1 }, human);
     try std.testing.expect(engine.goal_tools.?.authority.direct_human);
+}
+
+test "dsh-native harness: an aborted pre-step keeps the queued plan selection" {
+    // Regression: hostPreStep committed a pending /plan selection before the
+    // kernel's abort check, so a /stop that landed just before the step opened
+    // silently switched plan mode.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(dsh_home);
+    try fs_compat.makePath(dsh_home);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace);
+    try fs_compat.makePath(workspace);
+
+    var engine = try DshNativeHarness.init(allocator, .{
+        .session_key = "test-session-key",
+        .dsh_home = dsh_home,
+        .workspace_dir = workspace,
+        .provider = undefined,
+        .provider_name = "",
+        .model = "",
+    });
+    defer engine.deinit(allocator);
+    try engine.startFresh();
+
+    engine.plan_session.state.active = true;
+    engine.plan_session.pending = .{ .active = false, .narrate = false };
+    if (engine.loop) |*loop| loop.abort(.user);
+
+    var out: std.ArrayListUnmanaged(loop_mod.UserMessage) = .empty;
+    defer out.deinit(allocator);
+    _ = try DshNativeHarness.hostPreStep(&engine, allocator, .{ .turn = 1, .step = 1 }, .{
+        .next_step = &.{},
+        .next_turn = &.{},
+    }, &out);
+
+    try std.testing.expect(engine.plan_session.state.active);
+    try std.testing.expect(engine.plan_session.pending != null);
+    try std.testing.expectEqual(false, engine.plan_session.pending.?.active);
 }
