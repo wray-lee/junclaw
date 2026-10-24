@@ -2200,7 +2200,9 @@ test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
     }
     try testing.expect(found);
     // Regression: the bridge used to register before dsh's bash, so a host
-    // "bash" shadowed the dsh tool in the model-visible catalog.
+    // "bash" entered the host map and received every bash call.
+    try testing.expect(engine.registry.hostMeta("bash") == null);
+    try testing.expect(engine.registry.hostMeta("web_search") != null);
     for (engine.tool_schemas) |schema| {
         if (!std.mem.eql(u8, schema.name, tool_schemas.bash.name)) continue;
         try testing.expectEqualStrings(tool_schemas.bash.description, schema.description);
