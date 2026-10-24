@@ -756,6 +756,10 @@ fn plainEvent(seq: u64, event_type: []const u8) types.Event {
     return .{ .event_type = event_type, .seq = seq, .time_ms = 0, .data = .{ .null = {} } };
 }
 
+// Regression: the helpers returned slices of stack temporaries; ReleaseSmall
+// reused that stack, so `run` read corrupted blocks (bogus slice lengths gave
+// error.OutOfMemory, and rewritten events failed their assertions). Blocks now
+// come from the summarizer arena, which outlives `call`.
 const TestSummary = struct {
     calls: usize = 0,
     saw_system: bool = false,
@@ -763,7 +767,6 @@ const TestSummary = struct {
     tools: usize = 0,
 
     fn call(context: ?*anyopaque, allocator: Allocator, input: SummaryInput) anyerror!SummaryOutput {
-        _ = allocator;
         if (context) |raw| {
             const self: *TestSummary = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -773,8 +776,10 @@ const TestSummary = struct {
             self.saw_instruction = last.role == .user and last.content.len == 1 and
                 std.mem.eql(u8, last.content[0].text, compaction_text.instruction);
         }
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = textBlock("ok");
         return .{
-            .blocks = &.{textBlock("ok")},
+            .blocks = blocks,
             .provider = "test-provider",
             .model = "test-model",
             .max_tokens = 64,
@@ -783,15 +788,19 @@ const TestSummary = struct {
 };
 
 const EmptySummary = struct {
-    fn call(_: ?*anyopaque, _: Allocator, _: SummaryInput) anyerror!SummaryOutput {
-        return .{ .blocks = &.{textBlock("   ")} };
+    fn call(_: ?*anyopaque, allocator: Allocator, _: SummaryInput) anyerror!SummaryOutput {
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = textBlock("   ");
+        return .{ .blocks = blocks };
     }
 };
 
 const OversizedSummary = struct {
     fn call(_: ?*anyopaque, allocator: Allocator, _: SummaryInput) anyerror!SummaryOutput {
         const text = try repeatPattern(allocator, "x", 400);
-        return .{ .blocks = &.{textBlock(text)} };
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = textBlock(text);
+        return .{ .blocks = blocks };
     }
 };
 
