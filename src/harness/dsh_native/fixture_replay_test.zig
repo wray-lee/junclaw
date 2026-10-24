@@ -13,12 +13,15 @@ const fixture_compare = @import("fixture_compare.zig");
 const fs_compat = @import("../../fs_compat.zig");
 const generated_compaction = @import("generated/compaction.zig");
 const generated_interaction = @import("generated/interaction.zig");
+const generated_system_prompt = @import("generated/system_prompt.zig");
+const tool_schemas = @import("generated/tool_schemas.zig");
 const goal = @import("goal.zig");
 const goal_command = @import("goal_command.zig");
 const goal_rounds = @import("goal_rounds.zig");
 const harness_mod = @import("harness.zig");
 const inbox = @import("inbox.zig");
 const loop_mod = @import("loop.zig");
+const plan_mod = @import("plan.zig");
 const port = @import("../port.zig");
 const prompt = @import("prompt.zig");
 const providers = @import("../../providers/root.zig");
@@ -1445,6 +1448,11 @@ const EventInput = struct {
         approval: ?[]const u8 = null,
         noInteraction: bool = false,
         questions: ?QuestionScript = null,
+        /// Dispatch this builtin from inside the turn's first provider call,
+        /// so the command runs while `turn_open` is true.
+        commandDuringTurn: ?[]const u8 = null,
+        /// The plan-review answer for `exit_plan_mode` (default approve).
+        planReview: bool = true,
     };
 
     const QuestionScript = struct {
@@ -1467,7 +1475,15 @@ const HarnessReply = struct {
 
 const CapturedRequest = struct {
     contents: []const []const u8,
+    roles: []const providers.Role,
     tools: []const providers.ToolSpec,
+};
+
+/// Runs once, from the first provider call of a fixture turn.
+const DuringTurn = struct {
+    harness: port.Harness,
+    command: ?[]const u8 = null,
+    fired: bool = false,
 };
 
 /// Blocking provider over the P1 stream-call format: each recorded call is
@@ -1478,6 +1494,7 @@ const HarnessProvider = struct {
     requests: std.ArrayListUnmanaged(CapturedRequest) = .empty,
     arena: std.heap.ArenaAllocator,
     owner: Allocator,
+    during: ?*DuringTurn = null,
 
     fn init(allocator: Allocator, replies: []const HarnessReply) HarnessProvider {
         return .{
@@ -1511,6 +1528,14 @@ const HarnessProvider = struct {
     fn chat(ptr: *anyopaque, allocator: Allocator, chat_request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
         const self: *HarnessProvider = @ptrCast(@alignCast(ptr));
         try self.capture(chat_request);
+        if (self.during) |during| {
+            if (!during.fired) {
+                during.fired = true;
+                if (during.command) |line| {
+                    _ = try during.harness.handleLocalCommand(line) orelse return error.CommandNotClaimed;
+                }
+            }
+        }
         if (self.next >= self.replies.len) return error.NoScriptedReply;
         const reply = self.replies[self.next];
         self.next += 1;
@@ -1536,7 +1561,11 @@ const HarnessProvider = struct {
     fn capture(self: *HarnessProvider, chat_request: providers.ChatRequest) !void {
         const arena = self.arena.allocator();
         const contents = try arena.alloc([]const u8, chat_request.messages.len);
-        for (chat_request.messages, 0..) |message, index| contents[index] = try arena.dupe(u8, message.content);
+        const roles = try arena.alloc(providers.Role, chat_request.messages.len);
+        for (chat_request.messages, 0..) |message, index| {
+            contents[index] = try arena.dupe(u8, message.content);
+            roles[index] = message.role;
+        }
         const request_tools = chat_request.tools orelse &.{};
         const tools = try arena.alloc(providers.ToolSpec, request_tools.len);
         for (request_tools, 0..) |tool, index| {
@@ -1546,7 +1575,7 @@ const HarnessProvider = struct {
                 .parameters_json = try arena.dupe(u8, tool.parameters_json),
             };
         }
-        try self.requests.append(self.owner, .{ .contents = contents, .tools = tools });
+        try self.requests.append(self.owner, .{ .contents = contents, .roles = roles, .tools = tools });
     }
 
     fn supportsNativeTools(_: *anyopaque) bool {
@@ -1577,6 +1606,7 @@ const InteractionScript = struct {
     approval: port.ApprovalDecision = .rejected,
     answers: []const port.Answer = &.{},
     advance_ms: i64 = 0,
+    plan_review: bool = true,
 
     fn interaction(self: *InteractionScript) port.Interaction {
         return .{
@@ -1598,8 +1628,9 @@ const InteractionScript = struct {
         return self.answers;
     }
 
-    fn planReview(_: *anyopaque, _: []const u8) anyerror!bool {
-        return true;
+    fn planReview(context: *anyopaque, _: []const u8) anyerror!bool {
+        const self: *InteractionScript = @ptrCast(@alignCast(context));
+        return self.plan_review;
     }
 };
 
@@ -1766,6 +1797,81 @@ fn expectCompactionInstruction(manifest: Value, provider: *HarnessProvider) !voi
     return error.CompactionInstructionMissing;
 }
 
+fn manifestGroup(manifest: Value, group: []const u8) ?Obj {
+    const root = switch (manifest) {
+        .object => |object| object,
+        else => return null,
+    };
+    return switch (root.get(group) orelse return null) {
+        .object => |object| object,
+        else => null,
+    };
+}
+
+/// `planProjection` pins the wire projection derived from the final log, which
+/// a restart fixture checks after the log has been folded back.
+fn expectPlanProjection(manifest: Value, projection: plan_mod.Projection) !void {
+    const group = manifestGroup(manifest, "planProjection") orelse return;
+    const active = switch (group.get("active") orelse return error.InvalidManifest) {
+        .bool => |value| value,
+        else => return error.InvalidManifest,
+    };
+    const pending = switch (group.get("pending") orelse return error.InvalidManifest) {
+        .bool => |value| value,
+        else => return error.InvalidManifest,
+    };
+    try std.testing.expectEqual(active, projection.active);
+    try std.testing.expectEqual(pending, projection.pending);
+}
+
+/// `modelVisible.planTools` / `planPolicy` list one expectation per provider
+/// call, so a delayed mode switch (queued or exit-approved) is visible even
+/// though the log masks the prompt and tool catalog with tokens.
+fn expectModelVisible(manifest: Value, provider: *HarnessProvider) !void {
+    const group = manifestGroup(manifest, "modelVisible") orelse return;
+    const requests = provider.requests.items;
+    if (group.get("planTools")) |value| {
+        const expected = switch (value) {
+            .array => |array| array.items,
+            else => return error.InvalidManifest,
+        };
+        try std.testing.expectEqual(expected.len, requests.len);
+        for (expected, requests) |item, captured| {
+            const want = switch (item) {
+                .bool => |flag| flag,
+                else => return error.InvalidManifest,
+            };
+            var has = false;
+            for (captured.tools) |tool| {
+                if (std.mem.eql(u8, tool.name, tool_schemas.exit_plan_mode.name)) has = true;
+            }
+            try std.testing.expectEqual(want, has);
+        }
+    }
+    if (group.get("planPolicy")) |value| {
+        const expected = switch (value) {
+            .array => |array| array.items,
+            else => return error.InvalidManifest,
+        };
+        try std.testing.expectEqual(expected.len, requests.len);
+        for (expected, requests) |item, captured| {
+            const want = switch (item) {
+                .bool => |flag| flag,
+                else => return error.InvalidManifest,
+            };
+            var last_system: ?usize = null;
+            for (captured.roles, 0..) |role, message_index| {
+                if (role == .system) last_system = message_index;
+            }
+            const has = if (last_system) |message_index|
+                std.mem.indexOf(u8, captured.contents[message_index], generated_system_prompt.plan_policy_text) != null
+            else
+                false;
+            try std.testing.expectEqual(want, has);
+        }
+    }
+}
+
 fn runEventFixture(scenario: []const u8) !void {
     const allocator = std.testing.allocator;
     const dir = try fixtureDirAlloc(allocator, scenario);
@@ -1820,7 +1926,7 @@ fn runEventFixture(scenario: []const u8) !void {
     defer provider.deinit();
 
     var clock = TestClock{};
-    var engine = try harness_mod.DshNativeHarness.init(allocator, .{
+    const engine_options = harness_mod.Options{
         .session_key = "fixture-session-key",
         .dsh_home = dsh_home,
         .session_dir = session_dir,
@@ -1837,9 +1943,18 @@ fn runEventFixture(scenario: []const u8) !void {
         .question_timeout_s = input.config.questionTimeout,
         .now_ms = clockNow,
         .clock_context = &clock,
-    });
-    defer engine.deinit(allocator);
-    const h = engine.harness();
+    };
+    const engine = try allocator.create(harness_mod.DshNativeHarness);
+    engine.* = harness_mod.DshNativeHarness.init(allocator, engine_options) catch |err| {
+        allocator.destroy(engine);
+        return err;
+    };
+    var engine_live = true;
+    defer {
+        if (engine_live) engine.deinit(allocator);
+        allocator.destroy(engine);
+    }
+    var h = engine.harness();
 
     // A fixed session id keeps ids out of the expected log (the /feedback
     // settlement echoes it). Restore then reopens that empty log.
@@ -1861,6 +1976,15 @@ fn runEventFixture(scenario: []const u8) !void {
             if (step.workspace) |workspace_value| try writeWorkspaceFiles(allocator, workspace, workspace_value);
             continue;
         }
+        if (std.mem.eql(u8, step.op, "restart")) {
+            engine.deinit(allocator);
+            engine_live = false;
+            engine.* = try harness_mod.DshNativeHarness.init(allocator, engine_options);
+            engine_live = true;
+            h = engine.harness();
+            try h.restore(.{ .messages = &.{}, .dsh_session_id = "fixture-session" });
+            continue;
+        }
         if (std.mem.eql(u8, step.op, "prompt")) {
             const count = if (step.questions) |script| script.answers.len else 0;
             const answers = try allocator.alloc(port.Answer, count);
@@ -1875,7 +1999,11 @@ fn runEventFixture(scenario: []const u8) !void {
                 .approval = try decisionOf(step.approval orelse "allowed_once"),
                 .answers = answers,
                 .advance_ms = if (step.questions) |questions| questions.advanceMs else 0,
+                .plan_review = step.planReview,
             };
+            var during = DuringTurn{ .harness = h, .command = step.commandDuringTurn };
+            provider.during = if (step.commandDuringTurn != null) &during else null;
+            defer provider.during = null;
             const result = try h.runTurn(.{
                 .user_message = step.text orelse return error.MissingPrompt,
                 .workspace_dir = workspace,
@@ -1891,6 +2019,9 @@ fn runEventFixture(scenario: []const u8) !void {
         }
         return error.UnsupportedInput;
     }
+
+    try expectPlanProjection(manifest, engine.plan_session.projection());
+    try expectModelVisible(manifest, &provider);
 
     const log_path = try session_store.logPathAlloc(allocator, dsh_home, workspace, engine.session_id);
     defer allocator.free(log_path);
@@ -2034,4 +2165,32 @@ test "dsh native p2a command feedback matches normalized v4 fixture" {
 
 test "dsh native p2a command export matches normalized v4 fixture" {
     try runEventFixture("p2a-command-export");
+}
+
+test "dsh native p2b plan on matches normalized v4 fixture" {
+    try runEventFixture("p2b-plan-on");
+}
+
+test "dsh native p2b plan off matches normalized v4 fixture" {
+    try runEventFixture("p2b-plan-off");
+}
+
+test "dsh native p2b plan exit approved matches normalized v4 fixture" {
+    try runEventFixture("p2b-plan-exit-approved");
+}
+
+test "dsh native p2b plan exit rejected matches normalized v4 fixture" {
+    try runEventFixture("p2b-plan-exit-rejected");
+}
+
+test "dsh native p2b plan queued off matches normalized v4 fixture" {
+    try runEventFixture("p2b-plan-queued-off");
+}
+
+test "dsh native p2b plan restart matches normalized v4 fixture" {
+    try runEventFixture("p2b-plan-restart");
+}
+
+test "dsh native p2b todo write matches normalized v4 fixture" {
+    try runEventFixture("p2b-todo-write");
 }

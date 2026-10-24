@@ -348,7 +348,30 @@ pub const RunOptions = struct {
     /// Open turn for automatic triggers; null for standalone manual compaction.
     turn: ?u64 = null,
     tools: []const request.ToolSchema = &.{},
+    /// Set immediately before the summarizer call. A failing caller uses it to
+    /// tell a summary-stage failure (dsh's `compaction/start` is already
+    /// durable) from a pre-summary validation failure (dsh writes nothing).
+    started: ?*bool = null,
 };
+
+/// The two-event failure transaction dsh writes when compaction throws after
+/// its durable `compaction/start` (`compaction-basic/src/region.ts:210,240-249`).
+/// This engine summarizes synchronously, so the caller records the pair after
+/// the failure instead of before the provider call. dsh's retry
+/// (`compactionRetries`, `compaction-basic/src/index.ts:330-345`) is not
+/// reproduced: there is no retry policy here, and a retry would open a new
+/// transaction anyway.
+pub fn failureEvents(
+    allocator: Allocator,
+    compaction_id: []const u8,
+    turn: ?u64,
+    failure: []const u8,
+) ![]const Event {
+    const events = try allocator.alloc(Event, 2);
+    events[0] = .{ .start = .{ .compaction_id = compaction_id, .turn = turn } };
+    events[1] = .{ .end = .{ .compaction_id = compaction_id, .turn = turn, .failure = failure } };
+    return events;
+}
 
 pub const Result = struct {
     arena: std.heap.ArenaAllocator,
@@ -428,6 +451,7 @@ pub fn run(
         return .{ .arena = arena, .pruned = pruned, .total_tokens = total };
 
     const input = try buildSummaryInput(a, current, selection, options.tools);
+    if (options.started) |started| started.* = true;
     const output = try summarizer.call(summarizer.context, a, input);
 
     var filtered: std.ArrayListUnmanaged(types.ContentBlock) = .empty;

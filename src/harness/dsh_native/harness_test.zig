@@ -16,6 +16,9 @@ const goal_mod = @import("goal.zig");
 const session_log = @import("session_log.zig");
 const session_store = @import("session_store.zig");
 const types = @import("types.zig");
+const generated = @import("generated/interaction.zig");
+const generated_system_prompt = @import("generated/system_prompt.zig");
+const tool_schemas = @import("generated/tool_schemas.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -30,6 +33,10 @@ const Reply = struct {
     /// The provider aborts the running turn from inside `chat`, which is how a
     /// `/stop` reaches a blocking provider.
     abort: bool = false,
+    /// The call fails; compaction's summarizer propagates this.
+    fail: bool = false,
+    /// The call reports provider-confirmed context overflow.
+    overflow: bool = false,
 };
 
 const FakeProvider = struct {
@@ -41,11 +48,16 @@ const FakeProvider = struct {
     /// a stop exactly where a real one would arrive.
     on_abort: ?*const fn (ctx: *anyopaque) void = null,
     abort_context: ?*anyopaque = null,
+    /// Test seam: runs while the call is in flight, after the request was
+    /// recorded, so a command can land mid-turn.
+    on_call: ?*const fn (ctx: *anyopaque) void = null,
+    call_context: ?*anyopaque = null,
 
     /// Owned copy of what the adapter sent, so assertions stay valid after
     /// the adapter's per-call arena is reset.
     const Request = struct {
         contents: []const []const u8,
+        roles: []const providers.Role,
     };
 
     fn init(allocator: Allocator, replies: []const Reply) FakeProvider {
@@ -56,6 +68,7 @@ const FakeProvider = struct {
         for (self.requests.items) |request| {
             for (request.contents) |content| self.allocator.free(content);
             self.allocator.free(request.contents);
+            self.allocator.free(request.roles);
         }
         self.requests.deinit(self.allocator);
     }
@@ -79,13 +92,18 @@ const FakeProvider = struct {
     fn chat(ptr: *anyopaque, allocator: Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
         const self: *FakeProvider = @ptrCast(@alignCast(ptr));
         const contents = try self.allocator.alloc([]const u8, request.messages.len);
+        const roles = try self.allocator.alloc(providers.Role, request.messages.len);
         for (request.messages, 0..) |message, index| {
             contents[index] = try self.allocator.dupe(u8, message.content);
+            roles[index] = message.role;
         }
-        try self.requests.append(self.allocator, .{ .contents = contents });
+        try self.requests.append(self.allocator, .{ .contents = contents, .roles = roles });
         if (self.next >= self.replies.len) return error.UnscriptedCall;
         const reply = self.replies[self.next];
         self.next += 1;
+        if (self.on_call) |hook| hook(self.call_context.?);
+        if (reply.fail) return error.ScriptedFailure;
+        if (reply.overflow) return error.ContextLengthExceeded;
         if (reply.abort) {
             // The adapter aborts its own loop; this test seam reaches it
             // through the provider the same way a `/stop` would.
@@ -129,10 +147,13 @@ const FakeProvider = struct {
 /// allocation with 0xAA. A use-after-free then reads poison instead of
 /// whatever the still-mapped page happens to hold, so the assertion after the
 /// read fails on every host, not only where the freed page is unmapped.
-const PoisonAllocator = struct {
+pub const PoisonAllocator = struct {
     child: Allocator,
+    /// Releases that passed through the poison hook; tests assert this to
+    /// prove an arena reset really poisoned its bytes.
+    free_calls: usize = 0,
 
-    fn allocator(self: *PoisonAllocator) Allocator {
+    pub fn allocator(self: *PoisonAllocator) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
@@ -161,6 +182,7 @@ const PoisonAllocator = struct {
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
         @memset(memory, 0xAA);
+        self.free_calls += 1;
         self.child.rawFree(memory, alignment, ret_addr);
     }
 };
@@ -272,6 +294,63 @@ fn requestContains(request: FakeProvider.Request, needle: []const u8) bool {
         if (std.mem.indexOf(u8, content, needle) != null) return true;
     }
     return false;
+}
+
+fn contains(haystack: []const u8, needle: []const u8) bool {
+    return std.mem.indexOf(u8, haystack, needle) != null;
+}
+
+/// The prompt in force for a request: the last system message sent.
+fn lastSystemContent(request: FakeProvider.Request) []const u8 {
+    var found: []const u8 = "";
+    for (request.roles, request.contents) |role, content| {
+        if (role == .system) found = content;
+    }
+    return found;
+}
+
+fn headerHasTool(event: types.Event, name: []const u8) bool {
+    const data = event.data.object;
+    const header = data.get("header").?.object;
+    const tools = header.get("tools") orelse return false;
+    for (tools.array.items) |item| {
+        if (std.mem.eql(u8, item.object.get("name").?.string, name)) return true;
+    }
+    return false;
+}
+
+fn eventIndex(events: []const types.Event, event_type: []const u8, from: usize) ?usize {
+    var index = from;
+    while (index < events.len) : (index += 1) {
+        if (std.mem.eql(u8, events[index].event_type, event_type)) return index;
+    }
+    return null;
+}
+
+fn eventCount(events: []const types.Event, event_type: []const u8) usize {
+    var count: usize = 0;
+    for (events) |event| {
+        if (std.mem.eql(u8, event.event_type, event_type)) count += 1;
+    }
+    return count;
+}
+
+fn toolResultText(event: types.Event) []const u8 {
+    const message = event.data.object.get("message").?.object;
+    return message.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+fn toolResultFailed(event: types.Event) bool {
+    const message = event.data.object.get("message").?.object;
+    return message.get("isError").?.bool;
+}
+
+fn userMessageText(event: types.Event) []const u8 {
+    return event.data.object.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+fn userMessageKind(event: types.Event) []const u8 {
+    return event.data.object.get("source").?.object.get("kind").?.string;
 }
 
 fn messageContains(message: types.Message, needle: []const u8) bool {
@@ -956,7 +1035,7 @@ test "dsh-native adapter: builtin commands are claimed and other lines fall back
 
     // Not command lines / commands this engine does not own: host fallback.
     try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("hello"));
-    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/plan ship it"));
+    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/new"));
     try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/not-a-command"));
     // `/goal` is claimed; showing the empty projection creates nothing.
     try testing.expect(std.mem.indexOf(
@@ -1316,6 +1395,171 @@ test "dsh-native adapter: restore folds a compacted surface" {
     try testing.expect(messageContains(checkpoint, "condensed history"));
 }
 
+test "dsh-native adapter: a failed manual summary records the failure transaction" {
+    // Regression: a summarize failure returned before any compaction event was
+    // written, while the /compact settlement said the attempt was recorded.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "first" },
+        .{ .fail = true },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("first"));
+    defer allocator.free(first.reply);
+    const settlement = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+    try testing.expect(std.mem.indexOf(u8, settlement, "attempt is recorded in the session log") != null);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.arena.deinit();
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/start"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/end"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "compaction/summary"));
+    const start_index = eventIndex(read.events, "compaction/start", 0) orelse return error.TestUnexpectedResult;
+    const end_index = eventIndex(read.events, "compaction/end", start_index + 1) orelse return error.TestUnexpectedResult;
+    const run_index = eventIndex(read.events, "command/run", 0) orelse return error.TestUnexpectedResult;
+    const done_index = eventIndex(read.events, "command/done", end_index + 1) orelse return error.TestUnexpectedResult;
+    try testing.expect(run_index < start_index);
+    try testing.expect(end_index < done_index);
+    const start_data = read.events[start_index].data.object;
+    const end_data = read.events[end_index].data.object;
+    try testing.expectEqualStrings(
+        start_data.get("compactionId").?.string,
+        end_data.get("compactionId").?.string,
+    );
+    try testing.expectEqualStrings("ScriptedFailure", end_data.get("error").?.string);
+    try testing.expect(end_data.get("sourceCommandId") != null);
+}
+
+test "dsh-native adapter: a failed automatic summary records the failure transaction" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "a" },
+        // The request overflows, the forced compaction's summary then fails.
+        .{ .overflow = true },
+        .{ .fail = true },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("first"));
+    defer allocator.free(first.reply);
+    try testing.expectError(error.ScriptedFailure, h.runTurn(turnInput("second")));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.arena.deinit();
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/start"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/end"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "compaction/summary"));
+    const end_index = eventIndex(read.events, "compaction/end", 0) orelse return error.TestUnexpectedResult;
+    const end_data = read.events[end_index].data.object;
+    try testing.expectEqualStrings("ScriptedFailure", end_data.get("error").?.string);
+    try testing.expectEqual(@as(i64, 2), end_data.get("turn").?.integer);
+    try testing.expect(end_data.get("sourceCommandId") == null);
+}
+
+/// Highest `prefix<digits>` counter anywhere in the raw log text.
+fn maxCounterSuffix(text: []const u8, prefix: []const u8) !u64 {
+    var max: u64 = 0;
+    var index: usize = 0;
+    while (std.mem.indexOfPos(u8, text, index, prefix)) |found| {
+        var end = found + prefix.len;
+        while (end < text.len and std.ascii.isDigit(text[end])) : (end += 1) {}
+        if (end > found + prefix.len) {
+            const value = std.fmt.parseInt(u64, text[found + prefix.len .. end], 10) catch 0;
+            if (value > max) max = value;
+        }
+        index = @max(end, found + 1);
+    }
+    return max;
+}
+
+test "dsh-native adapter: restore seeds ids past the session log" {
+    // Regression: ids are process-local counters, so a resumed session minted
+    // command-1, compaction-1 and approval-1 again instead of continuing past
+    // the ids already in the log.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    const big = try allocator.alloc(u8, 2_000);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    const first_text = try std.fmt.allocPrint(allocator, "marker {s}", .{big});
+    defer allocator.free(first_text);
+    const bash_args =
+        "{\"description\":\"d\",\"command\":\"echo hi\"," ++
+        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "condensed history" },
+        .{ .text = "", .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = bash_args }} },
+        .{ .text = "done" },
+        // The restored session continues with these replies.
+        .{ .text = "condensed again" },
+        .{ .text = "", .tool_calls = &.{.{ .id = "call-2", .name = "bash", .arguments = bash_args }} },
+        .{ .text = "done again" },
+    });
+    defer fx.deinit();
+
+    var before_command: u64 = 0;
+    var before_compaction: u64 = 0;
+    var before_approval: u64 = 0;
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+        try h.restore(.{ .messages = &.{} });
+        const first = try h.runTurn(turnInput(first_text));
+        defer allocator.free(first.reply);
+        const compact = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+        try testing.expect(std.mem.startsWith(u8, compact, "Compacted"));
+        const escalation = try h.runTurn(turnInput("escalate"));
+        defer allocator.free(escalation.reply);
+        _ = (try h.handleLocalCommand("/feedback seed")) orelse return error.CommandNotClaimed;
+
+        const path = try fx.logPath(allocator, engine.session_id);
+        defer allocator.free(path);
+        const text = try readLogText(allocator, path);
+        defer allocator.free(text);
+        before_command = try maxCounterSuffix(text, "command-");
+        before_compaction = try maxCounterSuffix(text, "compaction-");
+        before_approval = try maxCounterSuffix(text, "approval-");
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+    try testing.expect(before_command > 0);
+    try testing.expect(before_compaction > 0);
+    try testing.expect(before_approval > 0);
+
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    const h = restored.harness();
+    try h.restore(.{ .messages = &.{} });
+    try testing.expectEqualStrings(session_id, restored.session_id);
+
+    const compact = (try h.handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+    try testing.expect(std.mem.startsWith(u8, compact, "Compacted"));
+    const escalation = try h.runTurn(turnInput("escalate again"));
+    defer allocator.free(escalation.reply);
+    _ = (try h.handleLocalCommand("/feedback restored")) orelse return error.CommandNotClaimed;
+
+    const path = try fx.logPath(allocator, session_id);
+    defer allocator.free(path);
+    const text = try readLogText(allocator, path);
+    defer allocator.free(text);
+    try testing.expect(try maxCounterSuffix(text, "command-") > before_command);
+    try testing.expect(try maxCounterSuffix(text, "compaction-") > before_compaction);
+    try testing.expect(try maxCounterSuffix(text, "approval-") > before_approval);
+}
+
 test "dsh-native adapter: restore reapplies the logged approval policy" {
     // Regression: after `/permission` switched the policy to ask, a restart
     // kept the configured never policy, so an escalation was rejected without
@@ -1401,4 +1645,501 @@ test "dsh-native adapter: /permission sandbox mode reaches the runtime context" 
         restored.system_prompt,
         "Current DSH file policy: read-only",
     ) == null);
+}
+
+// ── plan mode ───────────────────────────────────────────────────────────────
+
+const ReviewChannel = struct {
+    approve: bool,
+    calls: usize = 0,
+    plan_len: usize = 0,
+
+    fn interaction(self: *ReviewChannel) port.Interaction {
+        return .{
+            .ctx = self,
+            .requestApproval = rejectApproval,
+            .askQuestions = noAnswers,
+            .planReview = reviewPlan,
+        };
+    }
+
+    fn rejectApproval(_: *anyopaque, _: port.ApprovalRequest) anyerror!port.ApprovalDecision {
+        return .rejected;
+    }
+
+    fn noAnswers(_: *anyopaque, _: []const port.Question) anyerror![]const port.Answer {
+        return &.{};
+    }
+
+    fn reviewPlan(ctx: *anyopaque, plan_text: []const u8) anyerror!bool {
+        const self: *ReviewChannel = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.plan_len = plan_text.len;
+        return self.approve;
+    }
+};
+
+const PlanOffHook = struct {
+    harness: port.Harness,
+    engine: *DshNativeHarness,
+    calls: usize = 0,
+    reply: ?[]const u8 = null,
+    projection_pending: bool = false,
+};
+
+fn planOffDuringCall(ctx: *anyopaque) void {
+    const self: *PlanOffHook = @ptrCast(@alignCast(ctx));
+    self.calls += 1;
+    if (self.calls != 1) return;
+    self.reply = self.harness.handleLocalCommand("/plan off") catch null;
+    self.projection_pending = self.engine.plan_session.projection().pending;
+}
+
+fn exitPlanArgs(allocator: Allocator, plan_text: []const u8) ![]u8 {
+    var object = std.json.ObjectMap.empty;
+    try object.put(allocator, "plan", .{ .string = plan_text });
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = object }, .{});
+}
+
+test "dsh-native adapter: plan mode toggles the policy section and exit_plan_mode" {
+    const allocator = testing.allocator;
+    // Regression: before the harness wiring, /plan changed only the log; every
+    // request kept the base prompt and tool catalog.
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+        .{ .text = "three" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    try testing.expectEqual(port.EndReason.completed, first.end_reason);
+
+    try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
+
+    const second = try h.runTurn(turnInput("plan it"));
+    allocator.free(second.reply);
+    try testing.expect(contains(
+        lastSystemContent(fx.provider.requests.items[1]),
+        generated_system_prompt.plan_policy_text,
+    ));
+
+    try testing.expectEqualStrings(generated.plan_mode.off_committed, (try h.handleLocalCommand("/plan off")).?);
+
+    const third = try h.runTurn(turnInput("implement it"));
+    allocator.free(third.reply);
+    try testing.expect(!contains(
+        lastSystemContent(fx.provider.requests.items[2]),
+        generated_system_prompt.plan_policy_text,
+    ));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+
+    var headers: [3]?types.Event = .{ null, null, null };
+    var header_count: usize = 0;
+    var on_narrations: usize = 0;
+    var off_narrations: usize = 0;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "request/header")) {
+            if (header_count < headers.len) headers[header_count] = event;
+            header_count += 1;
+        } else if (std.mem.eql(u8, event.event_type, "user/message")) {
+            if (!std.mem.eql(u8, userMessageKind(event), "plan-mode")) continue;
+            const text = userMessageText(event);
+            if (std.mem.eql(u8, text, generated.plan_mode.narration_on)) on_narrations += 1;
+            if (std.mem.eql(u8, text, generated.plan_mode.narration_off)) off_narrations += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), header_count);
+    try testing.expect(headerHasTool(headers[0].?, tool_schemas.todo_write.name));
+    try testing.expect(!headerHasTool(headers[0].?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(headerHasTool(headers[1].?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(headerHasTool(headers[1].?, tool_schemas.todo_write.name));
+    try testing.expect(!headerHasTool(headers[2].?, tool_schemas.exit_plan_mode.name));
+    try testing.expectEqual(@as(usize, 1), on_narrations);
+    try testing.expectEqual(@as(usize, 1), off_narrations);
+}
+
+test "dsh-native adapter: a mid-turn /plan off commits at the next pre-step" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "start" },
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"note.txt\"}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
+
+    var hook = PlanOffHook{ .harness = h, .engine = &engine };
+    fx.provider.on_call = planOffDuringCall;
+    fx.provider.call_context = &hook;
+
+    const second = try h.runTurn(turnInput("read note.txt"));
+    allocator.free(second.reply);
+    try testing.expectEqual(port.EndReason.completed, second.end_reason);
+    try testing.expectEqualStrings(generated.plan_mode.off_queued, hook.reply.?);
+    // Regression: the live plan projection ignored the queued command's
+    // `command/run` and `command/done`, so it reported pending=false while the
+    // turn was open (dsh reports true until the pre-step commits).
+    try testing.expect(hook.projection_pending);
+    try testing.expect(contains(
+        lastSystemContent(fx.provider.requests.items[1]),
+        generated_system_prompt.plan_policy_text,
+    ));
+    try testing.expect(!contains(
+        lastSystemContent(fx.provider.requests.items[2]),
+        generated_system_prompt.plan_policy_text,
+    ));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+
+    var off_command: ?usize = null;
+    var command_runs: usize = 0;
+    var tool_call: ?usize = null;
+    var tool_result: ?usize = null;
+    var plan_off: ?usize = null;
+    var narration: ?usize = null;
+    var headers: [3]?types.Event = .{ null, null, null };
+    var header_indexes: [3]usize = undefined;
+    var header_count: usize = 0;
+    for (read.events, 0..) |event, index| {
+        if (std.mem.eql(u8, event.event_type, "command/run")) {
+            command_runs += 1;
+            if (command_runs == 2) off_command = index;
+        } else if (std.mem.eql(u8, event.event_type, "tool/call")) {
+            tool_call = index;
+        } else if (std.mem.eql(u8, event.event_type, "tool/result")) {
+            tool_result = index;
+        } else if (std.mem.eql(u8, event.event_type, "plan/mode")) {
+            plan_off = index;
+        } else if (std.mem.eql(u8, event.event_type, "request/header")) {
+            if (header_count < headers.len) {
+                headers[header_count] = event;
+                header_indexes[header_count] = index;
+            }
+            header_count += 1;
+        } else if (std.mem.eql(u8, event.event_type, "user/message")) {
+            if (std.mem.eql(u8, userMessageKind(event), "plan-mode") and
+                std.mem.eql(u8, userMessageText(event), generated.plan_mode.narration_off))
+                narration = index;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), header_count);
+    try testing.expect(off_command.? < tool_call.?);
+    try testing.expect(tool_call.? < tool_result.?);
+    try testing.expect(tool_result.? < plan_off.?);
+    try testing.expect(plan_off.? < header_indexes[2]);
+    try testing.expect(plan_off.? < narration.?);
+    try testing.expect(headerHasTool(headers[1].?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(!headerHasTool(headers[2].?, tool_schemas.exit_plan_mode.name));
+}
+
+test "dsh-native adapter: exit_plan_mode approval defers plan/mode to the pre-step" {
+    const allocator = testing.allocator;
+    var data_arena = std.heap.ArenaAllocator.init(allocator);
+    defer data_arena.deinit();
+    const a = data_arena.allocator();
+    // 64KB+ plan text: the tool-arg and review path must not leak or truncate.
+    const filler = try a.alloc(u8, 64 * 1024);
+    @memset(filler, 'x');
+    const plan_text = try std.fmt.allocPrint(a, "# Big plan\n{s}", .{filler});
+    const args = try exitPlanArgs(a, plan_text);
+    const calls = [_]providers.ToolCall{.{
+        .id = "call-1",
+        .name = tool_schemas.exit_plan_mode.name,
+        .arguments = args,
+    }};
+    var replies = [_]Reply{
+        .{ .text = "start" },
+        .{ .tool_calls = &calls },
+        .{ .text = "done" },
+    };
+    var fx = try Fixture.init(allocator, &replies);
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
+
+    var channel = ReviewChannel{ .approve = true };
+    var input = turnInput("present the plan");
+    input.interaction = channel.interaction();
+    const second = try h.runTurn(input);
+    allocator.free(second.reply);
+    try testing.expectEqual(port.EndReason.completed, second.end_reason);
+    try testing.expectEqual(@as(usize, 1), channel.calls);
+    try testing.expectEqual(plan_text.len, channel.plan_len);
+    try testing.expect(!engine.plan_session.state.active);
+    try testing.expect(engine.plan_session.pending == null);
+
+    // The approval step kept the plan prompt; the next pre-step dropped it.
+    try testing.expect(contains(
+        lastSystemContent(fx.provider.requests.items[1]),
+        generated_system_prompt.plan_policy_text,
+    ));
+    try testing.expect(!contains(
+        lastSystemContent(fx.provider.requests.items[2]),
+        generated_system_prompt.plan_policy_text,
+    ));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+
+    var tool_result: ?usize = null;
+    var plan_off: ?usize = null;
+    var off_narration = false;
+    var headers: [3]?types.Event = .{ null, null, null };
+    var header_indexes: [3]usize = undefined;
+    var header_count: usize = 0;
+    for (read.events, 0..) |event, index| {
+        if (std.mem.eql(u8, event.event_type, "tool/result")) {
+            tool_result = index;
+            try testing.expect(!toolResultFailed(event));
+            try testing.expectEqualStrings("{\"approved\":true}", toolResultText(event));
+        } else if (std.mem.eql(u8, event.event_type, "plan/mode")) {
+            plan_off = index;
+        } else if (std.mem.eql(u8, event.event_type, "request/header")) {
+            if (header_count < headers.len) {
+                headers[header_count] = event;
+                header_indexes[header_count] = index;
+            }
+            header_count += 1;
+        } else if (std.mem.eql(u8, event.event_type, "user/message")) {
+            if (std.mem.eql(u8, userMessageKind(event), "plan-mode") and
+                std.mem.eql(u8, userMessageText(event), generated.plan_mode.narration_off))
+                off_narration = true;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), header_count);
+    try testing.expect(tool_result.? < plan_off.?);
+    try testing.expect(plan_off.? < header_indexes[2]);
+    try testing.expect(headerHasTool(headers[1].?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(!headerHasTool(headers[2].?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(!off_narration);
+}
+
+test "dsh-native adapter: exit_plan_mode rejection keeps plan mode and returns the feedback" {
+    const allocator = testing.allocator;
+    var data_arena = std.heap.ArenaAllocator.init(allocator);
+    defer data_arena.deinit();
+    const a = data_arena.allocator();
+    const args = try exitPlanArgs(a, "# Plan\n\nSteps");
+    const calls = [_]providers.ToolCall{.{
+        .id = "call-1",
+        .name = tool_schemas.exit_plan_mode.name,
+        .arguments = args,
+    }};
+    var replies = [_]Reply{
+        .{ .text = "start" },
+        .{ .tool_calls = &calls },
+        .{ .text = "done" },
+    };
+    var fx = try Fixture.init(allocator, &replies);
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
+
+    var channel = ReviewChannel{ .approve = false };
+    var input = turnInput("present the plan");
+    input.interaction = channel.interaction();
+    const second = try h.runTurn(input);
+    allocator.free(second.reply);
+    try testing.expect(engine.plan_session.state.active);
+    try testing.expect(engine.plan_session.pending == null);
+    try testing.expect(contains(
+        lastSystemContent(fx.provider.requests.items[2]),
+        generated_system_prompt.plan_policy_text,
+    ));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+
+    const keep_planning = try std.fmt.allocPrint(
+        allocator,
+        "Error: {s}",
+        .{generated.plan_mode.exit_keep_planning},
+    );
+    defer allocator.free(keep_planning);
+    var saw_result = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        saw_result = true;
+        try testing.expect(toolResultFailed(event));
+        try testing.expectEqualStrings(keep_planning, toolResultText(event));
+    }
+    try testing.expect(saw_result);
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "plan/mode"));
+}
+
+test "dsh-native adapter: exit_plan_mode fails closed without an interaction channel" {
+    const allocator = testing.allocator;
+    var data_arena = std.heap.ArenaAllocator.init(allocator);
+    defer data_arena.deinit();
+    const a = data_arena.allocator();
+    const args = try exitPlanArgs(a, "# Plan\n\nSteps");
+    const calls = [_]providers.ToolCall{.{
+        .id = "call-1",
+        .name = tool_schemas.exit_plan_mode.name,
+        .arguments = args,
+    }};
+    var replies = [_]Reply{
+        .{ .text = "start" },
+        .{ .tool_calls = &calls },
+        .{ .text = "done" },
+    };
+    var fx = try Fixture.init(allocator, &replies);
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
+
+    const second = try h.runTurn(turnInput("present the plan"));
+    allocator.free(second.reply);
+    try testing.expect(engine.plan_session.state.active);
+    try testing.expect(engine.plan_session.pending == null);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+
+    const no_channel = try std.fmt.allocPrint(
+        allocator,
+        "Error: {s}",
+        .{generated.plan_mode.exit_no_channel},
+    );
+    defer allocator.free(no_channel);
+    var saw_result = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        saw_result = true;
+        try testing.expect(toolResultFailed(event));
+        try testing.expectEqualStrings(no_channel, toolResultText(event));
+    }
+    try testing.expect(saw_result);
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "plan/mode"));
+}
+
+test "dsh-native adapter: todo_write is a core tool with a live handler" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "start" },
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "todo_write", .arguments = "{\"todos\":[{\"content\":\"ship it\",\"status\":\"pending\"}]}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    const second = try h.runTurn(turnInput("write the list"));
+    allocator.free(second.reply);
+    try testing.expectEqual(port.EndReason.completed, second.end_reason);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+
+    var saw_result = false;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "tool/result")) {
+            saw_result = true;
+            try testing.expect(!toolResultFailed(event));
+            try testing.expect(contains(toolResultText(event), "Updated todo list: 1 pending, 0 in progress, 0 completed."));
+        }
+    }
+    try testing.expect(saw_result);
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "todo/write"));
+}
+
+test "dsh-native adapter: plan state survives a poisoned restore and reset" {
+    const allocator = testing.allocator;
+    var poison = PoisonAllocator{ .child = allocator };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "one" },
+        .{ .text = "two" },
+        .{ .text = "three" },
+        .{ .text = "four" },
+    });
+    defer fx.deinit();
+
+    var engine = try harness_mod.DshNativeHarness.init(poison.allocator(), fx.options());
+    defer engine.deinit(poison.allocator());
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+    try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
+
+    const second = try h.runTurn(turnInput("plan it"));
+    allocator.free(second.reply);
+    try testing.expect(contains(engine.system_prompt, generated_system_prompt.plan_policy_text));
+
+    try h.restore(.{ .messages = &.{} });
+    try testing.expect(contains(engine.system_prompt, generated_system_prompt.plan_policy_text));
+    const third = try h.runTurn(turnInput("after restore"));
+    allocator.free(third.reply);
+    try testing.expect(contains(
+        lastSystemContent(fx.provider.requests.items[2]),
+        generated_system_prompt.plan_policy_text,
+    ));
+
+    h.reset();
+    try testing.expect(!contains(engine.system_prompt, generated_system_prompt.plan_policy_text));
+    const fourth = try h.runTurn(turnInput("after reset"));
+    allocator.free(fourth.reply);
+    try testing.expect(!contains(
+        lastSystemContent(fx.provider.requests.items[3]),
+        generated_system_prompt.plan_policy_text,
+    ));
+    try testing.expect(poison.free_calls > 0);
 }

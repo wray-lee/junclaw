@@ -73,3 +73,11 @@ pub const goal = struct {
     pub const complete_wrapup = "<goal_complete>\nObjective: {s}\nThe goal is marked complete and this autonomous run is ending. Write the closing message to the user now: state the outcome, summarize what was done and how it was verified, and point to the concrete results (files, commits, or other artifacts). Report only what earlier rounds and tool results in this session actually establish; when a detail is not in the session, say so instead of inventing it. Note anything the user should review or do next. Address the user directly. Do not call any more tools in this run; further work waits for the user's next instruction.\n</goal_complete>";
     pub const blocked_wrapup = "<goal_blocked>\nObjective: {s}\nBlocked: {s}\nThe goal is marked blocked and this autonomous run is ending. Write the closing message to the user now: state what has been completed so far, describe the concrete blocking condition and what you tried, and say exactly what you need from the user to continue. Report only what earlier rounds and tool results in this session actually establish; when a detail is not in the session, say so instead of inventing it. Address the user directly. Do not call any more tools in this run; further work waits for the user's next instruction.\n</goal_blocked>";
 };
+
+pub const todo_write = struct {
+    pub const success = "Updated todo list: {d} pending, {d} in progress, {d} completed.";
+    pub const error_empty_content = "invalid todo: `content` must be a non-empty string";
+    pub const error_duplicate_content = "invalid todos: duplicate content {s}";
+    pub const error_parallel_in_progress = "invalid todos: at most one task may be in_progress (got {d})";
+    pub const error_requires_agent = "todo_write requires an owning agent session";
+};

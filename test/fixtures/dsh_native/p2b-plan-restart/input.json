@@ -1,0 +1,24 @@
+{
+  "config": {
+    "approvalPolicy": "never"
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "command",
+      "text": "/plan on"
+    },
+    {
+      "op": "restart"
+    },
+    {
+      "op": "prompt",
+      "text": "Continue planning."
+    }
+  ]
+}

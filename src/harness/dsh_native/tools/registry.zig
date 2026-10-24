@@ -134,10 +134,19 @@ pub const core_schemas = [_]Schema{
     .{ .name = generated.update_goal.name, .description = generated.update_goal.description, .input_schema_json = generated.update_goal.input_schema_json },
 };
 
+/// Registrable tools the current build does not advertise yet: the model tool
+/// list stays `core_schemas`. `todo_write` moves there when the harness wires
+/// its handler.
+const pending_schemas = [_]Schema{
+    .{ .name = generated.todo_write.name, .description = generated.todo_write.description, .input_schema_json = generated.todo_write.input_schema_json },
+};
+
+const known_schemas = core_schemas ++ pending_schemas;
+
 /// dsh tool names are exact schema keys: byte-equal, case-sensitive, no aliases.
-/// Returns the canonical slice from `core_schemas`.
+/// Returns the canonical slice from `known_schemas`.
 pub fn toolNameFromExactKeys(name: []const u8) ?[]const u8 {
-    for (core_schemas) |schema| {
+    for (known_schemas) |schema| {
         if (std.mem.eql(u8, name, schema.name)) return schema.name;
     }
     return null;
@@ -167,6 +176,9 @@ pub const CoreHandlers = struct {
     get_goal: Handler,
     create_goal: Handler,
     update_goal: Handler,
+    /// Null until the harness supplies the todo context; the tool is
+    /// registrable but stays out of the model-visible core list.
+    todo_write: ?Handler = null,
 };
 
 pub const Registry = struct {
@@ -204,6 +216,9 @@ pub const Registry = struct {
         try self.register(allocator, .{ .name = generated.get_goal.name, .description = generated.get_goal.description, .input_schema_json = generated.get_goal.input_schema_json, .handler = handlers.get_goal });
         try self.register(allocator, .{ .name = generated.create_goal.name, .description = generated.create_goal.description, .input_schema_json = generated.create_goal.input_schema_json, .handler = handlers.create_goal });
         try self.register(allocator, .{ .name = generated.update_goal.name, .description = generated.update_goal.description, .input_schema_json = generated.update_goal.input_schema_json, .handler = handlers.update_goal });
+        if (handlers.todo_write) |handler| {
+            try self.register(allocator, .{ .name = generated.todo_write.name, .description = generated.todo_write.description, .input_schema_json = generated.todo_write.input_schema_json, .handler = handler });
+        }
     }
 
     pub fn get(self: *const Registry, name: []const u8) ?*const Tool {
@@ -269,6 +284,30 @@ test "registerCore keeps the nine generated schemas verbatim" {
         try testing.expectEqual(@intFromPtr(schema.input_schema_json.ptr), @intFromPtr(tool.input_schema_json.ptr));
         try testing.expect(tool.handler.call == fakeHandler);
     }
+}
+
+test "registerCore registers todo_write only when a handler is supplied" {
+    var registry = Registry.init();
+    defer registry.deinit(testing.allocator);
+
+    var core = defaultHandlers(.{ .call = fakeHandler });
+    core.todo_write = .{ .call = fakeHandler };
+    try registry.registerCore(testing.allocator, core);
+
+    try testing.expectEqual(@as(usize, 10), registry.tools.count());
+    const tool = registry.get(generated.todo_write.name).?;
+    try testing.expectEqualStrings(generated.todo_write.description, tool.description);
+    try testing.expectEqualStrings(generated.todo_write.input_schema_json, tool.input_schema_json);
+
+    // Advertisement follows core_schemas; todo_write stays out until the
+    // harness wiring lands, so no request lists a handlerless tool.
+    for (core_schemas) |schema| {
+        try testing.expect(!std.mem.eql(u8, schema.name, generated.todo_write.name));
+    }
+}
+
+test {
+    _ = @import("todo.zig");
 }
 
 test "tool names are exact keys; only the dev__ sub-namespace resolves" {

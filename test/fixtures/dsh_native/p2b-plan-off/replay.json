@@ -1,0 +1,109 @@
+{
+  "calls": [
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "The repository is small."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 30,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "stream": [
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "I will plan the change."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 30,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "stream": [
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Implementing now."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 30,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

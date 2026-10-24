@@ -1,0 +1,120 @@
+{
+  "calls": [
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "The repository is small."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 30,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "stream": [
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            ""
+          ]
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_read",
+          "name": "read",
+          "args": [
+            "{\"file_path\": \"note.txt\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 50,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "stream": [
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Done."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 30,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

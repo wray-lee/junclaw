@@ -1,4 +1,4 @@
-//! Slash-command registry and the four builtins (design §1.9 B36-B37).
+//! Slash-command registry and the builtins (design §1.9 B36-B37).
 //!
 //! Mirrors dsh 0.2.1-rc.2:
 //! - `packages/interaction/commands/src/index.ts:125-132` (`parseCommand`),
@@ -9,15 +9,18 @@
 //! - `packages/interaction/permission-presets/src/index.ts:125-145,256-273`
 //!   (differential knob writes; snapshot `web/permission-policy-context`);
 //! - `packages/feedback/command-feedback/src/index.ts:48-121`;
-//! - `packages/session-query/session-log-export/src/index.ts:68-90`.
+//! - `packages/session-query/session-log-export/src/index.ts:68-90`;
+//! - `packages/plan/plan-mode/src/index.ts:230-275` (`/plan`).
 //!
 //! Pure module: it owns no log. `handleLocalCommand` returns the ordered
 //! events (`command/run`, domain events, `command/done`) with `seq`/`time_ms`
 //! left at zero for the caller to stamp while appending, plus the settlement
-//! text. `null` means the line belongs to the host: unknown names and `/plan`
-//! are never claimed. `/goal` is claimed through the wired goal seam; its
-//! `goal/change` events come from the goal domain and its lifecycle payloads
-//! are `recordInput:false`, so neither event carries `args`.
+//! text. `null` means the line belongs to the host: unknown names and host
+//! commands are never claimed. `/goal` is claimed through the wired goal seam;
+//! its `goal/change` events come from the goal domain and its lifecycle
+//! payloads are `recordInput:false`, so neither event carries `args`. `/plan`
+//! carries the user's verbatim args and returns its selection decision so the
+//! harness can queue a pre-step commit (`plan.zig`).
 //!
 //! `/compact` delegates the transaction to an injected seam; the harness plugs
 //! in `compaction.zig`. When the seam reports no useful range, the command
@@ -28,6 +31,8 @@
 //! can carry its future `sourceEventSeq`.
 
 const std = @import("std");
+const generated = @import("generated/interaction.zig");
+const plan = @import("plan.zig");
 const types = @import("types.zig");
 const context = @import("context.zig");
 
@@ -70,6 +75,11 @@ pub const builtins = [_]Definition{
         .description = "Set or view the goal for a long-running task",
         .input_hint = "[<objective>|clear|edit <objective>|pause|resume]",
         .record_input = false,
+    },
+    .{
+        .name = generated.plan_mode.command_name,
+        .description = generated.plan_mode.command_description,
+        .input_hint = generated.plan_mode.command_hint,
     },
 };
 
@@ -237,11 +247,19 @@ pub const Compacted = struct {
 /// Expected manual-compaction failures (`ManualCompactionErrorCode`).
 pub const CompactFailure = enum { busy, cancelled, changed, summary, commit, persistence };
 
+/// A failure plus the failed transaction already written for it. `events` is
+/// the `compaction/start` + `compaction/end{error}` pair when summarization
+/// began; it is empty when nothing was recorded (`busy`).
+pub const CompactFailureOutcome = struct {
+    failure: CompactFailure,
+    events: []const types.Event = &.{},
+};
+
 pub const CompactOutcome = union(enum) {
     /// No safe useful range exists; append nothing.
     no_history,
     compacted: Compacted,
-    failed: CompactFailure,
+    failed: CompactFailureOutcome,
 };
 
 pub const Compaction = struct {
@@ -282,6 +300,8 @@ pub const Context = struct {
     permission_defaults: PermissionDefaults = .{},
     compaction: Compaction = .{},
     goal: Goal = .{},
+    /// Logged plan mode plus any queued selection (`plan.zig`).
+    plan: plan.View = .{},
 };
 
 pub const Result = struct {
@@ -291,6 +311,10 @@ pub const Result = struct {
     kind: Kind,
     /// Settlement text returned to the dispatching surface (`command/done.text`).
     text: []const u8,
+    /// `/plan` selection for the harness to apply to its plan state. An
+    /// immediate `plan/mode` event is already in `events`; a queued target
+    /// carries `queue`.
+    plan_decision: ?plan.Decision = null,
 
     pub fn deinit(self: *Result) void {
         self.arena.deinit();
@@ -299,8 +323,8 @@ pub const Result = struct {
 };
 
 /// Claim and execute one builtin. Returns null when the line is not a builtin
-/// command line (unknown name, `plan`, or a non-command line), so the harness
-/// can fall back to the host's own slash commands.
+/// command line (unknown name or a non-command line), so the harness can fall
+/// back to the host's own slash commands.
 pub fn handleLocalCommand(allocator: Allocator, line: []const u8, ctx: Context) !?Result {
     const parsed = parseCommand(line) orelse return null;
     const definition = findDefinition(parsed.name) orelse return null;
@@ -313,6 +337,7 @@ const Settlement = struct {
     text: []const u8,
     source_event_seq: ?u64 = null,
     domain: []const types.Event = &.{},
+    plan: ?plan.Decision = null,
 };
 
 fn assemble(allocator: Allocator, ctx: Context, definition: Definition, parsed: Parsed) !Result {
@@ -333,6 +358,7 @@ fn assemble(allocator: Allocator, ctx: Context, definition: Definition, parsed: 
         .events = list,
         .kind = settlement.kind,
         .text = settlement.text,
+        .plan_decision = settlement.plan,
     };
 }
 
@@ -341,6 +367,8 @@ fn execute(allocator: Allocator, ctx: Context, definition: Definition, parsed: P
     if (std.mem.eql(u8, definition.name, "permission")) return executePermission(allocator, ctx, parsed.raw_input);
     if (std.mem.eql(u8, definition.name, "feedback")) return executeFeedback(allocator, ctx, parsed.raw_input);
     if (std.mem.eql(u8, definition.name, "goal")) return executeGoal(allocator, ctx, parsed.raw_input);
+    if (std.mem.eql(u8, definition.name, generated.plan_mode.command_name))
+        return executePlan(allocator, ctx, parsed.raw_input);
     return executeExport(parsed.raw_input);
 }
 
@@ -353,6 +381,32 @@ fn executeGoal(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settl
         return .{ .kind = .@"error", .text = text };
     };
     return .{ .kind = outcome.kind, .text = outcome.text, .domain = outcome.events };
+}
+
+/// `/plan [on|off]`: dsh treats only the exact word `off` as an exit; every
+/// other input (including `on` and a bare `/plan`) selects plan mode.
+fn executePlan(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settlement {
+    const text = generated.plan_mode;
+    const target = !std.mem.eql(u8, std.mem.trim(u8, raw_input, whitespace), "off");
+    const decision = plan.decide(ctx.plan, target);
+    const settlement = if (target) switch (decision.outcome) {
+        .committed, .cancelled => text.on_committed,
+        .queued => text.on_queued,
+        .noop => if (ctx.plan.active) text.on_committed else text.on_queued,
+    } else switch (decision.outcome) {
+        .committed => text.off_committed,
+        .queued => text.off_queued,
+        .cancelled => text.off_cancelled,
+        .noop => if (ctx.plan.active) text.off_queued else text.off_already_inactive,
+    };
+
+    var domain: []const types.Event = &.{};
+    if (decision.emit) |active| {
+        const events = try allocator.alloc(types.Event, 1);
+        events[0] = try boolEvent(allocator, "plan/mode", "active", active);
+        domain = events;
+    }
+    return .{ .kind = .success, .text = settlement, .domain = domain, .plan = decision };
 }
 
 fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settlement {
@@ -372,7 +426,11 @@ fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Se
 
     return switch (outcome) {
         .no_history => .{ .kind = .success, .text = "No compactable history yet." },
-        .failed => |failure| .{ .kind = .@"error", .text = failureText(failure) },
+        .failed => |failure| .{
+            .kind = .@"error",
+            .text = failureText(failure.failure, failure.events.len != 0),
+            .domain = failure.events,
+        },
         .compacted => |compacted| {
             if (compacted.events.len == 0 or compacted.summary_event_index >= compacted.events.len or
                 !std.mem.eql(u8, compacted.events[compacted.summary_event_index].event_type, "compaction/summary"))
@@ -398,12 +456,18 @@ fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Se
     };
 }
 
-fn failureText(failure: CompactFailure) []const u8 {
+fn failureText(failure: CompactFailure, recorded: bool) []const u8 {
     return switch (failure) {
         .busy => "Compaction is unavailable because this process has an active compaction, or the agent is not idle.",
         .cancelled => "Compaction cancelled.",
-        .changed => "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log.",
-        .summary => "Compaction could not produce a useful summary. The attempt is recorded in the session log.",
+        .changed => if (recorded)
+            "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log."
+        else
+            "The history selected for compaction changed before it could be replaced.",
+        .summary => if (recorded)
+            "Compaction could not produce a useful summary. The attempt is recorded in the session log."
+        else
+            "Compaction could not produce a useful summary.",
         .commit => "Compaction did not finish cleanly; some session history may have changed. Inspect the current session state before retrying.",
         .persistence => "Compaction finished, but the session could not be saved.",
     };
@@ -516,6 +580,13 @@ fn fieldEvent(allocator: Allocator, event_type: []const u8, key: []const u8, val
     return .{ .event_type = event_type, .seq = 0, .time_ms = 0, .data = .{ .object = object } };
 }
 
+/// One event with a single boolean field (`plan/mode`).
+fn boolEvent(allocator: Allocator, event_type: []const u8, key: []const u8, value: bool) !types.Event {
+    var object: std.json.ObjectMap = .empty;
+    try object.put(allocator, key, .{ .bool = value });
+    return .{ .event_type = event_type, .seq = 0, .time_ms = 0, .data = .{ .object = object } };
+}
+
 /// Assert `command/run` and `command/done` are the first and last events, share
 /// a commandId, and enclose only domain events (B36 adjacency).
 pub fn assertLifecycle(events: []const types.Event) !void {
@@ -550,6 +621,16 @@ fn eventString(event: types.Event, key: []const u8) ?[]const u8 {
     };
 }
 
+fn eventBool(event: types.Event, key: []const u8) ?bool {
+    return switch (event.data) {
+        .object => |object| switch (object.get(key) orelse return null) {
+            .bool => |value| value,
+            else => null,
+        },
+        else => null,
+    };
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 fn expectTypes(events: []const types.Event, expected: []const []const u8) !void {
@@ -578,7 +659,7 @@ fn expectUnclaimed(line: []const u8) !void {
 const CompactStub = struct {
     calls: usize = 0,
     seen_command_id: ?[]const u8 = null,
-    scenario: enum { history, no_history, failed, thrown, malformed } = .history,
+    scenario: enum { history, no_history, failed, failed_recorded, thrown, malformed } = .history,
     failure: CompactFailure = .busy,
 
     fn seam(self: *CompactStub) Compaction {
@@ -592,12 +673,30 @@ const CompactStub = struct {
         return switch (self.scenario) {
             .history => .{ .compacted = try transaction(allocator, 1) },
             .no_history => .no_history,
-            .failed => .{ .failed = self.failure },
+            .failed => .{ .failed = .{ .failure = self.failure } },
+            .failed_recorded => .{ .failed = .{
+                .failure = .summary,
+                .events = try failureTransaction(allocator),
+            } },
             .thrown => error.HostFailure,
             .malformed => .{ .compacted = try transaction(allocator, 9) },
         };
     }
 };
+
+fn failureTransaction(allocator: Allocator) ![]const types.Event {
+    const event_types = [_][]const u8{ "compaction/start", "compaction/end" };
+    const events = try allocator.alloc(types.Event, event_types.len);
+    for (events, 0..) |*event, index| {
+        event.* = .{
+            .event_type = event_types[index],
+            .seq = 0,
+            .time_ms = 0,
+            .data = .{ .integer = @intCast(index) },
+        };
+    }
+    return events;
+}
 
 fn transaction(allocator: Allocator, summary_index: usize) !Compacted {
     const event_types = [_][]const u8{
@@ -684,11 +783,11 @@ test "/compact renders every expected manual-compaction failure" {
         .{ .failure = .cancelled, .text = "Compaction cancelled." },
         .{
             .failure = .changed,
-            .text = "The history selected for compaction changed before it could be replaced. The attempt is recorded in the session log.",
+            .text = "The history selected for compaction changed before it could be replaced.",
         },
         .{
             .failure = .summary,
-            .text = "Compaction could not produce a useful summary. The attempt is recorded in the session log.",
+            .text = "Compaction could not produce a useful summary.",
         },
         .{
             .failure = .commit,
@@ -708,6 +807,22 @@ test "/compact renders every expected manual-compaction failure" {
         try std.testing.expectEqual(Kind.@"error", result.kind);
         try std.testing.expectEqualStrings(case.text, result.text);
     }
+}
+
+test "/compact settles a recorded failure between the lifecycle pair" {
+    var stub = CompactStub{ .scenario = .failed_recorded };
+    var result = try claimed("/compact", .{ .command_id = "cmd-4b", .compaction = stub.seam() });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{
+        "command/run",
+        "compaction/start",
+        "compaction/end",
+        "command/done",
+    });
+    try assertLifecycle(result.events);
+    try std.testing.expectEqual(Kind.@"error", result.kind);
+    try std.testing.expectEqualStrings(failureText(.summary, true), result.text);
 }
 
 test "/compact keeps the lifecycle pair when the seam throws" {
@@ -902,24 +1017,26 @@ test "/export rejects a path without domain events" {
     try std.testing.expectEqualStrings(" /tmp/log.zip", stringField(result.events[0], "args"));
 }
 
-test "the registry exposes the four P2a builtins plus goal" {
-    try std.testing.expectEqual(@as(usize, 5), builtins.len);
-    for ([_][]const u8{ "compact", "permission", "feedback", "export", "goal" }) |name| {
+test "the registry exposes the P2a builtins, goal and plan" {
+    try std.testing.expectEqual(@as(usize, 6), builtins.len);
+    for ([_][]const u8{ "compact", "permission", "feedback", "export", "goal", "plan" }) |name| {
         try std.testing.expect(findDefinition(name) != null);
     }
-    try std.testing.expect(findDefinition("plan") == null);
     try std.testing.expect(!findDefinition("feedback").?.record_input);
     try std.testing.expect(!findDefinition("goal").?.record_input);
+    try std.testing.expect(findDefinition("plan").?.record_input);
     try std.testing.expectEqualStrings(
         "[<objective>|clear|edit <objective>|pause|resume]",
         findDefinition("goal").?.input_hint.?,
     );
     try std.testing.expectEqualStrings("<preset>", findDefinition("permission").?.input_hint.?);
+    try std.testing.expectEqualStrings(generated.plan_mode.command_hint, findDefinition("plan").?.input_hint.?);
 }
 
-test "unknown and plan command lines are not claimed" {
+test "unknown and host command lines are not claimed" {
+    // `/plan` is claimed by dsh-native; `/new` remains a host command.
     const lines = [_][]const u8{
-        "/plan off",
+        "/new",
         "/help",
         "/compactx",
         "/",
@@ -991,6 +1108,101 @@ test "/goal without a wired seam settles as unavailable" {
     try expectTypes(result.events, &.{ "command/run", "command/done" });
     try std.testing.expectEqual(Kind.@"error", result.kind);
     try std.testing.expectEqualStrings("The /goal command is unavailable.", result.text);
+}
+
+test "/plan on commits plan/mode in the command lifecycle" {
+    var result = try claimed("/plan on", .{ .command_id = "cmd-30" });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "plan/mode", "command/done" });
+    try assertLifecycle(result.events);
+    try std.testing.expectEqual(Kind.success, result.kind);
+    try std.testing.expectEqualStrings(generated.plan_mode.on_committed, result.text);
+    try std.testing.expectEqualStrings(" on", stringField(result.events[0], "args"));
+    try std.testing.expectEqual(true, eventBool(result.events[1], "active").?);
+    try std.testing.expectEqual(plan.Outcome.committed, result.plan_decision.?.outcome);
+    try std.testing.expectEqual(@as(?bool, true), result.plan_decision.?.emit);
+}
+
+test "/plan off commits plan/mode=false" {
+    var result = try claimed("/plan off", .{ .command_id = "cmd-31", .plan = .{ .active = true } });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "plan/mode", "command/done" });
+    try assertLifecycle(result.events);
+    try std.testing.expectEqualStrings(generated.plan_mode.off_committed, result.text);
+    try std.testing.expectEqualStrings(" off", stringField(result.events[0], "args"));
+    try std.testing.expectEqual(false, eventBool(result.events[1], "active").?);
+    try std.testing.expectEqual(plan.Outcome.committed, result.plan_decision.?.outcome);
+}
+
+test "/plan queues a mode switch while a turn is open" {
+    var on = try claimed("/plan on", .{
+        .command_id = "cmd-32",
+        .plan = .{ .active = false, .turn_open = true },
+    });
+    defer on.deinit();
+    try expectTypes(on.events, &.{ "command/run", "command/done" });
+    try assertLifecycle(on.events);
+    try std.testing.expectEqualStrings(generated.plan_mode.on_queued, on.text);
+    try std.testing.expectEqual(plan.Outcome.queued, on.plan_decision.?.outcome);
+    try std.testing.expectEqual(@as(?bool, true), on.plan_decision.?.queue);
+
+    var off = try claimed("/plan off", .{
+        .command_id = "cmd-33",
+        .plan = .{ .active = true, .turn_open = true },
+    });
+    defer off.deinit();
+    try expectTypes(off.events, &.{ "command/run", "command/done" });
+    try std.testing.expectEqualStrings(generated.plan_mode.off_queued, off.text);
+    try std.testing.expectEqual(plan.Outcome.queued, off.plan_decision.?.outcome);
+    try std.testing.expectEqual(@as(?bool, false), off.plan_decision.?.queue);
+}
+
+test "/plan off is idempotent when plan mode is inactive" {
+    var result = try claimed("/plan off", .{ .command_id = "cmd-34" });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "command/done" });
+    try std.testing.expectEqualStrings(generated.plan_mode.off_already_inactive, result.text);
+    try std.testing.expectEqual(plan.Outcome.noop, result.plan_decision.?.outcome);
+}
+
+test "/plan cancels a queued entry when switched back during the turn" {
+    var result = try claimed("/plan off", .{
+        .command_id = "cmd-35",
+        .plan = .{ .active = false, .pending = true, .turn_open = true },
+    });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "command/done" });
+    try std.testing.expectEqualStrings(generated.plan_mode.off_cancelled, result.text);
+    try std.testing.expectEqual(plan.Outcome.cancelled, result.plan_decision.?.outcome);
+    try std.testing.expectEqual(@as(?bool, false), result.plan_decision.?.queue);
+}
+
+test "/plan on narrates the switch when the last header saw plan mode off" {
+    var result = try claimed("/plan on", .{
+        .command_id = "cmd-36",
+        .plan = .{ .active = false, .active_at_last_header = false },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqualStrings(generated.plan_mode.narration_on, result.plan_decision.?.narration.?);
+}
+
+test "/plan accepts a 64 KiB message without leaking" {
+    const size = 64 * 1024;
+    const line = try std.testing.allocator.alloc(u8, size + "/plan ".len);
+    defer std.testing.allocator.free(line);
+    @memcpy(line[0.."/plan ".len], "/plan ");
+    @memset(line["/plan ".len..], 'x');
+
+    var result = try claimed(line, .{ .command_id = "cmd-37" });
+    defer result.deinit();
+
+    try expectTypes(result.events, &.{ "command/run", "plan/mode", "command/done" });
+    try std.testing.expectEqual(size + 1, stringField(result.events[0], "args").len);
 }
 
 test "parseCommand preserves separator whitespace and enforces the name grammar" {

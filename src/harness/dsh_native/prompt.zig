@@ -64,6 +64,8 @@ pub const Options = struct {
     persona_prefix: []const u8 = generated.persona_prefix_default,
     /// `deployment:persona-suffix` text; empty text drops the section.
     persona_suffix: []const u8 = generated.persona_suffix_default,
+    /// `plan:policy` text at the PLAN_POLICY order; empty drops the section.
+    plan_policy: []const u8 = "",
 };
 
 const Section = struct {
@@ -85,7 +87,7 @@ pub fn buildSystemPrompt(allocator: Allocator, opts: Options) ![]u8 {
         }
     }
 
-    var sections: [Tool.all.len + 3]Section = undefined;
+    var sections: [Tool.all.len + 4]Section = undefined;
     var count: usize = 0;
     sections[count] = .{
         .order = generated.section_orders.HARNESS_IDENTITY,
@@ -97,6 +99,12 @@ pub fn buildSystemPrompt(allocator: Allocator, opts: Options) ![]u8 {
         .order = generated.section_orders.DEPLOYMENT_PERSONA_PREFIX,
         .name = generated.persona_prefix_section,
         .text = opts.persona_prefix,
+    };
+    count += 1;
+    sections[count] = .{
+        .order = generated.section_orders.PLAN_POLICY,
+        .name = "plan:policy",
+        .text = opts.plan_policy,
     };
     count += 1;
     for (opts.tools) |tool| {
