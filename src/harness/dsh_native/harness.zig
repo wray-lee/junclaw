@@ -336,6 +336,10 @@ pub const DshNativeHarness = struct {
         const perm = self.perm.allocator();
         const dir = self.workspace();
         self.spill_dir = try std.fs.path.join(perm, &.{ self.opts.dsh_home, "spill" });
+        // Regression: the spill directory was only joined, never created, so
+        // the bash tool's temp files failed and every bash call returned an
+        // error before spawning.
+        try fs_compat.makePath(self.spill_dir);
 
         const builtins = try self.allocator.create(builtins_mod.Builtins);
         errdefer self.allocator.destroy(builtins);
@@ -587,10 +591,17 @@ pub const DshNativeHarness = struct {
     /// skipped so a damaged transcript cannot abort the open. Returns the
     /// events for the in-memory surface fold.
     fn appendSeed(self: *Self, entries: []const memory_mod.MessageEntry) ![]types.Event {
+        return self.appendSeedFrom(entries, 0);
+    }
+
+    /// `already` usable rows were written by an earlier, interrupted run:
+    /// skip them so a resumed import never duplicates history.
+    fn appendSeedFrom(self: *Self, entries: []const memory_mod.MessageEntry, already: usize) ![]types.Event {
         const arena = self.arena.allocator();
         var events: std.ArrayListUnmanaged(types.Event) = .empty;
         errdefer events.deinit(arena);
         var skipped: usize = 0;
+        var usable: usize = 0;
         for (entries) |entry| {
             const role = seedRole(entry.role) orelse {
                 skipped += 1;
@@ -600,6 +611,8 @@ pub const DshNativeHarness = struct {
                 skipped += 1;
                 continue;
             }
+            usable += 1;
+            if (usable <= already) continue;
             const text = try arena.dupe(u8, entry.content);
             var blocks = [_]types.ContentBlock{.{ .text = text }};
             const message = types.Message{
@@ -643,7 +656,7 @@ pub const DshNativeHarness = struct {
     }
 
     /// Reopen the JSONL for `session_id` and rebuild the surface from it.
-    fn openExistingSession(self: *Self, session_id: []const u8) !void {
+    fn openExistingSession(self: *Self, session_id: []const u8, seed: []const memory_mod.MessageEntry) !void {
         // Copy before closeSession: restore passes the id loadMappedId
         // allocated in the session arena, which closeSession frees.
         const id_copy = try self.allocator.dupe(u8, session_id);
@@ -672,7 +685,16 @@ pub const DshNativeHarness = struct {
             if (std.mem.eql(u8, event.event_type, "permission/preset")) self.context_written = true;
         }
         self.seedIds(read.events);
-        try self.rebuildSurface(read.events, arena);
+        // Regression: a crash between the is_seeded header and the end-seed
+        // marker left a valid log that replayed half the host transcript and
+        // never finished the import. Continue from the rows already written,
+        // before the marker, so the inherited prefix becomes complete.
+        var events: []const types.Event = read.events;
+        if (read.header.is_seeded and !hasEndSeedMarker(read.events) and seedableCount(seed) != 0) {
+            const resumed = try self.appendSeedFrom(seed, seededMessageCount(read.events));
+            events = try concatEvents(arena, read.events, resumed);
+        }
+        try self.rebuildSurface(events, arena);
         if (self.goal_store) |store| store.rebuild(read.events) catch |err| {
             // Same policy as a corrupt log: a projection the log cannot
             // replay starts a fresh session instead of wedging every open.
@@ -838,7 +860,7 @@ pub const DshNativeHarness = struct {
             try self.startFreshSeeded(input.messages);
             return;
         };
-        self.openExistingSession(session_id) catch |err| switch (err) {
+        self.openExistingSession(session_id, input.messages) catch |err| switch (err) {
             error.FileNotFound => try self.startFreshSeeded(input.messages),
             else => return err,
         };
@@ -2020,7 +2042,11 @@ pub const DshNativeHarness = struct {
         if (self.opts.policy) |policy| {
             if (security_mod.autonomyDenial(policy)) |reason| return reason;
             if (security_mod.rateLimitDenial(policy)) |reason| return reason;
-            if (std.mem.eql(u8, call.name, generated.bash.name)) {
+            // Regression: the gate compared the raw call name with "bash", so
+            // `dev__bash` dispatched to the bash handler with no command check.
+            // Match the resolved identity instead of the model's spelling.
+            const tool_name = registry.resolveName(call.name) orelse call.name;
+            if (std.mem.eql(u8, tool_name, generated.bash.name)) {
                 switch (args) {
                     .object => |object| {
                         if (object.get("command")) |command| switch (command) {
@@ -3154,6 +3180,37 @@ fn seedableCount(entries: []const memory_mod.MessageEntry) usize {
     return count;
 }
 
+/// The marker that closes the inherited prefix; a seeded log without it was
+/// interrupted before the import finished.
+fn hasEndSeedMarker(events: []const types.Event) bool {
+    for (events) |event| {
+        if (std.mem.eql(u8, event.event_type, "session/end-seed")) return true;
+    }
+    return false;
+}
+
+/// One message event per imported store row; before the marker the log holds
+/// nothing else, so this is the resume cursor.
+fn seededMessageCount(events: []const types.Event) usize {
+    var count: usize = 0;
+    for (events) |event| {
+        if (std.mem.eql(u8, event.event_type, "user/message") or
+            std.mem.eql(u8, event.event_type, "assistant/message") or
+            std.mem.eql(u8, event.event_type, "system/message"))
+        {
+            count += 1;
+        }
+    }
+    return count;
+}
+
+fn concatEvents(allocator: std.mem.Allocator, first: []const types.Event, second: []const types.Event) ![]types.Event {
+    const all = try allocator.alloc(types.Event, first.len + second.len);
+    @memcpy(all[0..first.len], first);
+    @memcpy(all[first.len..], second);
+    return all;
+}
+
 /// A v4 session id: 32 lowercase hex characters from a CSPRNG.
 fn newSessionId(allocator: Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
@@ -3497,4 +3554,64 @@ test "dsh-native harness: a torn tail on the seeded log resumes intact" {
     try std.testing.expectEqualStrings("before the crash", try seedEventText(read.events[0]));
     try std.testing.expectEqualStrings("answer before the crash", try seedEventText(read.events[1]));
     try std.testing.expectEqual(@as(usize, 2), resumed.messages.items.len);
+}
+
+test "dsh-native harness: a seeded log without end-seed resumes the import" {
+    // Regression: a crash between the is_seeded header and the end-seed marker
+    // left a valid log that replayed only the imported prefix and never
+    // appended the remaining history.
+    const allocator = std.testing.allocator;
+    var env = try SeedTestEnv.init();
+    defer env.deinit();
+
+    const id = "half-seed";
+    var seed_arena = std.heap.ArenaAllocator.init(allocator);
+    defer seed_arena.deinit();
+    var interrupted = try session_store.createLog(allocator, env.dsh_home, env.workspace, id, .{
+        .id = id,
+        .created_at = 0,
+        .cwd = env.workspace,
+        .is_seeded = true,
+        .delegation_depth = 0,
+    });
+    const first = types.Message{
+        .id = "msg-1",
+        .role = .user,
+        .content = &.{.{ .text = "first question" }},
+        .source = .user,
+    };
+    _ = try interrupted.append("user/message", try DshNativeHarness.messageValue(seed_arena.allocator(), first), .{ .surface_op = .append });
+    interrupted.close();
+
+    const entries = [_]memory_mod.MessageEntry{
+        .{ .role = "user", .content = "first question" },
+        .{ .role = "assistant", .content = "first answer" },
+        .{ .role = "user", .content = "second question" },
+    };
+    var engine = try env.engine("seed-interrupted");
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .dsh_session_id = id, .messages = &entries });
+
+    var read = try session_log.readLog(allocator, engine.log.?.path);
+    defer read.deinit();
+    try std.testing.expect(read.header.is_seeded);
+    const expected_types = [_][]const u8{
+        "user/message",
+        "assistant/message",
+        "user/message",
+        "session/end-seed",
+    };
+    try std.testing.expectEqual(expected_types.len, read.events.len);
+    for (read.events, expected_types) |event, expected| {
+        try std.testing.expectEqualStrings(expected, event.event_type);
+    }
+    // The already-imported row is not duplicated.
+    try std.testing.expectEqualStrings("first question", try seedEventText(read.events[0]));
+    try std.testing.expectEqualStrings("first answer", try seedEventText(read.events[1]));
+    try std.testing.expectEqualStrings("second question", try seedEventText(read.events[2]));
+    try std.testing.expectEqual(@as(usize, 3), engine.messages.items.len);
+    try std.testing.expectEqualStrings("second question", switch (engine.messages.items[2].content[0]) {
+        .text => |text| text,
+        else => return error.InvalidSeedMessage,
+    });
 }

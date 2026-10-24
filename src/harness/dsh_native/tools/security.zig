@@ -47,7 +47,22 @@ fn check(allocator: std.mem.Allocator, scope: Scope, input: []const u8, allow_re
     // exist yet is checked through its nearest existing ancestor, which is the
     // native file tools' rule for create/write.
     const resolved = fs_compat.realpathAllocPath(allocator, absolute) catch |err| switch (err) {
-        error.FileNotFound => file_common.resolveNearestExistingAncestor(allocator, absolute) catch return false,
+        error.FileNotFound => blk: {
+            // Regression: a dangling final symlink resolves through its parent,
+            // which made the ancestor check pass, but create() then followed the
+            // link and wrote outside the workspace. Native swaps inodes via
+            // temp+rename; the dsh write path opens in place, so refuse the link.
+            if (!allow_read_root) {
+                // Only a missing parent is a normal create; any other
+                // inspection failure is a reason to refuse, not to proceed.
+                const is_link = file_common.isSymlinkPath(absolute) catch |inspect_err| switch (inspect_err) {
+                    error.FileNotFound => false,
+                    else => return false,
+                };
+                if (is_link) return false;
+            }
+            break :blk file_common.resolveNearestExistingAncestor(allocator, absolute) catch return false;
+        },
         else => return false,
     };
     defer allocator.free(resolved);
@@ -191,10 +206,16 @@ test "security: a symlink inside the workspace cannot escape it" {
     const link = try std.fs.path.join(allocator, &.{ workspace, "link" });
     defer allocator.free(link);
     try compat.fs.Dir.wrap(tmp.dir).symLink("../outside", "workspace/link", .{});
+    // Regression: a dangling link hid behind its existing parent, so the
+    // ancestor rule allowed it while create() followed it to a missing target.
+    try compat.fs.Dir.wrap(tmp.dir).symLink("../outside/not-there.txt", "workspace/dangling", .{});
 
     const scope: Scope = .{ .cwd = workspace };
     try std.testing.expect(!try readPathAllowed(allocator, scope, "link/secret.txt"));
     try std.testing.expect(!try pathAllowed(allocator, scope, "link/new.txt"));
+    try std.testing.expect(!try pathAllowed(allocator, scope, "dangling"));
+    // Reads keep their existing not-found behavior; only writers must refuse.
+    try std.testing.expect(try readPathAllowed(allocator, scope, "dangling"));
 }
 
 test "security: autonomy and command policy mirror the native gate" {

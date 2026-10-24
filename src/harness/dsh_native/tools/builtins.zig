@@ -1312,6 +1312,32 @@ test "write creates parents, reports Created/Updated, and rejects escapes" {
     try testing.expect(std.mem.indexOf(u8, escaped, "outside the session working directory") != null);
 }
 
+test "write refuses a dangling symlink instead of following it outside" {
+    // Regression: the workspace check resolved a dangling final symlink through
+    // its parent and allowed it; create(truncate) then followed the link and
+    // created the target outside the workspace.
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+    const outside_base = try compat.fs.Dir.wrap(outside_tmp.dir).realpathAlloc(arena, ".");
+    const outside_target = try std.fs.path.join(arena, &.{ outside_base, "created.txt" });
+    try compat.fs.Dir.wrap(tmp.dir).symLink(outside_target, "dangling.txt", .{});
+
+    const denied = try expectFailure(try callWrite(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "dangling.txt" } },
+        .{ "content", .{ .string = "escaped" } },
+    })), "FS_SANDBOX_DENIED");
+    try testing.expect(std.mem.indexOf(u8, denied, "outside the session working directory") != null);
+    try testing.expectError(error.FileNotFound, fs_compat.accessPath(outside_target, .{}));
+}
+
 test "every builtin refuses paths outside the workspace and allowed_paths" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();

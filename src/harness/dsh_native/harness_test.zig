@@ -2418,6 +2418,84 @@ test "dsh-native adapter: junclaw policy denies out-of-workspace reads and high-
     try testing.expect(requestContains(feedback, "High-risk command blocked by security policy"));
 }
 
+test "dsh-native adapter: a dev__bash alias cannot skip the command policy" {
+    // Regression: the gate compared the raw call name with "bash", so a
+    // `dev__bash` call dispatched to the bash handler with no command-risk
+    // check (allowed_commands, high/medium blocking, approval fail-closed).
+    const allocator = testing.allocator;
+    // `rm` is allowlisted so the high-risk branch, not the allowlist, denies.
+    const policy = SecurityPolicy{ .allowed_commands = &.{"rm"} };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "dev__bash",
+            .arguments = "{\"description\":\"remove\",\"command\":\"rm -rf alias-policy-marker\"}",
+        }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.policy = &policy;
+    const marker = try std.fs.path.join(allocator, &.{ fx.workspace, "alias-policy-marker" });
+    defer allocator.free(marker);
+    try fs_compat.makePath(marker);
+    const marker_file = try std.fs.path.join(allocator, &.{ marker, "keep.txt" });
+    defer allocator.free(marker_file);
+    {
+        const file = try fs_compat.createPath(marker_file, .{ .truncate = true });
+        file.close();
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("probe"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "High-risk command blocked by security policy"));
+    // The command never ran.
+    try fs_compat.accessPath(marker_file, .{});
+}
+
+test "dsh-native adapter: bash creates dsh_home/spill before spawning" {
+    // Regression: buildTools joined dsh_home/spill but never created it, so
+    // createTempFile failed and every bash call returned a tool error instead
+    // of running the command.
+    const builtin = @import("builtin");
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "bash",
+            .arguments = "{\"description\":\"hello\",\"command\":\"echo dsh-p3-spill\"}",
+        }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("probe"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_result = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        try testing.expect(!toolResultFailed(event));
+        try testing.expect(std.mem.indexOf(u8, toolResultText(event), "dsh-p3-spill") != null);
+        saw_result = true;
+    }
+    try testing.expect(saw_result);
+    const spill = try std.fs.path.join(allocator, &.{ fx.dsh_home, "spill" });
+    defer allocator.free(spill);
+    try fs_compat.accessPath(spill, .{});
+}
+
 test "dsh-native adapter: read-only autonomy denies dsh tool calls" {
     const allocator = testing.allocator;
     const policy = SecurityPolicy{ .autonomy = .read_only };

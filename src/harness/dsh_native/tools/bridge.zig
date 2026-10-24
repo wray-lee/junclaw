@@ -188,7 +188,13 @@ fn writeSpill(allocator: Allocator, spill_dir: []const u8, name: []const u8, tex
     var random: [6]u8 = undefined;
     compat.crypto.random.bytes(&random);
     const hex = std.fmt.bytesToHex(random, .lower);
-    const filename = try std.fmt.allocPrint(allocator, "dsh-tool-{s}-{s}.log", .{ &hex, name });
+    // The tool name is host/MCP-controlled: never put it in the path. Keep a
+    // stable hash for operators instead of the raw (possibly separator-bearing)
+    // spelling.
+    const filename = try std.fmt.allocPrint(allocator, "dsh-tool-{s}-{x}.log", .{
+        &hex,
+        std.hash.Wyhash.hash(0, name),
+    });
     const path = try std.fs.path.join(allocator, &.{ spill_dir, filename });
     const file = try compat.fs.createFileAbsolute(path, .{
         .truncate = true,
@@ -404,6 +410,47 @@ test "bridge truncates long output to the dsh cap with a spill file" {
     // Exact notice length: tail + newline + marker + real spill path + "]".
     // Regression: a fixed +120 slack failed when the checkout path got longer.
     try testing.expectEqual(bash.max_output_bytes + marker.len + 2 + (to - from), text.len);
+    const spill = try compat.fs.openFileAbsolute(text[from..to], .{});
+    defer spill.close();
+    try testing.expectEqual(@as(u64, bash.max_output_bytes + 4096), (try spill.stat()).size);
+}
+
+test "bridge spill keeps host tool names out of the path" {
+    // Regression: the raw host tool name was embedded in the spill filename.
+    // A name with separators made the spill silently unavailable, and any
+    // future removal of the random prefix would have steered the write.
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const spill_dir = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(spill_dir);
+    try compat.fs.Dir.wrap(tmp.dir).makeDir("spill");
+    const target_dir = try std.fs.path.join(allocator, &.{ spill_dir, "spill" });
+    defer allocator.free(target_dir);
+
+    var reg = registry.Registry.init();
+    defer reg.deinit(allocator);
+    var fake = FakeHost{ .allocator = allocator, .big_len = bash.max_output_bytes + 4096 };
+    defer fake.deinit();
+    const specs = [_]HostTool{
+        .{ .name = "../../escape", .description = "hostile", .input_schema_json = "{}" },
+    };
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    _ = try register(arena.allocator(), allocator, &reg, .{
+        .tools = &specs,
+        .executor = fake.executor(),
+        .spill_dir = target_dir,
+    });
+
+    const result = try @import("execute.zig").execute(&reg, arena.allocator(), callNamed("../../escape"));
+    try testing.expect(!result.isError());
+    const text = textOf(result.content()[0]);
+    const marker = "[output truncated; full output: ";
+    try testing.expect(std.mem.indexOf(u8, text, "(unavailable)") == null);
+    const from = std.mem.indexOf(u8, text, marker).? + marker.len;
+    const to = std.mem.indexOfScalarPos(u8, text, from, ']').?;
+    try testing.expect(std.mem.startsWith(u8, text[from..to], target_dir));
     const spill = try compat.fs.openFileAbsolute(text[from..to], .{});
     defer spill.close();
     try testing.expectEqual(@as(u64, bash.max_output_bytes + 4096), (try spill.stat()).size);
