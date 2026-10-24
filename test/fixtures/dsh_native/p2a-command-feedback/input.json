@@ -1,0 +1,19 @@
+{
+  "config": {},
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Ready for feedback."
+    },
+    {
+      "op": "command",
+      "text": "/feedback the fixture is concise"
+    }
+  ]
+}

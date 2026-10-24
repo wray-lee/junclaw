@@ -173,6 +173,11 @@ const Fixture = struct {
     session_dir: []const u8,
     allocator: Allocator,
     provider: FakeProvider,
+    context_window: u64 = 0,
+    compaction_threshold_ratio: ?f64 = null,
+    compaction_retain_ratio: ?f64 = null,
+    compaction_headroom_tokens: ?u64 = null,
+    question_timeout_s: i32 = 120,
 
     fn init(allocator: Allocator, replies: []const Reply) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -219,6 +224,11 @@ const Fixture = struct {
             .model = "test-model",
             .persona = "",
             .now_ms = fixedClock,
+            .context_window = self.context_window,
+            .compaction_threshold_ratio = self.compaction_threshold_ratio,
+            .compaction_retain_ratio = self.compaction_retain_ratio,
+            .compaction_headroom_tokens = self.compaction_headroom_tokens,
+            .question_timeout_s = self.question_timeout_s,
         };
     }
 
@@ -257,6 +267,45 @@ fn requestContains(request: FakeProvider.Request, needle: []const u8) bool {
         if (std.mem.indexOf(u8, content, needle) != null) return true;
     }
     return false;
+}
+
+fn dataArray(value: std.json.Value, key: []const u8) ![]const std.json.Value {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    return switch (object.get(key) orelse return error.TestUnexpectedResult) {
+        .array => |array| array.items,
+        else => return error.TestUnexpectedResult,
+    };
+}
+
+fn seqListContains(items: []const std.json.Value, seq: u64) bool {
+    for (items) |item| switch (item) {
+        .integer => |value| if (value == @as(i64, @intCast(seq))) return true,
+        else => {},
+    };
+    return false;
+}
+
+fn summaryRange(data: std.json.Value) !struct { start: u64, end: u64 } {
+    const object = switch (data) {
+        .object => |object| object,
+        else => return error.TestUnexpectedResult,
+    };
+    const range = switch (object.get("shadowedRange") orelse return error.TestUnexpectedResult) {
+        .object => |value| value,
+        else => return error.TestUnexpectedResult,
+    };
+    const start = switch (range.get("start") orelse return error.TestUnexpectedResult) {
+        .integer => |value| @as(u64, @intCast(value)),
+        else => return error.TestUnexpectedResult,
+    };
+    const end = switch (range.get("end") orelse return error.TestUnexpectedResult) {
+        .integer => |value| @as(u64, @intCast(value)),
+        else => return error.TestUnexpectedResult,
+    };
+    return .{ .start = start, .end = end };
 }
 
 test "dsh-native adapter: plain text turn completes and persists" {
@@ -878,4 +927,227 @@ test "dsh-native adapter: an unreplayable goal projection follows on_corrupt" {
     const text = try readLogText(allocator, mapping);
     defer allocator.free(text);
     try testing.expect(std.mem.indexOf(u8, text, restored.session_id) != null);
+}
+
+test "dsh-native adapter: builtin commands are claimed and other lines fall back" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "hello" }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    // Open a session without a turn so `/compact` sees an empty surface.
+    try h.restore(.{ .messages = &.{} });
+
+    // Not command lines / commands this engine does not own: host fallback.
+    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("hello"));
+    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/goal ship it"));
+    try testing.expectEqual(@as(?[]const u8, null), try h.handleLocalCommand("/not-a-command"));
+    try testing.expectEqualStrings("No compactable history yet.", (try h.handleLocalCommand("/compact")).?);
+
+    const first = try h.runTurn(turnInput("hi"));
+    defer allocator.free(first.reply);
+
+    // A claimed builtin writes its lifecycle + domain events.
+    const feedback = (try h.handleLocalCommand("/feedback nice work")).?;
+    try testing.expect(std.mem.indexOf(u8, feedback, "Feedback recorded") != null);
+
+    // 64KB+ command payload: the suite runs under testing.allocator, so this
+    // also covers the new wiring's release path.
+    const big = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big);
+    @memset(big, 'f');
+    const line = try std.fmt.allocPrint(allocator, "/feedback {s}", .{big});
+    defer allocator.free(line);
+    const ack = (try h.handleLocalCommand(line)).?;
+    try testing.expect(std.mem.indexOf(u8, ack, "Feedback recorded") != null);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    const log_text = try readLogText(allocator, path);
+    defer allocator.free(log_text);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"command/run\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"feedback/record\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"command/done\"") != null);
+}
+
+test "dsh-native adapter: sandbox escalation fails closed without an approval channel" {
+    const allocator = testing.allocator;
+    const bash_args =
+        "{\"description\":\"d\",\"command\":\"echo hi\"," ++
+        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "", .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = bash_args }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const result = try h.runTurn(turnInput("run it"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    const log_text = try readLogText(allocator, path);
+    defer allocator.free(log_text);
+    // The ask/decide audit pair exists and the tool result is the denial.
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"approval/asked\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"approval/decided\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "ToolApprovalError") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "APPROVAL_DENIED") != null);
+}
+
+test "dsh-native adapter: pre-step pressure compacts and rewrites the surface" {
+    const allocator = testing.allocator;
+    const big_a = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big_a);
+    const big_b = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big_b);
+    @memset(big_a, 'x');
+    @memset(big_b, 'y');
+    const first_text = try std.fmt.allocPrint(allocator, "marker-one {s}", .{big_a});
+    defer allocator.free(first_text);
+    const second_text = try std.fmt.allocPrint(allocator, "marker-two {s}", .{big_b});
+    defer allocator.free(second_text);
+
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "a", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "b", .prompt_tokens = 900, .completion_tokens = 10 },
+        // The auxiliary summary call.
+        .{ .text = "condensed history", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "c" },
+    });
+    defer fx.deinit();
+    fx.context_window = 1000;
+    fx.compaction_headroom_tokens = 10;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const one = try h.runTurn(turnInput(first_text));
+    defer allocator.free(one.reply);
+    const two = try h.runTurn(turnInput(second_text));
+    defer allocator.free(two.reply);
+    const three = try h.runTurn(turnInput("third"));
+    defer allocator.free(three.reply);
+
+    // a, b, the summary call, c.
+    try testing.expectEqual(@as(usize, 4), fx.provider.requests.items.len);
+    // The checkpoint replaced the first exchange; the retained tail survives.
+    try testing.expect(!requestContains(fx.provider.requests.items[3], "marker-one"));
+    try testing.expect(requestContains(fx.provider.requests.items[3], "marker-two"));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    const log_text = try readLogText(allocator, path);
+    defer allocator.free(log_text);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"compaction/start\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"compaction/summary\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"compaction/end\"") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "compact-checkpoint") != null);
+}
+
+test "dsh-native adapter: a pruned result shadowed by the summary keeps the replacement seq" {
+    // Regression: the pruner rewrote a tool result in place but kept its old
+    // seq, so compaction/summary.shadowedSeqs and the checkpoint's
+    // sourceEventSeqs named a seq the log had already replaced.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-big", .name = "read", .arguments = "{\"file_path\":\"big.txt\"}" }} },
+        .{ .text = "first done" },
+        .{ .text = "condensed history", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "second done" },
+        .{ .text = "third done" },
+    });
+    defer fx.deinit();
+    fx.context_window = 1000;
+    fx.compaction_headroom_tokens = 10;
+    // Keep only the newest message so the pruned result lands in the range.
+    fx.compaction_retain_ratio = 0.01;
+
+    const big_path = try std.fs.path.join(allocator, &.{ fx.workspace, "big.txt" });
+    defer allocator.free(big_path);
+    const big = try allocator.alloc(u8, 60_000);
+    defer allocator.free(big);
+    @memset(big, 'x');
+    for (big, 0..) |*byte, index| {
+        if (index % 80 == 79) byte.* = '\n';
+    }
+    {
+        const file = try fs_compat.createPath(big_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(big);
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const one = try h.runTurn(turnInput("read big.txt"));
+    defer allocator.free(one.reply);
+    const two = try h.runTurn(turnInput("second"));
+    defer allocator.free(two.reply);
+    const three = try h.runTurn(turnInput("third"));
+    defer allocator.free(three.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var log = try session_log.readLog(allocator, path);
+    defer log.arena.deinit();
+
+    var pruned_seq: ?u64 = null;
+    var replacement_seq: ?u64 = null;
+    var summary: ?types.Event = null;
+    var checkpoint: ?types.Event = null;
+    for (log.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "compaction/prune")) {
+            const seqs = try dataArray(event.data, "shadowedSeqs");
+            try testing.expectEqual(@as(usize, 1), seqs.len);
+            pruned_seq = @intCast(seqs[0].integer);
+        } else if (std.mem.eql(u8, event.event_type, "tool/result")) {
+            if (event.surface_op) |op| switch (op) {
+                .replace => |range| {
+                    if (pruned_seq) |seq| {
+                        if (range.start_seq == seq) replacement_seq = event.seq;
+                    }
+                },
+                .append => {},
+            };
+        } else if (std.mem.eql(u8, event.event_type, "compaction/summary")) {
+            summary = event;
+        } else if (std.mem.eql(u8, event.event_type, "user/message")) {
+            if (event.source_event_seqs != null) checkpoint = event;
+        }
+    }
+
+    const old_seq = pruned_seq orelse return error.TestUnexpectedResult;
+    const new_seq = replacement_seq orelse return error.TestUnexpectedResult;
+    const summary_event = summary orelse return error.TestUnexpectedResult;
+    const checkpoint_event = checkpoint orelse return error.TestUnexpectedResult;
+
+    const shadowed = try dataArray(summary_event.data, "shadowedSeqs");
+    try testing.expect(!seqListContains(shadowed, old_seq));
+    try testing.expect(seqListContains(shadowed, new_seq));
+
+    const range = try summaryRange(summary_event.data);
+    const replace = switch (checkpoint_event.surface_op.?) {
+        .replace => |value| value,
+        .append => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqual(range.start, replace.start_seq);
+    try testing.expectEqual(range.end, replace.end_seq);
+
+    const source = checkpoint_event.source_event_seqs.?;
+    try testing.expectEqual(@as(usize, 2 + shadowed.len), source.len);
+    try testing.expectEqual(summary_event.seq - 1, source[0]);
+    try testing.expectEqual(summary_event.seq, source[1]);
+    for (shadowed, 0..) |seq, index| {
+        try testing.expectEqual(@as(u64, @intCast(seq.integer)), source[2 + index]);
+    }
+    try testing.expect(seqListContains(shadowed, new_seq));
 }

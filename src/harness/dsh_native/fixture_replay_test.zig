@@ -8,20 +8,27 @@
 const std = @import("std");
 const builtins_mod = @import("tools/builtins.zig");
 const compat = @import("compat");
+const config_types = @import("../../config_types.zig");
 const fixture_compare = @import("fixture_compare.zig");
 const fs_compat = @import("../../fs_compat.zig");
+const generated_compaction = @import("generated/compaction.zig");
+const generated_interaction = @import("generated/interaction.zig");
 const goal = @import("goal.zig");
 const goal_command = @import("goal_command.zig");
 const goal_rounds = @import("goal_rounds.zig");
+const harness_mod = @import("harness.zig");
 const inbox = @import("inbox.zig");
 const loop_mod = @import("loop.zig");
+const port = @import("../port.zig");
 const prompt = @import("prompt.zig");
+const providers = @import("../../providers/root.zig");
 const registry = @import("tools/registry.zig");
 const replay_provider = @import("replay_provider.zig");
 const request = @import("request.zig");
 const scheduler = @import("tools/scheduler.zig");
 const tools_goal = @import("tools/goal.zig");
 const session_log = @import("session_log.zig");
+const session_store = @import("session_store.zig");
 const stream = @import("stream.zig");
 const surface = @import("surface.zig");
 const types = @import("types.zig");
@@ -1406,6 +1413,510 @@ fn expectWorkspaceEffects(allocator: Allocator, records: []const Value, cwd: []c
     }
 }
 
+// ── P2a event-stream fixtures ──────────────────────────────────────────────
+//
+// P2a behaviour (approvals, questions, slash commands, compaction) lives in
+// the adapter, above the kernel the P1 fixtures drive. These scenarios run the
+// real `harness.zig` with a scripted provider and interaction, then compare
+// the same normalized v4 log.
+
+const EventInput = struct {
+    config: Config = .{},
+    steps: []const Step = &.{},
+
+    const Config = struct {
+        approvalPolicy: []const u8 = "ask",
+        contextWindow: u64 = 0,
+        compactionRetainRatio: ?f64 = null,
+        compactionHeadroomTokens: ?u64 = null,
+        maxTokens: ?u32 = null,
+        questionTimeout: i32 = 120,
+    };
+
+    const Step = struct {
+        op: []const u8 = "",
+        text: ?[]const u8 = null,
+        workspace: ?Value = null,
+        approval: ?[]const u8 = null,
+        noInteraction: bool = false,
+        questions: ?QuestionScript = null,
+    };
+
+    const QuestionScript = struct {
+        answers: []const Answer = &.{},
+        advanceMs: i64 = 0,
+    };
+
+    const Answer = struct {
+        id: []const u8,
+        text: []const u8,
+    };
+};
+
+const HarnessReply = struct {
+    text: []const u8 = "",
+    tool_calls: []const providers.ToolCall = &.{},
+    prompt_tokens: u32 = 0,
+    completion_tokens: u32 = 0,
+};
+
+const CapturedRequest = struct {
+    contents: []const []const u8,
+    tools: []const providers.ToolSpec,
+};
+
+/// Blocking provider over the P1 stream-call format: each recorded call is
+/// reduced to the ChatResponse the adapter sees (text, tool calls, usage).
+const HarnessProvider = struct {
+    replies: []const HarnessReply,
+    next: usize = 0,
+    requests: std.ArrayListUnmanaged(CapturedRequest) = .empty,
+    arena: std.heap.ArenaAllocator,
+    owner: Allocator,
+
+    fn init(allocator: Allocator, replies: []const HarnessReply) HarnessProvider {
+        return .{
+            .replies = replies,
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .owner = allocator,
+        };
+    }
+
+    fn deinit(self: *HarnessProvider) void {
+        self.requests.deinit(self.owner);
+        self.arena.deinit();
+    }
+
+    fn provider(self: *HarnessProvider) providers.Provider {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    const vtable = providers.Provider.VTable{
+        .chatWithSystem = chatWithSystem,
+        .chat = chat,
+        .supportsNativeTools = supportsNativeTools,
+        .getName = getName,
+        .deinit = deinitProvider,
+    };
+
+    fn chatWithSystem(_: *anyopaque, allocator: Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        return allocator.dupe(u8, "");
+    }
+
+    fn chat(ptr: *anyopaque, allocator: Allocator, chat_request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *HarnessProvider = @ptrCast(@alignCast(ptr));
+        try self.capture(chat_request);
+        if (self.next >= self.replies.len) return error.NoScriptedReply;
+        const reply = self.replies[self.next];
+        self.next += 1;
+        const calls = try allocator.alloc(providers.ToolCall, reply.tool_calls.len);
+        for (reply.tool_calls, 0..) |call, index| {
+            calls[index] = .{
+                .id = try allocator.dupe(u8, call.id),
+                .name = try allocator.dupe(u8, call.name),
+                .arguments = try allocator.dupe(u8, call.arguments),
+            };
+        }
+        return .{
+            .content = try allocator.dupe(u8, reply.text),
+            .tool_calls = calls,
+            .usage = .{
+                .prompt_tokens = reply.prompt_tokens,
+                .completion_tokens = reply.completion_tokens,
+                .total_tokens = reply.prompt_tokens + reply.completion_tokens,
+            },
+        };
+    }
+
+    fn capture(self: *HarnessProvider, chat_request: providers.ChatRequest) !void {
+        const arena = self.arena.allocator();
+        const contents = try arena.alloc([]const u8, chat_request.messages.len);
+        for (chat_request.messages, 0..) |message, index| contents[index] = try arena.dupe(u8, message.content);
+        const request_tools = chat_request.tools orelse &.{};
+        const tools = try arena.alloc(providers.ToolSpec, request_tools.len);
+        for (request_tools, 0..) |tool, index| {
+            tools[index] = .{
+                .name = try arena.dupe(u8, tool.name),
+                .description = try arena.dupe(u8, tool.description),
+                .parameters_json = try arena.dupe(u8, tool.parameters_json),
+            };
+        }
+        try self.requests.append(self.owner, .{ .contents = contents, .tools = tools });
+    }
+
+    fn supportsNativeTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn getName(_: *anyopaque) []const u8 {
+        return "fake";
+    }
+
+    fn deinitProvider(_: *anyopaque) void {}
+};
+
+const TestClock = struct {
+    now_ms: i64 = 0,
+};
+
+fn clockNow(context: ?*anyopaque) i64 {
+    const clock: *TestClock = @ptrCast(@alignCast(context.?));
+    return clock.now_ms;
+}
+
+/// Host interaction scripted from `input.json`. `advanceMs` is applied inside
+/// the blocking call, so the question timeout is decided by the injected clock
+/// and never by a sleep.
+const InteractionScript = struct {
+    clock: *TestClock,
+    approval: port.ApprovalDecision = .rejected,
+    answers: []const port.Answer = &.{},
+    advance_ms: i64 = 0,
+
+    fn interaction(self: *InteractionScript) port.Interaction {
+        return .{
+            .ctx = @ptrCast(self),
+            .requestApproval = requestApproval,
+            .askQuestions = askQuestions,
+            .planReview = planReview,
+        };
+    }
+
+    fn requestApproval(context: *anyopaque, _: port.ApprovalRequest) anyerror!port.ApprovalDecision {
+        const self: *InteractionScript = @ptrCast(@alignCast(context));
+        return self.approval;
+    }
+
+    fn askQuestions(context: *anyopaque, _: []const port.Question) anyerror![]const port.Answer {
+        const self: *InteractionScript = @ptrCast(@alignCast(context));
+        self.clock.now_ms += self.advance_ms;
+        return self.answers;
+    }
+
+    fn planReview(_: *anyopaque, _: []const u8) anyerror!bool {
+        return true;
+    }
+};
+
+fn stringField(value: Value) ?[]const u8 {
+    return switch (value) {
+        .string => |text| text,
+        else => null,
+    };
+}
+
+fn intField(value: Value) u32 {
+    return switch (value) {
+        .integer => |number| if (number < 0) 0 else @intCast(@min(number, std.math.maxInt(u32))),
+        else => 0,
+    };
+}
+
+fn repliesFromReplay(allocator: Allocator, bytes: []const u8) ![]HarnessReply {
+    const root = try fixture_compare.parseJson(allocator, bytes);
+    const object = switch (root) {
+        .object => |value| value,
+        else => return error.InvalidReplay,
+    };
+    const calls_value = object.get("calls") orelse return error.InvalidReplay;
+    const calls = switch (calls_value) {
+        .array => |value| value,
+        else => return error.InvalidReplay,
+    };
+    const replies = try allocator.alloc(HarnessReply, calls.items.len);
+    for (calls.items, 0..) |call_value, call_index| {
+        const call = switch (call_value) {
+            .object => |value| value,
+            else => return error.InvalidReplay,
+        };
+        const stream_value = call.get("stream") orelse return error.InvalidReplay;
+        const records = switch (stream_value) {
+            .array => |value| value,
+            else => return error.InvalidReplay,
+        };
+        var text: std.ArrayListUnmanaged(u8) = .empty;
+        var tool_calls: std.ArrayListUnmanaged(providers.ToolCall) = .empty;
+        var prompt_tokens: u32 = 0;
+        var completion_tokens: u32 = 0;
+        for (records.items) |record_value| {
+            const record = switch (record_value) {
+                .object => |value| value,
+                else => continue,
+            };
+            const record_type = stringField(record.get("type") orelse continue) orelse continue;
+            if (std.mem.eql(u8, record_type, "text-chunks")) {
+                const texts = switch (record.get("texts") orelse continue) {
+                    .array => |value| value,
+                    else => continue,
+                };
+                for (texts.items) |item| if (stringField(item)) |part| try text.appendSlice(allocator, part);
+            } else if (std.mem.eql(u8, record_type, "tool-call-chunks")) {
+                const args = switch (record.get("args") orelse continue) {
+                    .array => |value| value,
+                    else => continue,
+                };
+                var arguments: std.ArrayListUnmanaged(u8) = .empty;
+                for (args.items) |item| if (stringField(item)) |part| try arguments.appendSlice(allocator, part);
+                try tool_calls.append(allocator, .{
+                    .id = try allocator.dupe(u8, stringField(record.get("id") orelse continue) orelse ""),
+                    .name = try allocator.dupe(u8, stringField(record.get("name") orelse continue) orelse ""),
+                    .arguments = try arguments.toOwnedSlice(allocator),
+                });
+            } else if (std.mem.eql(u8, record_type, "chunk")) {
+                const chunk = switch (record.get("chunk") orelse continue) {
+                    .object => |value| value,
+                    else => continue,
+                };
+                if (!std.mem.eql(u8, stringField(chunk.get("type") orelse continue) orelse continue, "usage")) continue;
+                const usage = switch (chunk.get("usage") orelse continue) {
+                    .object => |value| value,
+                    else => continue,
+                };
+                prompt_tokens = intField(usage.get("inputTokens") orelse .{ .integer = 0 });
+                completion_tokens = intField(usage.get("outputTokens") orelse .{ .integer = 0 });
+            }
+        }
+        replies[call_index] = .{
+            .text = try text.toOwnedSlice(allocator),
+            .tool_calls = try tool_calls.toOwnedSlice(allocator),
+            .prompt_tokens = prompt_tokens,
+            .completion_tokens = completion_tokens,
+        };
+    }
+    return replies;
+}
+
+fn approvalPolicyOf(name: []const u8) !config_types.DshApprovalPolicy {
+    if (std.mem.eql(u8, name, "ask")) return .ask;
+    if (std.mem.eql(u8, name, "never")) return .never;
+    return error.InvalidApprovalPolicy;
+}
+
+fn decisionOf(name: []const u8) !port.ApprovalDecision {
+    if (std.mem.eql(u8, name, "allowed_once") or std.mem.eql(u8, name, "allowed-once")) return .allowed_once;
+    if (std.mem.eql(u8, name, "rejected")) return .rejected;
+    if (std.mem.eql(u8, name, "cancelled")) return .cancelled;
+    if (std.mem.eql(u8, name, "unavailable")) return .unavailable;
+    return error.InvalidApprovalOutcome;
+}
+
+fn writeWorkspaceFiles(allocator: Allocator, workspace: []const u8, value: Value) !void {
+    const files = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidWorkspace,
+    };
+    var iterator = files.iterator();
+    while (iterator.next()) |entry| {
+        const content = switch (entry.value_ptr.*) {
+            .string => |text| text,
+            else => return error.InvalidWorkspace,
+        };
+        const path = try std.fs.path.join(allocator, &.{ workspace, entry.key_ptr.* });
+        defer allocator.free(path);
+        if (std.fs.path.dirname(path)) |parent| try fs_compat.makePath(parent);
+        const file = try fs_compat.createPath(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(content);
+    }
+}
+
+fn manifestFlag(manifest: Value, group: []const u8, key: []const u8) bool {
+    const root = switch (manifest) {
+        .object => |object| object,
+        else => return false,
+    };
+    const group_value = root.get(group) orelse return false;
+    const group_object = switch (group_value) {
+        .object => |object| object,
+        else => return false,
+    };
+    const value = group_object.get(key) orelse return false;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => false,
+    };
+}
+
+/// The ask_user_question schema the model sees must be the generated dsh text.
+fn checkGeneratedToolSchema(provider: *HarnessProvider) !void {
+    var seen = false;
+    for (provider.requests.items) |captured| {
+        for (captured.tools) |tool| {
+            if (!std.mem.eql(u8, tool.name, generated_interaction.ask_user_question.name)) continue;
+            seen = true;
+            try std.testing.expectEqualStrings(generated_interaction.ask_user_question.description, tool.description);
+            try std.testing.expectEqualStrings(generated_interaction.ask_user_question.input_schema_json, tool.parameters_json);
+        }
+    }
+    try std.testing.expect(seen);
+}
+
+fn expectCompactionInstruction(manifest: Value, provider: *HarnessProvider) !void {
+    if (!manifestFlag(manifest, "modelVisible", "compactionInstruction")) return;
+    for (provider.requests.items) |captured| {
+        for (captured.contents) |content| {
+            if (std.mem.eql(u8, content, generated_compaction.instruction)) return;
+        }
+    }
+    return error.CompactionInstructionMissing;
+}
+
+fn runEventFixture(scenario: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const dir = try fixtureDirAlloc(allocator, scenario);
+    defer allocator.free(dir);
+
+    var fixture_arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer fixture_arena_state.deinit();
+    const fixture_allocator = fixture_arena_state.allocator();
+
+    const input_bytes = try fixture_compare.readFixture(allocator, dir, "input.json");
+    defer allocator.free(input_bytes);
+    const input = try std.json.parseFromSliceLeaky(EventInput, fixture_allocator, input_bytes, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    });
+
+    const replay_bytes = try fixture_compare.readFixture(allocator, dir, "replay.json");
+    defer allocator.free(replay_bytes);
+    const replies = try repliesFromReplay(fixture_allocator, replay_bytes);
+
+    const expected_bytes = try fixture_compare.readFixture(allocator, dir, "expected.v4.jsonl");
+    defer allocator.free(expected_bytes);
+    const expected_records = try fixture_compare.parseJsonl(fixture_allocator, expected_bytes);
+    const manifest_bytes = try fixture_compare.readFixture(allocator, dir, "manifest.json");
+    defer allocator.free(manifest_bytes);
+    const manifest = try fixture_compare.parseJson(fixture_allocator, manifest_bytes);
+
+    var declared: std.StringHashMapUnmanaged(void) = .empty;
+    var ordinal: std.StringHashMapUnmanaged(void) = .empty;
+    try fixture_compare.loadDeclaredTokens(allocator, manifest, &declared, &ordinal);
+    defer declared.deinit(allocator);
+    defer ordinal.deinit(allocator);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace);
+    try fs_compat.makePath(workspace);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(dsh_home);
+    try fs_compat.makePath(dsh_home);
+    const session_dir = try std.fs.path.join(allocator, &.{ root, "sessions" });
+    defer allocator.free(session_dir);
+    try fs_compat.makePath(session_dir);
+    const spill_dir = try std.fs.path.join(allocator, &.{ dsh_home, "spill" });
+    defer allocator.free(spill_dir);
+    try fs_compat.makePath(spill_dir);
+
+    var provider = HarnessProvider.init(allocator, replies);
+    defer provider.deinit();
+
+    var clock = TestClock{};
+    var engine = try harness_mod.DshNativeHarness.init(allocator, .{
+        .session_key = "fixture-session-key",
+        .dsh_home = dsh_home,
+        .session_dir = session_dir,
+        .workspace_dir = workspace,
+        .provider = provider.provider(),
+        .provider_name = "fake",
+        .model = "fake",
+        .approval_policy = try approvalPolicyOf(input.config.approvalPolicy),
+        .max_tokens = input.config.maxTokens,
+        .context_window = input.config.contextWindow,
+        .compaction_retain_ratio = input.config.compactionRetainRatio,
+        .compaction_headroom_tokens = input.config.compactionHeadroomTokens,
+        .question_timeout_s = input.config.questionTimeout,
+        .now_ms = clockNow,
+        .clock_context = &clock,
+    });
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    // A fixed session id keeps ids out of the expected log (the /feedback
+    // settlement echoes it). Restore then reopens that empty log.
+    {
+        var seeded = try session_store.createLog(allocator, dsh_home, workspace, "fixture-session", .{
+            .id = "fixture-session",
+            .created_at = session_created_at,
+            .cwd = workspace,
+            .is_seeded = false,
+            .delegation_depth = 0,
+        });
+        seeded.close();
+    }
+    try h.restore(.{ .messages = &.{}, .dsh_session_id = "fixture-session" });
+
+    for (input.steps) |step| {
+        if (std.mem.eql(u8, step.op, "initialize")) continue;
+        if (std.mem.eql(u8, step.op, "newSession")) {
+            if (step.workspace) |workspace_value| try writeWorkspaceFiles(allocator, workspace, workspace_value);
+            continue;
+        }
+        if (std.mem.eql(u8, step.op, "prompt")) {
+            const count = if (step.questions) |script| script.answers.len else 0;
+            const answers = try allocator.alloc(port.Answer, count);
+            defer allocator.free(answers);
+            if (step.questions) |script| {
+                for (script.answers, 0..) |answer, index| {
+                    answers[index] = .{ .id = answer.id, .text = answer.text };
+                }
+            }
+            var script = InteractionScript{
+                .clock = &clock,
+                .approval = try decisionOf(step.approval orelse "allowed_once"),
+                .answers = answers,
+                .advance_ms = if (step.questions) |questions| questions.advanceMs else 0,
+            };
+            const result = try h.runTurn(.{
+                .user_message = step.text orelse return error.MissingPrompt,
+                .workspace_dir = workspace,
+                .interaction = if (step.noInteraction) null else script.interaction(),
+            });
+            allocator.free(result.reply);
+            continue;
+        }
+        if (std.mem.eql(u8, step.op, "command")) {
+            _ = try h.handleLocalCommand(step.text orelse return error.MissingCommandText) orelse
+                return error.CommandNotClaimed;
+            continue;
+        }
+        return error.UnsupportedInput;
+    }
+
+    const log_path = try session_store.logPathAlloc(allocator, dsh_home, workspace, engine.session_id);
+    defer allocator.free(log_path);
+    const log_bytes = try fs_compat.readFileAlloc(compat.fs.cwd(), allocator, log_path, 16 * 1024 * 1024);
+    defer allocator.free(log_bytes);
+
+    try checkGeneratedToolSchema(&provider);
+    try expectCompactionInstruction(manifest, &provider);
+
+    const actual_records = try fixture_compare.parseJsonl(fixture_allocator, log_bytes);
+    var normalizer = fixture_compare.Normalizer{
+        .arena = fixture_allocator,
+        .declared = &declared,
+        .ordinal = &ordinal,
+        .cwd = workspace,
+    };
+    try normalizer.expectLog(expected_records, actual_records);
+
+    if (manifestFlag(manifest, "comparison", "skipSurfaceFold")) return;
+    const expected_events = try fixture_compare.eventsFromRecords(fixture_allocator, expected_records);
+    var read = try session_log.readLog(allocator, log_path);
+    defer read.deinit();
+    var expected_fold = try surface.fold(allocator, expected_events);
+    defer expected_fold.deinit();
+    var actual_fold = try surface.fold(allocator, read.events);
+    defer actual_fold.deinit();
+    try std.testing.expectEqual(expected_fold.nodes.len, actual_fold.nodes.len);
+    for (expected_fold.nodes, actual_fold.nodes) |expected_node, actual_node| {
+        try normalizer.expectMessagesMatch(expected_node.message, actual_node.message);
+    }
+}
+
 test "dsh native tool-turn matches normalized v4 fixture" {
     try runFixture("tool-turn");
 }
@@ -1457,4 +1968,60 @@ test "hook abort cause serializes as kind hook and reason" {
     try std.testing.expectEqualStrings("hook", reason.get("kind").?.string);
     try std.testing.expectEqualStrings("policy-hook", reason.get("reason").?.string);
     try std.testing.expect(reason.get("name") == null);
+}
+
+test "dsh native p2a compaction pressure matches normalized v4 fixture" {
+    try runEventFixture("p2a-compaction-pressure");
+}
+
+test "dsh native p2a compaction command matches normalized v4 fixture" {
+    try runEventFixture("p2a-compaction-command");
+}
+
+test "dsh native p2a compaction prune matches normalized v4 fixture" {
+    try runEventFixture("p2a-compaction-prune");
+}
+
+test "dsh native p2a approval allowed-once matches normalized v4 fixture" {
+    try runEventFixture("p2a-approval-allowed-once");
+}
+
+test "dsh native p2a approval rejected matches normalized v4 fixture" {
+    try runEventFixture("p2a-approval-rejected");
+}
+
+test "dsh native p2a approval cancelled matches normalized v4 fixture" {
+    try runEventFixture("p2a-approval-cancelled");
+}
+
+test "dsh native p2a approval unavailable matches normalized v4 fixture" {
+    try runEventFixture("p2a-approval-unavailable");
+}
+
+test "dsh native p2a approval never matches normalized v4 fixture" {
+    try runEventFixture("p2a-approval-never");
+}
+
+test "dsh native p2a questions answered matches normalized v4 fixture" {
+    try runEventFixture("p2a-questions-answered");
+}
+
+test "dsh native p2a questions timeout matches normalized v4 fixture" {
+    try runEventFixture("p2a-questions-timeout");
+}
+
+test "dsh native p2a questions no channel matches normalized v4 fixture" {
+    try runEventFixture("p2a-questions-no-channel");
+}
+
+test "dsh native p2a command permission matches normalized v4 fixture" {
+    try runEventFixture("p2a-command-permission");
+}
+
+test "dsh native p2a command feedback matches normalized v4 fixture" {
+    try runEventFixture("p2a-command-feedback");
+}
+
+test "dsh native p2a command export matches normalized v4 fixture" {
+    try runEventFixture("p2a-command-export");
 }

@@ -1,0 +1,19 @@
+{
+  "config": {},
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Ready for a command."
+    },
+    {
+      "op": "command",
+      "text": "/permission read-only"
+    }
+  ]
+}

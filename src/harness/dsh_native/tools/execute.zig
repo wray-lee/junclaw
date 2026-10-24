@@ -24,6 +24,19 @@ const Violations = std.ArrayListUnmanaged([]const u8);
 
 pub const ExecuteError = error{ OutOfMemory, InvalidToolSchema };
 
+/// Pre-dispatch hook (design B24): bind per-call state and run the approval
+/// gate before any handler sees the call. Returning a reason denies the call
+/// with a structured `isError` result; null allows it.
+pub const Gate = struct {
+    context: *anyopaque,
+    decide: *const fn (
+        context: *anyopaque,
+        allocator: Allocator,
+        call: types.ToolCall,
+        args: Value,
+    ) anyerror!?[]const u8,
+};
+
 /// `CLOSER_TEXT.interrupted.started` from dsh `core/session/src/repair.ts`: a
 /// started call whose outcome was never recorded, so retries must be careful.
 const outcome_unknown_text =
@@ -42,7 +55,22 @@ pub fn execute(
     allocator: Allocator,
     call: types.ToolCall,
 ) ExecuteError!registry.ToolResult {
-    const tool = reg.get(call.name) orelse return unknownTool(allocator, call.name);
+    return executeWithGate(reg, allocator, call, null);
+}
+
+/// Same pipeline with an optional pre-dispatch gate. Non-core registered
+/// schemas (`ask_user_question`) are resolved through the exact-name map;
+/// aliases still only resolve through `Registry.get`.
+pub fn executeWithGate(
+    reg: *const registry.Registry,
+    allocator: Allocator,
+    call: types.ToolCall,
+    gate: ?Gate,
+) ExecuteError!registry.ToolResult {
+    const tool = reg.get(call.name) orelse blk: {
+        const entry = reg.tools.getPtr(call.name) orelse return unknownTool(allocator, call.name);
+        break :blk entry;
+    };
 
     // dsh keeps unparseable arguments as raw text; the schema walk then reports
     // `"arguments" must be an object` instead of a JSON syntax error.
@@ -55,10 +83,24 @@ pub fn execute(
     const violations = try collectViolations(allocator, tool.input_schema_json, args);
     if (violations.len != 0) return invalidArguments(allocator, violations);
 
-    const result = reg.invoke(allocator, call.name, args) catch |err| {
+    if (gate) |hook| {
+        const denial = hook.decide(hook.context, allocator, call, args) catch |err|
+            return recovery(allocator, @errorName(err));
+        if (denial) |reason| {
+            const text = try std.fmt.allocPrint(allocator, "Error: {s}", .{reason});
+            return failure(allocator, "ToolApprovalError", "APPROVAL_DENIED", reason, text);
+        }
+    }
+
+    var result = tool.handler.call(tool.handler.context, allocator, args) catch |err| {
         if (err == error.UnknownTool) return unknownTool(allocator, call.name);
         return recovery(allocator, @errorName(err));
     };
+    if (tool.wrap) |wrap| {
+        const extra = wrap.render(wrap.context, allocator, args, &result) catch |err|
+            return recovery(allocator, @errorName(err));
+        try result.appendContent(allocator, extra);
+    }
     return result;
 }
 
@@ -633,4 +675,87 @@ test "a 64KB+ handler result is owned by the arena and does not leak" {
     try testing.expectEqual(@as(usize, big_len), result.content()[0].text.len);
     try testing.expectEqual(@as(u8, 'x'), result.content()[0].text[0]);
     try testing.expectEqual(@as(u8, 'x'), result.content()[0].text[big_len - 1]);
+}
+
+const GateState = struct {
+    calls: usize = 0,
+    deny: ?[]const u8 = null,
+    fail: bool = false,
+    tool_name: []const u8 = "",
+    call_id: []const u8 = "",
+    saw_args: bool = false,
+};
+
+fn gateDecision(context: *anyopaque, allocator: Allocator, call: types.ToolCall, args: Value) anyerror!?[]const u8 {
+    _ = allocator;
+    const state: *GateState = @ptrCast(@alignCast(context));
+    state.calls += 1;
+    state.tool_name = call.name;
+    state.call_id = call.id;
+    state.saw_args = args == .object and args.object.get("file_path") != null;
+    if (state.fail) return error.GateBroken;
+    return state.deny;
+}
+
+test "approval gate denies before the handler and preserves the reason" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tool_ctx = TestContext{};
+    var reg = try setupRegistry(handlers(.{ .context = @ptrCast(&tool_ctx), .call = successHandler }));
+    defer reg.deinit(testing.allocator);
+
+    var gate = GateState{ .deny = "the user rejected tool \"read\"" };
+    const result = try executeWithGate(&reg, arena, expectCall("call-9", "read", "{\"file_path\":\"a.txt\"}"), .{
+        .context = @ptrCast(&gate),
+        .decide = gateDecision,
+    });
+    const denied = switch (result) {
+        .failure => |value| value,
+        .success => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings("ToolApprovalError", denied.error_info.name);
+    try testing.expectEqualStrings("APPROVAL_DENIED", denied.error_info.code);
+    try testing.expectEqualStrings("the user rejected tool \"read\"", denied.error_info.reason.?);
+    try testing.expectEqualStrings("Error: the user rejected tool \"read\"", denied.content[0].text);
+    // Fail closed: the handler never ran, and the gate saw the call identity.
+    try testing.expectEqual(@as(usize, 0), tool_ctx.calls);
+    try testing.expectEqual(@as(usize, 1), gate.calls);
+    try testing.expectEqualStrings("read", gate.tool_name);
+    try testing.expectEqualStrings("call-9", gate.call_id);
+    try testing.expect(gate.saw_args);
+}
+
+test "approval gate allows, and a gate failure fails closed" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var tool_ctx = TestContext{};
+    var reg = try setupRegistry(handlers(.{ .context = @ptrCast(&tool_ctx), .call = successHandler }));
+    defer reg.deinit(testing.allocator);
+
+    var gate = GateState{};
+    const call = expectCall("call-1", "read", "{\"file_path\":\"a.txt\"}");
+    const allowed = try executeWithGate(&reg, arena, call, .{
+        .context = @ptrCast(&gate),
+        .decide = gateDecision,
+    });
+    try testing.expect(!allowed.isError());
+    try testing.expectEqual(@as(usize, 1), tool_ctx.calls);
+    try testing.expectEqual(@as(usize, 1), gate.calls);
+
+    gate.fail = true;
+    const failed = try executeWithGate(&reg, arena, call, .{
+        .context = @ptrCast(&gate),
+        .decide = gateDecision,
+    });
+    const gate_failure = switch (failed) {
+        .failure => |value| value,
+        .success => return error.TestUnexpectedResult,
+    };
+    try testing.expectEqualStrings("TOOL_OUTCOME_UNKNOWN", gate_failure.error_info.code);
+    try testing.expectEqualStrings("GateBroken", gate_failure.error_info.reason.?);
+    try testing.expectEqual(@as(usize, 1), tool_ctx.calls);
 }

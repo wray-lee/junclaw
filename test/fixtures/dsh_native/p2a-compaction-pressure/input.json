@@ -1,0 +1,28 @@
+{
+  "config": {
+    "contextWindow": 1000,
+    "compactionHeadroomTokens": 100,
+    "compactionRetainRatio": 0.01,
+    "maxTokens": 32
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "First turn. alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha alpha "
+    },
+    {
+      "op": "prompt",
+      "text": "Second turn carries enough text for range selection. beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta beta "
+    },
+    {
+      "op": "prompt",
+      "text": "Third turn runs after pressure compaction. gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma gamma "
+    }
+  ]
+}
