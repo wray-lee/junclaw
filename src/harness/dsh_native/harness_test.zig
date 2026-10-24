@@ -12,6 +12,7 @@ const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
 const port = @import("../port.zig");
 const harness_mod = @import("harness.zig");
+const bridge = @import("tools/bridge.zig");
 const goal_mod = @import("goal.zig");
 const session_log = @import("session_log.zig");
 const session_store = @import("session_store.zig");
@@ -203,6 +204,8 @@ const Fixture = struct {
     compaction_retain_ratio: ?f64 = null,
     compaction_headroom_tokens: ?u64 = null,
     question_timeout_s: i32 = 120,
+    host_tools: []const bridge.HostTool = &.{},
+    host_executor: ?bridge.HostExecutor = null,
 
     fn init(allocator: Allocator, replies: []const Reply) !Fixture {
         var tmp = std.testing.tmpDir(.{});
@@ -256,6 +259,8 @@ const Fixture = struct {
             .compaction_retain_ratio = self.compaction_retain_ratio,
             .compaction_headroom_tokens = self.compaction_headroom_tokens,
             .question_timeout_s = self.question_timeout_s,
+            .host_tools = self.host_tools,
+            .host_executor = self.host_executor,
         };
     }
 
@@ -344,6 +349,26 @@ fn toolResultFailed(event: types.Event) bool {
     const message = event.data.object.get("message").?.object;
     return message.get("isError").?.bool;
 }
+
+const BridgeFake = struct {
+    calls: usize = 0,
+    last_name: []const u8 = "",
+    output: []const u8 = "",
+    success: bool = true,
+
+    fn executor(self: *BridgeFake) bridge.HostExecutor {
+        return .{ .context = @ptrCast(self), .call = call };
+    }
+
+    fn call(context: *anyopaque, allocator: Allocator, name: []const u8, args: std.json.Value) anyerror!bridge.HostResult {
+        _ = allocator;
+        _ = args;
+        const self: *BridgeFake = @ptrCast(@alignCast(context));
+        self.calls += 1;
+        self.last_name = name;
+        return .{ .success = self.success, .output = self.output };
+    }
+};
 
 fn userMessageText(event: types.Event) []const u8 {
     return event.data.object.get("content").?.array.items[0].object.get("text").?.string;
@@ -2142,4 +2167,108 @@ test "dsh-native adapter: plan state survives a poisoned restore and reset" {
         generated_system_prompt.plan_policy_text,
     ));
     try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
+    const allocator = testing.allocator;
+    const search_schema = "{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"}},\"required\":[\"query\"]}";
+    var fake = BridgeFake{ .output = "two results" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "web_search", .arguments = "{\"query\":\"x\"}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.host_tools = &.{
+        .{ .name = "web_search", .description = "Search the web for pages", .input_schema_json = search_schema, .concurrency_safe = true },
+        // A host tool may not shadow a dsh tool, even one registered later in
+        // buildTools (the bridge registers after all dsh tools for this).
+        .{ .name = "bash", .description = "shadowed bash", .input_schema_json = "{}" },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    // Name, description and schema reach the model exactly as junclaw has them.
+    var found = false;
+    for (engine.tool_schemas) |schema| {
+        if (!std.mem.eql(u8, schema.name, "web_search")) continue;
+        found = true;
+        try testing.expectEqualStrings("Search the web for pages", schema.description);
+        try testing.expectEqualStrings(search_schema, schema.parameters_json);
+    }
+    try testing.expect(found);
+    // Regression: the bridge used to register before dsh's bash, so a host
+    // "bash" entered the host map and received every bash call.
+    try testing.expect(engine.registry.hostMeta("bash") == null);
+    try testing.expect(engine.registry.hostMeta("web_search") != null);
+    for (engine.tool_schemas) |schema| {
+        if (!std.mem.eql(u8, schema.name, tool_schemas.bash.name)) continue;
+        try testing.expectEqualStrings(tool_schemas.bash.description, schema.description);
+    }
+
+    const result = try h.runTurn(turnInput("search"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("web_search", fake.last_name);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_header = false;
+    var saw_result = false;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "request/header")) {
+            try testing.expect(headerHasTool(event, "web_search"));
+            // dsh's own file tools are not duplicated by junclaw's.
+            try testing.expect(!headerHasTool(event, "file_read"));
+            try testing.expect(!headerHasTool(event, "shell"));
+            saw_header = true;
+        } else if (std.mem.eql(u8, event.event_type, "tool/result")) {
+            try testing.expect(!toolResultFailed(event));
+            try testing.expectEqualStrings("two results", toolResultText(event));
+            saw_result = true;
+        }
+    }
+    try testing.expect(saw_header);
+    try testing.expect(saw_result);
+}
+
+test "dsh-native adapter: bridged tool fails closed without an interaction channel" {
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "should not run" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "needs_user", .arguments = "{}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.host_tools = &.{.{ .name = "needs_user", .description = "Ask the user", .input_schema_json = "{}", .requires_interaction = true }};
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    // `turnInput` installs no interaction channel, so the gate must refuse the
+    // call before the executor runs.
+    const result = try h.runTurn(turnInput("ask"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(@as(usize, 0), fake.calls);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_result = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        try testing.expect(toolResultFailed(event));
+        try testing.expect(std.mem.indexOf(u8, toolResultText(event), "interactive channel") != null);
+        saw_result = true;
+    }
+    try testing.expect(saw_result);
 }

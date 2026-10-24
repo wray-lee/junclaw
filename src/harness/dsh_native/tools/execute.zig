@@ -80,8 +80,13 @@ pub fn executeWithGate(
         std.json.parseFromSliceLeaky(Value, allocator, call.arguments, .{}) catch
             Value{ .string = call.arguments };
 
-    const violations = try collectViolations(allocator, tool.input_schema_json, args);
-    if (violations.len != 0) return invalidArguments(allocator, violations);
+    // Host tools validate their own arguments: bridged schemas (MCP servers in
+    // particular) may use JSON Schema keywords this walker rejects, and the
+    // junclaw executor already returns a structured failure for bad args.
+    if (tool.host == null) {
+        const violations = try collectViolations(allocator, tool.input_schema_json, args);
+        if (violations.len != 0) return invalidArguments(allocator, violations);
+    }
 
     if (gate) |hook| {
         const denial = hook.decide(hook.context, allocator, call, args) catch |err|

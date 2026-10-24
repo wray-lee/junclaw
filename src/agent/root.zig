@@ -3697,6 +3697,29 @@ pub const Agent = struct {
         };
     }
 
+    pub const HostToolOutcome = struct {
+        success: bool,
+        /// Model-facing text: the tool's output, or its failure message.
+        output: []const u8,
+    };
+
+    /// Execute one model-issued call by its visible name for the dsh-native
+    /// tool bridge. Runs the same policy gate, interrupt check and argument
+    /// parsing as the native loop's `executeTool`, so junclaw's risk and
+    /// autonomy rules keep applying. `output` is valid for `allocator`.
+    pub fn executeHostTool(
+        self: *Agent,
+        allocator: std.mem.Allocator,
+        name: []const u8,
+        arguments_json: []const u8,
+    ) HostToolOutcome {
+        const result = self.executeTool(allocator, .{
+            .name = name,
+            .arguments_json = arguments_json,
+        });
+        return .{ .success = result.success, .output = result.output };
+    }
+
     const LLM_LOG_MAX_BYTES: usize = 8192;
 
     fn previewText(text: []const u8, max_bytes: usize) TextPreview {

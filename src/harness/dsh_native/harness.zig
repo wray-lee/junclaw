@@ -50,6 +50,7 @@ const loop_mod = @import("loop.zig");
 const prompt = @import("prompt.zig");
 const request = @import("request.zig");
 const registry = @import("tools/registry.zig");
+const bridge = @import("tools/bridge.zig");
 const builtins_mod = @import("tools/builtins.zig");
 const bash_mod = @import("tools/bash.zig");
 const goal_mod = @import("goal.zig");
@@ -111,6 +112,13 @@ pub const Options = struct {
     /// Deterministic clock for tests; null uses the wall clock.
     now_ms: ?*const fn (clock_context: ?*anyopaque) i64 = null,
     clock_context: ?*anyopaque = null,
+    /// Host (junclaw) tools to bridge into the registry. Names, descriptions
+    /// and schemas are copied into the permanent arena during `init`; the
+    /// host keeps the strings alive only through `init`.
+    host_tools: []const bridge.HostTool = &.{},
+    /// Executor for `host_tools`; null disables bridging even when tools are
+    /// listed, which keeps the default (native) configuration unchanged.
+    host_executor: ?bridge.HostExecutor = null,
 };
 
 pub const DshNativeHarness = struct {
@@ -342,12 +350,20 @@ pub const DshNativeHarness = struct {
         self.goal_tools = goal_context;
         self.goal_driver = .{ .store = goal_store };
 
+        // Register after every dsh tool so the dedupe check sees them all.
+        const host_names = try bridge.register(perm, self.allocator, &self.registry, .{
+            .tools = self.opts.host_tools,
+            .executor = self.opts.host_executor,
+            .spill_dir = self.spill_dir,
+        });
+
         var names: std.ArrayListUnmanaged([]const u8) = .empty;
         for (registry.core_schemas) |schema| try names.append(perm, schema.name);
         try names.append(perm, generated_interaction.ask_user_question.name);
         try names.append(perm, generated.todo_write.name);
+        try names.appendSlice(perm, host_names);
         const ordered = try prompt.orderTools(perm, names.items, null);
-        const base = try assembleCatalog(perm, ordered);
+        const base = try self.assembleCatalog(perm, ordered);
         self.tool_schemas = base.schemas;
         self.tool_specs = base.specs;
 
@@ -355,7 +371,7 @@ pub const DshNativeHarness = struct {
         @memcpy(plan_names[0..names.items.len], names.items);
         plan_names[names.items.len] = generated.exit_plan_mode.name;
         const plan_ordered = try prompt.orderTools(perm, plan_names, null);
-        const plan_catalog = try assembleCatalog(perm, plan_ordered);
+        const plan_catalog = try self.assembleCatalog(perm, plan_ordered);
         self.plan_tool_schemas = plan_catalog.schemas;
         self.plan_tool_specs = plan_catalog.specs;
     }
@@ -365,11 +381,11 @@ pub const DshNativeHarness = struct {
         specs: []const providers.ToolSpec,
     };
 
-    fn assembleCatalog(perm: Allocator, ordered: []const []const u8) !Catalog {
+    fn assembleCatalog(self: *Self, perm: Allocator, ordered: []const []const u8) !Catalog {
         const schemas = try perm.alloc(request.ToolSchema, ordered.len);
         const specs = try perm.alloc(providers.ToolSpec, ordered.len);
         for (ordered, 0..) |name, index| {
-            const schema = findSchema(name) orelse return error.MissingToolSchema;
+            const schema = self.findSchema(name) orelse return error.MissingToolSchema;
             schemas[index] = .{
                 .name = schema.name,
                 .description = schema.description,
@@ -384,9 +400,16 @@ pub const DshNativeHarness = struct {
         return .{ .schemas = schemas, .specs = specs };
     }
 
-    fn findSchema(name: []const u8) ?registry.Schema {
+    fn findSchema(self: *Self, name: []const u8) ?registry.Schema {
         for (registry.core_schemas) |schema| {
             if (std.mem.eql(u8, schema.name, name)) return schema;
+        }
+        if (self.registry.get(name)) |tool| {
+            if (tool.host != null) return .{
+                .name = tool.name,
+                .description = tool.description,
+                .input_schema_json = tool.input_schema_json,
+            };
         }
         const extras = [_]registry.Schema{
             .{
@@ -1613,13 +1636,11 @@ pub const DshNativeHarness = struct {
 
     // ── tool bridge (kernel -> execute.zig) ────────────────────────────────
 
-    /// Only the three read-only tools are concurrency-safe; everything else is
+    /// Only the three read-only dsh tools, plus bridged tools that declare
+    /// themselves read-only, are concurrency-safe; everything else is
     /// exclusive, mirroring dsh's fail-closed classification.
     fn classifyTool(context_ptr: *anyopaque, call: types.ToolCall) bool {
-        _ = context_ptr;
-        return std.mem.eql(u8, call.name, "read") or
-            std.mem.eql(u8, call.name, "grep") or
-            std.mem.eql(u8, call.name, "glob");
+        return bridge.isParallel(&selfOf(context_ptr).registry, call.name);
     }
 
     fn dispatchTool(
@@ -1693,6 +1714,13 @@ pub const DshNativeHarness = struct {
             ask.options = self.questionOptions();
         }
         if (self.exit_plan) |exit| exit.interaction = self.interaction;
+        // Bridged tools that need the user fail closed without a channel; the
+        // turn's `interaction` is null when the host has no way to ask.
+        if (self.registry.hostMeta(call.name)) |meta| {
+            if (meta.requires_interaction and self.interaction == null) {
+                return "tool requires an interactive channel that is unavailable on this turn";
+            }
+        }
         const object = switch (args) {
             .object => |value| value,
             else => return null,
