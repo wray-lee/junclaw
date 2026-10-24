@@ -41,6 +41,7 @@ const compaction_mod = @import("compaction.zig");
 const context = @import("context.zig");
 const generated = @import("generated/tool_schemas.zig");
 const generated_interaction = @import("generated/interaction.zig");
+const generated_system_prompt = @import("generated/system_prompt.zig");
 const questions_mod = @import("questions.zig");
 const token_meter = @import("token_meter.zig");
 const tools_ask_user = @import("tools/ask_user.zig");
@@ -55,6 +56,9 @@ const goal_mod = @import("goal.zig");
 const goal_command_mod = @import("goal_command.zig");
 const goal_rounds = @import("goal_rounds.zig");
 const goal_tools = @import("tools/goal.zig");
+const plan_mod = @import("plan.zig");
+const tools_exit_plan = @import("tools/exit_plan.zig");
+const tools_todo = @import("tools/todo.zig");
 const execute = @import("tools/execute.zig");
 const scheduler = @import("tools/scheduler.zig");
 const session_log = @import("session_log.zig");
@@ -135,6 +139,9 @@ pub const DshNativeHarness = struct {
 
     tool_schemas: []const request.ToolSchema = &.{},
     tool_specs: []const providers.ToolSpec = &.{},
+    /// The same catalog plus `exit_plan_mode`; only plan mode advertises it.
+    plan_tool_schemas: []const request.ToolSchema = &.{},
+    plan_tool_specs: []const providers.ToolSpec = &.{},
     registry: registry.Registry = .{},
     builtins: ?*builtins_mod.Builtins = null,
     bash: ?*bash_mod.Context = null,
@@ -142,6 +149,12 @@ pub const DshNativeHarness = struct {
     goal_tools: ?*goal_tools.Context = null,
     goal_driver: ?goal_rounds.Driver = null,
     ask_user: ?*tools_ask_user.Context = null,
+    todo: ?*tools_todo.Context = null,
+    exit_plan: ?*tools_exit_plan.Context = null,
+    /// Logged plan mode plus the process-local selection queue. Heap-pinned:
+    /// the exit tool borrows this pointer and the harness struct itself moves
+    /// out of `init`.
+    plan_session: *plan_mod.Session,
     approval: approval_mod.Service = .{ .options = .{} },
     /// Current turn's blocking host channel (null fails closed).
     interaction: ?port.Interaction = null,
@@ -155,6 +168,12 @@ pub const DshNativeHarness = struct {
     spill_dir: []const u8 = "",
 
     in_turn: bool = false,
+    /// Bumped by every prompt rebuild; a mid-turn bump re-logs the system
+    /// message so the next request carries the plan policy change.
+    prompt_generation: u64 = 0,
+    emitted_prompt_generation: u64 = 0,
+    /// Plan mode the rendered system prompt reflects.
+    prompt_plan_active: bool = false,
     interrupt: bool = false,
     /// Tokens billed by every model call this harness ran (all turns).
     total_tokens: u64 = 0,
@@ -178,7 +197,10 @@ pub const DshNativeHarness = struct {
 
     pub fn init(allocator: Allocator, opts: Options) !Self {
         if (opts.dsh_home.len == 0) return error.MissingDshHome;
+        const plan_session = try allocator.create(plan_mod.Session);
+        plan_session.* = .{};
         var self = Self{
+            .plan_session = plan_session,
             .allocator = allocator,
             .perm = std.heap.ArenaAllocator.init(allocator),
             .prompt_arena = std.heap.ArenaAllocator.init(allocator),
@@ -209,6 +231,9 @@ pub const DshNativeHarness = struct {
             self.allocator.destroy(value);
         }
         if (self.ask_user) |value| self.allocator.destroy(value);
+        if (self.todo) |value| self.allocator.destroy(value);
+        if (self.exit_plan) |value| self.allocator.destroy(value);
+        self.allocator.destroy(self.plan_session);
         self.call_arena.deinit();
         self.arena.deinit();
         self.prompt_arena.deinit();
@@ -278,9 +303,21 @@ pub const DshNativeHarness = struct {
         ask_user.* = .{ .options = self.questionOptions() };
         try tools_ask_user.register(ask_user, &self.registry, self.allocator);
 
+        const todo = try self.allocator.create(tools_todo.Context);
+        errdefer self.allocator.destroy(todo);
+        todo.* = .{ .log = if (self.log) |*log| log else null };
+        try todo.register(&self.registry, self.allocator);
+
+        const exit_plan = try self.allocator.create(tools_exit_plan.Context);
+        errdefer self.allocator.destroy(exit_plan);
+        exit_plan.* = .{ .plan = self.plan_session };
+        try tools_exit_plan.register(exit_plan, &self.registry, self.allocator);
+
         self.builtins = builtins;
         self.bash = bash;
         self.ask_user = ask_user;
+        self.todo = todo;
+        self.exit_plan = exit_plan;
 
         const goal_store = try self.allocator.create(goal_mod.Store);
         errdefer self.allocator.destroy(goal_store);
@@ -293,11 +330,30 @@ pub const DshNativeHarness = struct {
         self.goal_tools = goal_context;
         self.goal_driver = .{ .store = goal_store };
 
-        const names = try perm.alloc([]const u8, registry.core_schemas.len + 1);
-        for (registry.core_schemas, 0..) |schema, index| names[index] = schema.name;
-        names[registry.core_schemas.len] = generated_interaction.ask_user_question.name;
-        const ordered = try prompt.orderTools(perm, names, null);
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (registry.core_schemas) |schema| try names.append(perm, schema.name);
+        try names.append(perm, generated_interaction.ask_user_question.name);
+        try names.append(perm, generated.todo_write.name);
+        const ordered = try prompt.orderTools(perm, names.items, null);
+        const base = try assembleCatalog(perm, ordered);
+        self.tool_schemas = base.schemas;
+        self.tool_specs = base.specs;
 
+        const plan_names = try perm.alloc([]const u8, names.items.len + 1);
+        @memcpy(plan_names[0..names.items.len], names.items);
+        plan_names[names.items.len] = generated.exit_plan_mode.name;
+        const plan_ordered = try prompt.orderTools(perm, plan_names, null);
+        const plan_catalog = try assembleCatalog(perm, plan_ordered);
+        self.plan_tool_schemas = plan_catalog.schemas;
+        self.plan_tool_specs = plan_catalog.specs;
+    }
+
+    const Catalog = struct {
+        schemas: []const request.ToolSchema,
+        specs: []const providers.ToolSpec,
+    };
+
+    fn assembleCatalog(perm: Allocator, ordered: []const []const u8) !Catalog {
         const schemas = try perm.alloc(request.ToolSchema, ordered.len);
         const specs = try perm.alloc(providers.ToolSpec, ordered.len);
         for (ordered, 0..) |name, index| {
@@ -313,17 +369,32 @@ pub const DshNativeHarness = struct {
                 .parameters_json = schema.input_schema_json,
             };
         }
-        self.tool_schemas = schemas;
-        self.tool_specs = specs;
+        return .{ .schemas = schemas, .specs = specs };
     }
 
     fn findSchema(name: []const u8) ?registry.Schema {
         for (registry.core_schemas) |schema| {
             if (std.mem.eql(u8, schema.name, name)) return schema;
         }
-        const ask = generated_interaction.ask_user_question;
-        if (std.mem.eql(u8, ask.name, name)) {
-            return .{ .name = ask.name, .description = ask.description, .input_schema_json = ask.input_schema_json };
+        const extras = [_]registry.Schema{
+            .{
+                .name = generated_interaction.ask_user_question.name,
+                .description = generated_interaction.ask_user_question.description,
+                .input_schema_json = generated_interaction.ask_user_question.input_schema_json,
+            },
+            .{
+                .name = generated.todo_write.name,
+                .description = generated.todo_write.description,
+                .input_schema_json = generated.todo_write.input_schema_json,
+            },
+            .{
+                .name = generated.exit_plan_mode.name,
+                .description = generated.exit_plan_mode.description,
+                .input_schema_json = generated.exit_plan_mode.input_schema_json,
+            },
+        };
+        for (extras) |schema| {
+            if (std.mem.eql(u8, schema.name, name)) return schema;
         }
         return null;
     }
@@ -333,10 +404,13 @@ pub const DshNativeHarness = struct {
     /// after `/permission` and on restore so the model sees the live policy.
     fn buildPrompt(self: *Self) !void {
         _ = self.prompt_arena.reset(.retain_capacity);
+        self.prompt_generation += 1;
         self.system_prompt = "";
         const perm = self.prompt_arena.allocator();
+        const plan_active = self.planActive();
         const built = try prompt.buildSystemPrompt(perm, .{
             .persona_prefix = self.opts.persona,
+            .plan_policy = if (plan_active) generated_system_prompt.plan_policy_text else "",
         });
 
         const sandbox: context.SandboxMode = self.permission_state.sandbox orelse
@@ -360,6 +434,7 @@ pub const DshNativeHarness = struct {
             built
         else
             try std.fmt.allocPrint(perm, "{s}\n\n{s}", .{ built, rendered });
+        self.prompt_plan_active = plan_active;
     }
 
     fn closeSession(self: *Self) void {
@@ -386,6 +461,8 @@ pub const DshNativeHarness = struct {
         self.messages = .empty;
         self.surface_seqs = .empty;
         self.permission_state = .{};
+        self.plan_session.* = .{};
+        if (self.todo) |ctx| ctx.log = null;
         self.applyApprovalPolicy(null);
         self.compaction_lock = .{};
         self.last_usage = null;
@@ -422,6 +499,7 @@ pub const DshNativeHarness = struct {
         };
         self.log = try session_store.createLog(self.allocator, self.opts.dsh_home, self.workspace(), id, header);
         if (self.goal_store) |store| store.attachLog(&self.log.?);
+        if (self.todo) |ctx| ctx.log = &self.log.?;
         self.buildLoop();
         // A new session starts from the composition defaults again.
         try self.buildPrompt();
@@ -438,6 +516,7 @@ pub const DshNativeHarness = struct {
         self.session_id = try arena.dupe(u8, id_copy);
         self.log = try session_store.openLog(self.allocator, self.opts.dsh_home, self.workspace(), self.session_id);
         if (self.goal_store) |store| store.attachLog(&self.log.?);
+        if (self.todo) |ctx| ctx.log = &self.log.?;
 
         var read = session_log.readLog(self.allocator, self.log.?.path) catch |err| {
             if (self.opts.on_corrupt != .native) return err;
@@ -502,6 +581,12 @@ pub const DshNativeHarness = struct {
         var fold = try surface_mod.fold(self.allocator, events);
         defer fold.deinit();
 
+        self.plan_session.* = try plan_mod.Session.replay(events);
+        // `UnitState.running.command_id` aliases the read arena; this fold
+        // must outlive it.
+        if (self.plan_session.state.running) |*running| {
+            running.command_id = try arena.dupe(u8, running.command_id);
+        }
         self.permission_state = commands_mod.PermissionState.fold(events);
         self.applyApprovalPolicy(self.permission_state.approval);
         try self.buildPrompt();
@@ -1023,7 +1108,16 @@ pub const DshNativeHarness = struct {
         var data: std.json.ObjectMap = .empty;
         try data.put(arena, "header", try headerValue(arena, decision.header));
         try data.put(arena, "reason", .{ .string = headerReasonName(decision.reason) });
-        return self.appendEvent("request/header", .{ .object = data }, null, null);
+        const seq = try self.appendEvent("request/header", .{ .object = data }, null, null);
+        // The plan fold narrates a switch only when the last header described
+        // the other mode; dsh records the logged mode at each header.
+        try self.plan_session.foldEvent(.{
+            .event_type = "request/header",
+            .seq = seq,
+            .time_ms = 0,
+            .data = .{ .null = {} },
+        });
+        return seq;
     }
 
     fn appendAssistant(
@@ -1185,7 +1279,8 @@ pub const DshNativeHarness = struct {
         out: *std.ArrayListUnmanaged(loop_mod.SystemMessage),
     ) anyerror!void {
         const self = selfOf(context_ptr);
-        if (position.step != 1) return;
+        if (position.step != 1 and self.prompt_generation == self.emitted_prompt_generation) return;
+        self.emitted_prompt_generation = self.prompt_generation;
         const id = try std.fmt.allocPrint(allocator, "system-{d}", .{position.turn});
         try out.append(allocator, .{ .id = id, .text = self.system_prompt });
     }
@@ -1204,8 +1299,9 @@ pub const DshNativeHarness = struct {
         _ = try loop.inbox.steer(.{ .id = id, .data = data });
     }
 
-    /// `agent/pre-step`: this adapter returns no runtime-context extras and
-    /// never vetoes; steer is pumped at the preceding `step_end` instead.
+    /// `agent/pre-step`: commit a queued plan selection before the request
+    /// header is snapshotted, then hand the narration to this step. Never
+    /// vetoes; steer is pumped at the preceding `step_end` instead.
     fn hostPreStep(
         context_ptr: *anyopaque,
         allocator: Allocator,
@@ -1213,11 +1309,29 @@ pub const DshNativeHarness = struct {
         claimed: loop_mod.Claimed,
         out: *std.ArrayListUnmanaged(loop_mod.UserMessage),
     ) anyerror!loop_mod.PreStepDecision {
-        _ = context_ptr;
-        _ = allocator;
         _ = position;
         _ = claimed;
-        _ = out;
+        const self = selfOf(context_ptr);
+        const boundary = self.plan_session.preStep();
+        if (boundary.emit) |active| {
+            var data: std.json.ObjectMap = .empty;
+            try data.put(allocator, "active", .{ .bool = active });
+            _ = try self.appendEvent("plan/mode", .{ .object = data }, null, null);
+            try self.plan_session.foldEvent(.{
+                .event_type = "plan/mode",
+                .seq = 0,
+                .time_ms = 0,
+                .data = .{ .object = data },
+            });
+            self.plan_session.pendingCommitted();
+        }
+        if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
+        if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
+        if (boundary.narration) |text| {
+            const id = try self.nextMessageId();
+            const json = try planNarrationJson(allocator, id, text);
+            try out.append(allocator, .{ .json = json });
+        }
         return .{};
     }
 
@@ -1248,7 +1362,7 @@ pub const DshNativeHarness = struct {
             .model = self.opts.model,
             .temperature = self.opts.temperature,
             .max_tokens = self.opts.max_tokens,
-            .tools = self.tool_specs,
+            .tools = self.planCatalogSpecs(),
             .reasoning_effort = self.opts.reasoning_effort,
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
         };
@@ -1510,6 +1624,7 @@ pub const DshNativeHarness = struct {
             ask.interaction = self.interaction;
             ask.options = self.questionOptions();
         }
+        if (self.exit_plan) |exit| exit.interaction = self.interaction;
         const object = switch (args) {
             .object => |value| value,
             else => return null,
@@ -1561,6 +1676,7 @@ pub const DshNativeHarness = struct {
             },
             .compaction = .{ .context = @ptrCast(self), .call = compactSeam },
             .goal = .{ .context = @ptrCast(self), .call = goalSeam },
+            .plan = self.plan_session.view(self.in_turn),
         }) orelse return null;
         defer result.deinit();
 
@@ -1570,7 +1686,55 @@ pub const DshNativeHarness = struct {
         }
         try self.applyPermissionEvents(result.events);
         try self.applyManualCompaction(result.events, seqs);
+        if (result.plan_decision) |decision| try self.applyPlanDecision(decision, result.events);
         return try arena.dupe(u8, result.text);
+    }
+
+    /// The mode the next request assembly uses: a queued selection wins over
+    /// the logged mode (dsh reads `pending?.active ?? active`).
+    fn planActive(self: *const Self) bool {
+        return if (self.plan_session.pending) |pending| pending.active else self.plan_session.state.active;
+    }
+
+    fn planCatalogSchemas(self: *const Self) []const request.ToolSchema {
+        return if (self.planActive()) self.plan_tool_schemas else self.tool_schemas;
+    }
+
+    fn planCatalogSpecs(self: *const Self) []const providers.ToolSpec {
+        return if (self.planActive()) self.plan_tool_specs else self.tool_specs;
+    }
+
+    /// `/plan` settlement: fold the mode, inject the narration the command
+    /// decided on, and republish the prompt and tool catalog.
+    fn applyPlanDecision(self: *Self, decision: plan_mod.Decision, events: []const types.Event) !void {
+        self.plan_session.applyDecision(decision);
+        for (events) |event| {
+            if (std.mem.eql(u8, event.event_type, "plan/mode")) try self.plan_session.foldEvent(event);
+        }
+        if (self.plan_session.state.running) |*running| {
+            running.command_id = try self.arena.allocator().dupe(u8, running.command_id);
+        }
+        if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
+        if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
+        const narration = decision.narration orelse return;
+        const id = try self.nextMessageId();
+        const json = try planNarrationJson(self.arena.allocator(), id, narration);
+        if (self.loop) |*loop| _ = try loop.inject(.{ .id = id, .data = json });
+    }
+
+    /// dsh plan-mode narration user message (`source.kind="plan-mode"`).
+    fn planNarrationJson(allocator: Allocator, id: []const u8, text: []const u8) ![]u8 {
+        var writer: Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        const w = &writer.writer;
+        try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeAll("}],\"source\":{\"kind\":\"plan-mode\",\"form\":\"notice\",\"summary\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeAll("},\"role\":\"user\",\"id\":");
+        try std.json.Stringify.value(id, .{}, w);
+        try w.writeByte('}');
+        return writer.toOwnedSlice();
     }
 
     /// Run the human `/goal` command on the live goal projection; the
@@ -2315,6 +2479,18 @@ pub const DshNativeHarness = struct {
             try config.put(allocator, "maxTokens", .{ .integer = @intCast(max_tokens) });
         }
         try object.put(allocator, "config", .{ .object = config });
+        if (header.tools) |tools| {
+            var array = std.json.Array.init(allocator);
+            try array.ensureTotalCapacity(tools.len);
+            for (tools) |tool| {
+                var tool_object: std.json.ObjectMap = .empty;
+                try tool_object.put(allocator, "name", .{ .string = tool.name });
+                try tool_object.put(allocator, "description", .{ .string = tool.description });
+                try tool_object.put(allocator, "parameters", try parseValue(allocator, tool.parameters_json));
+                array.appendAssumeCapacity(.{ .object = tool_object });
+            }
+            try object.put(allocator, "tools", .{ .array = array });
+        }
         return .{ .object = object };
     }
 

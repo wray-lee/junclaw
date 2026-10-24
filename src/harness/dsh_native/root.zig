@@ -34,6 +34,7 @@ pub const goal_command = @import("goal_command.zig");
 pub const plan = @import("plan.zig");
 pub const tools_ask_user = @import("tools/ask_user.zig");
 pub const tools_exit_plan = @import("tools/exit_plan.zig");
+pub const tools_todo = @import("tools/todo.zig");
 pub const generated = @import("generated/root.zig");
 pub const harness = @import("harness.zig");
 
@@ -71,6 +72,7 @@ test {
     _ = @import("plan.zig");
     _ = @import("tools/ask_user.zig");
     _ = @import("tools/exit_plan.zig");
+    _ = @import("tools/todo.zig");
     _ = @import("plan_mode_test.zig");
     _ = @import("generated/root.zig");
     _ = @import("fixture_compare.zig");
