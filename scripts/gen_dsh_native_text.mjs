@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Generate Zig constants for dsh model-visible text (design §3.5, B15, B25b,
-// B26, B27, B30, B31).
+// B26, B27, B30, B31, B34, B35).
 //
 // Usage:
 //   node scripts/gen_dsh_native_text.mjs \
@@ -23,6 +23,12 @@
 // packages/bundle/base/cordis.patch.yml sets sampleOverCapGlobResults=false;
 // tool-bash defaults enableRunInBackground/promoteOnTimeout=true; no sandbox
 // escalation modes are advertised without a confining backend.
+//
+// todo_write is the documented exception: P2b stage 2 selects the single-active
+// discipline (allowParallelInProgress=false) for junclaw's todo executor, so its
+// description composes DESCRIPTION_SINGLE. The base bundle file currently sets
+// allowParallelInProgress: true; switch the composed clause to
+// DESCRIPTION_PARALLEL if junclaw adopts that deployment policy.
 //
 // If the source checkout is unavailable, run this against the mirror image
 // junclaw:full-dsh-test's /opt/dsh/node_modules instead (same relative paths).
@@ -50,13 +56,16 @@ const PRUNER_CONFIG = 'packages/compaction/compaction-tool-result-pruner/src/con
 const USER_APPROVAL = 'packages/interaction/user-approval/src/index.ts'
 const CORE_TOOLS = 'packages/core/tools/src/index.ts'
 const TOOL_ASK_USER = 'packages/interaction/tool-ask-user/src/index.ts'
+const PLAN_MODE = 'packages/plan/plan-mode/src/index.ts'
+const TOOL_TODO = 'packages/todo/tool-todo/src/index.ts'
+const BASE_BUNDLE = 'packages/bundle/base/cordis.patch.yml'
 
 // Files whose semantics or defaults shape the generated text without yielding a
 // string constant of their own. Their hashes still gate --check.
 const SUPPORTING_SOURCES = [
   ['packages/core/tools/src/schema.ts', 'parameter DSL to JSON Schema compiler semantics'],
   ['packages/core/tools/src/presentation.ts', 'tool presentation vocabulary'],
-  ['packages/bundle/base/cordis.patch.yml', 'deployment defaults for conditional text'],
+  [BASE_BUNDLE, 'deployment defaults for conditional text and the plan:policy section'],
   ['packages/subprocess/subprocess/src/types.ts', 'DSH_ENV_PREFIX used by the bash description'],
 ]
 
@@ -96,6 +105,30 @@ function E(id, file, start, end, opts = {}) {
 function C(id, file, start, end, value) {
   const source = readSource(file)
   return { id, file, start, end, value, source_sha256: source.sha, content_sha256: sha256hex(Buffer.from(value, 'utf8')) }
+}
+
+// A YAML literal block scalar (`section: |`). The base bundle's plan guidance
+// is the deployment-owned plan:policy text; YAML clip chomping keeps one
+// trailing newline, and dsh does not trim section text before joining.
+function yamlBlockScalar(id, file, declLine, endLine) {
+  const source = readSource(file)
+  const decl = /^(\s*)section:\s*\|\s*$/.exec(source.lines[declLine - 1] ?? '')
+  if (decl === null) throw new Error(`${file}:${declLine}: expected a 'section: |' line`)
+  const content = []
+  let indent = -1
+  for (let line = declLine + 1; line <= endLine; line++) {
+    const raw = source.lines[line - 1]
+    if (raw.trim() === '') {
+      content.push('')
+      continue
+    }
+    if (indent === -1) indent = raw.length - raw.trimStart().length
+    if (indent <= decl[1].length) throw new Error(`${file}:${line}: block scalar is not indented under section`)
+    if (!raw.startsWith(' '.repeat(indent))) throw new Error(`${file}:${line}: inconsistent block indentation`)
+    content.push(raw.slice(indent))
+  }
+  if (indent === -1) throw new Error(`${file}:${declLine}-${endLine}: empty block scalar`)
+  return C(id, file, declLine, endLine, content.join('\n') + '\n')
 }
 
 function zigLiteral(value) {
@@ -498,6 +531,16 @@ const tools = [
       { name: 'blocked_reason', type: 'string', required: false, desc: E('update_goal.blocked_reason.description', GOAL_TOOL, 249, 252, { pick: [1] }) },
     ],
   },
+  {
+    module: 'exit_plan_mode',
+    file: PLAN_MODE,
+    name: E('exit_plan_mode.name', PLAN_MODE, 66, 66),
+    description: E('exit_plan_mode.description', PLAN_MODE, 84, 86),
+    schemaRange: [280, 282],
+    params: [
+      { name: 'plan', type: 'string', required: true, desc: E('exit_plan_mode.plan.description', PLAN_MODE, 281, 281, { pick: [1] }) },
+    ],
+  },
 ]
 
 // Goal prompt/wrap-up text: <goal_round> is one template literal; wrap-up uses
@@ -637,6 +680,24 @@ const renderGroups = [
     name: 'goal',
     consts: goalRenderEntries,
   },
+  {
+    name: 'todo_write',
+    consts: [
+      E('todo_write.success', TOOL_TODO, 189, 189, {
+        subs: {
+          'value.counts.pending': '{d}',
+          'value.counts.inProgress': '{d}',
+          'value.counts.completed': '{d}',
+        },
+      }),
+      E('todo_write.error_empty_content', TOOL_TODO, 87, 87),
+      E('todo_write.error_duplicate_content', TOOL_TODO, 90, 90, {
+        subs: { 'JSON.stringify(content)': '{s}' },
+      }),
+      E('todo_write.error_parallel_in_progress', TOOL_TODO, 97, 97, { subs: { active: '{d}' } }),
+      E('todo_write.error_requires_agent', TOOL_TODO, 197, 197),
+    ],
+  },
 ]
 
 // Numeric pruner defaults are extracted from the DEFAULTS object literal.
@@ -681,6 +742,10 @@ function generateSystemPrompt() {
   for (const entry of sysEntries) {
     out += moduleConst('system_prompt', entry.id, extract(entry))
   }
+  // Deployment-owned plan:policy text from the base bundle, appended while plan
+  // mode is active (PLAN_POLICY order below).
+  out += moduleConst('system_prompt', 'plan_policy_text',
+    yamlBlockScalar('plan_policy_text', BASE_BUNDLE, 335, 346))
   const orders = sectionOrders()
   out += '\npub const section_orders = struct {\n'
   for (const order of orders) out += `    pub const ${order.name}: i32 = ${order.value};\n`
@@ -702,7 +767,7 @@ function generateSystemPrompt() {
 }
 
 function generateToolSchemas() {
-  let out = header('tool name, description and inputSchema JSON for read/write/edit/bash/grep/glob')
+  let out = header('tool name, description and inputSchema JSON for read/write/edit/bash/grep/glob/exit_plan_mode/todo_write', 'B15, B25b, B35')
   for (const tool of tools) {
     out += `\npub const ${tool.module} = struct {\n`
     out += structConst('tool_schemas', tool.module, 'name', extract(tool.name))
@@ -721,6 +786,52 @@ function generateToolSchemas() {
     out += structConst('tool_schemas', tool.module, 'input_schema_json', schemaExt)
     out += '};\n'
   }
+  // todo_write's nested item schema is beyond the flat parameter DSL, so its
+  // JSON is composed here. The description uses DESCRIPTION_SINGLE (see the
+  // todo policy note at the top of this file).
+  const todoHead = extract(E('todo_write.head', TOOL_TODO, 45, 47)).value
+  const todoSingle = extract(E('todo_write.single_clause', TOOL_TODO, 52, 53)).value
+  const todoTail = extract(E('todo_write.tail', TOOL_TODO, 55, 55)).value
+  const todoDescription = C('todo_write.description', TOOL_TODO, 45, 55, todoHead + todoSingle + todoTail)
+  const todoSchema = JSON.stringify({
+    type: 'object',
+    properties: {
+      todos: {
+        type: 'array',
+        description: extract(E('todo_write.todos.description', TOOL_TODO, 142, 142)).value,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            content: {
+              type: 'string',
+              description: extract(E('todo_write.content.description', TOOL_TODO, 147, 147, { pick: [1] })).value,
+            },
+            status: {
+              type: 'string',
+              description: extract(E('todo_write.status.description', TOOL_TODO, 152, 152)).value,
+              enum: ['pending', 'in_progress', 'completed'],
+            },
+          },
+          required: ['content', 'status'],
+        },
+      },
+    },
+    required: ['todos'],
+  })
+  out += '\npub const todo_write = struct {\n'
+  out += structConst('tool_schemas', 'todo_write', 'name', extract(E('todo_write.name', TOOL_TODO, 136, 136)))
+  out += structConst('tool_schemas', 'todo_write', 'description', todoDescription)
+  out += structConst('tool_schemas', 'todo_write', 'input_schema_json', {
+    id: 'todo_write.input_schema_json',
+    file: TOOL_TODO,
+    start: 139,
+    end: 156,
+    value: todoSchema,
+    source_sha256: readSource(TOOL_TODO).sha,
+    content_sha256: sha256hex(Buffer.from(todoSchema, 'utf8')),
+  })
+  out += '};\n'
   return out
 }
 
@@ -807,7 +918,7 @@ function buildAskUserQuestionSchema() {
 }
 
 function generateInteraction() {
-  let out = header('approval policy text and ask_user_question tool schema', 'B26, B27')
+  let out = header('approval policy text, ask_user_question tool schema, and /plan command/narration text', 'B26, B27, B34')
   out += '\npub const approval = struct {\n'
   out += structConst('interaction', 'approval', 'never_sentence',
     extract(E('approval.never_sentence', USER_APPROVAL, 73, 73)))
@@ -846,6 +957,28 @@ function generateInteraction() {
     source_sha256: readSource(TOOL_ASK_USER).sha,
     content_sha256: sha256hex(Buffer.from(schema, 'utf8')),
   })
+  out += '};\n'
+  out += '\npub const plan_mode = struct {\n'
+  // Settlement lines also carry the command/done kind literal; pick only the
+  // text.
+  const planTexts = [
+    ['command_name', 232],
+    ['command_description', 233],
+    ['command_hint', 234],
+    ['off_attachments_error', 238, 1],
+    ['off_committed', 243, 1],
+    ['off_queued', 245, 1],
+    ['off_cancelled', 247, 1],
+    ['off_already_inactive', 254, 1],
+    ['on_committed', 270],
+    ['on_queued', 271],
+    ['narration_on', 467],
+    ['narration_off', 468],
+  ]
+  for (const [name, line, pick] of planTexts) {
+    out += structConst('interaction', 'plan_mode', name,
+      extract(E(`plan_mode.${name}`, PLAN_MODE, line, line, pick === undefined ? {} : { pick })))
+  }
   out += '};\n'
   return out
 }
