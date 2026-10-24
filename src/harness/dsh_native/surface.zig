@@ -2,7 +2,8 @@
 //!
 //! Mirrors `packages/core/session/src/surface.ts:63-105,120-220` and the
 //! `SurfaceOp` vocabulary in `types.ts:440-479` of dsh 0.2.1-rc.2.
-//! P0 implements the append path used by the plain-turn fixture.
+//! Covers the append path and replacement fold (compaction checkpoints and the
+//! pruner's shadowed nodes).
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -64,24 +65,59 @@ pub fn fold(allocator: Allocator, events: []const types.Event) !Fold {
             continue;
         }
 
-        const op = event.surface_op orelse return error.MissingSurfaceOp;
-        switch (op) {
-            .append => {},
-            // shortcut: replacement fold and contentGeneration are unimplemented until a fixture exercises them (design §3.1 P0).
-            .replace => return error.UnsupportedSurfaceOp,
-        }
         if (event.source_event_seqs != null and std.mem.eql(u8, event.event_type, "assistant/message")) {
             return error.InvalidSourceEventSeqs;
         }
 
-        try nodes.append(arena_allocator, .{
-            .seq = event.seq,
-            .message = try messageFromEvent(arena_allocator, event),
-        });
+        const op = event.surface_op orelse return error.MissingSurfaceOp;
+        switch (op) {
+            .append => try nodes.append(arena_allocator, .{
+                .seq = event.seq,
+                .message = try messageFromEvent(arena_allocator, event),
+            }),
+            .replace => |range| {
+                // dsh locates the range in the current surface, not the log
+                // (`surface.ts` `replacementRange`), so a replacement may
+                // shadow a node an earlier replacement introduced.
+                if (range.start_seq >= event.seq or range.end_seq >= event.seq) {
+                    return error.InvalidSurfaceRange;
+                }
+                const start_idx = indexOfNode(nodes.items, 0, range.start_seq) orelse
+                    return error.UnknownSurfaceRange;
+                const end_idx = indexOfNode(nodes.items, start_idx, range.end_seq) orelse
+                    return error.UnknownSurfaceRange;
+                // When present, sourceEventSeqs must name every shadowed node
+                // (`assertSourceEventReferences`).
+                if (event.source_event_seqs) |sources| {
+                    for (nodes.items[start_idx .. end_idx + 1]) |node| {
+                        if (!containsSeq(sources, node.seq)) return error.InvalidSourceEventSeqs;
+                    }
+                }
+                const replacement: Node = .{
+                    .seq = event.seq,
+                    .message = try messageFromEvent(arena_allocator, event),
+                };
+                try nodes.replaceRange(arena_allocator, start_idx, end_idx - start_idx + 1, &.{replacement});
+            },
+        }
     }
 
     const node_slice = try nodes.toOwnedSlice(arena_allocator);
     return .{ .arena = arena, .nodes = node_slice };
+}
+
+fn indexOfNode(nodes: []const Node, from: usize, seq: u64) ?usize {
+    for (nodes[from..], from..) |node, index| {
+        if (node.seq == seq) return index;
+    }
+    return null;
+}
+
+fn containsSeq(seqs: []const u64, seq: u64) bool {
+    for (seqs) |candidate| {
+        if (candidate == seq) return true;
+    }
+    return false;
 }
 
 /// Derive the message a surface event projects.
@@ -249,9 +285,99 @@ test "surface fold appends message events and derives messages" {
     try std.testing.expectError(error.MissingSurfaceOp, fold(std.testing.allocator, events));
 
     events[0].surface_op = .{ .replace = .{ .start_seq = 0, .end_seq = 0 } };
-    try std.testing.expectError(error.UnsupportedSurfaceOp, fold(std.testing.allocator, events));
+    try std.testing.expectError(error.InvalidSurfaceRange, fold(std.testing.allocator, events));
 
     events[0].surface_op = .append;
     events[2].surface_op = .append;
     try std.testing.expectError(error.UnexpectedSurfaceMetadata, fold(std.testing.allocator, events));
+}
+
+test "surface fold replaces shadowed nodes, including earlier replacements" {
+    // Regression: a log holding a compaction checkpoint or a pruner
+    // replacement aborted the fold with error.UnsupportedSurfaceOp, so a
+    // session that had compacted could not be reopened after a restart.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const events = try allocator.alloc(types.Event, 5);
+    events[0] = .{
+        .event_type = "system/message",
+        .seq = 0,
+        .time_ms = 0,
+        .data = try std.json.parseFromSliceLeaky(
+            Value,
+            allocator,
+            "{\"turn\":1,\"step\":1,\"message\":{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"sys\"}],\"source\":{\"kind\":\"system-prompt\"},\"id\":\"m1\"}}",
+            .{ .allocate = .alloc_always },
+        ),
+        .surface_op = .append,
+    };
+    // 64KB+ input: testing.allocator fails the test if the fold leaks it.
+    const big = try allocator.alloc(u8, 70_000);
+    @memset(big, 'a');
+    const big_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"source\":{{\"kind\":\"user\"}},\"role\":\"user\",\"id\":\"m2\"}}",
+        .{big},
+    );
+    events[1] = .{
+        .event_type = "user/message",
+        .seq = 1,
+        .time_ms = 0,
+        .data = try std.json.parseFromSliceLeaky(Value, allocator, big_json, .{ .allocate = .alloc_always }),
+        .surface_op = .append,
+    };
+    // A checkpoint replaces the user message in place.
+    events[2] = .{
+        .event_type = "user/message",
+        .seq = 2,
+        .time_ms = 0,
+        .data = try std.json.parseFromSliceLeaky(
+            Value,
+            allocator,
+            "{\"content\":[{\"type\":\"text\",\"text\":\"checkpoint\"}],\"source\":{\"kind\":\"compact-checkpoint\"},\"role\":\"user\",\"id\":\"m3\"}",
+            .{ .allocate = .alloc_always },
+        ),
+        .surface_op = .{ .replace = .{ .start_seq = 1, .end_seq = 1 } },
+        .source_event_seqs = try allocator.dupe(u64, &.{1}),
+    };
+    // A later replacement shadows the checkpoint by its log seq.
+    events[3] = .{
+        .event_type = "user/message",
+        .seq = 3,
+        .time_ms = 0,
+        .data = try std.json.parseFromSliceLeaky(
+            Value,
+            allocator,
+            "{\"content\":[{\"type\":\"text\",\"text\":\"next\"}],\"source\":{\"kind\":\"user\"},\"role\":\"user\",\"id\":\"m4\"}",
+            .{ .allocate = .alloc_always },
+        ),
+        .surface_op = .{ .replace = .{ .start_seq = 2, .end_seq = 2 } },
+        .source_event_seqs = try allocator.dupe(u64, &.{2}),
+    };
+    // Seq 2 was shadowed by the later replacement, so it is no longer a
+    // surface position.
+    events[4] = .{
+        .event_type = "user/message",
+        .seq = 4,
+        .time_ms = 0,
+        .data = try std.json.parseFromSliceLeaky(
+            Value,
+            allocator,
+            "{\"content\":[{\"type\":\"text\",\"text\":\"missing\"}],\"source\":{\"kind\":\"user\"},\"role\":\"user\",\"id\":\"m5\"}",
+            .{ .allocate = .alloc_always },
+        ),
+        .surface_op = .{ .replace = .{ .start_seq = 2, .end_seq = 2 } },
+    };
+
+    var folded = try fold(std.testing.allocator, events[0..4]);
+    defer folded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), folded.nodes.len);
+    try std.testing.expectEqual(@as(u64, 0), folded.nodes[0].seq);
+    try std.testing.expectEqual(@as(u64, 3), folded.nodes[1].seq);
+    try std.testing.expectEqualStrings("sys", folded.nodes[0].message.content[0].text);
+    try std.testing.expectEqualStrings("next", folded.nodes[1].message.content[0].text);
+
+    try std.testing.expectError(error.UnknownSurfaceRange, fold(std.testing.allocator, events));
 }

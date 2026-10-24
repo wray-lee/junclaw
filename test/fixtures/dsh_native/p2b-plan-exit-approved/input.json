@@ -1,0 +1,25 @@
+{
+  "config": {
+    "approvalPolicy": "never"
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Summarize the repository."
+    },
+    {
+      "op": "command",
+      "text": "/plan on"
+    },
+    {
+      "op": "prompt",
+      "text": "Present the plan."
+    }
+  ]
+}

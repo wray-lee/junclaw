@@ -1,0 +1,74 @@
+{
+  "scenario": "p2b-todo-write",
+  "purpose": "P2b event-stream fixture for the dsh-native Zig adapter: drive the real harness with a scripted provider and interaction, then compare the normalized v4 session log.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "mode": "snapshot-derived",
+    "snapshot": "snapshots/session/todo-write/session.v4.jsonl",
+    "supporting": [
+      "tmp/dsh-p2b2-record/dsh-live/todo-write.v4.jsonl"
+    ],
+    "source": [
+      "packages/todo/tool-todo/src/index.ts:113-209",
+      "flock <zig-lock> docker run --rm --entrypoint node -v <junclaw>/.scratch/dsh-record:/work -v <junclaw>/tmp/dsh-p2b2-record:/out -w /work <dsh-test-image> /work/record-dsh-plan.mjs"
+    ],
+    "reason": null
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}"
+      },
+      {
+        "token": "{{system}}"
+      },
+      {
+        "token": "{{tools}}"
+      }
+    ],
+    "comparisonMask": [],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}"
+      },
+      {
+        "token": "{{message:1}}"
+      },
+      {
+        "token": "{{message:2}}"
+      },
+      {
+        "token": "{{message:3}}"
+      },
+      {
+        "token": "{{message:4}}"
+      },
+      {
+        "token": "{{message:5}}"
+      },
+      {
+        "token": "{{message:6}}"
+      },
+      {
+        "token": "{{message:7}}"
+      }
+    ]
+  },
+  "comparison": {},
+  "modelVisible": {},
+  "planProjection": {
+    "active": false,
+    "pending": false
+  },
+  "openIssues": [
+    "The port validates the single-active discipline (allowParallelInProgress=false, matching its generated description); dsh's base deployment sets it true, and snapshots/session/todo-write accepts two in_progress items.",
+    "dsh records only the rendered sentence in tool/result; the adapter also records the structured output under data.meta (todos + counts)."
+  ],
+  "files": [
+    "input.json",
+    "replay.json",
+    "manifest.json",
+    "expected.v4.jsonl"
+  ]
+}

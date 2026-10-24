@@ -1,0 +1,18 @@
+{
+  "config": {
+    "approvalPolicy": "never"
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Request the sandbox escalation.",
+      "approval": "allowed_once"
+    }
+  ]
+}

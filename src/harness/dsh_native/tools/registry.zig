@@ -37,7 +37,8 @@ pub const ToolResult = union(enum) {
         meta: ?Value = null,
         /// User messages spliced into the next-step inbox, not the tool result.
         additional_contexts: []const types.Message = &.{},
-        /// Stop the turn after this result batch (goal wrap-up; goal tools are P2).
+        /// Stop the turn after this result batch (dsh `concludesTurn`; the goal
+        /// wrap-up uses additional contexts instead).
         concludes_turn: bool = false,
         /// Presentation hint: keep it intact through wrapping; not model-visible.
         replaces_selected_content: bool = false,
@@ -120,7 +121,7 @@ pub const Schema = struct {
     input_schema_json: []const u8,
 };
 
-/// The six P1 core tools, in dsh order, referencing the generated constants.
+/// Core tools in dsh order, referencing the generated constants.
 pub const core_schemas = [_]Schema{
     .{ .name = generated.read.name, .description = generated.read.description, .input_schema_json = generated.read.input_schema_json },
     .{ .name = generated.write.name, .description = generated.write.description, .input_schema_json = generated.write.input_schema_json },
@@ -128,12 +129,24 @@ pub const core_schemas = [_]Schema{
     .{ .name = generated.bash.name, .description = generated.bash.description, .input_schema_json = generated.bash.input_schema_json },
     .{ .name = generated.grep.name, .description = generated.grep.description, .input_schema_json = generated.grep.input_schema_json },
     .{ .name = generated.glob.name, .description = generated.glob.description, .input_schema_json = generated.glob.input_schema_json },
+    .{ .name = generated.get_goal.name, .description = generated.get_goal.description, .input_schema_json = generated.get_goal.input_schema_json },
+    .{ .name = generated.create_goal.name, .description = generated.create_goal.description, .input_schema_json = generated.create_goal.input_schema_json },
+    .{ .name = generated.update_goal.name, .description = generated.update_goal.description, .input_schema_json = generated.update_goal.input_schema_json },
 };
 
+/// Registrable tools the current build does not advertise yet: the model tool
+/// list stays `core_schemas`. `todo_write` moves there when the harness wires
+/// its handler.
+const pending_schemas = [_]Schema{
+    .{ .name = generated.todo_write.name, .description = generated.todo_write.description, .input_schema_json = generated.todo_write.input_schema_json },
+};
+
+const known_schemas = core_schemas ++ pending_schemas;
+
 /// dsh tool names are exact schema keys: byte-equal, case-sensitive, no aliases.
-/// Returns the canonical slice from `core_schemas`.
+/// Returns the canonical slice from `known_schemas`.
 pub fn toolNameFromExactKeys(name: []const u8) ?[]const u8 {
-    for (core_schemas) |schema| {
+    for (known_schemas) |schema| {
         if (std.mem.eql(u8, name, schema.name)) return schema.name;
     }
     return null;
@@ -160,6 +173,12 @@ pub const CoreHandlers = struct {
     bash: Handler,
     grep: Handler,
     glob: Handler,
+    get_goal: Handler,
+    create_goal: Handler,
+    update_goal: Handler,
+    /// Null until the harness supplies the todo context; the tool is
+    /// registrable but stays out of the model-visible core list.
+    todo_write: ?Handler = null,
 };
 
 pub const Registry = struct {
@@ -185,7 +204,7 @@ pub const Registry = struct {
         try self.tools.put(allocator, canonical, registered);
     }
 
-    /// Register the six P1 core tools. Only handlers vary per deployment; names,
+    /// Register the core tools. Only handlers vary per deployment; names,
     /// descriptions and schemas are the generated dsh strings.
     pub fn registerCore(self: *Registry, allocator: Allocator, handlers: CoreHandlers) !void {
         try self.register(allocator, .{ .name = generated.read.name, .description = generated.read.description, .input_schema_json = generated.read.input_schema_json, .handler = handlers.read });
@@ -194,6 +213,12 @@ pub const Registry = struct {
         try self.register(allocator, .{ .name = generated.bash.name, .description = generated.bash.description, .input_schema_json = generated.bash.input_schema_json, .handler = handlers.bash });
         try self.register(allocator, .{ .name = generated.grep.name, .description = generated.grep.description, .input_schema_json = generated.grep.input_schema_json, .handler = handlers.grep });
         try self.register(allocator, .{ .name = generated.glob.name, .description = generated.glob.description, .input_schema_json = generated.glob.input_schema_json, .handler = handlers.glob });
+        try self.register(allocator, .{ .name = generated.get_goal.name, .description = generated.get_goal.description, .input_schema_json = generated.get_goal.input_schema_json, .handler = handlers.get_goal });
+        try self.register(allocator, .{ .name = generated.create_goal.name, .description = generated.create_goal.description, .input_schema_json = generated.create_goal.input_schema_json, .handler = handlers.create_goal });
+        try self.register(allocator, .{ .name = generated.update_goal.name, .description = generated.update_goal.description, .input_schema_json = generated.update_goal.input_schema_json, .handler = handlers.update_goal });
+        if (handlers.todo_write) |handler| {
+            try self.register(allocator, .{ .name = generated.todo_write.name, .description = generated.todo_write.description, .input_schema_json = generated.todo_write.input_schema_json, .handler = handler });
+        }
     }
 
     pub fn get(self: *const Registry, name: []const u8) ?*const Tool {
@@ -233,17 +258,22 @@ fn defaultHandlers(handler: Handler) CoreHandlers {
         .bash = handler,
         .grep = handler,
         .glob = handler,
+        .get_goal = handler,
+        .create_goal = handler,
+        .update_goal = handler,
     };
 }
 
-test "registerCore keeps the six generated schemas verbatim" {
+test "registerCore keeps the nine generated schemas verbatim" {
     var registry = Registry.init();
     defer registry.deinit(testing.allocator);
 
     try registry.registerCore(testing.allocator, defaultHandlers(.{ .call = fakeHandler }));
 
-    try testing.expectEqual(@as(usize, 6), registry.tools.count());
-    const expected_names = [_][]const u8{ "read", "write", "edit", "bash", "grep", "glob" };
+    try testing.expectEqual(@as(usize, 9), registry.tools.count());
+    const expected_names = [_][]const u8{
+        "read", "write", "edit", "bash", "grep", "glob", "get_goal", "create_goal", "update_goal",
+    };
     for (expected_names, core_schemas) |expected, schema| {
         try testing.expectEqualStrings(expected, schema.name);
         const tool = registry.get(expected).?;
@@ -254,6 +284,30 @@ test "registerCore keeps the six generated schemas verbatim" {
         try testing.expectEqual(@intFromPtr(schema.input_schema_json.ptr), @intFromPtr(tool.input_schema_json.ptr));
         try testing.expect(tool.handler.call == fakeHandler);
     }
+}
+
+test "registerCore registers todo_write only when a handler is supplied" {
+    var registry = Registry.init();
+    defer registry.deinit(testing.allocator);
+
+    var core = defaultHandlers(.{ .call = fakeHandler });
+    core.todo_write = .{ .call = fakeHandler };
+    try registry.registerCore(testing.allocator, core);
+
+    try testing.expectEqual(@as(usize, 10), registry.tools.count());
+    const tool = registry.get(generated.todo_write.name).?;
+    try testing.expectEqualStrings(generated.todo_write.description, tool.description);
+    try testing.expectEqualStrings(generated.todo_write.input_schema_json, tool.input_schema_json);
+
+    // Advertisement follows core_schemas; todo_write stays out until the
+    // harness wiring lands, so no request lists a handlerless tool.
+    for (core_schemas) |schema| {
+        try testing.expect(!std.mem.eql(u8, schema.name, generated.todo_write.name));
+    }
+}
+
+test {
+    _ = @import("todo.zig");
 }
 
 test "tool names are exact keys; only the dev__ sub-namespace resolves" {

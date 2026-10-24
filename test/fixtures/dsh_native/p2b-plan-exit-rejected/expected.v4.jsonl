@@ -1,0 +1,29 @@
+{"type":"session","version":4,"id":"{{session:1}}","createdAt":200,"cwd":"{{cwd}}","isSeeded":false,"delegationDepth":0}
+{"type":"permission/preset","data":{"preset":"workspace-write"}}
+{"type":"sandbox/mode","data":{"mode":"workspace-write"}}
+{"type":"approval/policy","data":{"policy":"never"}}
+{"type":"turn/start","data":{"turn":1}}
+{"type":"step/start","data":{"turn":1,"step":1}}
+{"type":"system/message","data":{"turn":1,"step":1,"message":{"role":"system","content":[{"type":"text","text":"{{system}}"}],"source":{"kind":"system-prompt"},"id":"{{message:1}}"}},"surfaceOp":"append"}
+{"type":"user/message","data":{"content":[{"type":"text","text":"Summarize the repository."}],"source":{"kind":"user"},"role":"user","id":"{{message:2}}"},"surfaceOp":"append"}
+{"type":"request/header","data":{"header":{"config":{"provider":"fake","model":"fake"},"tools":"{{tools}}"},"reason":"initial"}}
+{"type":"assistant/message","data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"The repository is small."}],"source":{"kind":"model","provider":"fake","model":"fake"},"id":"{{message:3}}"},"usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35},"stream":[{"type":"text-chunks","time0":0,"index":0,"dt":[],"texts":["The repository is small."]},{"type":"chunk","time":0,"chunk":{"type":"usage","usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35}}},{"type":"chunk","time":0,"chunk":{"type":"finish","reason":"stop"}}]},"surfaceOp":"append"}
+{"type":"step/end","data":{"turn":1,"step":1}}
+{"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}
+{"type":"command/run","data":{"commandId":"command-2","name":"plan","args":" on","source":{"kind":"user"}}}
+{"type":"plan/mode","data":{"active":true}}
+{"type":"command/done","data":{"commandId":"command-2","kind":"success","text":"Plan mode on. Use /plan off to leave."}}
+{"type":"turn/start","data":{"turn":2}}
+{"type":"step/start","data":{"turn":2,"step":1}}
+{"type":"system/message","data":{"turn":2,"step":1,"message":{"role":"system","content":[{"type":"text","text":"{{system}}"}],"source":{"kind":"system-prompt"},"id":"{{message:4}}"}},"surfaceOp":"append"}
+{"type":"user/message","data":{"content":[{"type":"text","text":"The user switched this session to plan mode."}],"source":{"kind":"plan-mode","form":"notice","summary":"The user switched this session to plan mode."},"role":"user","id":"{{message:5}}"},"surfaceOp":"append"}
+{"type":"user/message","data":{"content":[{"type":"text","text":"Present the plan."}],"source":{"kind":"user"},"role":"user","id":"{{message:6}}"},"surfaceOp":"append"}
+{"type":"request/header","data":{"header":{"config":{"provider":"fake","model":"fake"},"tools":"{{tools}}"},"reason":"change"}}
+{"type":"assistant/message","data":{"turn":2,"step":1,"message":{"role":"assistant","content":[{"type":"tool-call","id":"call_exit","name":"exit_plan_mode","arguments":"{\"plan\": \"# Greeting flag\\n\\n- add a --greeting flag to the CLI\"}"}],"source":{"kind":"model","provider":"fake","model":"fake"},"id":"{{message:7}}"},"usage":{"inputTokens":50,"outputTokens":5,"totalTokens":55},"stream":[{"type":"chunk","time":0,"chunk":{"type":"block-start","index":0,"blockType":"tool-call"}},{"type":"tool-call-chunks","time0":0,"index":0,"dt":[],"id":"call_exit","name":"exit_plan_mode","args":["{\"plan\": \"# Greeting flag\\n\\n- add a --greeting flag to the CLI\"}"]},{"type":"chunk","time":0,"chunk":{"type":"block-end","index":0,"block":[{"type":"tool-call","id":"call_exit","name":"exit_plan_mode","arguments":"{\"plan\": \"# Greeting flag\\n\\n- add a --greeting flag to the CLI\"}"}]}},{"type":"chunk","time":0,"chunk":{"type":"usage","usage":{"inputTokens":50,"outputTokens":5,"totalTokens":55}}},{"type":"chunk","time":0,"chunk":{"type":"finish","reason":"tool-calls"}}]},"surfaceOp":"append"}
+{"type":"tool/call","data":{"turn":2,"step":1,"callId":"call_exit","name":"exit_plan_mode","arguments":"{\"plan\": \"# Greeting flag\\n\\n- add a --greeting flag to the CLI\"}"}}
+{"type":"tool/result","data":{"turn":2,"step":1,"message":{"role":"tool","content":[{"type":"text","text":"Error: The user chose to keep planning; revise the plan and present it again."}],"source":{"kind":"tool","callId":"call_exit"},"id":"{{message:8}}","toolCallId":"call_exit","isError":true},"error":{"name":"Error","code":"PLAN_NOT_APPROVED","reason":"The user chose to keep planning; revise the plan and present it again."}},"sourceEventSeqs":[21],"surfaceOp":"append"}
+{"type":"step/end","data":{"turn":2,"step":1}}
+{"type":"step/start","data":{"turn":2,"step":2}}
+{"type":"assistant/message","data":{"turn":2,"step":2,"message":{"role":"assistant","content":[{"type":"text","text":"I will keep planning."}],"source":{"kind":"model","provider":"fake","model":"fake"},"id":"{{message:9}}"},"usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35},"stream":[{"type":"text-chunks","time0":0,"index":0,"dt":[],"texts":["I will keep planning."]},{"type":"chunk","time":0,"chunk":{"type":"usage","usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35}}},{"type":"chunk","time":0,"chunk":{"type":"finish","reason":"stop"}}]},"surfaceOp":"append"}
+{"type":"step/end","data":{"turn":2,"step":2}}
+{"type":"turn/end","data":{"turn":2,"reason":{"kind":"completed"}}}

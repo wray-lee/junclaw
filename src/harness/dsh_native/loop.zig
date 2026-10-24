@@ -121,6 +121,21 @@ pub const Provider = struct {
     cancel: ?*const fn (context: *anyopaque) void = null,
 };
 
+/// Fixed compaction plugin layer (design §1.6 B29-B31). The kernel calls these
+/// host callbacks and never imports `compaction.zig`; the wiring lives in
+/// `harness.zig` so the dependency arrow stays kernel <- host.
+pub const CompactionHook = struct {
+    context: *anyopaque,
+    /// `agent/pre-step` pressure probe. `true` means the host rewrote the
+    /// surface, so this step opens a new request series.
+    pressure: *const fn (context: *anyopaque, allocator: Allocator, position: Position) anyerror!bool,
+    /// Provider-confirmed context overflow. `true` means one compaction ran and
+    /// the failed attempt may be retried.
+    overflow: *const fn (context: *anyopaque, allocator: Allocator, position: Position) anyerror!bool,
+    /// dsh `maxOverflowRetries` (`config.ts:106`).
+    max_overflow_retries: u32 = 1,
+};
+
 pub const Host = struct {
     context: *anyopaque,
     /// Append one durable event and return its sequence number.
@@ -151,6 +166,8 @@ pub const Host = struct {
     /// `agent/turn-stopping` gate. Returning false keeps the turn open only
     /// when the host also queued next-step input.
     can_turn_end: ?*const fn (context: *anyopaque, turn: u64) anyerror!bool = null,
+    /// Null keeps the kernel's pre-compaction behaviour.
+    compaction: ?CompactionHook = null,
     provider: Provider,
     classifier: scheduler.Classifier,
     dispatcher: scheduler.Dispatcher,
@@ -427,6 +444,15 @@ pub const Loop = struct {
                 carried_extras = .empty;
             } else {
                 claim = try self.claimFor(target);
+                // Pressure runs before the host's pre-step gate, like dsh's
+                // `agent/pre-step` compaction hook (index.ts:319-341).
+                const compacted = if (self.host.compaction) |hook|
+                    try hook.pressure(hook.context, self.allocator(), .{
+                        .turn = self.turn,
+                        .step = self.step + 1,
+                    })
+                else
+                    false;
                 decision = try self.host.pre_step(
                     self.host.context,
                     self.allocator(),
@@ -434,6 +460,7 @@ pub const Loop = struct {
                     .{ .next_step = claim.next_step, .next_turn = claim.next_turn },
                     &extras,
                 );
+                if (compacted) decision.starts_request_series = true;
             }
 
             switch (decision.kind) {
@@ -475,15 +502,7 @@ pub const Loop = struct {
 
             // Header bookkeeping is taken before this step's surface appends,
             // like dsh prepareRequest (agent.ts:632-667).
-            const header = request.Header{
-                .config = .{
-                    .provider = self.config.provider,
-                    .model = self.config.model,
-                    .reasoning_effort = self.config.reasoning_effort,
-                    .max_tokens = self.config.max_tokens,
-                },
-                .tools = self.config.tools,
-            };
+            const header = self.currentHeader();
             const header_decision = self.tracker.beginRequest(
                 self.last_header,
                 header,
@@ -569,29 +588,32 @@ pub const Loop = struct {
         });
     }
 
-    fn runStep(self: *Loop, position: Position, header_decision: request.HeaderDecision) anyerror!StepResult {
-        self.checkpoint = .{};
-        const request_seq = try self.emit(.{
-            .request_start = .{ .position = position, .attempt = 1, .header = header_decision },
-        });
-        if (header_decision.append) self.checkpoint.header_seq = request_seq;
-
-        self.host.provider.begin(self.host.provider.context, .{
-            .position = position,
-            .attempt = 1,
-            .provider = self.config.provider,
-            .model = self.config.model,
-            .header = header_decision,
-        }) catch |err| {
-            if (self.isAborted()) return .aborted;
-            _ = try self.emit(.{ .step_end = position });
-            return .{ .failure = .{
-                .message = "provider request failed to start",
-                .code = @errorName(err),
-            } };
+    fn currentHeader(self: *const Loop) request.Header {
+        return .{
+            .config = .{
+                .provider = self.config.provider,
+                .model = self.config.model,
+                .reasoning_effort = self.config.reasoning_effort,
+                .max_tokens = self.config.max_tokens,
+            },
+            .tools = self.config.tools,
         };
-        self.checkpoint.request_started = true;
+    }
 
+    /// One forced compaction-and-retry after a provider context overflow
+    /// (`compaction-basic/src/index.ts:193-235`). `attempt` is 1-based.
+    fn retryOverflow(self: *Loop, attempt: *u32, position: Position) anyerror!bool {
+        const hook = self.host.compaction orelse return false;
+        if (attempt.* - 1 >= hook.max_overflow_retries) return false;
+        if (!try hook.overflow(hook.context, self.allocator(), position)) return false;
+        attempt.* += 1;
+        // A replacement rewrites the surface; the next request must observe a
+        // new generation, like dsh's contentGeneration bump.
+        self.surface_generation +%= 1;
+        return true;
+    }
+
+    fn runStep(self: *Loop, position: Position, header_decision: request.HeaderDecision) anyerror!StepResult {
         var accumulator = stream.Accumulator.init(self.allocator());
         defer accumulator.deinit();
 
@@ -599,6 +621,46 @@ pub const Loop = struct {
         var stream_error: ?anyerror = null;
         var aborted = false;
         var done = false;
+
+        var attempt: u32 = 1;
+        var header = header_decision;
+        while (true) {
+            self.checkpoint = .{};
+            if (attempt > 1) {
+                // Retry after compaction: the surface changed, so re-decide the
+                // header and start a new series (dsh agent.ts:632-667).
+                header = self.tracker.beginRequest(
+                    self.last_header,
+                    self.currentHeader(),
+                    self.surface_generation,
+                    true,
+                );
+                if (header.append) self.last_header = header.header;
+            }
+            const request_seq = try self.emit(.{
+                .request_start = .{ .position = position, .attempt = attempt, .header = header },
+            });
+            if (header.append) self.checkpoint.header_seq = request_seq;
+
+            self.host.provider.begin(self.host.provider.context, .{
+                .position = position,
+                .attempt = attempt,
+                .provider = self.config.provider,
+                .model = self.config.model,
+                .header = header,
+            }) catch |err| {
+                if (self.isAborted()) return .aborted;
+                if (err == error.ContextLengthExceeded and try self.retryOverflow(&attempt, position))
+                    continue;
+                _ = try self.emit(.{ .step_end = position });
+                return .{ .failure = .{
+                    .message = "provider request failed to start",
+                    .code = @errorName(err),
+                } };
+            };
+            self.checkpoint.request_started = true;
+            break;
+        }
         while (!done) {
             if (self.isAborted()) {
                 aborted = true;
@@ -614,7 +676,7 @@ pub const Loop = struct {
             };
             const event = maybe_event orelse break;
             _ = try self.emit(.{
-                .assistant_stream = .{ .position = position, .attempt = 1, .event = event },
+                .assistant_stream = .{ .position = position, .attempt = attempt, .event = event },
             });
             switch (event) {
                 .chunk, .record => saw_chunk = true,
@@ -853,6 +915,8 @@ const Record = struct {
     reason: ?types.EndReason = null,
     header_append: bool = false,
     header_reason: ?request.HeaderReason = null,
+    header_starts_series: bool = false,
+    attempt: u32 = 0,
     call_name: []const u8 = "",
     result_code: ?[]const u8 = null,
     source_seq_count: usize = 0,
@@ -866,6 +930,8 @@ const Attempt = struct {
 };
 
 const Harness = struct {
+    const HookOrder = enum { none, pressure, pre_step };
+
     allocator: Allocator,
     arena: std.heap.ArenaAllocator,
     records: std.ArrayListUnmanaged(Record) = .empty,
@@ -888,6 +954,12 @@ const Harness = struct {
     on_event: ?*const fn (h: *Harness, attempt: usize, index: usize) void = null,
     on_start: ?*const fn (h: *Harness) void = null,
     begin_error: ?anyerror = null,
+    begin_errors: []const ?anyerror = &.{},
+    pressure_calls: usize = 0,
+    overflow_calls: usize = 0,
+    pressure_compacts: bool = false,
+    overflow_compacts: bool = false,
+    last_hook: HookOrder = .none,
     dispatches: usize = 0,
     dispatch_hook: ?*const fn (h: *Harness, allocator: Allocator, call: types.ToolCall) anyerror!registry.ToolResult = null,
     parallel: bool = true,
@@ -913,6 +985,12 @@ const Harness = struct {
             .pre_step = preStep,
             .serialize_message = serializeMessage,
             .can_turn_end = canTurnEnd,
+            .compaction = .{
+                .context = self,
+                .pressure = compactionPressure,
+                .overflow = compactionOverflow,
+                .max_overflow_retries = 1,
+            },
             .provider = .{
                 .context = self,
                 .begin = providerBegin,
@@ -997,6 +1075,8 @@ fn emitEvent(context: *anyopaque, event: Event) anyerror!u64 {
                 .step = payload.position.step,
                 .header_append = payload.header.append,
                 .header_reason = payload.header.reason,
+                .header_starts_series = payload.header.starts_series,
+                .attempt = payload.attempt,
             };
         },
         .assistant_stream => |payload| {
@@ -1090,6 +1170,7 @@ fn preStep(
     _ = out;
     const h = harnessOf(context);
     h.pre_calls += 1;
+    h.last_hook = .pre_step;
     if (h.pre_hook) |hook| hook(h);
     const decision = h.pre_kind;
     if (h.pre_kind_once) h.pre_kind = .enter;
@@ -1113,11 +1194,31 @@ fn canTurnEnd(context: *anyopaque, turn: u64) !bool {
     return h.allow_turn_end;
 }
 
+fn compactionPressure(context: *anyopaque, allocator: Allocator, position: Position) !bool {
+    _ = allocator;
+    _ = position;
+    const h = harnessOf(context);
+    h.pressure_calls += 1;
+    h.last_hook = .pressure;
+    return h.pressure_compacts;
+}
+
+fn compactionOverflow(context: *anyopaque, allocator: Allocator, position: Position) !bool {
+    _ = allocator;
+    _ = position;
+    const h = harnessOf(context);
+    h.overflow_calls += 1;
+    return h.overflow_compacts;
+}
+
 fn providerBegin(context: *anyopaque, view: RequestView) !void {
     const h = harnessOf(context);
     try h.requests.append(h.allocator, view);
     h.current = h.started;
     h.started += 1;
+    if (h.current < h.begin_errors.len) {
+        if (h.begin_errors[h.current]) |err| return err;
+    }
     if (h.begin_error) |err| return err;
     if (h.started > h.attempts.items.len) return error.NoScriptedAttempt;
     h.attempts.items[h.current].index = 0;
@@ -1961,4 +2062,81 @@ fn sharedUserPayloadLen(h: *Harness) usize {
         }
     }
     return 0;
+}
+
+test "pre-step pressure hook runs before the host gate and starts a new series" {
+    var h = Harness.init(std.testing.allocator);
+    defer h.deinit();
+    var loop = try newLoop(&h, testConfig());
+    h.loop = &loop;
+    defer loop.deinit();
+
+    h.pressure_compacts = true;
+    const events = &[_]stream.Event{
+        .{ .chunk = .{ .text_delta = .{ .index = 0, .text = "after compact" } } },
+        .{ .done = .{ .finish = .stop } },
+    };
+    try h.script(&.{Harness.attempt(events)});
+    try steerText(&h, &loop, "m1", "hi");
+
+    const outcome = try loop.runTurn();
+    try testing.expectEqual(@as(usize, 1), h.pressure_calls);
+    try testing.expectEqual(@as(usize, 1), h.pre_calls);
+    try testing.expectEqual(Harness.HookOrder.pre_step, h.last_hook);
+    const request_start = h.find(.request_start).?;
+    try testing.expect(request_start.header_starts_series);
+    try testing.expect(isTag(reasonOf(outcome), .completed));
+}
+
+test "context overflow compacts once and retries the request exactly once" {
+    var h = Harness.init(std.testing.allocator);
+    defer h.deinit();
+    var loop = try newLoop(&h, testConfig());
+    h.loop = &loop;
+    defer loop.deinit();
+
+    h.overflow_compacts = true;
+    h.begin_errors = &.{ error.ContextLengthExceeded, null };
+    const events = &[_]stream.Event{
+        .{ .chunk = .{ .text_delta = .{ .index = 0, .text = "recovered" } } },
+        .{ .done = .{ .finish = .stop } },
+    };
+    try h.script(&.{ Harness.attempt(events), Harness.attempt(events) });
+    try steerText(&h, &loop, "m1", "hi");
+
+    const outcome = try loop.runTurn();
+    try testing.expectEqual(@as(usize, 1), h.overflow_calls);
+    try testing.expectEqual(@as(usize, 2), h.requests.items.len);
+    try testing.expectEqual(@as(u32, 1), h.requests.items[0].attempt);
+    try testing.expectEqual(@as(u32, 2), h.requests.items[1].attempt);
+    var starts: usize = 0;
+    for (h.records.items) |record| {
+        if (record.kind != .request_start) continue;
+        starts += 1;
+        if (starts != 2) continue;
+        try testing.expectEqual(@as(u32, 2), record.attempt);
+        try testing.expectEqual(request.HeaderReason.series, record.header_reason.?);
+    }
+    try testing.expectEqual(@as(usize, 2), starts);
+    try testing.expectEqualStrings("recovered", h.find(.assistant_message).?.text);
+    try testing.expect(isTag(reasonOf(outcome), .completed));
+}
+
+test "a second overflow after one retry is a typed failure" {
+    var h = Harness.init(std.testing.allocator);
+    defer h.deinit();
+    var loop = try newLoop(&h, testConfig());
+    h.loop = &loop;
+    defer loop.deinit();
+
+    h.overflow_compacts = true;
+    h.begin_errors = &.{ error.ContextLengthExceeded, error.ContextLengthExceeded };
+    try steerText(&h, &loop, "m1", "hi");
+
+    const outcome = try loop.runTurn();
+    try testing.expectEqual(@as(usize, 1), h.overflow_calls);
+    try testing.expectEqual(@as(usize, 2), h.requests.items.len);
+    const reason = reasonOf(outcome);
+    try testing.expect(isTag(reason, .failure));
+    try testing.expectEqualStrings("ContextLengthExceeded", reason.failure.code);
 }

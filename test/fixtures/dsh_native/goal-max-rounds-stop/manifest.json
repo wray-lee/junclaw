@@ -1,0 +1,137 @@
+{
+  "scenario": "goal-max-rounds-stop",
+  "purpose": "Goal cap fixture: a direct human turn creates a goal with max_goal_rounds=1; the driver runs round 1, then blocks the goal with code round-limit instead of queueing round 2, so no further turn starts.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "dshSource": {
+      "path": "packages/goal/goal-round-driver/src/index.ts and tool-goal/src/index.ts",
+      "note": "Constructed from the round-limit branch: at maxGoalRounds the driver blocks with code round-limit and message \"Goal reached its configured limit of N rounds.\""
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "replay": "replay.json",
+    "expected": "expected.v4.jsonl",
+    "manifest": "manifest.json"
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Recorded workspace path; the fixture host substitutes its temp workspace."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl system/message",
+        "note": "System prompt text token; the prompt is pinned by the P1 plain-turn fixture."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Whole tool-schema array token; the nine schemas are pinned by the P1 fixtures."
+      },
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.provider."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.model."
+      },
+      {
+        "token": "{{command:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl command/run and command/done",
+        "note": "Goal command identity; generated as goal-cmd-1 by the fixture host."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Ordinal session identity."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-1."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to system-1."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-1."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-2."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-2."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-1."
+      },
+      {
+        "token": "{{message:7}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-2-1."
+      }
+    ],
+    "comparisonMask": []
+  },
+  "volatile": [
+    {
+      "field": "event time/seq",
+      "note": "time 0; expected rows omit both."
+    },
+    {
+      "field": "assistant usage",
+      "note": "Authored neutral token counts."
+    },
+    {
+      "field": "goal/change createdAt/updatedAt",
+      "value": 300,
+      "note": "Pinned deterministic goal clock (fixture host now_ms=300); real recordings use wall time."
+    },
+    {
+      "field": "session/message/goal ids",
+      "note": "Deterministic fixture ids; ordinal tokens."
+    },
+    {
+      "field": "round-limit message",
+      "note": "Pinned implementation text (grammar 1 rounds)."
+    }
+  ],
+  "openIssues": [
+    "Constructed scenario: the only live goal recording has maxGoalRounds=256 and never reaches the cap. The expected log is bound to the native cap branch.",
+    "The create_goal tool path is used because /goal create does not accept a cap."
+  ],
+  "origin": "constructed-from-dsh-source"
+}

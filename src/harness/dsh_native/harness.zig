@@ -17,7 +17,8 @@
 //! - Runtime context (working directory / sandbox / approval policy) is
 //!   appended to the system prompt rather than being a separate
 //!   `runtime-context` user message (dsh emits the latter; P3).
-//! - Approvals, questions, compaction, goal, plan and slash commands are P2;
+//! - Approvals, questions, compaction, plan and slash commands are P2; goal
+//!   commands stay unwired (rounds and wrap-ups are P2b);
 //!   `handleLocalCommand` stays null.
 //! - `restore` reattaches to the JSONL and rebuilds the surface. Nothing else
 //!   is replayed: this adapter never leaves durable pending inbox input, and
@@ -34,8 +35,16 @@ const dispatcher = @import("../../agent/dispatcher.zig");
 const providers = @import("../../providers/root.zig");
 const config_types = @import("../../config_types.zig");
 const port = @import("../port.zig");
+const approval_mod = @import("approval.zig");
+const commands_mod = @import("commands.zig");
+const compaction_mod = @import("compaction.zig");
 const context = @import("context.zig");
 const generated = @import("generated/tool_schemas.zig");
+const generated_interaction = @import("generated/interaction.zig");
+const generated_system_prompt = @import("generated/system_prompt.zig");
+const questions_mod = @import("questions.zig");
+const token_meter = @import("token_meter.zig");
+const tools_ask_user = @import("tools/ask_user.zig");
 const inbox = @import("inbox.zig");
 const loop_mod = @import("loop.zig");
 const prompt = @import("prompt.zig");
@@ -43,6 +52,13 @@ const request = @import("request.zig");
 const registry = @import("tools/registry.zig");
 const builtins_mod = @import("tools/builtins.zig");
 const bash_mod = @import("tools/bash.zig");
+const goal_mod = @import("goal.zig");
+const goal_command_mod = @import("goal_command.zig");
+const goal_rounds = @import("goal_rounds.zig");
+const goal_tools = @import("tools/goal.zig");
+const plan_mod = @import("plan.zig");
+const tools_exit_plan = @import("tools/exit_plan.zig");
+const tools_todo = @import("tools/todo.zig");
 const execute = @import("tools/execute.zig");
 const scheduler = @import("tools/scheduler.zig");
 const session_log = @import("session_log.zig");
@@ -78,6 +94,19 @@ pub const Options = struct {
     sandbox: config_types.DshSandbox = .workspace_write,
     max_parallel_tools: usize = config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS,
     on_corrupt: config_types.DshOnCorrupt = .fail,
+    /// Routed model capacity for dsh proactive compaction. Zero disables the
+    /// pre-step pressure probe; provider-confirmed overflow still compacts.
+    context_window: u64 = 0,
+    compaction_threshold_ratio: ?f64 = null,
+    compaction_retain_ratio: ?f64 = null,
+    compaction_headroom_tokens: ?u64 = null,
+    /// Test seam: when non-empty, substitute workspace-path occurrences in
+    /// message text with this fixed string for compaction pricing and prune
+    /// windowing, so fixture results do not depend on the checkout location.
+    /// Empty keeps the real path.
+    workspace_placeholder: []const u8 = "",
+    /// `agent.dsh_question_timeout`: ask_user_question wait in seconds.
+    question_timeout_s: i32 = 120,
     temperature: f64 = 0.7,
     /// Deterministic clock for tests; null uses the wall clock.
     now_ms: ?*const fn (clock_context: ?*anyopaque) i64 = null,
@@ -93,8 +122,11 @@ pub const DshNativeHarness = struct {
     };
 
     allocator: Allocator,
-    /// Permanent: tool schemas and the system prompt.
+    /// Permanent: tool schemas.
     perm: std.heap.ArenaAllocator,
+    /// The system prompt, rebuilt when the folded permission state or the
+    /// session changes; reset first so repeated renders stay bounded.
+    prompt_arena: std.heap.ArenaAllocator,
     /// Session: ids and the surface. Freed on reset/restore.
     arena: std.heap.ArenaAllocator,
     opts: Options,
@@ -112,13 +144,41 @@ pub const DshNativeHarness = struct {
 
     tool_schemas: []const request.ToolSchema = &.{},
     tool_specs: []const providers.ToolSpec = &.{},
+    /// The same catalog plus `exit_plan_mode`; only plan mode advertises it.
+    plan_tool_schemas: []const request.ToolSchema = &.{},
+    plan_tool_specs: []const providers.ToolSpec = &.{},
     registry: registry.Registry = .{},
     builtins: ?*builtins_mod.Builtins = null,
     bash: ?*bash_mod.Context = null,
+    goal_store: ?*goal_mod.Store = null,
+    goal_tools: ?*goal_tools.Context = null,
+    goal_driver: ?goal_rounds.Driver = null,
+    ask_user: ?*tools_ask_user.Context = null,
+    todo: ?*tools_todo.Context = null,
+    exit_plan: ?*tools_exit_plan.Context = null,
+    /// Logged plan mode plus the process-local selection queue. Heap-pinned:
+    /// the exit tool borrows this pointer and the harness struct itself moves
+    /// out of `init`.
+    plan_session: *plan_mod.Session,
+    approval: approval_mod.Service = .{ .options = .{} },
+    /// Current turn's blocking host channel (null fails closed).
+    interaction: ?port.Interaction = null,
+    permission_state: commands_mod.PermissionState = .{},
+    compaction_lock: compaction_mod.LockState = .{},
+    /// Provider usage from the latest successful request; compaction's anchor.
+    last_usage: ?types.Usage = null,
+    /// Log seq of each surface node, parallel to `messages`.
+    surface_seqs: std.ArrayListUnmanaged(u64) = .empty,
     system_prompt: []const u8 = "",
     spill_dir: []const u8 = "",
 
     in_turn: bool = false,
+    /// Bumped by every prompt rebuild; a mid-turn bump re-logs the system
+    /// message so the next request carries the plan policy change.
+    prompt_generation: u64 = 0,
+    emitted_prompt_generation: u64 = 0,
+    /// Plan mode the rendered system prompt reflects.
+    prompt_plan_active: bool = false,
     interrupt: bool = false,
     /// Tokens billed by every model call this harness ran (all turns).
     total_tokens: u64 = 0,
@@ -142,15 +202,20 @@ pub const DshNativeHarness = struct {
 
     pub fn init(allocator: Allocator, opts: Options) !Self {
         if (opts.dsh_home.len == 0) return error.MissingDshHome;
+        const plan_session = try allocator.create(plan_mod.Session);
+        plan_session.* = .{};
         var self = Self{
+            .plan_session = plan_session,
             .allocator = allocator,
             .perm = std.heap.ArenaAllocator.init(allocator),
+            .prompt_arena = std.heap.ArenaAllocator.init(allocator),
             .arena = std.heap.ArenaAllocator.init(allocator),
             .opts = opts,
             .call_arena = std.heap.ArenaAllocator.init(allocator),
             .registry = registry.Registry.init(),
         };
         errdefer self.deinit(allocator);
+        self.approval = approval_mod.Service.init(.{ .policy = opts.approval_policy });
         try self.buildTools();
         try self.buildPrompt();
         return self;
@@ -165,8 +230,18 @@ pub const DshNativeHarness = struct {
         self.registry.deinit(self.allocator);
         if (self.builtins) |value| self.allocator.destroy(value);
         if (self.bash) |value| self.allocator.destroy(value);
+        if (self.goal_tools) |value| self.allocator.destroy(value);
+        if (self.goal_store) |value| {
+            value.deinit();
+            self.allocator.destroy(value);
+        }
+        if (self.ask_user) |value| self.allocator.destroy(value);
+        if (self.todo) |value| self.allocator.destroy(value);
+        if (self.exit_plan) |value| self.allocator.destroy(value);
+        self.allocator.destroy(self.plan_session);
         self.call_arena.deinit();
         self.arena.deinit();
+        self.prompt_arena.deinit();
         self.perm.deinit();
     }
 
@@ -192,6 +267,13 @@ pub const DshNativeHarness = struct {
 
     fn workspace(self: *const Self) []const u8 {
         return if (self.opts.workspace_dir.len == 0) "." else self.opts.workspace_dir;
+    }
+
+    fn workspaceSubstitution(self: *const Self) token_meter.WorkspaceSubstitution {
+        return .{
+            .workspace = self.workspace(),
+            .placeholder = self.opts.workspace_placeholder,
+        };
     }
 
     fn now(self: *const Self) ?i64 {
@@ -228,13 +310,62 @@ pub const DshNativeHarness = struct {
             .handler = bash.handler(),
         });
 
+        const ask_user = try self.allocator.create(tools_ask_user.Context);
+        errdefer self.allocator.destroy(ask_user);
+        ask_user.* = .{ .options = self.questionOptions() };
+        try tools_ask_user.register(ask_user, &self.registry, self.allocator);
+
+        const todo = try self.allocator.create(tools_todo.Context);
+        errdefer self.allocator.destroy(todo);
+        todo.* = .{ .log = if (self.log) |*log| log else null };
+        try todo.register(&self.registry, self.allocator);
+
+        const exit_plan = try self.allocator.create(tools_exit_plan.Context);
+        errdefer self.allocator.destroy(exit_plan);
+        exit_plan.* = .{ .plan = self.plan_session };
+        try tools_exit_plan.register(exit_plan, &self.registry, self.allocator);
+
         self.builtins = builtins;
         self.bash = bash;
+        self.ask_user = ask_user;
+        self.todo = todo;
+        self.exit_plan = exit_plan;
 
-        const names = try perm.alloc([]const u8, registry.core_schemas.len);
-        for (registry.core_schemas, 0..) |schema, index| names[index] = schema.name;
-        const ordered = try prompt.orderTools(perm, names, null);
+        const goal_store = try self.allocator.create(goal_mod.Store);
+        errdefer self.allocator.destroy(goal_store);
+        goal_store.* = goal_mod.Store.init(self.allocator);
+        const goal_context = try self.allocator.create(goal_tools.Context);
+        errdefer self.allocator.destroy(goal_context);
+        goal_context.* = .{ .store = goal_store };
+        try goal_context.register(&self.registry, self.allocator);
+        self.goal_store = goal_store;
+        self.goal_tools = goal_context;
+        self.goal_driver = .{ .store = goal_store };
 
+        var names: std.ArrayListUnmanaged([]const u8) = .empty;
+        for (registry.core_schemas) |schema| try names.append(perm, schema.name);
+        try names.append(perm, generated_interaction.ask_user_question.name);
+        try names.append(perm, generated.todo_write.name);
+        const ordered = try prompt.orderTools(perm, names.items, null);
+        const base = try assembleCatalog(perm, ordered);
+        self.tool_schemas = base.schemas;
+        self.tool_specs = base.specs;
+
+        const plan_names = try perm.alloc([]const u8, names.items.len + 1);
+        @memcpy(plan_names[0..names.items.len], names.items);
+        plan_names[names.items.len] = generated.exit_plan_mode.name;
+        const plan_ordered = try prompt.orderTools(perm, plan_names, null);
+        const plan_catalog = try assembleCatalog(perm, plan_ordered);
+        self.plan_tool_schemas = plan_catalog.schemas;
+        self.plan_tool_specs = plan_catalog.specs;
+    }
+
+    const Catalog = struct {
+        schemas: []const request.ToolSchema,
+        specs: []const providers.ToolSpec,
+    };
+
+    fn assembleCatalog(perm: Allocator, ordered: []const []const u8) !Catalog {
         const schemas = try perm.alloc(request.ToolSchema, ordered.len);
         const specs = try perm.alloc(providers.ToolSpec, ordered.len);
         for (ordered, 0..) |name, index| {
@@ -250,34 +381,61 @@ pub const DshNativeHarness = struct {
                 .parameters_json = schema.input_schema_json,
             };
         }
-        self.tool_schemas = schemas;
-        self.tool_specs = specs;
+        return .{ .schemas = schemas, .specs = specs };
     }
 
     fn findSchema(name: []const u8) ?registry.Schema {
         for (registry.core_schemas) |schema| {
             if (std.mem.eql(u8, schema.name, name)) return schema;
         }
+        const extras = [_]registry.Schema{
+            .{
+                .name = generated_interaction.ask_user_question.name,
+                .description = generated_interaction.ask_user_question.description,
+                .input_schema_json = generated_interaction.ask_user_question.input_schema_json,
+            },
+            .{
+                .name = generated.todo_write.name,
+                .description = generated.todo_write.description,
+                .input_schema_json = generated.todo_write.input_schema_json,
+            },
+            .{
+                .name = generated.exit_plan_mode.name,
+                .description = generated.exit_plan_mode.description,
+                .input_schema_json = generated.exit_plan_mode.input_schema_json,
+            },
+        };
+        for (extras) |schema| {
+            if (std.mem.eql(u8, schema.name, name)) return schema;
+        }
         return null;
     }
 
     /// System prompt plus the runtime-context block (working directory, file
-    /// and approval policy), rendered once per harness.
+    /// and approval policy) for the current folded permission state. Rebuilt
+    /// after `/permission` and on restore so the model sees the live policy.
     fn buildPrompt(self: *Self) !void {
-        const perm = self.perm.allocator();
+        _ = self.prompt_arena.reset(.retain_capacity);
+        self.prompt_generation += 1;
+        self.system_prompt = "";
+        const perm = self.prompt_arena.allocator();
+        const plan_active = self.planActive();
         const built = try prompt.buildSystemPrompt(perm, .{
             .persona_prefix = self.opts.persona,
+            .plan_policy = if (plan_active) generated_system_prompt.plan_policy_text else "",
         });
 
-        const sandbox: context.SandboxMode = switch (self.opts.sandbox) {
-            .read_only => .read_only,
-            .workspace_write => .workspace_write,
-            .danger_full_access => .danger_full_access,
-        };
-        const approval: context.ApprovalPolicy = switch (self.opts.approval_policy) {
-            .ask => .ask,
-            .never => .never,
-        };
+        const sandbox: context.SandboxMode = self.permission_state.sandbox orelse
+            switch (self.opts.sandbox) {
+                .read_only => .read_only,
+                .workspace_write => .workspace_write,
+                .danger_full_access => .danger_full_access,
+            };
+        const approval: context.ApprovalPolicy = self.permission_state.approval orelse
+            switch (self.opts.approval_policy) {
+                .ask => .ask,
+                .never => .never,
+            };
         const sections = [_]context.Section{
             try context.workingDirectorySection(perm, self.workspace()),
             try context.sandboxPolicySection(perm, sandbox, self.workspace()),
@@ -288,6 +446,7 @@ pub const DshNativeHarness = struct {
             built
         else
             try std.fmt.allocPrint(perm, "{s}\n\n{s}", .{ built, rendered });
+        self.prompt_plan_active = plan_active;
     }
 
     fn closeSession(self: *Self) void {
@@ -296,6 +455,11 @@ pub const DshNativeHarness = struct {
             l.deinit();
             self.loop = null;
         }
+        if (self.goal_store) |store| {
+            store.reset();
+            store.attachLog(null);
+        }
+        if (self.goal_driver) |*driver| driver.pending = null;
         if (self.log) |*log| {
             log.close();
             self.log = null;
@@ -305,8 +469,19 @@ pub const DshNativeHarness = struct {
         self.turn_text.clearRetainingCapacity();
         self.arena.deinit();
         self.arena = std.heap.ArenaAllocator.init(self.allocator);
-        // The list itself lived in the arena that was just released.
+        // The lists themselves lived in the arena that was just released.
         self.messages = .empty;
+        self.surface_seqs = .empty;
+        self.permission_state = .{};
+        self.plan_session.* = .{};
+        if (self.todo) |ctx| ctx.log = null;
+        self.applyApprovalPolicy(null);
+        self.compaction_lock = .{};
+        self.last_usage = null;
+        // A fresh or reopened session starts its counters at 1; `restore`
+        // then seeds them past the ids already in the log.
+        self.next_id = 1;
+        self.approval.next_id = 1;
         self.session_id = "";
         self.last_assistant_text = null;
         self.total_tokens = 0;
@@ -318,10 +493,14 @@ pub const DshNativeHarness = struct {
     /// Create a fresh session id + JSONL, take its write lease and start the
     /// kernel loop.
     fn openNewSession(self: *Self, session_id: ?[]const u8) !void {
+        // Copy before closeSession: the caller may pass an id that lives in
+        // this harness session arena, which closeSession frees.
+        const id_copy = if (session_id) |value| try self.allocator.dupe(u8, value) else null;
+        defer if (id_copy) |copy| self.allocator.free(copy);
         self.closeSession();
         const arena = self.arena.allocator();
 
-        const id = if (session_id) |value|
+        const id = if (id_copy) |value|
             try arena.dupe(u8, value)
         else
             try newSessionId(arena);
@@ -335,19 +514,29 @@ pub const DshNativeHarness = struct {
             .delegation_depth = 0,
         };
         self.log = try session_store.createLog(self.allocator, self.opts.dsh_home, self.workspace(), id, header);
+        if (self.goal_store) |store| store.attachLog(&self.log.?);
+        if (self.todo) |ctx| ctx.log = &self.log.?;
         self.buildLoop();
+        // A new session starts from the composition defaults again.
+        try self.buildPrompt();
     }
 
     /// Reopen the JSONL for `session_id` and rebuild the surface from it.
     fn openExistingSession(self: *Self, session_id: []const u8) !void {
+        // Copy before closeSession: restore passes the id loadMappedId
+        // allocated in the session arena, which closeSession frees.
+        const id_copy = try self.allocator.dupe(u8, session_id);
+        defer self.allocator.free(id_copy);
         self.closeSession();
         const arena = self.arena.allocator();
-        self.session_id = try arena.dupe(u8, session_id);
+        self.session_id = try arena.dupe(u8, id_copy);
         self.log = try session_store.openLog(self.allocator, self.opts.dsh_home, self.workspace(), self.session_id);
+        if (self.goal_store) |store| store.attachLog(&self.log.?);
+        if (self.todo) |ctx| ctx.log = &self.log.?;
 
         var read = session_log.readLog(self.allocator, self.log.?.path) catch |err| {
             if (self.opts.on_corrupt != .native) return err;
-            try self.openNewSession(null);
+            try self.startFresh();
             return;
         };
         defer read.deinit();
@@ -361,7 +550,15 @@ pub const DshNativeHarness = struct {
         for (read.events) |event| {
             if (std.mem.eql(u8, event.event_type, "permission/preset")) self.context_written = true;
         }
+        self.seedIds(read.events);
         try self.rebuildSurface(read.events, arena);
+        if (self.goal_store) |store| store.rebuild(read.events) catch |err| {
+            // Same policy as a corrupt log: a projection the log cannot
+            // replay starts a fresh session instead of wedging every open.
+            if (self.opts.on_corrupt != .native) return err;
+            try self.startFresh();
+            return;
+        };
         self.buildLoop();
         if (baseline) |header| {
             const loop = &self.loop.?;
@@ -401,6 +598,19 @@ pub const DshNativeHarness = struct {
         var fold = try surface_mod.fold(self.allocator, events);
         defer fold.deinit();
 
+        self.plan_session.* = try plan_mod.Session.replay(events);
+        // `UnitState.running.command_id` aliases the read arena; this fold
+        // must outlive it.
+        if (self.plan_session.state.running) |*running| {
+            running.command_id = try arena.dupe(u8, running.command_id);
+        }
+        self.permission_state = commands_mod.PermissionState.fold(events);
+        self.applyApprovalPolicy(self.permission_state.approval);
+        try self.buildPrompt();
+        self.compaction_lock = compaction_mod.scanLock(events);
+        self.surface_seqs.clearRetainingCapacity();
+        for (fold.nodes) |node| try self.surface_seqs.append(arena, node.seq);
+
         const messages = try arena.alloc(types.Message, fold.nodes.len);
         for (fold.nodes, 0..) |node, index| {
             messages[index] = try cloneMessage(arena, node.message);
@@ -427,6 +637,12 @@ pub const DshNativeHarness = struct {
             .system_messages = hostSystemMessages,
             .pre_step = hostPreStep,
             .serialize_message = hostSerializeMessage,
+            .compaction = .{
+                .context = @ptrCast(self),
+                .pressure = compactionPressure,
+                .overflow = compactionOverflow,
+                .max_overflow_retries = 1,
+            },
             .provider = .{
                 .context = @ptrCast(self),
                 .begin = providerBegin,
@@ -487,6 +703,51 @@ pub const DshNativeHarness = struct {
         return try arena.dupe(u8, loaded);
     }
 
+    /// Move the in-process counters past every id the restored log already
+    /// used, so a resumed session never mints a duplicate command, message,
+    /// compaction or approval id.
+    fn seedIds(self: *Self, events: []const types.Event) void {
+        for (events) |event| self.seedIdsFromValue(event.data);
+    }
+
+    fn seedIdsFromValue(self: *Self, value: std.json.Value) void {
+        switch (value) {
+            .object => |object| {
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    const key = entry.key_ptr.*;
+                    if (std.mem.eql(u8, key, "id") or
+                        std.mem.eql(u8, key, "commandId") or
+                        std.mem.eql(u8, key, "compactionId") or
+                        std.mem.eql(u8, key, "sourceCommandId"))
+                    {
+                        if (entry.value_ptr.* == .string) self.seedId(entry.value_ptr.string);
+                    }
+                    self.seedIdsFromValue(entry.value_ptr.*);
+                }
+            },
+            .array => |array| for (array.items) |item| self.seedIdsFromValue(item),
+            else => {},
+        }
+    }
+
+    fn seedId(self: *Self, id: []const u8) void {
+        const counters = [_]struct { prefix: []const u8, next: *u64 }{
+            .{ .prefix = "msg-", .next = &self.next_id },
+            .{ .prefix = "command-", .next = &self.next_id },
+            .{ .prefix = "compaction-checkpoint-", .next = &self.next_id },
+            .{ .prefix = "compaction-", .next = &self.next_id },
+            .{ .prefix = "approval-", .next = &self.approval.next_id },
+        };
+        for (counters) |counter| {
+            if (!std.mem.startsWith(u8, id, counter.prefix)) continue;
+            const number = std.fmt.parseInt(u64, id[counter.prefix.len..], 10) catch continue;
+            if (number == std.math.maxInt(u64)) return;
+            if (number >= counter.next.*) counter.next.* = number + 1;
+            return;
+        }
+    }
+
     /// `{session_dir}/{Wyhash(session_key)}.json`, the sidecar's format.
     fn mappingPath(self: *Self, allocator: Allocator) ![]u8 {
         const dir = self.opts.session_dir orelse return error.NoSessionDir;
@@ -542,6 +803,7 @@ pub const DshNativeHarness = struct {
         .reset = reset,
         .invalidatePrompt = invalidatePrompt,
         .info = info,
+        .handleLocalCommand = handleLocalCommand,
         .deinit = deinitVtable,
     };
 
@@ -563,14 +825,20 @@ pub const DshNativeHarness = struct {
         const arena = self.arena.allocator();
         self.in_turn = true;
         defer self.in_turn = false;
+        // A goal round is one kernel turn; never leak that authority forward.
+        defer {
+            if (self.goal_tools) |tools| tools.authority = .{};
+        }
         self.sink = input.sink;
         self.live_stream = input.live_stream;
         self.drain = input.drain;
         self.drain_ctx = input.drain_ctx;
+        self.interaction = input.interaction;
         defer {
             self.sink = null;
             self.drain = null;
             self.drain_ctx = null;
+            self.interaction = null;
         }
 
         self.turn_text.clearRetainingCapacity();
@@ -590,7 +858,25 @@ pub const DshNativeHarness = struct {
             self.context_written = true;
         }
 
-        const outcome = try loop.runTurn();
+        // Automatic goal continuation: after a completed turn, the driver
+        // reserves at most one `<goal_round>` followup and the kernel runs it
+        // as another turn in this session; terminal goal phases stop it.
+        var outcome = try loop.runTurn();
+        while (true) {
+            const reason = switch (outcome) {
+                .ended => |value| value,
+                .paused => return error.UnexpectedPause,
+            };
+            const continues = switch (reason) {
+                .completed => true,
+                else => false,
+            };
+            if (!continues) break;
+            const driver = if (self.goal_driver) |*value| value else break;
+            const continuation = (try driver.next(arena)) orelse break;
+            _ = try loop.followup(continuation);
+            outcome = try loop.runTurn();
+        }
         const reason = switch (outcome) {
             .ended => |value| value,
             .paused => return error.UnexpectedPause,
@@ -826,7 +1112,7 @@ pub const DshNativeHarness = struct {
         const text = try arena.dupe(u8, message.text);
         try data.put(arena, "message", try systemMessageValue(arena, id, text));
         const seq = try self.appendEvent("system/message", .{ .object = data }, .append, null);
-        try self.addSurfaceSnapshot(arena, .{
+        try self.addSurfaceSnapshot(arena, seq, .{
             .id = id,
             .role = .system,
             .content = try arena.dupe(types.ContentBlock, &.{.{ .text = text }}),
@@ -841,8 +1127,34 @@ pub const DshNativeHarness = struct {
         // dsh stores `user/message` with the message at the top level of
         // `data` (no inner `message` key); `surface.fold` reads it that way.
         const data = try parseValue(arena, message.json);
+        // Fold before logging: a goal round the projection rejects (stale
+        // revision, wrong phase) must not leave a user/message the log can
+        // never replay.
+        // Regression: logging first turned one rejected goal round into a
+        // session that failed every later open/restore with GoalInvalidChange.
+        if (self.goal_store) |store| {
+            try store.applyEvent(.{
+                .event_type = "user/message",
+                .seq = 0,
+                .time_ms = 0,
+                .data = data,
+            });
+        }
+        // Authority follows the admitted message, not the loop position: a
+        // goal followup queued before a pause can be admitted in a later
+        // human turn and must stay autonomous. Wrap-ups keep the open turn.
+        if (self.goal_tools) |tools| {
+            const kind = messageSourceKind(data);
+            if (std.mem.eql(u8, kind, "goal")) {
+                if (self.goal_store) |store| {
+                    tools.authority = .{ .direct_human = false, .goal_round = store.find() };
+                }
+            } else if (!std.mem.eql(u8, kind, "tool-goal")) {
+                tools.authority = .{};
+            }
+        }
         const seq = try self.appendEvent("user/message", data, .append, message.source_event_seqs);
-        try self.addSurfaceSnapshot(arena, try surface_mod.messageFromEvent(arena, .{
+        try self.addSurfaceSnapshot(arena, seq, try surface_mod.messageFromEvent(arena, .{
             .event_type = "user/message",
             .seq = seq,
             .time_ms = 0,
@@ -858,7 +1170,16 @@ pub const DshNativeHarness = struct {
         var data: std.json.ObjectMap = .empty;
         try data.put(arena, "header", try headerValue(arena, decision.header));
         try data.put(arena, "reason", .{ .string = headerReasonName(decision.reason) });
-        return self.appendEvent("request/header", .{ .object = data }, null, null);
+        const seq = try self.appendEvent("request/header", .{ .object = data }, null, null);
+        // The plan fold narrates a switch only when the last header described
+        // the other mode; dsh records the logged mode at each header.
+        try self.plan_session.foldEvent(.{
+            .event_type = "request/header",
+            .seq = seq,
+            .time_ms = 0,
+            .data = .{ .null = {} },
+        });
+        return seq;
     }
 
     fn appendAssistant(
@@ -888,7 +1209,7 @@ pub const DshNativeHarness = struct {
             if (text.len > 0) sink.send(.{ .assistant_message = .{ .text = text } });
         }
         // The kernel's accumulator arena dies at step end: copy first.
-        try self.addSurfaceSnapshot(arena, try cloneMessage(arena, settlement.message));
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, settlement.message));
         if (settlement.usage) |usage| {
             self.total_tokens += usage.input_tokens + usage.output_tokens;
             // The host's ledger wants one record per model call, like the
@@ -976,7 +1297,7 @@ pub const DshNativeHarness = struct {
         }
         const seqs = [1]u64{call.seq};
         const seq = try self.appendEvent("tool/result", .{ .object = data }, .append, &seqs);
-        try self.addSurfaceSnapshot(arena, try cloneMessage(arena, message));
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, message));
         if (self.sink) |sink| sink.send(.{ .tool_result = .{
             .call_id = call.call.id,
             .name = call.call.name,
@@ -988,8 +1309,9 @@ pub const DshNativeHarness = struct {
 
     /// Record one surface message in request order. The caller passes an
     /// arena-owned message; it is adopted, not copied.
-    fn addSurfaceSnapshot(self: *Self, arena: Allocator, message: types.Message) !void {
+    fn addSurfaceSnapshot(self: *Self, arena: Allocator, seq: u64, message: types.Message) !void {
         try self.messages.append(arena, message);
+        try self.surface_seqs.append(arena, seq);
     }
 
     fn forwardDelta(self: *Self, event: stream.Event) void {
@@ -1019,7 +1341,8 @@ pub const DshNativeHarness = struct {
         out: *std.ArrayListUnmanaged(loop_mod.SystemMessage),
     ) anyerror!void {
         const self = selfOf(context_ptr);
-        if (position.step != 1) return;
+        if (position.step != 1 and self.prompt_generation == self.emitted_prompt_generation) return;
+        self.emitted_prompt_generation = self.prompt_generation;
         const id = try std.fmt.allocPrint(allocator, "system-{d}", .{position.turn});
         try out.append(allocator, .{ .id = id, .text = self.system_prompt });
     }
@@ -1038,8 +1361,9 @@ pub const DshNativeHarness = struct {
         _ = try loop.inbox.steer(.{ .id = id, .data = data });
     }
 
-    /// `agent/pre-step`: this adapter returns no runtime-context extras and
-    /// never vetoes; steer is pumped at the preceding `step_end` instead.
+    /// `agent/pre-step`: commit a queued plan selection before the request
+    /// header is snapshotted, then hand the narration to this step. Never
+    /// vetoes; steer is pumped at the preceding `step_end` instead.
     fn hostPreStep(
         context_ptr: *anyopaque,
         allocator: Allocator,
@@ -1047,11 +1371,35 @@ pub const DshNativeHarness = struct {
         claimed: loop_mod.Claimed,
         out: *std.ArrayListUnmanaged(loop_mod.UserMessage),
     ) anyerror!loop_mod.PreStepDecision {
-        _ = context_ptr;
-        _ = allocator;
         _ = position;
         _ = claimed;
-        _ = out;
+        const self = selfOf(context_ptr);
+        // dsh checks `signal.aborted` before committing a queued selection; the
+        // kernel's own check runs after this callback, so an abort that lands
+        // just before the step opens must not switch plan mode.
+        if (self.loop) |*loop| {
+            if (loop.isAborted()) return .{};
+        }
+        const boundary = self.plan_session.preStep();
+        if (boundary.emit) |active| {
+            var data: std.json.ObjectMap = .empty;
+            try data.put(allocator, "active", .{ .bool = active });
+            _ = try self.appendEvent("plan/mode", .{ .object = data }, null, null);
+            try self.plan_session.foldEvent(.{
+                .event_type = "plan/mode",
+                .seq = 0,
+                .time_ms = 0,
+                .data = .{ .object = data },
+            });
+            self.plan_session.pendingCommitted();
+        }
+        if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
+        if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
+        if (boundary.narration) |text| {
+            const id = try self.nextMessageId();
+            const json = try planNarrationJson(allocator, id, text);
+            try out.append(allocator, .{ .json = json });
+        }
         return .{};
     }
 
@@ -1082,7 +1430,7 @@ pub const DshNativeHarness = struct {
             .model = self.opts.model,
             .temperature = self.opts.temperature,
             .max_tokens = self.opts.max_tokens,
-            .tools = self.tool_specs,
+            .tools = self.planCatalogSpecs(),
             .reasoning_effort = self.opts.reasoning_effort,
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
         };
@@ -1112,6 +1460,7 @@ pub const DshNativeHarness = struct {
             .completion_tokens = response.usage.completion_tokens,
             .total_tokens = response.usage.total_tokens,
         };
+        self.last_usage = stream.normalizeUsage(usage);
         const finish: stream.Finish = if (response.tool_calls.len > 0)
             .tool_calls
         else if (response.truncated)
@@ -1138,7 +1487,9 @@ pub const DshNativeHarness = struct {
     }
 
     fn cancelCall(self: *Self) void {
-        self.pending.clearRetainingCapacity();
+        // The buffer lives in `call_arena`; drop it before the arena resets
+        // (clearRetainingCapacity would keep a dangling capacity).
+        self.pending = .empty;
         self.pending_index = 0;
         _ = self.call_arena.reset(.retain_capacity);
     }
@@ -1280,7 +1631,757 @@ pub const DshNativeHarness = struct {
         const self = selfOf(context_ptr);
         if (signal.isAborted()) return error.Aborted;
         if (self.interrupt) return error.Aborted;
-        return execute.execute(&self.registry, allocator, call);
+        return execute.executeWithGate(&self.registry, allocator, call, self.gate());
+    }
+
+    // ── approval / questions / commands / compaction wiring ────────────────
+
+    fn questionOptions(self: *const Self) questions_mod.Options {
+        return .{
+            .timeout_s = self.opts.question_timeout_s,
+            .now_ms = self.opts.now_ms,
+            .clock_context = self.opts.clock_context,
+        };
+    }
+
+    fn sandboxMode(self: *const Self) context.SandboxMode {
+        return self.permission_state.sandbox orelse switch (self.opts.sandbox) {
+            .read_only => .read_only,
+            .workspace_write => .workspace_write,
+            .danger_full_access => .danger_full_access,
+        };
+    }
+
+    fn approvalPolicy(self: *const Self) context.ApprovalPolicy {
+        return switch (self.approval.options.policy) {
+            .ask => .ask,
+            .never => .never,
+        };
+    }
+
+    /// Point the approval service at the folded policy (else the composition
+    /// default); `gateDecide` reads the service, not the log.
+    fn applyApprovalPolicy(self: *Self, folded: ?commands_mod.ApprovalPolicy) void {
+        self.approval.options.policy = if (folded) |value|
+            switch (value) {
+                .ask => .ask,
+                .never => .never,
+            }
+        else switch (self.opts.approval_policy) {
+            .ask => .ask,
+            .never => .never,
+        };
+    }
+
+    fn gate(self: *Self) execute.Gate {
+        return .{ .context = @ptrCast(self), .decide = gateDecide };
+    }
+
+    /// dsh `tools/pre-execute` ask (B24): only a sandbox-escalation call is
+    /// gated, so ordinary P1 tool calls keep their fixture behaviour. The same
+    /// hook binds the current call identity into `ask_user_question`.
+    fn gateDecide(
+        context_ptr: *anyopaque,
+        allocator: Allocator,
+        call: types.ToolCall,
+        args: Value,
+    ) anyerror!?[]const u8 {
+        const self = selfOf(context_ptr);
+        if (self.ask_user) |ask| {
+            ask.call_id = call.id;
+            ask.interaction = self.interaction;
+            ask.options = self.questionOptions();
+        }
+        if (self.exit_plan) |exit| exit.interaction = self.interaction;
+        const object = switch (args) {
+            .object => |value| value,
+            else => return null,
+        };
+        const escalation = object.get("sandbox_permissions") orelse return null;
+        switch (escalation) {
+            .string => |mode| if (mode.len == 0) return null,
+            else => return null,
+        }
+        const reason = switch (object.get("justification") orelse Value{ .null = {} }) {
+            .string => |text| text,
+            else => "",
+        };
+        var decision = try self.approval.request(allocator, self.interaction, .{
+            .tool_name = call.name,
+            .call_id = call.id,
+            .reason = if (reason.len == 0) null else reason,
+        });
+        defer decision.deinit();
+        try approval_mod.assertPaired(&decision.events);
+        for (decision.events) |event| {
+            const json = try approval_mod.dataJsonAlloc(event, allocator);
+            const data = try parseValue(allocator, json);
+            _ = try self.appendEvent(switch (event) {
+                .asked => "approval/asked",
+                .decided => "approval/decided",
+            }, data, null, null);
+        }
+        const denial = decision.denial_reason orelse return null;
+        return try allocator.dupe(u8, denial);
+    }
+
+    /// Claim a builtin command (`commands.zig`) and append its events; null
+    /// lets the host run its own slash commands.
+    fn handleLocalCommand(ptr: *anyopaque, content: []const u8) anyerror!?[]const u8 {
+        const self: *Self = @ptrCast(@alignCast(ptr));
+        const log = if (self.log) |*value| value else return null;
+        const arena = self.arena.allocator();
+        const command_id = try std.fmt.allocPrint(arena, "command-{d}", .{self.next_id});
+        self.next_id += 1;
+        var result = try commands_mod.handleLocalCommand(arena, content, .{
+            .command_id = command_id,
+            .next_seq = log.next_seq,
+            .session_id = self.session_id,
+            .permissions = self.permission_state,
+            .permission_defaults = .{
+                .sandbox = self.sandboxMode(),
+                .approval = self.approvalPolicy(),
+            },
+            .compaction = .{ .context = @ptrCast(self), .call = compactSeam },
+            .goal = .{ .context = @ptrCast(self), .call = goalSeam },
+            .plan = self.plan_session.view(self.in_turn),
+        }) orelse return null;
+        defer result.deinit();
+
+        const seqs = try arena.alloc(u64, result.events.len);
+        for (result.events, 0..) |event, index| {
+            seqs[index] = try self.appendEvent(event.event_type, event.data, event.surface_op, event.source_event_seqs);
+        }
+        try self.applyPermissionEvents(result.events);
+        try self.applyManualCompaction(result.events, seqs);
+        if (result.plan_decision) |decision| try self.applyPlanDecision(decision, result.events);
+        return try arena.dupe(u8, result.text);
+    }
+
+    /// The mode the next request assembly uses: a queued selection wins over
+    /// the logged mode (dsh reads `pending?.active ?? active`).
+    fn planActive(self: *const Self) bool {
+        return if (self.plan_session.pending) |pending| pending.active else self.plan_session.state.active;
+    }
+
+    fn planCatalogSchemas(self: *const Self) []const request.ToolSchema {
+        return if (self.planActive()) self.plan_tool_schemas else self.tool_schemas;
+    }
+
+    fn planCatalogSpecs(self: *const Self) []const providers.ToolSpec {
+        return if (self.planActive()) self.plan_tool_specs else self.tool_specs;
+    }
+
+    /// `/plan` settlement: fold the command lifecycle and mode, inject the
+    /// narration the command decided on, and republish the prompt and catalog.
+    fn applyPlanDecision(self: *Self, decision: plan_mod.Decision, events: []const types.Event) !void {
+        self.plan_session.applyDecision(decision);
+        for (events) |event| try self.plan_session.foldEvent(event);
+        if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
+        if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
+        const narration = decision.narration orelse return;
+        const id = try self.nextMessageId();
+        const json = try planNarrationJson(self.arena.allocator(), id, narration);
+        if (self.loop) |*loop| _ = try loop.inject(.{ .id = id, .data = json });
+    }
+
+    /// dsh plan-mode narration user message (`source.kind="plan-mode"`).
+    fn planNarrationJson(allocator: Allocator, id: []const u8, text: []const u8) ![]u8 {
+        var writer: Writer.Allocating = .init(allocator);
+        defer writer.deinit();
+        const w = &writer.writer;
+        try w.writeAll("{\"content\":[{\"type\":\"text\",\"text\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeAll("}],\"source\":{\"kind\":\"plan-mode\",\"form\":\"notice\",\"summary\":");
+        try std.json.Stringify.value(text, .{}, w);
+        try w.writeAll("},\"role\":\"user\",\"id\":");
+        try std.json.Stringify.value(id, .{}, w);
+        try w.writeByte('}');
+        return writer.toOwnedSlice();
+    }
+
+    /// Run the human `/goal` command on the live goal projection; the
+    /// command module owns the lifecycle and appends the returned
+    /// `goal/change` events between `command/run` and `command/done`.
+    fn goalSeam(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        raw_input: []const u8,
+    ) anyerror!commands_mod.GoalOutcome {
+        const self = selfOf(context_ptr.?);
+        const store = self.goal_store orelse
+            return .{ .kind = .@"error", .text = "The /goal command is unavailable." };
+        var command = goal_command_mod.Goal{ .store = store };
+        const outcome = try command.executeCaptured(allocator, raw_input);
+        return .{
+            .kind = switch (outcome.result.kind) {
+                .success => .success,
+                .failure => .@"error",
+            },
+            .text = outcome.result.text,
+            .events = outcome.events,
+        };
+    }
+
+    /// Fold one command's permission events into the live knobs and re-render
+    /// the prompt when the model-visible context changed.
+    fn applyPermissionEvents(self: *Self, events: []const types.Event) !void {
+        const delta = commands_mod.PermissionState.fold(events);
+        if (delta.preset) |preset| self.permission_state.preset = preset;
+        if (delta.sandbox) |sandbox| self.permission_state.sandbox = sandbox;
+        if (delta.approval) |approval| self.permission_state.approval = approval;
+        if (delta.sandbox == null and delta.approval == null) return;
+        self.applyApprovalPolicy(self.permission_state.approval);
+        try self.buildPrompt();
+    }
+
+    /// Apply the four events a `/compact` seam returned after the command
+    /// module's lifecycle has been appended (`command/run` prepends the
+    /// transaction, so locate it by type rather than a fixed offset).
+    fn applyManualCompaction(self: *Self, events: []const types.Event, seqs: []const u64) !void {
+        if (seqs.len != events.len) return error.InvalidCompactionEvents;
+        var start: usize = 0;
+        while (start + 3 < events.len) : (start += 1) {
+            if (std.mem.eql(u8, events[start].event_type, "compaction/start")) break;
+        }
+        if (start + 3 >= events.len) return;
+        if (!std.mem.eql(u8, events[start + 1].event_type, "compaction/summary") or
+            !std.mem.eql(u8, events[start + 2].event_type, "user/message") or
+            !std.mem.eql(u8, events[start + 3].event_type, "compaction/end")) return;
+
+        const arena = self.arena.allocator();
+        const summary_data = switch (events[start + 1].data) {
+            .object => |value| value,
+            else => return error.InvalidCompactionEvents,
+        };
+        const range = switch (summary_data.get("shadowedRange") orelse return error.InvalidCompactionEvents) {
+            .object => |value| value,
+            else => return error.InvalidCompactionEvents,
+        };
+        const start_seq = switch (range.get("start") orelse return error.InvalidCompactionEvents) {
+            .integer => |value| @as(u64, @intCast(value)),
+            else => return error.InvalidCompactionEvents,
+        };
+        const shadowed = switch (summary_data.get("shadowedSeqs") orelse return error.InvalidCompactionEvents) {
+            .array => |value| value,
+            else => return error.InvalidCompactionEvents,
+        };
+        const first_idx = indexOfSeq(self.surface_seqs.items, start_seq) orelse
+            return error.SurfaceSeqMismatch;
+        if (shadowed.items.len > self.messages.items.len - first_idx)
+            return error.InvalidCompactionEvents;
+
+        const message = try surface_mod.messageFromEvent(arena, events[start + 2]);
+        const new_len = self.messages.items.len - shadowed.items.len;
+        std.mem.copyForwards(
+            types.Message,
+            self.messages.items[first_idx..new_len],
+            self.messages.items[first_idx + shadowed.items.len ..],
+        );
+        self.messages.shrinkRetainingCapacity(new_len);
+        try self.messages.insert(arena, first_idx, message);
+
+        std.mem.copyForwards(
+            u64,
+            self.surface_seqs.items[first_idx..new_len],
+            self.surface_seqs.items[first_idx + shadowed.items.len ..],
+        );
+        self.surface_seqs.shrinkRetainingCapacity(new_len);
+        try self.surface_seqs.insert(arena, first_idx, seqs[start + 2]);
+        self.last_usage = null;
+        self.compaction_lock = .{};
+    }
+
+    fn compactionPolicy(self: *const Self) compaction_mod.Options {
+        var options = compaction_mod.Options{};
+        if (self.opts.compaction_threshold_ratio) |value| options.threshold_ratio = value;
+        if (self.opts.compaction_retain_ratio) |value| options.retain_ratio = value;
+        if (self.opts.compaction_headroom_tokens) |value| options.headroom_tokens = value;
+        options.workspace_substitution = self.workspaceSubstitution();
+        return options;
+    }
+
+    fn surfaceNodes(self: *const Self, allocator: Allocator) ![]compaction_mod.Node {
+        if (self.messages.items.len != self.surface_seqs.items.len) return error.SurfaceSeqMismatch;
+        const nodes = try allocator.alloc(compaction_mod.Node, self.messages.items.len);
+        for (self.messages.items, self.surface_seqs.items, 0..) |message, seq, index| {
+            nodes[index] = .{ .seq = seq, .message = message };
+        }
+        return nodes;
+    }
+
+    fn reservedCompletionTokens(self: *const Self) u64 {
+        return self.opts.max_tokens orelse 0;
+    }
+
+    /// Fixed kernel hook (`agent/pre-step`): measure, then compact at or above
+    /// dsh's threshold. Misconfigured pressure specs leave the turn running;
+    /// config validation rejects them at load.
+    fn compactionPressure(context_ptr: *anyopaque, allocator: Allocator, position: loop_mod.Position) anyerror!bool {
+        const self = selfOf(context_ptr);
+        if (self.opts.context_window == 0) return false;
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        const nodes = self.surfaceNodes(tmp.allocator()) catch |err| switch (err) {
+            error.SurfaceSeqMismatch => return false,
+            else => return err,
+        };
+        const probe = compaction_mod.check(
+            tmp.allocator(),
+            nodes,
+            self.compactionPolicy(),
+            self.opts.context_window,
+            self.reservedCompletionTokens(),
+            self.last_usage,
+        ) catch |err| switch (err) {
+            error.InvalidContextWindow,
+            error.NoMessageBudget,
+            error.NoPressureBudget,
+            error.InvalidThresholdRatio,
+            error.InvalidRetainRatio,
+            error.RetainNotBelowThreshold,
+            => return false,
+            else => return err,
+        };
+        if (!probe.pressured) return false;
+        return self.compactAuto(allocator, .pressure, position.turn);
+    }
+
+    /// Fixed kernel hook (`agent/request-error`): one forced compaction so the
+    /// kernel can retry the overflowed request.
+    fn compactionOverflow(context_ptr: *anyopaque, allocator: Allocator, position: loop_mod.Position) anyerror!bool {
+        const self = selfOf(context_ptr);
+        return self.compactAuto(allocator, .context_overflow, position.turn);
+    }
+
+    const CompactRun = union(enum) {
+        result: compaction_mod.Result,
+        /// Summarization began (dsh's `compaction/start` would be durable) and
+        /// failed; `events` is the start/end{error} pair to record.
+        failed: struct {
+            events: []const compaction_mod.Event,
+            err: anyerror,
+        },
+    };
+
+    fn compactAuto(self: *Self, allocator: Allocator, trigger: compaction_mod.Trigger, turn: u64) anyerror!bool {
+        var run = self.compactRun(allocator, trigger, turn) catch |err| switch (err) {
+            error.CompactionLocked => return false,
+            else => return err,
+        };
+        switch (run) {
+            .failed => |failure| {
+                try self.appendCompactionFailure(self.arena.allocator(), failure.events, null);
+                return failure.err;
+            },
+            .result => |*result| {
+                defer result.deinit();
+                if (result.events.len == 0 and result.pruned.len == 0) return false;
+                try self.commitCompaction(result.*, null);
+                return true;
+            },
+        }
+    }
+
+    fn compactRun(
+        self: *Self,
+        allocator: Allocator,
+        trigger: compaction_mod.Trigger,
+        turn: ?u64,
+    ) !CompactRun {
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        const nodes = try self.surfaceNodes(tmp.allocator());
+        const compaction_id = try std.fmt.allocPrint(allocator, "compaction-{d}", .{self.next_id});
+        self.next_id += 1;
+        const replacement_id = try std.fmt.allocPrint(allocator, "compaction-checkpoint-{d}", .{self.next_id});
+        self.next_id += 1;
+        var started = false;
+        const result = compaction_mod.run(allocator, nodes, .{
+            .context_window = self.opts.context_window,
+            .policy = self.compactionPolicy(),
+            .reserved_completion_tokens = self.reservedCompletionTokens(),
+            .provider_usage = self.last_usage,
+            .trigger = trigger,
+            .recovery = self.compaction_lock,
+            .compaction_id = compaction_id,
+            .replacement_message_id = replacement_id,
+            .turn = turn,
+            .tools = self.tool_schemas,
+            .started = &started,
+        }, .{ .context = @ptrCast(self), .call = summarizeCompaction }) catch |err| {
+            // Before the summarizer ran dsh has written no `compaction/start`.
+            if (!started or err == error.OutOfMemory) return err;
+            const events = try compaction_mod.failureEvents(allocator, compaction_id, turn, @errorName(err));
+            return .{ .failed = .{ .events = events, .err = err } };
+        };
+        return .{ .result = result };
+    }
+
+    /// dsh's cache-reusing auxiliary call (`summarizer.ts:120-170`): replay the
+    /// selected prefix plus the instruction, with the routed model's tools.
+    fn summarizeCompaction(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        input: compaction_mod.SummaryInput,
+    ) anyerror!compaction_mod.SummaryOutput {
+        const self = selfOf(context_ptr.?);
+        const messages = try requestsFromMessages(allocator, input.messages);
+        const chat = providers.ChatRequest{
+            .messages = messages,
+            .model = self.opts.model,
+            .temperature = self.opts.temperature,
+            .max_tokens = self.opts.max_tokens,
+            .tools = self.tool_specs,
+            .reasoning_effort = self.opts.reasoning_effort,
+            .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
+        };
+        const response = try self.opts.provider.chatWithTools(allocator, chat);
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = try allocator.dupe(u8, response.content orelse "") };
+        const usage: ?types.Usage = if (response.usage.prompt_tokens == 0 and
+            response.usage.completion_tokens == 0 and response.usage.total_tokens == 0)
+            null
+        else
+            stream.normalizeUsage(.{
+                .prompt_tokens = response.usage.prompt_tokens,
+                .completion_tokens = response.usage.completion_tokens,
+                .total_tokens = response.usage.total_tokens,
+            });
+        return .{
+            .blocks = blocks,
+            .provider = self.opts.provider_name,
+            .model = self.opts.model,
+            .max_tokens = self.opts.max_tokens,
+            .usage = usage,
+        };
+    }
+
+    /// Log the prune pass and the four adjacent compaction events, then rewrite
+    /// the in-memory surface (and drop the usage anchor).
+    fn commitCompaction(self: *Self, result: compaction_mod.Result, command_id: ?[]const u8) !void {
+        const arena = self.arena.allocator();
+        // dsh appends the pruner's replacements before selecting the summary
+        // range, so a node shadowed by both keeps the replacement's seq in the
+        // summary and checkpoint records.
+        var remap: std.AutoHashMapUnmanaged(u64, u64) = .empty;
+        defer remap.deinit(arena);
+
+        for (result.pruned) |pruned| {
+            const index = indexOfSeq(self.surface_seqs.items, pruned.seq) orelse continue;
+            const tokens = token_meter.estimateMessageWithWorkspace(
+                arena,
+                self.messages.items[index],
+                self.workspaceSubstitution(),
+            ) catch 0;
+            var prune_data: std.json.ObjectMap = .empty;
+            var range: std.json.ObjectMap = .empty;
+            try range.put(arena, "start", .{ .integer = @intCast(pruned.seq) });
+            try range.put(arena, "end", .{ .integer = @intCast(pruned.seq) });
+            try prune_data.put(arena, "shadowedRange", .{ .object = range });
+            try prune_data.put(arena, "shadowedSeqs", try seqArrayValue(arena, &.{pruned.seq}));
+            try prune_data.put(arena, "shadowedTokenCount", .{ .integer = @intCast(tokens) });
+            _ = try self.appendEvent("compaction/prune", .{ .object = prune_data }, null, null);
+
+            var data: std.json.ObjectMap = .empty;
+            const replacement = try cloneMessage(arena, pruned.message);
+            try data.put(arena, "message", try messageValue(arena, replacement));
+            const seq = try self.appendEvent("tool/result", .{ .object = data }, .{
+                .replace = .{ .start_seq = pruned.seq, .end_seq = pruned.seq },
+            }, try arena.dupe(u64, &.{pruned.seq}));
+            try remap.put(arena, pruned.seq, seq);
+            self.messages.items[index] = replacement;
+            self.surface_seqs.items[index] = seq;
+        }
+
+        if (result.events.len == 4) {
+            try compaction_mod.assertAdjacent(result.events);
+            const summary = switch (result.events[1]) {
+                .summary => |value| value,
+                else => return error.CompactionEventsNotAdjacent,
+            };
+            const mapped_seqs = try arena.alloc(u64, summary.shadowed_seqs.len);
+            for (summary.shadowed_seqs, 0..) |seq, index| {
+                mapped_seqs[index] = remap.get(seq) orelse seq;
+            }
+            const shadowed = CompactionShadowed{
+                .start_seq = remap.get(summary.shadowed_start_seq) orelse summary.shadowed_start_seq,
+                .end_seq = remap.get(summary.shadowed_end_seq) orelse summary.shadowed_end_seq,
+                .seqs = mapped_seqs,
+            };
+            const first_idx = indexOfSeq(self.surface_seqs.items, shadowed.start_seq) orelse
+                return error.SurfaceSeqMismatch;
+
+            const events = try self.buildCompactionEvents(arena, result, command_id, shadowed, null);
+            const start_seq = try self.appendEvent(events[0].event_type, events[0].data, events[0].surface_op, events[0].source_event_seqs);
+            const summary_seq = try self.appendEvent(events[1].event_type, events[1].data, events[1].surface_op, events[1].source_event_seqs);
+            // dsh records `[startEvent.seq, summaryEvent.seq, ...shadowedSeqs]`.
+            const source_seqs = try arena.alloc(u64, 2 + shadowed.seqs.len);
+            source_seqs[0] = start_seq;
+            source_seqs[1] = summary_seq;
+            @memcpy(source_seqs[2..], shadowed.seqs);
+            events[2].source_event_seqs = source_seqs;
+            const replacement_seq = try self.appendEvent(events[2].event_type, events[2].data, events[2].surface_op, events[2].source_event_seqs);
+            _ = try self.appendEvent(events[3].event_type, events[3].data, events[3].surface_op, events[3].source_event_seqs);
+
+            const replacement = switch (result.events[2]) {
+                .replacement => |value| value,
+                else => return error.CompactionEventsNotAdjacent,
+            };
+            var message = try cloneMessage(arena, replacement.message);
+            message = try compactionReplacementMessage(arena, message, command_id);
+            const idx = first_idx;
+            const new_len = self.messages.items.len - shadowed.seqs.len;
+            std.mem.copyForwards(
+                types.Message,
+                self.messages.items[idx..new_len],
+                self.messages.items[idx + shadowed.seqs.len ..],
+            );
+            self.messages.shrinkRetainingCapacity(new_len);
+            try self.messages.insert(arena, idx, message);
+
+            std.mem.copyForwards(
+                u64,
+                self.surface_seqs.items[idx..new_len],
+                self.surface_seqs.items[idx + shadowed.seqs.len ..],
+            );
+            self.surface_seqs.shrinkRetainingCapacity(new_len);
+            try self.surface_seqs.insert(arena, idx, replacement_seq);
+        }
+        self.last_usage = null;
+        self.compaction_lock = .{};
+    }
+
+    /// Surface seqs used by the summary and checkpoint records. They differ
+    /// from `result.events` when the pruner replaced a shadowed node first.
+    const CompactionShadowed = struct {
+        start_seq: u64,
+        end_seq: u64,
+        seqs: []const u64,
+    };
+
+    fn buildCompactionEvents(
+        self: *Self,
+        allocator: Allocator,
+        result: compaction_mod.Result,
+        command_id: ?[]const u8,
+        shadowed: CompactionShadowed,
+        source_prefix: ?[]const u64,
+    ) ![]types.Event {
+        _ = self;
+        const start = switch (result.events[0]) {
+            .start => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const summary = switch (result.events[1]) {
+            .summary => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const replacement = switch (result.events[2]) {
+            .replacement => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const end = switch (result.events[3]) {
+            .end => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+
+        const events = try allocator.alloc(types.Event, 4);
+        events[0] = .{
+            .event_type = "compaction/start",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, start.compaction_id, start.turn, command_id, null),
+        };
+        events[1] = .{
+            .event_type = "compaction/summary",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionSummaryData(allocator, summary, command_id, shadowed),
+        };
+        const message = try compactionReplacementMessage(allocator, replacement.message, command_id);
+        var source_seqs: []const u64 = shadowed.seqs;
+        if (source_prefix) |prefix| {
+            const combined = try allocator.alloc(u64, prefix.len + shadowed.seqs.len);
+            @memcpy(combined[0..prefix.len], prefix);
+            @memcpy(combined[prefix.len..], shadowed.seqs);
+            source_seqs = combined;
+        }
+        events[2] = .{
+            .event_type = "user/message",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try messageValue(allocator, message),
+            .surface_op = .{ .replace = .{
+                .start_seq = shadowed.start_seq,
+                .end_seq = shadowed.end_seq,
+            } },
+            .source_event_seqs = source_seqs,
+        };
+        events[3] = .{
+            .event_type = "compaction/end",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, end.compaction_id, end.turn, command_id, end.failure),
+        };
+        return events;
+    }
+
+    /// The two log rows of a failed transaction, in log order.
+    fn buildCompactionFailureEvents(
+        self: *Self,
+        allocator: Allocator,
+        events: []const compaction_mod.Event,
+        command_id: ?[]const u8,
+    ) ![]types.Event {
+        _ = self;
+        if (events.len != 2) return error.CompactionEventsNotAdjacent;
+        const start = switch (events[0]) {
+            .start => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const end = switch (events[1]) {
+            .end => |value| value,
+            else => return error.CompactionEventsNotAdjacent,
+        };
+        const out = try allocator.alloc(types.Event, 2);
+        out[0] = .{
+            .event_type = "compaction/start",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, start.compaction_id, start.turn, command_id, null),
+        };
+        out[1] = .{
+            .event_type = "compaction/end",
+            .seq = 0,
+            .time_ms = 0,
+            .data = try compactionEdgeData(allocator, end.compaction_id, end.turn, command_id, end.failure),
+        };
+        return out;
+    }
+
+    fn appendCompactionFailure(
+        self: *Self,
+        allocator: Allocator,
+        events: []const compaction_mod.Event,
+        command_id: ?[]const u8,
+    ) !void {
+        const rows = try self.buildCompactionFailureEvents(allocator, events, command_id);
+        for (rows) |row| _ = try self.appendEvent(row.event_type, row.data, null, null);
+    }
+
+    fn compactionEdgeData(
+        allocator: Allocator,
+        compaction_id: []const u8,
+        turn: ?u64,
+        command_id: ?[]const u8,
+        failure: ?[]const u8,
+    ) !Value {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(allocator, "compactionId", .{ .string = compaction_id });
+        if (command_id) |value| try object.put(allocator, "sourceCommandId", .{ .string = value });
+        if (failure) |value| try object.put(allocator, "error", .{ .string = value });
+        try object.put(allocator, "turn", if (turn) |value|
+            Value{ .integer = @intCast(value) }
+        else
+            Value{ .null = {} });
+        return .{ .object = object };
+    }
+
+    fn compactionSummaryData(
+        allocator: Allocator,
+        summary: compaction_mod.SummaryEvent,
+        command_id: ?[]const u8,
+        shadowed: CompactionShadowed,
+    ) !Value {
+        var object: std.json.ObjectMap = .empty;
+        try object.put(allocator, "compactionId", .{ .string = summary.compaction_id });
+        if (command_id) |value| try object.put(allocator, "sourceCommandId", .{ .string = value });
+        try object.put(allocator, "summary", try contentValue(allocator, summary.summary));
+        try object.put(allocator, "rawOutput", try contentValue(allocator, summary.raw_output));
+        try object.put(allocator, "llmStreamCall", .{ .bool = true });
+        var range: std.json.ObjectMap = .empty;
+        try range.put(allocator, "start", .{ .integer = @intCast(shadowed.start_seq) });
+        try range.put(allocator, "end", .{ .integer = @intCast(shadowed.end_seq) });
+        try object.put(allocator, "shadowedRange", .{ .object = range });
+        try object.put(allocator, "shadowedSeqs", try seqArrayValue(allocator, shadowed.seqs));
+        try object.put(allocator, "shadowedTokenCount", .{ .integer = @intCast(summary.shadowed_token_count) });
+        try object.put(allocator, "provider", .{ .string = summary.provider });
+        try object.put(allocator, "model", .{ .string = summary.model });
+        if (summary.max_tokens) |value| try object.put(allocator, "maxTokens", .{ .integer = @intCast(value) });
+        if (summary.usage) |usage| try object.put(allocator, "usage", try usageValue(allocator, usage));
+        return .{ .object = object };
+    }
+
+    fn compactionReplacementMessage(
+        allocator: Allocator,
+        message: types.Message,
+        command_id: ?[]const u8,
+    ) !types.Message {
+        var out = message;
+        if (command_id) |id| switch (out.source) {
+            .other => |*value| switch (value.*) {
+                .object => |*object| try object.put(allocator, "sourceCommandId", .{ .string = id }),
+                else => {},
+            },
+            else => {},
+        };
+        return out;
+    }
+
+    fn seqArrayValue(allocator: Allocator, seqs: []const u64) !Value {
+        var array = std.json.Array.init(allocator);
+        try array.ensureTotalCapacity(seqs.len);
+        for (seqs) |seq| array.appendAssumeCapacity(.{ .integer = @intCast(seq) });
+        return .{ .array = array };
+    }
+
+    fn compactSeam(
+        context_ptr: ?*anyopaque,
+        allocator: Allocator,
+        command: commands_mod.CompactRequest,
+    ) anyerror!commands_mod.CompactOutcome {
+        const self = selfOf(context_ptr.?);
+        var run = self.compactRun(allocator, .manual, null) catch |err| switch (err) {
+            error.CompactionLocked => return .{ .failed = .{ .failure = .busy } },
+            error.OutOfMemory => return err,
+            else => return .{ .failed = .{ .failure = .summary } },
+        };
+        switch (run) {
+            .failed => |failure| return .{ .failed = .{
+                .failure = .summary,
+                .events = try self.buildCompactionFailureEvents(allocator, failure.events, command.command_id),
+            } },
+            .result => |*result| {
+                defer result.deinit();
+                if (result.events.len == 0) return .no_history;
+                try compaction_mod.assertAdjacent(result.events);
+                const summary = switch (result.events[1]) {
+                    .summary => |value| value,
+                    else => return error.CompactionEventsNotAdjacent,
+                };
+                // Domain events follow `command/run`; dsh's checkpoint records the
+                // start and summary seqs before the shadowed range.
+                const prefix: ?[]const u64 = if (command.next_seq) |first| blk: {
+                    const head = try allocator.alloc(u64, 2);
+                    head[0] = first + 1;
+                    head[1] = first + 2;
+                    break :blk head;
+                } else null;
+                const events = try self.buildCompactionEvents(allocator, result.*, command.command_id, .{
+                    .start_seq = summary.shadowed_start_seq,
+                    .end_seq = summary.shadowed_end_seq,
+                    .seqs = summary.shadowed_seqs,
+                }, prefix);
+                for (events) |*event| event.data = try cloneValue(allocator, event.data);
+                return .{ .compacted = .{
+                    .events = events,
+                    .shadowed_item_count = summary.shadowed_seqs.len,
+                    .shadowed_token_count = summary.shadowed_token_count,
+                    .summary_event_index = 1,
+                } };
+            },
+        }
     }
 
     fn toolOutputText(allocator: Allocator, result: registry.ToolResult) ![]const u8 {
@@ -1525,6 +2626,18 @@ pub const DshNativeHarness = struct {
             try config.put(allocator, "maxTokens", .{ .integer = @intCast(max_tokens) });
         }
         try object.put(allocator, "config", .{ .object = config });
+        if (header.tools) |tools| {
+            var array = std.json.Array.init(allocator);
+            try array.ensureTotalCapacity(tools.len);
+            for (tools) |tool| {
+                var tool_object: std.json.ObjectMap = .empty;
+                try tool_object.put(allocator, "name", .{ .string = tool.name });
+                try tool_object.put(allocator, "description", .{ .string = tool.description });
+                try tool_object.put(allocator, "parameters", try parseValue(allocator, tool.parameters_json));
+                array.appendAssumeCapacity(.{ .object = tool_object });
+            }
+            try object.put(allocator, "tools", .{ .array = array });
+        }
         return .{ .object = object };
     }
 
@@ -1552,10 +2665,137 @@ pub const DshNativeHarness = struct {
     }
 };
 
+/// `source.kind` of a logged message, or "" when absent.
+fn messageSourceKind(data: Value) []const u8 {
+    const object = switch (data) {
+        .object => |value| value,
+        else => return "",
+    };
+    const source = switch (object.get("source") orelse return "") {
+        .object => |value| value,
+        else => return "",
+    };
+    return switch (source.get("kind") orelse return "") {
+        .string => |value| value,
+        else => return "",
+    };
+}
+
+fn indexOfSeq(seqs: []const u64, seq: u64) ?usize {
+    for (seqs, 0..) |value, index| {
+        if (value == seq) return index;
+    }
+    return null;
+}
+
 /// A v4 session id: 32 lowercase hex characters from a CSPRNG.
 fn newSessionId(allocator: Allocator) ![]u8 {
     var bytes: [16]u8 = undefined;
     compat.crypto.random.bytes(&bytes);
     const hex = std.fmt.bytesToHex(bytes, .lower);
     return allocator.dupe(u8, &hex);
+}
+
+test "dsh-native harness: a rejected goal round never reaches the log" {
+    // Regression: user/message was logged before `goal.Store` folded it, so a
+    // stale goal round left a record every later open/restore failed to replay.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(dsh_home);
+    try fs_compat.makePath(dsh_home);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace);
+    try fs_compat.makePath(workspace);
+
+    // The provider is unused: this drives the host emit path directly.
+    var engine = try DshNativeHarness.init(allocator, .{
+        .session_key = "test-session-key",
+        .dsh_home = dsh_home,
+        .workspace_dir = workspace,
+        .provider = undefined,
+        .provider_name = "",
+        .model = "",
+    });
+    defer engine.deinit(allocator);
+    engine.log = try session_store.createLog(allocator, dsh_home, workspace, "test-session", .{
+        .id = "test-session",
+        .created_at = 0,
+        .cwd = workspace,
+    });
+    engine.goal_store.?.attachLog(&engine.log.?);
+
+    const store = engine.goal_store.?;
+    _ = try store.create("ship it", 4);
+
+    const stale = loop_mod.UserMessage{
+        .json = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"stale\"}],\"source\":{\"kind\":\"goal\",\"goalId\":\"goal-1\",\"revision\":2,\"round\":1},\"id\":\"stale\"}",
+    };
+    try std.testing.expectError(error.GoalInvalidChange, engine.appendUserMessage(.{ .turn = 1, .step = 1 }, stale));
+
+    var read = try session_log.readLog(allocator, engine.log.?.path);
+    defer read.deinit();
+    try std.testing.expectEqual(@as(usize, 1), read.events.len);
+    try std.testing.expectEqualStrings("goal/change", read.events[0].event_type);
+
+    const round = loop_mod.UserMessage{
+        .json = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"round one\"}],\"source\":{\"kind\":\"goal\",\"goalId\":\"goal-1\",\"revision\":1,\"round\":1},\"id\":\"round-1\"}",
+    };
+    _ = try engine.appendUserMessage(.{ .turn = 2, .step = 1 }, round);
+    try std.testing.expectEqual(@as(u32, 1), store.rounds_started);
+    // Authority is derived from the admitted message, not the loop position.
+    try std.testing.expect(!engine.goal_tools.?.authority.direct_human);
+    try std.testing.expectEqualStrings("goal-1", engine.goal_tools.?.authority.goal_round.?.id);
+
+    const human = loop_mod.UserMessage{
+        .json = "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"source\":{\"kind\":\"user\"},\"id\":\"human-1\"}",
+    };
+    _ = try engine.appendUserMessage(.{ .turn = 3, .step = 1 }, human);
+    try std.testing.expect(engine.goal_tools.?.authority.direct_human);
+}
+
+test "dsh-native harness: an aborted pre-step keeps the queued plan selection" {
+    // Regression: hostPreStep committed a pending /plan selection before the
+    // kernel's abort check, so a /stop that landed just before the step opened
+    // silently switched plan mode.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dsh_home = try std.fs.path.join(allocator, &.{ root, "dsh-home" });
+    defer allocator.free(dsh_home);
+    try fs_compat.makePath(dsh_home);
+    const workspace = try std.fs.path.join(allocator, &.{ root, "workspace" });
+    defer allocator.free(workspace);
+    try fs_compat.makePath(workspace);
+
+    var engine = try DshNativeHarness.init(allocator, .{
+        .session_key = "test-session-key",
+        .dsh_home = dsh_home,
+        .workspace_dir = workspace,
+        .provider = undefined,
+        .provider_name = "",
+        .model = "",
+    });
+    defer engine.deinit(allocator);
+    try engine.startFresh();
+
+    engine.plan_session.state.active = true;
+    engine.plan_session.pending = .{ .active = false, .narrate = false };
+    if (engine.loop) |*loop| loop.abort(.user);
+
+    var out: std.ArrayListUnmanaged(loop_mod.UserMessage) = .empty;
+    defer out.deinit(allocator);
+    _ = try DshNativeHarness.hostPreStep(&engine, allocator, .{ .turn = 1, .step = 1 }, .{
+        .next_step = &.{},
+        .next_turn = &.{},
+    }, &out);
+
+    try std.testing.expect(engine.plan_session.state.active);
+    try std.testing.expect(engine.plan_session.pending != null);
+    try std.testing.expectEqual(false, engine.plan_session.pending.?.active);
 }

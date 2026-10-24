@@ -157,6 +157,11 @@ const DshNativeState = struct {
             .sandbox = config.agent.dsh_sandbox,
             .max_parallel_tools = config.agent.dsh_max_parallel_tools,
             .on_corrupt = config.agent.dsh_on_corrupt,
+            .context_window = config.agent.dsh_compaction_context_window,
+            .compaction_threshold_ratio = config.agent.dsh_compaction_threshold_ratio,
+            .compaction_retain_ratio = config.agent.dsh_compaction_retain_ratio,
+            .compaction_headroom_tokens = config.agent.dsh_compaction_headroom_tokens,
+            .question_timeout_s = config.agent.dsh_question_timeout,
             .temperature = session.agent.temperature,
         });
         errdefer harness.deinit(allocator);
@@ -7463,6 +7468,32 @@ const DshNativeFixture = struct {
 
 fn readDshNativeLog(path: []const u8) ![]u8 {
     return fs_compat.readFileAlloc(std_compat.fs.cwd(), testing.allocator, path, 1 << 20);
+}
+
+test "dsh-native: compaction and question config reach the engine options" {
+    // Regression: DshNativeState.init built Options without agent.dsh_compaction_*
+    // and agent.dsh_question_timeout, so the production path always ran on the
+    // engine defaults.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.agent.dsh_compaction_context_window = 32768;
+    fixture.cfg.agent.dsh_compaction_threshold_ratio = 0.75;
+    fixture.cfg.agent.dsh_compaction_retain_ratio = 0.25;
+    fixture.cfg.agent.dsh_compaction_headroom_tokens = 1024;
+    fixture.cfg.agent.dsh_question_timeout = 300;
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:dsh-native-config");
+    const opts = session.dsh_native.?.harness.opts;
+    try testing.expectEqual(@as(u64, 32768), opts.context_window);
+    try testing.expectEqual(@as(?f64, 0.75), opts.compaction_threshold_ratio);
+    try testing.expectEqual(@as(?f64, 0.25), opts.compaction_retain_ratio);
+    try testing.expectEqual(@as(?u64, 1024), opts.compaction_headroom_tokens);
+    try testing.expectEqual(@as(i32, 300), opts.question_timeout_s);
 }
 
 test "dsh-native: plain turn runs in process, reports usage and selects the engine" {

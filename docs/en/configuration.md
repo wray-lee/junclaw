@@ -258,13 +258,30 @@ These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` 
 
 - `agent.dsh_home` (string, default `<config dir>/.dsh`): dsh home root. Session JSONL logs live under it; the session-key mapping lives under `agent.dsh_session_dir`.
 - `agent.dsh_session_dir` (string, default `<config dir>/dsh-sessions`): where each host session key's dsh session id is persisted.
-- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): the approval policy recorded for the session. P1b has no approval prompt (that is P2 scope): any request that needs approval is rejected: a `sandbox_permissions` escalation is validated and recorded as `sandboxRequest` in the tool result, but it is never granted (the command still runs at the current level). The configured value currently only changes the approval-policy sentence in the model-visible context and the `approval/policy` event in the session JSONL. The rule that turns for non-interactive channels (cron, heartbeat, webhooks, A2A) behave as `never` regardless of the configured value is part of the P2 approval work and is not enforced in P1b.
-- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): the sandbox policy sentence the model sees, also recorded as a `sandbox/mode` event in the session JSONL. The values are exactly dsh's `SandboxMode` names. P1b does not enforce the mode: mutating file tools always refuse paths outside the session workspace whatever the configured value, and `danger-full-access` does not widen them yet; enforcement is P2.
+- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): controls the pre-execute approval gate. Only calls that request `sandbox_permissions` escalation are asked for approval, after argument validation; ordinary tool calls are not prompted. `"ask"` prompts the host channel; `"never"` rejects without prompting. Every branch is fail-closed: a missing channel, a channel error, a cancellation, or an explicit rejection denies the call and returns the denial reason to the model, and each request appends exactly one `approval/asked` + `approval/decided` pair. A granted escalation still executes at the current sandbox level: dsh-native records the `sandboxRequest` but does not widen permissions yet. Non-interactive turns (cron, heartbeat, webhooks, A2A) are not yet forced to `"never"`; that rule is not enforced yet.
+- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): the sandbox policy sentence the model sees, also recorded as a `sandbox/mode` event in the session JSONL. The values are exactly dsh's `SandboxMode` names. dsh-native does not enforce the mode yet: mutating file tools always refuse paths outside the session workspace whatever the configured value, and `danger-full-access` does not widen them; enforcement is not wired.
 - `agent.dsh_max_parallel_tools` (integer > 0, default `10`): size of the parallel tool pool. dsh's own default is 10; large values raise provider-side concurrency and timeout risk.
 - `agent.dsh_persona` (string, default unset): extra persona text appended to dsh's system prompt. Unset keeps dsh's built-in identity.
 - `agent.dsh_on_corrupt` (`"fail"` | `"native"`, default `"fail"`): what a session does when its dsh JSONL log cannot be read or repaired. `fail` refuses the turn and reports the parse error; `native` starts a new, empty dsh session and continues in it. dsh-native creation does not replay junclaw's stored native history, so the conversation context restarts from zero.
+- `agent.dsh_compaction_context_window` (integer >= 0, default `0`): the routed model's context window in tokens, used to derive compaction budgets. `0` disables the pre-step pressure probe; a provider-confirmed context overflow still compacts and retries once.
+- `agent.dsh_compaction_threshold_ratio` (number in `(0, 1]`, default `0.8`; unset keeps dsh's default): fraction of the context window at which automatic pressure compaction starts. The threshold is `floor(min(contextWindow * thresholdRatio, contextWindow - maxTokens - headroomTokens))`, where `maxTokens` is the routed completion budget and `messageBudget = contextWindow - maxTokens`.
+- `agent.dsh_compaction_retain_ratio` (number in `[0, 1]`, default `0.16`; unset keeps dsh's default): fraction of the message budget kept after compaction (`retainTokens = floor(messageBudget * retainRatio)`). It must be below the threshold ratio.
+- `agent.dsh_compaction_headroom_tokens` (integer >= 0, default `65536`; unset keeps dsh's default): tokens subtracted from the message budget before the threshold comparison. It must be below the context window when that window is non-zero.
+- `agent.dsh_question_timeout` (integer seconds, default `120`): how long `ask_user_question` waits for an answer. `-1` waits without a deadline. Non-integers, `0`, and values below `-1` are rejected at load time; the tool accepts `-1` or 1-2147483 seconds.
 
-P1b status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P1b covers text and tool turns, steer, `/new`, and resume over the dsh JSONL log. It does not provide approval prompts, user questions, plan mode, goal, compaction commands or the six dsh slash commands; those are P2 scope.
+Non-numeric or out-of-range ratios, `retain_ratio >= threshold_ratio`, and `headroom_tokens >= context_window` are also rejected at load time.
+
+P2a status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P2a adds the approval gate, user questions, automatic compaction, and six dsh slash commands:
+
+- `ask_user_question` is exposed to the model. It waits up to `agent.dsh_question_timeout` for an answer; when the deadline passes with no answer, the tool result is `pending` (not a denial) and the model may continue. With no answerer on the channel the call returns a `NO_PROVIDER` result.
+- `/compact` (no arguments): runs one manual compaction of older history; with nothing to compact it settles `No compactable history yet.` and writes no domain events.
+- `/permission [preset]`: with no argument reports the current preset and the available ones; `read-only`, `workspace-write`, and `danger-full-access` record the session's sandbox mode and approval policy (`read-only`/`workspace-write` use `ask`, `danger-full-access` uses `never`), writing only the knobs that changed.
+- `/feedback <text>`: records a `feedback/record` event; empty text is an error.
+- `/export` (no arguments): requests a session-log download and appends the command lifecycle events.
+- `/goal [<objective>|clear|edit <objective>|pause|resume]`: shows the current goal, creates one from an objective, edits, pauses, resumes, or clears it; each invocation writes the command lifecycle with its `goal/change` events in between.
+- `/plan [on|off]`: enters plan mode for `on` or an omitted argument (any argument other than `off` enters), and leaves it for `off`. While a turn is running, the switch is queued for the next accepted in-turn pre-step; otherwise it is written immediately. In plan mode the model can call `exit_plan_mode` to present a plan for review; approval exits plan mode, while rejection keeps it and returns a keep-planning tool result to the model.
+- Automatic compaction runs on the agent pre-step once the measured token count reaches the threshold, and a provider context-overflow error at request start triggers one compaction and one retry. `/compact` is the manual entry point.
+- Other slash commands are left to the host.
 
 Example:
 
@@ -276,7 +293,12 @@ Example:
     "dsh_approval_policy": "never",
     "dsh_sandbox": "workspace-write",
     "dsh_max_parallel_tools": 10,
-    "dsh_on_corrupt": "fail"
+    "dsh_on_corrupt": "fail",
+    "dsh_compaction_context_window": 262144,
+    "dsh_compaction_threshold_ratio": 0.8,
+    "dsh_compaction_retain_ratio": 0.16,
+    "dsh_compaction_headroom_tokens": 65536,
+    "dsh_question_timeout": 120
   }
 }
 ```

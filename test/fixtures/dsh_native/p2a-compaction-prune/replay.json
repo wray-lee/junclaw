@@ -1,0 +1,176 @@
+{
+  "calls": [
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_big_read",
+          "name": "read",
+          "args": [
+            "{\"file_path\":\"big.txt\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_big_read",
+              "name": "read",
+              "arguments": "{\"file_path\":\"big.txt\"}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 50,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Read the large file."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Read the large file."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 17000,
+              "outputTokens": 10
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 0,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Second reply."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Second reply."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 100,
+              "outputTokens": 5
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

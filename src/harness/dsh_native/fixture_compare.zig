@@ -92,6 +92,13 @@ pub fn asString(value: Value) ![]const u8 {
     };
 }
 
+fn asInteger(value: Value) !i64 {
+    return switch (value) {
+        .integer => |number| number,
+        else => error.FixtureMismatch,
+    };
+}
+
 pub fn requiredString(object: Obj, key: []const u8) ![]const u8 {
     const value = object.get(key) orelse return error.FixtureMismatch;
     return asString(value);
@@ -110,11 +117,23 @@ pub fn eventsFromRecords(allocator: Allocator, records: []const Value) ![]types.
         };
         var surface_op: ?types.SurfaceOp = null;
         if (object.get("surfaceOp")) |op_value| {
-            const op = try asString(op_value);
-            if (std.mem.eql(u8, op, "append")) {
-                surface_op = .append;
-            } else {
-                return error.UnsupportedSurfaceOp;
+            switch (op_value) {
+                .string => |op| {
+                    if (!std.mem.eql(u8, op, "append")) return error.UnsupportedSurfaceOp;
+                    surface_op = .append;
+                },
+                .object => |op_object| {
+                    if (!std.mem.eql(u8, try requiredString(op_object, "op"), "replace")) {
+                        return error.UnsupportedSurfaceOp;
+                    }
+                    const start_seq = op_object.get("startSeq") orelse return error.FixtureMismatch;
+                    const end_seq = op_object.get("endSeq") orelse return error.FixtureMismatch;
+                    surface_op = .{ .replace = .{
+                        .start_seq = @intCast(try asInteger(start_seq)),
+                        .end_seq = @intCast(try asInteger(end_seq)),
+                    } };
+                },
+                else => return error.UnsupportedSurfaceOp,
             }
         }
         events.appendAssumeCapacity(.{
@@ -606,4 +625,21 @@ test "parseJsonl accepts CRLF and a missing final newline" {
     try std.testing.expectEqual(@as(usize, 3), records.len);
     try std.testing.expectEqual(@as(i64, 2), records[1].object.get("b").?.integer);
     try std.testing.expectEqual(@as(i64, 3), records[2].object.get("c").?.integer);
+}
+
+test "eventsFromRecords parses append and replace surface ops" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const records = try parseJsonl(arena,
+        \\{"type":"session","version":4,"id":"s","createdAt":0,"cwd":"c","isSeeded":false,"delegationDepth":0}
+        \\{"type":"user/message","data":{},"surfaceOp":"append"}
+        \\{"type":"user/message","data":{},"surfaceOp":{"op":"replace","startSeq":0,"endSeq":1}}
+    );
+    const events = try eventsFromRecords(arena, records);
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+    try std.testing.expect(events[0].surface_op.? == .append);
+    try std.testing.expectEqual(@as(u64, 0), events[1].surface_op.?.replace.start_seq);
+    try std.testing.expectEqual(@as(u64, 1), events[1].surface_op.?.replace.end_seq);
 }

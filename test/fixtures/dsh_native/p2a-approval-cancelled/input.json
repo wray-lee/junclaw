@@ -1,0 +1,16 @@
+{
+  "config": {},
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Request the sandbox escalation.",
+      "approval": "cancelled"
+    }
+  ]
+}

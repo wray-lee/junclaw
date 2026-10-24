@@ -1,0 +1,14 @@
+{
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "goal",
+      "text": " Finish the fixture objective."
+    }
+  ]
+}

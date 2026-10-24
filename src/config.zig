@@ -1385,6 +1385,11 @@ pub const Config = struct {
             .dsh_max_parallel_tools = self.agent.dsh_max_parallel_tools,
             .dsh_persona = self.agent.dsh_persona,
             .dsh_on_corrupt = self.agent.dsh_on_corrupt.toSlice(),
+            .dsh_compaction_context_window = self.agent.dsh_compaction_context_window,
+            .dsh_compaction_threshold_ratio = self.agent.dsh_compaction_threshold_ratio,
+            .dsh_compaction_retain_ratio = self.agent.dsh_compaction_retain_ratio,
+            .dsh_compaction_headroom_tokens = self.agent.dsh_compaction_headroom_tokens,
+            .dsh_question_timeout = self.agent.dsh_question_timeout,
         }, ",\n");
 
         // Channels
@@ -1556,6 +1561,8 @@ pub const Config = struct {
         TemperatureOutOfRange,
         InvalidAgentTimezone,
         InvalidDshMaxParallelTools,
+        InvalidDshCompactionRetainRatio,
+        InvalidDshCompactionHeadroomTokens,
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
@@ -1633,6 +1640,17 @@ pub const Config = struct {
         }
         if (self.agent.dsh_max_parallel_tools == 0) {
             return ValidationError.InvalidDshMaxParallelTools;
+        }
+        // dsh rejects retain >= threshold (compaction-basic/src/config.ts:198-206).
+        const dsh_threshold = self.agent.dsh_compaction_threshold_ratio orelse 0.8;
+        if (self.agent.dsh_compaction_retain_ratio) |ratio| {
+            if (ratio >= dsh_threshold) return ValidationError.InvalidDshCompactionRetainRatio;
+        }
+        if (self.agent.dsh_compaction_context_window > 0) {
+            if (self.agent.dsh_compaction_headroom_tokens) |headroom| {
+                if (headroom >= self.agent.dsh_compaction_context_window)
+                    return ValidationError.InvalidDshCompactionHeadroomTokens;
+            }
         }
         for (self.agents) |agent_cfg| {
             if (namedAgentUsesReservedRootId(agent_cfg.name)) {
@@ -1854,6 +1872,8 @@ pub const Config = struct {
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
             ValidationError.InvalidAgentTimezone => std.debug.print("Config error: agent.timezone must be 'UTC' or a fixed offset like 'UTC+08:00'.\n", .{}),
             ValidationError.InvalidDshMaxParallelTools => std.debug.print("Config error: agent.dsh_max_parallel_tools must be greater than 0.\n", .{}),
+            ValidationError.InvalidDshCompactionRetainRatio => std.debug.print("Config error: agent.dsh_compaction_retain_ratio must be below the threshold ratio.\n", .{}),
+            ValidationError.InvalidDshCompactionHeadroomTokens => std.debug.print("Config error: agent.dsh_compaction_headroom_tokens must be below the context window.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
@@ -7013,6 +7033,92 @@ test "agent.dsh_* defaults" {
     );
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.agent.dsh_persona);
     try std.testing.expectEqual(config_types.DshOnCorrupt.fail, cfg.agent.dsh_on_corrupt);
+    try std.testing.expectEqual(@as(u64, 0), cfg.agent.dsh_compaction_context_window);
+    try std.testing.expectEqual(@as(?f64, null), cfg.agent.dsh_compaction_threshold_ratio);
+    try std.testing.expectEqual(@as(?f64, null), cfg.agent.dsh_compaction_retain_ratio);
+    try std.testing.expectEqual(@as(?u64, null), cfg.agent.dsh_compaction_headroom_tokens);
+    try std.testing.expectEqual(config_types.DEFAULT_DSH_QUESTION_TIMEOUT, cfg.agent.dsh_question_timeout);
+    try std.testing.expectEqual(@as(i32, 120), cfg.agent.dsh_question_timeout);
+}
+
+test "agent.dsh_compaction_* and dsh_question_timeout parse and reject invalid values" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .default_model = "test/model", .allocator = arena.allocator() };
+    try cfg.parseJson(
+        \\{"agent":{"dsh_compaction_context_window":4096,
+        \\"dsh_compaction_threshold_ratio":0.5,
+        \\"dsh_compaction_retain_ratio":0.1,
+        \\"dsh_compaction_headroom_tokens":256,
+        \\"dsh_question_timeout":-1}}
+    );
+    try std.testing.expectEqual(@as(u64, 4096), cfg.agent.dsh_compaction_context_window);
+    try std.testing.expectEqual(@as(?f64, 0.5), cfg.agent.dsh_compaction_threshold_ratio);
+    try std.testing.expectEqual(@as(?f64, 0.1), cfg.agent.dsh_compaction_retain_ratio);
+    try std.testing.expectEqual(@as(?u64, 256), cfg.agent.dsh_compaction_headroom_tokens);
+    try std.testing.expectEqual(@as(i32, -1), cfg.agent.dsh_question_timeout);
+    try cfg.validate();
+
+    try std.testing.expectError(error.InvalidDshCompactionContextWindow, cfg.parseJson(
+        \\{"agent":{"dsh_compaction_context_window":-1}}
+    ));
+    try std.testing.expectError(error.InvalidDshCompactionThresholdRatio, cfg.parseJson(
+        \\{"agent":{"dsh_compaction_threshold_ratio":1.5}}
+    ));
+    try std.testing.expectError(error.InvalidDshCompactionThresholdRatio, cfg.parseJson(
+        \\{"agent":{"dsh_compaction_threshold_ratio":0}}
+    ));
+    try std.testing.expectError(error.InvalidDshCompactionThresholdRatio, cfg.parseJson(
+        \\{"agent":{"dsh_compaction_threshold_ratio":"high"}}
+    ));
+    try std.testing.expectError(error.InvalidDshCompactionRetainRatio, cfg.parseJson(
+        \\{"agent":{"dsh_compaction_retain_ratio":-0.1}}
+    ));
+    try std.testing.expectError(error.InvalidDshCompactionHeadroomTokens, cfg.parseJson(
+        \\{"agent":{"dsh_compaction_headroom_tokens":-1}}
+    ));
+    try std.testing.expectError(error.InvalidDshQuestionTimeout, cfg.parseJson(
+        \\{"agent":{"dsh_question_timeout":0}}
+    ));
+    try std.testing.expectError(error.InvalidDshQuestionTimeout, cfg.parseJson(
+        \\{"agent":{"dsh_question_timeout":-2}}
+    ));
+    try std.testing.expectError(error.InvalidDshQuestionTimeout, cfg.parseJson(
+        \\{"agent":{"dsh_question_timeout":1.5}}
+    ));
+    // ask_user_question accepts at most 2147483s; the loader matches it.
+    try std.testing.expectError(error.InvalidDshQuestionTimeout, cfg.parseJson(
+        \\{"agent":{"dsh_question_timeout":2147484}}
+    ));
+}
+
+test "validation rejects dsh compaction ratios that dsh rejects" {
+    const retain_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
+        .agent = .{ .dsh_compaction_retain_ratio = 0.8 },
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(
+        Config.ValidationError.InvalidDshCompactionRetainRatio,
+        retain_cfg.validate(),
+    );
+
+    const headroom_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "test/model",
+        .agent = .{
+            .dsh_compaction_context_window = 1024,
+            .dsh_compaction_headroom_tokens = 1024,
+        },
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(
+        Config.ValidationError.InvalidDshCompactionHeadroomTokens,
+        headroom_cfg.validate(),
+    );
 }
 
 test "parse agent.dsh_* keys" {

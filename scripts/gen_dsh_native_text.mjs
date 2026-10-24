@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Generate Zig constants for dsh model-visible text (design §3.5, B15, B25b).
+// Generate Zig constants for dsh model-visible text (design §3.5, B15, B25b,
+// B26, B27, B30, B31, B34, B35).
 //
 // Usage:
 //   node scripts/gen_dsh_native_text.mjs \
@@ -23,6 +24,12 @@
 // tool-bash defaults enableRunInBackground/promoteOnTimeout=true; no sandbox
 // escalation modes are advertised without a confining backend.
 //
+// todo_write is the documented exception: P2b stage 2 selects the single-active
+// discipline (allowParallelInProgress=false) for junclaw's todo executor, so its
+// description composes DESCRIPTION_SINGLE. The base bundle file currently sets
+// allowParallelInProgress: true; switch the composed clause to
+// DESCRIPTION_PARALLEL if junclaw adopts that deployment policy.
+//
 // If the source checkout is unavailable, run this against the mirror image
 // junclaw:full-dsh-test's /opt/dsh/node_modules instead (same relative paths).
 
@@ -41,13 +48,24 @@ const BASH_RENDER = 'packages/shell/tool-bash/src/render.ts'
 const GREP = 'packages/fs/tool-fs-search/src/grep.ts'
 const GLOB = 'packages/fs/tool-fs-search/src/glob.ts'
 const SPILL_LOCAL = 'packages/spill/spill-local/src/index.ts'
+const GOAL_TOOL = 'packages/goal/tool-goal/src/index.ts'
+const GOAL_ROUND_PROMPT = 'packages/goal/goal-round-driver/src/prompt.ts'
+const GOAL_WRAPUP = 'packages/goal/tool-goal/src/wrapup.ts'
+const SUMMARIZER = 'packages/compaction/compaction-basic/src/summarizer.ts'
+const PRUNER_CONFIG = 'packages/compaction/compaction-tool-result-pruner/src/config.ts'
+const USER_APPROVAL = 'packages/interaction/user-approval/src/index.ts'
+const CORE_TOOLS = 'packages/core/tools/src/index.ts'
+const TOOL_ASK_USER = 'packages/interaction/tool-ask-user/src/index.ts'
+const PLAN_MODE = 'packages/plan/plan-mode/src/index.ts'
+const TOOL_TODO = 'packages/todo/tool-todo/src/index.ts'
+const BASE_BUNDLE = 'packages/bundle/base/cordis.patch.yml'
 
 // Files whose semantics or defaults shape the generated text without yielding a
 // string constant of their own. Their hashes still gate --check.
 const SUPPORTING_SOURCES = [
   ['packages/core/tools/src/schema.ts', 'parameter DSL to JSON Schema compiler semantics'],
   ['packages/core/tools/src/presentation.ts', 'tool presentation vocabulary'],
-  ['packages/bundle/base/cordis.patch.yml', 'deployment defaults for conditional text'],
+  [BASE_BUNDLE, 'deployment defaults for conditional text and the plan:policy section'],
   ['packages/subprocess/subprocess/src/types.ts', 'DSH_ENV_PREFIX used by the bash description'],
 ]
 
@@ -80,6 +98,37 @@ function sha256hex(data) {
 // (without `${}`) to their generated value.
 function E(id, file, start, end, opts = {}) {
   return { id, file, start, end, ...opts }
+}
+
+// Entry whose value is composed from several anchored literals; the recorded
+// range covers every contributing line and CONTENT_SHA256 hashes the result.
+function C(id, file, start, end, value) {
+  const source = readSource(file)
+  return { id, file, start, end, value, source_sha256: source.sha, content_sha256: sha256hex(Buffer.from(value, 'utf8')) }
+}
+
+// A YAML literal block scalar (`section: |`). The base bundle's plan guidance
+// is the deployment-owned plan:policy text; YAML clip chomping keeps one
+// trailing newline, and dsh does not trim section text before joining.
+function yamlBlockScalar(id, file, declLine, endLine) {
+  const source = readSource(file)
+  const decl = /^(\s*)section:\s*\|\s*$/.exec(source.lines[declLine - 1] ?? '')
+  if (decl === null) throw new Error(`${file}:${declLine}: expected a 'section: |' line`)
+  const content = []
+  let indent = -1
+  for (let line = declLine + 1; line <= endLine; line++) {
+    const raw = source.lines[line - 1]
+    if (raw.trim() === '') {
+      content.push('')
+      continue
+    }
+    if (indent === -1) indent = raw.length - raw.trimStart().length
+    if (indent <= decl[1].length) throw new Error(`${file}:${line}: block scalar is not indented under section`)
+    if (!raw.startsWith(' '.repeat(indent))) throw new Error(`${file}:${line}: inconsistent block indentation`)
+    content.push(raw.slice(indent))
+  }
+  if (indent === -1) throw new Error(`${file}:${declLine}-${endLine}: empty block scalar`)
+  return C(id, file, declLine, endLine, content.join('\n') + '\n')
 }
 
 function zigLiteral(value) {
@@ -247,6 +296,7 @@ function scanLiterals(text, subs, where) {
 }
 
 function extract(entry) {
+  if (entry.value !== undefined) return entry
   const source = readSource(entry.file)
   if (!Number.isInteger(entry.start) || !Number.isInteger(entry.end)
     || entry.start < 1 || entry.end < entry.start || entry.end > source.lines.length) {
@@ -256,18 +306,17 @@ function extract(entry) {
   const text = source.lines.slice(entry.start - 1, entry.end).join('\n')
   const literals = scanLiterals(text, entry.subs ?? {}, where)
   if (literals.length === 0) throw new Error(`${where}: no string literal found`)
-  let value
-  if (entry.pick === undefined) {
-    value = literals.join('')
-  } else if (Array.isArray(entry.pick)) {
-    value = entry.pick.map((index) => {
+  let picked = literals
+  if (Array.isArray(entry.pick)) {
+    picked = entry.pick.map((index) => {
       if (literals[index] === undefined) throw new Error(`${where}: pick ${index} out of range (${literals.length})`)
       return literals[index]
-    }).join('')
-  } else {
-    value = literals[entry.pick]
-    if (value === undefined) throw new Error(`${where}: pick ${entry.pick} out of range (${literals.length})`)
+    })
+  } else if (entry.pick !== undefined) {
+    picked = [literals[entry.pick]]
+    if (picked[0] === undefined) throw new Error(`${where}: pick ${entry.pick} out of range (${literals.length})`)
   }
+  const value = picked.join(entry.join ?? '')
   return {
     id: entry.id,
     file: entry.file,
@@ -279,11 +328,38 @@ function extract(entry) {
   }
 }
 
-function header(concern) {
+// Extract one integer option from an object literal. The manifest hashes the
+// decimal digits; generated Zig constants carry them as u32.
+function extractNumber(entry) {
+  const source = readSource(entry.file)
+  if (!Number.isInteger(entry.start) || !Number.isInteger(entry.end)
+    || entry.start < 1 || entry.end < entry.start || entry.end > source.lines.length) {
+    throw new Error(`${entry.file}:${entry.start}-${entry.end}: line range out of bounds`)
+  }
+  const where = `${entry.file}:${entry.start}-${entry.end} (${entry.id})`
+  const pattern = new RegExp(`^\\s*${entry.key}:\\s*(\\d+),?\\s*$`)
+  for (let line = entry.start; line <= entry.end; line++) {
+    const match = source.lines[line - 1].match(pattern)
+    if (match === null) continue
+    const value = match[1]
+    return {
+      id: entry.id,
+      file: entry.file,
+      start: line,
+      end: line,
+      value,
+      source_sha256: source.sha,
+      content_sha256: sha256hex(Buffer.from(value, 'utf8')),
+    }
+  }
+  throw new Error(`${where}: no numeric literal for ${entry.key}`)
+}
+
+function header(concern, refs = 'B15, B25b') {
   return [
     '//! Generated by scripts/gen_dsh_native_text.mjs from the dsh checkout.',
     '//! Do not edit by hand: run the generator; `--check` rejects drift.',
-    `//! Concern: ${concern} (design §3.5, B15, B25b).`,
+    `//! Concern: ${concern} (design §3.5, ${refs}).`,
     '//! Source paths are dsh-relative POSIX identifiers (provenance only); the',
     '//! model-facing strings keep dsh\'s LF newlines on every platform.',
     '',
@@ -312,6 +388,13 @@ function moduleConst(module, name, ext) {
 function structConst(module, structName, name, ext) {
   record(ext, `${module}.${structName}.${name}`)
   return `    pub const ${name} = ${zigLiteral(ext.value)};\n`
+}
+
+// Numeric constants have no Zig string constant to point the manifest at, so
+// the root Source.content is the decimal literal itself.
+function numberConst(name, ext) {
+  record(ext, zigLiteral(ext.value))
+  return `    pub const ${name}: u32 = ${ext.value};\n`
 }
 
 // ---------------------------------------------------------------------------
@@ -408,7 +491,89 @@ const tools = [
       { name: 'path', type: 'string', required: false, desc: E('glob.path.description', GLOB, 318, 318, { pick: [1] }) },
     ],
   },
+  {
+    module: 'get_goal',
+    file: GOAL_TOOL,
+    name: E('get_goal.name', GOAL_TOOL, 196, 196),
+    description: E('get_goal.description', GOAL_TOOL, 56, 56),
+    schemaRange: [198, 198],
+    params: [],
+  },
+  {
+    module: 'create_goal',
+    file: GOAL_TOOL,
+    name: E('create_goal.name', GOAL_TOOL, 208, 208),
+    description: E('create_goal.description', GOAL_TOOL, 51, 54),
+    schemaRange: [210, 220],
+    params: [
+      { name: 'objective', type: 'string', required: true, desc: E('create_goal.objective.description', GOAL_TOOL, 211, 214, { pick: [1] }) },
+      { name: 'max_goal_rounds', type: 'number', required: false, desc: E('create_goal.max_goal_rounds.description', GOAL_TOOL, 216, 219, { pick: [1] }) },
+    ],
+  },
+  {
+    module: 'update_goal',
+    file: GOAL_TOOL,
+    name: E('update_goal.name', GOAL_TOOL, 235, 235),
+    description: E('update_goal.description', GOAL_TOOL, 236, 236),
+    schemaRange: [237, 253],
+    params: [
+      { name: 'goal_id', type: 'string', required: true, desc: E('update_goal.goal_id.description', GOAL_TOOL, 238, 238, { pick: [1] }) },
+      { name: 'revision', type: 'number', required: true, desc: E('update_goal.revision.description', GOAL_TOOL, 239, 239, { pick: [1] }) },
+      {
+        name: 'action',
+        type: 'string',
+        required: true,
+        enum: ['edit', 'pause', 'resume', 'complete', 'blocked'],
+        desc: E('update_goal.action.description', GOAL_TOOL, 240, 246, { pick: [1, 2] }),
+      },
+      { name: 'objective', type: 'string', required: false, desc: E('update_goal.objective.description', GOAL_TOOL, 247, 247, { pick: [1] }) },
+      { name: 'max_goal_rounds', type: 'number', required: false, desc: E('update_goal.max_goal_rounds.description', GOAL_TOOL, 248, 248, { pick: [1] }) },
+      { name: 'blocked_reason', type: 'string', required: false, desc: E('update_goal.blocked_reason.description', GOAL_TOOL, 249, 252, { pick: [1] }) },
+    ],
+  },
+  {
+    module: 'exit_plan_mode',
+    file: PLAN_MODE,
+    name: E('exit_plan_mode.name', PLAN_MODE, 66, 66),
+    description: E('exit_plan_mode.description', PLAN_MODE, 84, 86),
+    schemaRange: [280, 282],
+    params: [
+      { name: 'plan', type: 'string', required: true, desc: E('exit_plan_mode.plan.description', PLAN_MODE, 281, 281, { pick: [1] }) },
+    ],
+  },
 ]
+
+// Goal prompt/wrap-up text: <goal_round> is one template literal; wrap-up uses
+// JS string concatenation, so its exact final text is composed from anchored
+// pieces plus the shared heading and grounding constants.
+function goalRenderEntries() {
+  const heading = extract(E('goal.wrapup_heading', GOAL_WRAPUP, 18, 18, {
+    subs: { 'JSON.stringify(objective)': '{s}' },
+  })).value
+  const grounding = extract(E('goal.wrapup_grounding', GOAL_WRAPUP, 5, 7)).value
+  const complete = extract(E('goal.complete_open', GOAL_WRAPUP, 20, 20)).value
+    + heading
+    + extract(E('goal.complete_body', GOAL_WRAPUP, 22, 24)).value
+    + grounding
+    + extract(E('goal.complete_tail', GOAL_WRAPUP, 26, 27)).value
+    + extract(E('goal.complete_close', GOAL_WRAPUP, 28, 28)).value
+  const blocked = extract(E('goal.blocked_open', GOAL_WRAPUP, 29, 29)).value
+    + heading
+    + extract(E('goal.blocked_reason', GOAL_WRAPUP, 31, 31, {
+      subs: { 'JSON.stringify(blockedReason)': '{s}' },
+    })).value
+    + extract(E('goal.blocked_body', GOAL_WRAPUP, 32, 35)).value
+    + grounding
+    + extract(E('goal.blocked_tail', GOAL_WRAPUP, 37, 38)).value
+    + extract(E('goal.blocked_close', GOAL_WRAPUP, 39, 39)).value
+  return [
+    E('goal.round_prompt', GOAL_ROUND_PROMPT, 15, 24, {
+      subs: { 'JSON.stringify(goal.objective)': '{s}', 'round': '{d}', 'goal.maxGoalRounds': '{d}' },
+    }),
+    C('goal.complete_wrapup', GOAL_WRAPUP, 18, 28, complete),
+    C('goal.blocked_wrapup', GOAL_WRAPUP, 18, 39, blocked),
+  ]
+}
 
 const renderGroups = [
   {
@@ -511,6 +676,35 @@ const renderGroups = [
       E('spill.retrieval_hint', SPILL_LOCAL, 159, 159),
     ],
   },
+  {
+    name: 'goal',
+    consts: goalRenderEntries,
+  },
+  {
+    name: 'todo_write',
+    consts: [
+      E('todo_write.success', TOOL_TODO, 189, 189, {
+        subs: {
+          'value.counts.pending': '{d}',
+          'value.counts.inProgress': '{d}',
+          'value.counts.completed': '{d}',
+        },
+      }),
+      E('todo_write.error_empty_content', TOOL_TODO, 87, 87),
+      E('todo_write.error_duplicate_content', TOOL_TODO, 90, 90, {
+        subs: { 'JSON.stringify(content)': '{s}' },
+      }),
+      E('todo_write.error_parallel_in_progress', TOOL_TODO, 97, 97, { subs: { active: '{d}' } }),
+      E('todo_write.error_requires_agent', TOOL_TODO, 197, 197),
+    ],
+  },
+]
+
+// Numeric pruner defaults are extracted from the DEFAULTS object literal.
+const compactionNumberEntries = [
+  { id: 'compaction.prune_threshold_chars', file: PRUNER_CONFIG, start: 10, end: 14, key: 'thresholdChars' },
+  { id: 'compaction.prune_head_chars', file: PRUNER_CONFIG, start: 10, end: 14, key: 'headChars' },
+  { id: 'compaction.prune_tail_chars', file: PRUNER_CONFIG, start: 10, end: 14, key: 'tailChars' },
 ]
 
 // ---------------------------------------------------------------------------
@@ -534,6 +728,7 @@ function buildInputSchema(tool) {
   for (const param of tool.params) {
     const ext = extract(param.desc)
     properties[param.name] = { type: param.type, description: ext.value }
+    if (param.enum !== undefined) properties[param.name].enum = param.enum
     if (param.required) required.push(param.name)
   }
   const schema = { type: 'object', properties }
@@ -547,6 +742,10 @@ function generateSystemPrompt() {
   for (const entry of sysEntries) {
     out += moduleConst('system_prompt', entry.id, extract(entry))
   }
+  // Deployment-owned plan:policy text from the base bundle, appended while plan
+  // mode is active (PLAN_POLICY order below).
+  out += moduleConst('system_prompt', 'plan_policy_text',
+    yamlBlockScalar('plan_policy_text', BASE_BUNDLE, 335, 346))
   const orders = sectionOrders()
   out += '\npub const section_orders = struct {\n'
   for (const order of orders) out += `    pub const ${order.name}: i32 = ${order.value};\n`
@@ -568,7 +767,7 @@ function generateSystemPrompt() {
 }
 
 function generateToolSchemas() {
-  let out = header('tool name, description and inputSchema JSON for read/write/edit/bash/grep/glob')
+  let out = header('tool name, description and inputSchema JSON for read/write/edit/bash/grep/glob/exit_plan_mode/todo_write', 'B15, B25b, B35')
   for (const tool of tools) {
     out += `\npub const ${tool.module} = struct {\n`
     out += structConst('tool_schemas', tool.module, 'name', extract(tool.name))
@@ -587,6 +786,52 @@ function generateToolSchemas() {
     out += structConst('tool_schemas', tool.module, 'input_schema_json', schemaExt)
     out += '};\n'
   }
+  // todo_write's nested item schema is beyond the flat parameter DSL, so its
+  // JSON is composed here. The description uses DESCRIPTION_SINGLE (see the
+  // todo policy note at the top of this file).
+  const todoHead = extract(E('todo_write.head', TOOL_TODO, 45, 47)).value
+  const todoSingle = extract(E('todo_write.single_clause', TOOL_TODO, 52, 53)).value
+  const todoTail = extract(E('todo_write.tail', TOOL_TODO, 55, 55)).value
+  const todoDescription = C('todo_write.description', TOOL_TODO, 45, 55, todoHead + todoSingle + todoTail)
+  const todoSchema = JSON.stringify({
+    type: 'object',
+    properties: {
+      todos: {
+        type: 'array',
+        description: extract(E('todo_write.todos.description', TOOL_TODO, 142, 142)).value,
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            content: {
+              type: 'string',
+              description: extract(E('todo_write.content.description', TOOL_TODO, 147, 147, { pick: [1] })).value,
+            },
+            status: {
+              type: 'string',
+              description: extract(E('todo_write.status.description', TOOL_TODO, 152, 152)).value,
+              enum: ['pending', 'in_progress', 'completed'],
+            },
+          },
+          required: ['content', 'status'],
+        },
+      },
+    },
+    required: ['todos'],
+  })
+  out += '\npub const todo_write = struct {\n'
+  out += structConst('tool_schemas', 'todo_write', 'name', extract(E('todo_write.name', TOOL_TODO, 136, 136)))
+  out += structConst('tool_schemas', 'todo_write', 'description', todoDescription)
+  out += structConst('tool_schemas', 'todo_write', 'input_schema_json', {
+    id: 'todo_write.input_schema_json',
+    file: TOOL_TODO,
+    start: 139,
+    end: 156,
+    value: todoSchema,
+    source_sha256: readSource(TOOL_TODO).sha,
+    content_sha256: sha256hex(Buffer.from(todoSchema, 'utf8')),
+  })
+  out += '};\n'
   return out
 }
 
@@ -594,7 +839,7 @@ function generateToolRender() {
   let out = header('tool result rendering templates and edit failure text')
   for (const group of renderGroups) {
     out += `\npub const ${group.name} = struct {\n`
-    for (const entry of group.consts) {
+    for (const entry of typeof group.consts === 'function' ? group.consts() : group.consts) {
       out += structConst('tool_render', group.name, entry.id.slice(group.name.length + 1), extract(entry))
     }
     out += '};\n'
@@ -602,12 +847,162 @@ function generateToolRender() {
   return out
 }
 
+function generateCompaction() {
+  let out = header('compaction summary instruction/framing and tool-result pruner defaults', 'B30, B31')
+  out += '\n'
+  const open = extract(E('compaction.summary_open_tag', SUMMARIZER, 22, 22))
+  out += moduleConst('compaction', 'summary_open_tag', open)
+  out += moduleConst('compaction', 'summary_close_tag', extract(E('compaction.summary_close_tag', SUMMARIZER, 23, 23)))
+  out += moduleConst('compaction', 'instruction', extract(E('compaction.instruction', SUMMARIZER, 33, 66, {
+    join: '\n',
+    subs: { SUMMARY_OPEN_TAG: open.value },
+  })))
+  const preamble = extract(E('compaction.checkpoint_preamble', SUMMARIZER, 70, 71))
+  out += moduleConst('compaction', 'checkpoint_preamble', preamble)
+  out += '/// Replacement user message: replacement_prefix, then the summary, then summary_close_tag.\n'
+  out += moduleConst('compaction', 'replacement_prefix', extract(E('compaction.replacement_prefix', SUMMARIZER, 190, 190, {
+    pick: 1,
+    subs: { CHECKPOINT_PREAMBLE: preamble.value, SUMMARY_OPEN_TAG: open.value },
+  })))
+  out += moduleConst('compaction', 'prune_marker', extract(E('compaction.prune_marker', PRUNER_CONFIG, 7, 7)))
+  out += '\npub const prune_defaults = struct {\n'
+  for (const entry of compactionNumberEntries) {
+    out += numberConst(entry.id.slice('compaction.prune_'.length), extractNumber(entry))
+  }
+  out += '};\n'
+  return out
+}
+
+// The legacy (default) ask_user_question parameter schema compiled by
+// packages/core/tools/src/schema.ts. Descriptions are extracted from the tool
+// declaration; the shape mirrors the author schema DSL.
+function askUserDescription(line, pick = 0) {
+  return extract(E('questions.schema_description', TOOL_ASK_USER, line, line, { pick })).value
+}
+
+function buildAskUserQuestionSchema() {
+  return JSON.stringify({
+    type: 'object',
+    properties: {
+      questions: {
+        type: 'array',
+        description: askUserDescription(45),
+        items: {
+          type: 'object',
+          additionalProperties: true,
+          properties: {
+            id: { type: 'string', description: askUserDescription(50, 1) },
+            question: { type: 'string', description: askUserDescription(51, 1) },
+            header: { type: 'string', description: askUserDescription(54) },
+            options: {
+              type: 'array',
+              description: askUserDescription(58),
+              items: {
+                type: 'object',
+                additionalProperties: true,
+                properties: {
+                  label: { type: 'string', description: askUserDescription(63, 1) },
+                  description: { type: 'string', description: askUserDescription(64, 1) },
+                },
+                required: ['label'],
+              },
+            },
+            multi_select: { type: 'boolean', description: askUserDescription(70) },
+          },
+          required: ['id', 'question'],
+        },
+      },
+    },
+    required: ['questions'],
+  })
+}
+
+function generateInteraction() {
+  let out = header('approval policy text, ask_user_question tool schema, /plan command/narration text, and exit_plan_mode result/error text', 'B26, B27, B34, B35')
+  out += '\npub const approval = struct {\n'
+  out += structConst('interaction', 'approval', 'never_sentence',
+    extract(E('approval.never_sentence', USER_APPROVAL, 73, 73)))
+  out += structConst('interaction', 'approval', 'ask_sentence',
+    extract(E('approval.ask_sentence', USER_APPROVAL, 75, 75)))
+  out += structConst('interaction', 'approval', 'policy_change_notice',
+    extract(E('approval.policy_change_notice', USER_APPROVAL, 191, 191, {
+      subs: { previous: '{s}', policy: '{s}' },
+    })))
+  const denials = [
+    ['deny_no_service', 1742],
+    ['deny_no_agent', 1748],
+    ['deny_rejected', 1763],
+    ['deny_cancelled', 1767],
+    ['deny_no_channel', 1771],
+  ]
+  for (const [name, line] of denials) {
+    out += structConst('interaction', 'approval', name,
+      extract(E(`approval.${name}`, CORE_TOOLS, line, line, {
+        pick: 1, subs: { 'exec.name': '{s}' },
+      })))
+  }
+  out += '};\n'
+  out += '\npub const ask_user_question = struct {\n'
+  out += structConst('interaction', 'ask_user_question', 'name',
+    extract(E('questions.name', TOOL_ASK_USER, 39, 39)))
+  out += structConst('interaction', 'ask_user_question', 'description',
+    extract(E('questions.description', TOOL_ASK_USER, 31, 31)))
+  const schema = buildAskUserQuestionSchema()
+  out += structConst('interaction', 'ask_user_question', 'input_schema_json', {
+    id: 'questions.input_schema_json',
+    file: TOOL_ASK_USER,
+    start: 41,
+    end: 75,
+    value: schema,
+    source_sha256: readSource(TOOL_ASK_USER).sha,
+    content_sha256: sha256hex(Buffer.from(schema, 'utf8')),
+  })
+  out += '};\n'
+  out += '\npub const plan_mode = struct {\n'
+  // Settlement lines also carry the command/done kind literal; pick only the
+  // text.
+  const planTexts = [
+    ['command_name', 232],
+    ['command_description', 233],
+    ['command_hint', 234],
+    ['off_attachments_error', 238, 1],
+    ['off_committed', 243, 1],
+    ['off_queued', 245, 1],
+    ['off_cancelled', 247, 1],
+    ['off_already_inactive', 254, 1],
+    ['on_committed', 270],
+    ['on_queued', 271],
+    ['narration_on', 467],
+    ['narration_off', 468],
+    // exit_plan_mode model-visible result and failure text (B35).
+    ['exit_approved_result', 294],
+    ['exit_dismissed_result', 295],
+    ['exit_requires_agent', 300, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_requires_plan_mode', 302, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_requires_heading', 305, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_no_channel', 309],
+    ['exit_reloaded', 345],
+    ['exit_keep_planning', 352],
+  ]
+  for (const [name, line, pick, subs] of planTexts) {
+    const opts = {}
+    if (pick !== undefined) opts.pick = pick
+    if (subs !== undefined) opts.subs = subs
+    out += structConst('interaction', 'plan_mode', name,
+      extract(E(`plan_mode.${name}`, PLAN_MODE, line, line, opts)))
+  }
+  out += '};\n'
+  return out
+}
+
 function generateRoot() {
-  let out = header('generated artifact manifest and content-hash self-check')
+  let out = header('generated artifact manifest and content-hash self-check', 'B15, B25b, B26, B27, B30, B31')
   out += 'const std = @import("std");\n\n'
   out += 'pub const system_prompt = @import("system_prompt.zig");\n'
   out += 'pub const tool_schemas = @import("tool_schemas.zig");\n'
-  out += 'pub const tool_render = @import("tool_render.zig");\n\n'
+  out += 'pub const tool_render = @import("tool_render.zig");\n'
+  out += 'pub const compaction = @import("compaction.zig");\n'
+  out += 'pub const interaction = @import("interaction.zig");\n\n'
   out += 'pub const Source = struct {\n'
   out += '    id: []const u8,\n'
   out += '    path: []const u8,\n'
@@ -667,6 +1062,8 @@ function build() {
     'system_prompt.zig': generateSystemPrompt(),
     'tool_schemas.zig': generateToolSchemas(),
     'tool_render.zig': generateToolRender(),
+    'compaction.zig': generateCompaction(),
+    'interaction.zig': generateInteraction(),
   }
   // root.zig records reference constants from the modules above, so build it last.
   files['root.zig'] = generateRoot()

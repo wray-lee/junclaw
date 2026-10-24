@@ -1,0 +1,87 @@
+{
+  "scenario": "p2b-plan-on",
+  "purpose": "P2b event-stream fixture for the dsh-native Zig adapter: drive the real harness with a scripted provider and interaction, then compare the normalized v4 session log.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "mode": "snapshot-derived",
+    "snapshot": "snapshots/web/plan-review/session.v4.jsonl",
+    "supporting": [
+      "tmp/dsh-p2b2-record/dsh-live/plan-on.v4.jsonl"
+    ],
+    "source": [
+      "packages/plan/plan-mode/src/index.ts:230-275",
+      "packages/plan/plan-mode/tests/integration.spec.ts:95-130",
+      "flock <zig-lock> docker run --rm --entrypoint node -v <junclaw>/.scratch/dsh-record:/work -v <junclaw>/tmp/dsh-p2b2-record:/out -w /work <dsh-test-image> /work/record-dsh-plan.mjs"
+    ],
+    "reason": null
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}"
+      },
+      {
+        "token": "{{system}}"
+      },
+      {
+        "token": "{{tools}}"
+      }
+    ],
+    "comparisonMask": [],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}"
+      },
+      {
+        "token": "{{message:1}}"
+      },
+      {
+        "token": "{{message:2}}"
+      },
+      {
+        "token": "{{message:3}}"
+      },
+      {
+        "token": "{{message:4}}"
+      },
+      {
+        "token": "{{message:5}}"
+      },
+      {
+        "token": "{{message:6}}"
+      },
+      {
+        "token": "{{message:7}}"
+      }
+    ]
+  },
+  "comparison": {},
+  "modelVisible": {
+    "planTools": [
+      false,
+      true
+    ],
+    "planPolicy": [
+      false,
+      true
+    ]
+  },
+  "planProjection": {
+    "active": true,
+    "pending": false
+  },
+  "openIssues": [
+    "dsh logs agent/inbox/spliced bookkeeping and runtime-context user messages; the adapter's v4 log omits them (P2a fixture convention).",
+    "The adapter appends a system/message per step; dsh replaces the changed prompt node in place (packages/plan/plan-mode/tests/integration.spec.ts:130-180). Compaction can select a mid-conversation system node.",
+    "dsh keeps exit_plan_mode in the request tool catalog in every mode; the adapter advertises it only while plan mode is active (packages/plan/plan-mode/tests/integration.spec.ts:130-180).",
+    "Because the adapter appends system nodes and changes the tool catalog per mode, its request/header reason is change where dsh's replacement bumps the generation and logs series.",
+    "dsh treats /plan <text> as a mode selection plus a user message, so /plan on also submits the word \"on\"; the port documents /plan [on|off] and drops the message, so this fixture uses on as a selection alias and the comparison recording used a bare /plan."
+  ],
+  "files": [
+    "input.json",
+    "replay.json",
+    "manifest.json",
+    "expected.v4.jsonl"
+  ]
+}

@@ -1,0 +1,179 @@
+{
+  "calls": [
+    {
+      "index": 1,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_create_goal",
+          "name": "create_goal",
+          "args": [
+            "{\"objective\":\"Finish one bounded round.\",\"max_goal_rounds\":1}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_create_goal",
+              "name": "create_goal",
+              "arguments": "{\"objective\":\"Finish one bounded round.\",\"max_goal_rounds\":1}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 20,
+              "outputTokens": 4,
+              "totalTokens": 24
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Goal created."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Goal created."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 28,
+              "outputTokens": 4,
+              "totalTokens": 32
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "The single round is done."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "The single round is done."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 36,
+              "outputTokens": 6,
+              "totalTokens": 42
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

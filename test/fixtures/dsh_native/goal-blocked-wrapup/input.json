@@ -1,0 +1,17 @@
+{
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession",
+      "config": {
+        "goalBlockedAfter": 1
+      }
+    },
+    {
+      "op": "goal",
+      "text": " Resolve the blocking condition."
+    }
+  ]
+}

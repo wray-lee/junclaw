@@ -1,0 +1,331 @@
+{
+  "calls": [
+    {
+      "index": 1,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Round 1: reading the goal before working."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Round 1: reading the goal before working."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 1,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 1,
+          "dt": [],
+          "id": "call_round1_get_goal",
+          "name": "get_goal",
+          "args": [
+            "{}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 1,
+            "block": {
+              "type": "tool-call",
+              "id": "call_round1_get_goal",
+              "name": "get_goal",
+              "arguments": "{}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 20,
+              "outputTokens": 8,
+              "totalTokens": 28
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Round 1 done: one more round remains."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Round 1 done: one more round remains."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 28,
+              "outputTokens": 6,
+              "totalTokens": 34
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_round2_get_goal",
+          "name": "get_goal",
+          "args": [
+            "{}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_round2_get_goal",
+              "name": "get_goal",
+              "arguments": "{}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 40,
+              "outputTokens": 4,
+              "totalTokens": 44
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "tool-call"
+          }
+        },
+        {
+          "type": "tool-call-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "id": "call_goal_complete",
+          "name": "update_goal",
+          "args": [
+            "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"complete\"}"
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "tool-call",
+              "id": "call_goal_complete",
+              "name": "update_goal",
+              "arguments": "{\"goal_id\":\"goal-1\",\"revision\":1,\"action\":\"complete\"}"
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 48,
+              "outputTokens": 4,
+              "totalTokens": 52
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "tool-calls"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "stream": [
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-start",
+            "index": 0,
+            "blockType": "text"
+          }
+        },
+        {
+          "type": "text-chunks",
+          "time0": 0,
+          "index": 0,
+          "dt": [],
+          "texts": [
+            "Both rounds are complete."
+          ]
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "block-end",
+            "index": 0,
+            "block": {
+              "type": "text",
+              "text": "Both rounds are complete."
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "usage",
+            "usage": {
+              "inputTokens": 60,
+              "outputTokens": 8,
+              "totalTokens": 68
+            }
+          }
+        },
+        {
+          "type": "chunk",
+          "time": 0,
+          "chunk": {
+            "type": "finish",
+            "reason": {
+              "kind": "stop"
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

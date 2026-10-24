@@ -1,0 +1,202 @@
+{
+  "scenario": "p2a-command-permission",
+  "purpose": "P2a event-stream fixture for the dsh-native Zig adapter: drive the real harness with a scripted provider and interaction, then compare the normalized v4 session log.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "mode": "snapshot-derived",
+    "snapshot": "snapshots/web/permission-policy-context/session.v4.jsonl",
+    "supporting": [],
+    "source": [],
+    "reason": null
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}"
+      },
+      {
+        "token": "{{system}}"
+      },
+      {
+        "token": "{{tools}}"
+      }
+    ],
+    "comparisonMask": [],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}"
+      },
+      {
+        "token": "{{message:1}}"
+      },
+      {
+        "token": "{{message:2}}"
+      },
+      {
+        "token": "{{message:3}}"
+      },
+      {
+        "token": "{{message:4}}"
+      },
+      {
+        "token": "{{message:5}}"
+      },
+      {
+        "token": "{{message:6}}"
+      },
+      {
+        "token": "{{message:7}}"
+      },
+      {
+        "token": "{{message:8}}"
+      },
+      {
+        "token": "{{message:9}}"
+      },
+      {
+        "token": "{{message:10}}"
+      },
+      {
+        "token": "{{message:11}}"
+      },
+      {
+        "token": "{{message:12}}"
+      },
+      {
+        "token": "{{message:13}}"
+      },
+      {
+        "token": "{{message:14}}"
+      },
+      {
+        "token": "{{message:15}}"
+      },
+      {
+        "token": "{{message:16}}"
+      },
+      {
+        "token": "{{message:17}}"
+      },
+      {
+        "token": "{{message:18}}"
+      },
+      {
+        "token": "{{message:19}}"
+      },
+      {
+        "token": "{{message:20}}"
+      },
+      {
+        "token": "{{message:21}}"
+      },
+      {
+        "token": "{{message:22}}"
+      },
+      {
+        "token": "{{message:23}}"
+      },
+      {
+        "token": "{{message:24}}"
+      },
+      {
+        "token": "{{message:25}}"
+      },
+      {
+        "token": "{{message:26}}"
+      },
+      {
+        "token": "{{message:27}}"
+      },
+      {
+        "token": "{{message:28}}"
+      },
+      {
+        "token": "{{message:29}}"
+      },
+      {
+        "token": "{{message:30}}"
+      },
+      {
+        "token": "{{message:31}}"
+      },
+      {
+        "token": "{{message:32}}"
+      },
+      {
+        "token": "{{message:33}}"
+      },
+      {
+        "token": "{{message:34}}"
+      },
+      {
+        "token": "{{message:35}}"
+      },
+      {
+        "token": "{{message:36}}"
+      },
+      {
+        "token": "{{message:37}}"
+      },
+      {
+        "token": "{{message:38}}"
+      },
+      {
+        "token": "{{message:39}}"
+      },
+      {
+        "token": "{{message:40}}"
+      }
+    ]
+  },
+  "comparison": {},
+  "modelVisible": {},
+  "provenance": {
+    "kind": "snapshot-derived",
+    "snapshot": "snapshots/web/permission-policy-context/session.v4.jsonl",
+    "events": [
+      "command/run",
+      "permission/preset",
+      "sandbox/mode",
+      "command/done"
+    ],
+    "notes": [
+      "The differential preset write emits a preset and a sandbox mode event between run and done, as in the snapshot."
+    ]
+  },
+  "files": [
+    "input.json",
+    "replay.json",
+    "manifest.json",
+    "expected.v4.jsonl"
+  ],
+  "providerModelConvention": {
+    "name": "fake",
+    "model": "fake",
+    "note": "provider/model are literal so request headers stay comparable without tokens; replay.json keeps the P1 packed-stream call format and the runner reduces each call to ChatResponse text/tool calls/usage."
+  },
+  "openIssues": [
+    "The adapter repeats a system/message per step; dsh snapshots show one system message per session. Compaction can therefore select a mid-conversation system node.",
+    "The approval fixtures escalate a write call (portable to Windows); the dsh snapshots escalate bash. The gate itself is tool-agnostic.",
+    "The approval reason is the call justification, not dsh escalation wording (\"escalate sandbox to <mode>: <justification>\").",
+    "The provider bridge is blocking and returns one text block per call; replay.json is reduced from the P1 packed-stream format."
+  ],
+  "validation": {
+    "commands": [
+      "zig build test --summary all",
+      "zig build test -Dharness_dsh=true --summary all",
+      "zig fmt --check src/",
+      "node scripts/gen_dsh_native_text.mjs --dsh-root <dsh-checkout> --out src/harness/dsh_native/generated --check"
+    ],
+    "result": "Both build configs pass with 0 leaks; see the P2a record."
+  },
+  "scenarioInput": {
+    "ops": [
+      "initialize",
+      "newSession",
+      "prompt",
+      "command"
+    ],
+    "note": "Same vocabulary as the P1 fixtures. The runner seeds a fixed empty session (fixture-session) and restores it before the steps, so newSession only writes the workspace files. prompt takes optional approval/questions/noInteraction scripts."
+  }
+}

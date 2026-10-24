@@ -1,0 +1,17 @@
+{
+  "config": {
+    "approvalPolicy": "never"
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession"
+    },
+    {
+      "op": "prompt",
+      "text": "Record the plan with todo_write."
+    }
+  ]
+}

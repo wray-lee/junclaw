@@ -1,0 +1,29 @@
+{
+  "config": {
+    "approvalPolicy": "never"
+  },
+  "steps": [
+    {
+      "op": "initialize"
+    },
+    {
+      "op": "newSession",
+      "workspace": {
+        "note.txt": "one\n"
+      }
+    },
+    {
+      "op": "prompt",
+      "text": "Summarize the repository."
+    },
+    {
+      "op": "command",
+      "text": "/plan on"
+    },
+    {
+      "op": "prompt",
+      "text": "Read the note.",
+      "commandDuringTurn": "/plan off"
+    }
+  ]
+}

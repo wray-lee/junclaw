@@ -1,0 +1,135 @@
+{
+  "scenario": "goal-blocked-wrapup",
+  "purpose": "Goal wrap-up fixture: an autonomous round reports the goal blocked with a reason; the generated <goal_blocked> wrap-up is spliced into the next step, the model writes the closing message, and the turn ends completed with the goal persisted blocked.",
+  "dshVersion": "0.2.1-rc.2",
+  "formatVersion": 4,
+  "sourceArtifacts": {
+    "dshSource": {
+      "path": "packages/goal/tool-goal/src/{index,wrapup}.ts",
+      "note": "Constructed from dsh update_goal blocked semantics and renderWrapupContext; no live blocked recording exists in snapshots."
+    },
+    "config": {
+      "path": "packages/goal/tool-goal/src/index.ts:34-44",
+      "note": "blockedAfterConsecutiveRounds is configurable; the fixture sets 1 (default 3) so one round exercises the wrap-up."
+    }
+  },
+  "files": {
+    "input": "input.json",
+    "replay": "replay.json",
+    "expected": "expected.v4.jsonl",
+    "manifest": "manifest.json"
+  },
+  "normalization": {
+    "tokens": [
+      {
+        "token": "{{cwd}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Recorded workspace path; the fixture host substitutes its temp workspace."
+      },
+      {
+        "token": "{{system}}",
+        "used": true,
+        "where": "expected.v4.jsonl system/message",
+        "note": "System prompt text token; the prompt is pinned by the P1 plain-turn fixture."
+      },
+      {
+        "token": "{{tools}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Whole tool-schema array token; the nine schemas are pinned by the P1 fixtures."
+      },
+      {
+        "token": "{{provider}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.provider."
+      },
+      {
+        "token": "{{model}}",
+        "used": true,
+        "where": "expected.v4.jsonl request/header",
+        "note": "Comparison mask for request/header config.model."
+      },
+      {
+        "token": "{{command:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl command/run and command/done",
+        "note": "Goal command identity; generated as goal-cmd-1 by the fixture host."
+      }
+    ],
+    "fixtureOrdinalTokens": [
+      {
+        "token": "{{session:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session header",
+        "note": "Ordinal session identity."
+      },
+      {
+        "token": "{{message:1}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-round-goal-1-1-1."
+      },
+      {
+        "token": "{{message:2}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to system-1."
+      },
+      {
+        "token": "{{message:3}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-1."
+      },
+      {
+        "token": "{{message:4}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to msg-1."
+      },
+      {
+        "token": "{{message:5}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to goal-wrapup-goal-1-2."
+      },
+      {
+        "token": "{{message:6}}",
+        "used": true,
+        "where": "expected.v4.jsonl session-log message identity",
+        "note": "Ordinal message identity bound to assistant-1-2."
+      }
+    ],
+    "comparisonMask": []
+  },
+  "volatile": [
+    {
+      "field": "event time/seq",
+      "note": "time 0; expected rows omit both."
+    },
+    {
+      "field": "assistant usage",
+      "note": "Authored neutral token counts."
+    },
+    {
+      "field": "goal/change createdAt/updatedAt",
+      "value": 300,
+      "note": "Pinned deterministic goal clock (fixture host now_ms=300); real recordings use wall time."
+    },
+    {
+      "field": "session/message/goal ids",
+      "note": "Deterministic fixture ids; ordinal tokens."
+    },
+    {
+      "field": "blocked reason text",
+      "note": "Authored neutral fixture text."
+    }
+  ],
+  "openIssues": [
+    "Constructed scenario: there is no blocked recording under snapshots/. The expected log is bound to the native goal implementation and the dsh wrap-up source text.",
+    "The recorded wrap-up source would carry a UI-only summary; the native wrap-up omits it."
+  ],
+  "origin": "constructed-from-dsh-source"
+}
