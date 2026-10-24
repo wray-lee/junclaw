@@ -96,6 +96,11 @@ pub const Options = struct {
     compaction_threshold_ratio: ?f64 = null,
     compaction_retain_ratio: ?f64 = null,
     compaction_headroom_tokens: ?u64 = null,
+    /// Test seam: when non-empty, substitute workspace-path occurrences in
+    /// message text with this fixed string for compaction pricing and prune
+    /// windowing, so fixture results do not depend on the checkout location.
+    /// Empty keeps the real path.
+    workspace_placeholder: []const u8 = "",
     /// `agent.dsh_question_timeout`: ask_user_question wait in seconds.
     question_timeout_s: i32 = 120,
     temperature: f64 = 0.7,
@@ -237,6 +242,13 @@ pub const DshNativeHarness = struct {
 
     fn workspace(self: *const Self) []const u8 {
         return if (self.opts.workspace_dir.len == 0) "." else self.opts.workspace_dir;
+    }
+
+    fn workspaceSubstitution(self: *const Self) token_meter.WorkspaceSubstitution {
+        return .{
+            .workspace = self.workspace(),
+            .placeholder = self.opts.workspace_placeholder,
+        };
     }
 
     fn now(self: *const Self) ?i64 {
@@ -1670,6 +1682,7 @@ pub const DshNativeHarness = struct {
         if (self.opts.compaction_threshold_ratio) |value| options.threshold_ratio = value;
         if (self.opts.compaction_retain_ratio) |value| options.retain_ratio = value;
         if (self.opts.compaction_headroom_tokens) |value| options.headroom_tokens = value;
+        options.workspace_substitution = self.workspaceSubstitution();
         return options;
     }
 
@@ -1815,7 +1828,11 @@ pub const DshNativeHarness = struct {
 
         for (result.pruned) |pruned| {
             const index = indexOfSeq(self.surface_seqs.items, pruned.seq) orelse continue;
-            const tokens = token_meter.estimateMessage(arena, self.messages.items[index]) catch 0;
+            const tokens = token_meter.estimateMessageWithWorkspace(
+                arena,
+                self.messages.items[index],
+                self.workspaceSubstitution(),
+            ) catch 0;
             var prune_data: std.json.ObjectMap = .empty;
             var range: std.json.ObjectMap = .empty;
             try range.put(arena, "start", .{ .integer = @intCast(pruned.seq) });

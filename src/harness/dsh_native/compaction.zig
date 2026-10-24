@@ -46,6 +46,9 @@ pub const Options = struct {
     /// `maxOverflowRetries` default (config.ts:106).
     max_overflow_retries: u32 = 1,
     prune: PruneConfig = .{},
+    /// Workspace-path substitution for pricing and prune windowing; disabled
+    /// by default.
+    workspace_substitution: token_meter.WorkspaceSubstitution = .{},
 };
 
 /// Tool-result pruner budgets (`compaction-tool-result-pruner/src/config.ts:10-14`).
@@ -138,7 +141,7 @@ pub fn check(
     const spec = try resolveSpec(options, context_window, reserved_completion_tokens);
     const prices = try allocator.alloc(u64, nodes.len);
     defer allocator.free(prices);
-    var total = try priceNodes(allocator, nodes, prices);
+    var total = try priceNodes(allocator, nodes, prices, options.workspace_substitution);
     if (provider_usage) |usage| total = token_meter.usageTokens(usage);
     return .{
         .total_tokens = total,
@@ -383,7 +386,7 @@ pub fn run(
 
     const current = try a.dupe(Node, nodes);
     const prices = try a.alloc(u64, current.len);
-    var total = try priceNodes(a, current, prices);
+    var total = try priceNodes(a, current, prices, options.policy.workspace_substitution);
     if (options.provider_usage) |usage| total = token_meter.usageTokens(usage);
 
     var pruned: []const PrunedNode = &.{};
@@ -392,18 +395,29 @@ pub fn run(
             const pressure_spec = spec.?;
             if (total < pressure_spec.threshold_tokens)
                 return .{ .arena = arena, .total_tokens = total };
-            pruned = try pruneNodes(a, current, options.policy.prune);
+            pruned = try pruneNodes(
+                a,
+                current,
+                options.policy.prune,
+                options.policy.workspace_substitution,
+            );
             if (pruned.len > 0) {
                 // A surface rewrite invalidates the provider-usage anchor; dsh
                 // reprices through the singleton fold (`index.ts:321-327`).
-                total = try priceNodes(a, current, prices);
+                total = try priceNodes(a, current, prices, options.policy.workspace_substitution);
                 if (total < pressure_spec.threshold_tokens)
                     return .{ .arena = arena, .pruned = pruned, .total_tokens = total };
             }
         },
         .context_overflow => {
-            pruned = try pruneNodes(a, current, options.policy.prune);
-            if (pruned.len > 0) total = try priceNodes(a, current, prices);
+            pruned = try pruneNodes(
+                a,
+                current,
+                options.policy.prune,
+                options.policy.workspace_substitution,
+            );
+            if (pruned.len > 0)
+                total = try priceNodes(a, current, prices, options.policy.workspace_substitution);
         },
         .manual => {},
     }
@@ -595,10 +609,19 @@ fn isImageBlock(block: types.ContentBlock) bool {
     };
 }
 
-fn priceNodes(allocator: Allocator, nodes: []const Node, prices: []u64) !u64 {
+fn priceNodes(
+    allocator: Allocator,
+    nodes: []const Node,
+    prices: []u64,
+    substitution: token_meter.WorkspaceSubstitution,
+) !u64 {
     var total: u64 = 0;
     for (nodes, 0..) |node, index| {
-        const price = try token_meter.estimateMessage(allocator, node.message);
+        const price = try token_meter.estimateMessageWithWorkspace(
+            allocator,
+            node.message,
+            substitution,
+        );
         prices[index] = price;
         total += price;
     }
@@ -613,13 +636,53 @@ pub fn validatePruneConfig(config: PruneConfig) !void {
     if (emitted > config.threshold_chars) return error.InvalidPruneConfig;
 }
 
-fn pruneNodes(allocator: Allocator, nodes: []Node, config: PruneConfig) ![]const PrunedNode {
+fn substituteBlockTexts(
+    allocator: Allocator,
+    blocks: []const types.ContentBlock,
+    from: []const u8,
+    to: []const u8,
+) ![]const types.ContentBlock {
+    const out = try allocator.alloc(types.ContentBlock, blocks.len);
+    for (blocks, 0..) |block, index| {
+        out[index] = switch (block) {
+            .text => |text| .{ .text = try std.mem.replaceOwned(u8, allocator, text, from, to) },
+            else => block,
+        };
+    }
+    return out;
+}
+
+fn pruneNodes(
+    allocator: Allocator,
+    nodes: []Node,
+    config: PruneConfig,
+    substitution: token_meter.WorkspaceSubstitution,
+) ![]const PrunedNode {
     try validatePruneConfig(config);
     var out: std.ArrayListUnmanaged(PrunedNode) = .empty;
     for (nodes) |*node| {
         if (node.message.role != .tool) continue;
-        const content = try pruneContent(allocator, node.message.content, config) orelse continue;
-        node.message.content = content;
+        // A fixed-length placeholder makes the head/tail window independent of
+        // the checkout path; the real path is restored in the logged rewrite.
+        const input = if (substitution.active())
+            try substituteBlockTexts(
+                allocator,
+                node.message.content,
+                substitution.workspace,
+                substitution.placeholder,
+            )
+        else
+            node.message.content;
+        const content = try pruneContent(allocator, input, config) orelse continue;
+        node.message.content = if (substitution.active())
+            try substituteBlockTexts(
+                allocator,
+                content,
+                substitution.placeholder,
+                substitution.workspace,
+            )
+        else
+            content;
         try out.append(allocator, .{ .seq = node.seq, .message = node.message });
     }
     return out.toOwnedSlice(allocator);
@@ -886,6 +949,53 @@ test "pruner boundary is exactly 8192/8193 code points" {
     try testing.expectEqualStrings(over[0..4096], out[0..4096]);
     try testing.expectEqualStrings(over[8193 - 1024 ..], out[out.len - 1024 ..]);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, out, compaction_text.prune_marker));
+}
+
+test "pruner window ignores the workspace path length" {
+    // Regression: the head/tail cut shifted with the checkout path length, so
+    // the logged prune replacement content diverged from the fixture frozen
+    // against a 46-character /src workspace.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const placeholder = "{{cwd}}/00000000000000000000000000000000000000";
+    const short_workspace = "/checkout/a/workspace";
+    const long_workspace = "/ci/work/junclaw/junclaw/.zig-cache/tmp/0123456789abcdef/workspace";
+    const filler = try repeatPattern(a, "y", 65_536);
+    const short_text = try std.fmt.allocPrint(
+        a,
+        "<path>{s}/big.txt</path>\n{s}",
+        .{ short_workspace, filler },
+    );
+    const long_text = try std.fmt.allocPrint(
+        a,
+        "<path>{s}/big.txt</path>\n{s}",
+        .{ long_workspace, filler },
+    );
+    const short_blocks = [_]types.ContentBlock{textBlock(short_text)};
+    const long_blocks = [_]types.ContentBlock{textBlock(long_text)};
+    var short_nodes = [_]Node{surfaceNode(1, toolMessage("m1", "call-1", &short_blocks))};
+    var long_nodes = [_]Node{surfaceNode(1, toolMessage("m2", "call-2", &long_blocks))};
+
+    const short_pruned = try pruneNodes(a, &short_nodes, .{}, .{
+        .workspace = short_workspace,
+        .placeholder = placeholder,
+    });
+    const long_pruned = try pruneNodes(a, &long_nodes, .{}, .{
+        .workspace = long_workspace,
+        .placeholder = placeholder,
+    });
+    try testing.expectEqual(@as(usize, 1), short_pruned.len);
+    try testing.expectEqual(@as(usize, 1), long_pruned.len);
+    const short_out = short_pruned[0].message.content[0].text;
+    const long_out = long_pruned[0].message.content[0].text;
+    try testing.expect(std.mem.indexOf(u8, short_out, short_workspace) != null);
+    try testing.expect(std.mem.indexOf(u8, long_out, long_workspace) != null);
+    try testing.expectEqualStrings(
+        try std.mem.replaceOwned(u8, a, short_out, short_workspace, placeholder),
+        try std.mem.replaceOwned(u8, a, long_out, long_workspace, placeholder),
+    );
 }
 
 test "pruner slices Unicode code points without splitting them" {

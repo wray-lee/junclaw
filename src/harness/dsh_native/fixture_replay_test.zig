@@ -50,6 +50,11 @@ const test_model = "fake";
 const headless_persona = "You are a coding agent powered by the fake model.";
 const session_created_at: i64 = 200;
 
+/// Fixed 46-character estimate workspace: the p2a compaction fixtures were
+/// frozen against `/src/.zig-cache/tmp/<16>/workspace` (46 chars), and
+/// `{{cwd}}` mirrors the fixture-comparison token.
+const fixture_workspace_placeholder = "{{cwd}}/00000000000000000000000000000000000000";
+
 const InputFile = struct {
     steps: []const Step = &.{},
 
@@ -1828,6 +1833,7 @@ fn runEventFixture(scenario: []const u8) !void {
         .context_window = input.config.contextWindow,
         .compaction_retain_ratio = input.config.compactionRetainRatio,
         .compaction_headroom_tokens = input.config.compactionHeadroomTokens,
+        .workspace_placeholder = fixture_workspace_placeholder,
         .question_timeout_s = input.config.questionTimeout,
         .now_ms = clockNow,
         .clock_context = &clock,
@@ -1970,6 +1976,8 @@ test "hook abort cause serializes as kind hook and reason" {
     try std.testing.expect(reason.get("name") == null);
 }
 
+// Regression: the summary's shadowedTokenCount was 502 when the checkout path
+// was longer than /src, because the runtime-context prompt embeds the cwd.
 test "dsh native p2a compaction pressure matches normalized v4 fixture" {
     try runEventFixture("p2a-compaction-pressure");
 }
@@ -1978,6 +1986,8 @@ test "dsh native p2a compaction command matches normalized v4 fixture" {
     try runEventFixture("p2a-compaction-command");
 }
 
+// Regression: the prune record's shadowedTokenCount was 5496 when the checkout
+// path was longer than /src, because the read envelope embeds the cwd.
 test "dsh native p2a compaction prune matches normalized v4 fixture" {
     try runEventFixture("p2a-compaction-prune");
 }

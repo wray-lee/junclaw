@@ -74,6 +74,79 @@ pub fn estimateMessage(allocator: Allocator, message: types.Message) !u64 {
     return content + ROLE_OVERHEAD;
 }
 
+/// Estimate-time replacement of a workspace path. A non-empty `workspace` and
+/// `placeholder` pair prices every occurrence of the path as the placeholder,
+/// keeping counts independent of the checkout location.
+pub const WorkspaceSubstitution = struct {
+    workspace: []const u8 = "",
+    placeholder: []const u8 = "",
+
+    pub fn active(self: WorkspaceSubstitution) bool {
+        return self.workspace.len != 0 and self.placeholder.len != 0;
+    }
+};
+
+fn jsonEscapedAlloc(allocator: Allocator, value: []const u8) ![]const u8 {
+    const quoted = try std.json.Stringify.valueAlloc(allocator, value, .{});
+    defer allocator.free(quoted);
+    std.debug.assert(quoted.len >= 2);
+    return allocator.dupe(u8, quoted[1 .. quoted.len - 1]);
+}
+
+fn substituteWorkspace(
+    allocator: Allocator,
+    text: []const u8,
+    substitution: WorkspaceSubstitution,
+    escaped_workspace: []const u8,
+) ![]const u8 {
+    const raw = try std.mem.replaceOwned(
+        u8,
+        allocator,
+        text,
+        substitution.workspace,
+        substitution.placeholder,
+    );
+    if (std.mem.eql(u8, escaped_workspace, substitution.workspace)) return raw;
+    return std.mem.replaceOwned(
+        u8,
+        allocator,
+        raw,
+        escaped_workspace,
+        substitution.placeholder,
+    );
+}
+
+/// Price a message after substituting the workspace path in its text. Runtime
+/// context prompts JSON-quote paths, so both the raw and the escaped form are
+/// replaced; empty substitution delegates to `estimateMessage`.
+pub fn estimateMessageWithWorkspace(
+    allocator: Allocator,
+    message: types.Message,
+    substitution: WorkspaceSubstitution,
+) !u64 {
+    if (!substitution.active()) return estimateMessage(allocator, message);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const escaped_workspace = try jsonEscapedAlloc(a, substitution.workspace);
+    const content = try a.alloc(types.ContentBlock, message.content.len);
+    for (message.content, 0..) |block, index| {
+        content[index] = switch (block) {
+            .text => |text| .{ .text = try substituteWorkspace(a, text, substitution, escaped_workspace) },
+            .reasoning => |text| .{ .reasoning = try substituteWorkspace(a, text, substitution, escaped_workspace) },
+            .tool_call => |call| .{ .tool_call = .{
+                .id = call.id,
+                .name = try substituteWorkspace(a, call.name, substitution, escaped_workspace),
+                .arguments = try substituteWorkspace(a, call.arguments, substitution, escaped_workspace),
+            } },
+            .raw => block,
+        };
+    }
+    var normalized = message;
+    normalized.content = content;
+    return estimateMessage(a, normalized);
+}
+
 /// Disjoint provider buckets (`packages/llm/token-meter/src/index.ts:71-76`);
 /// cache fields are optional and reasoning output is already inside
 /// `outputTokens`.
@@ -436,6 +509,64 @@ test "64KB+ text and raw JSON paths estimate without leaking" {
     defer buffer.deinit();
     try writeBlock(&buffer.writer, raw[0]);
     try testing.expectEqual(@as(usize, 65588), buffer.written().len);
+}
+
+test "workspace substitution prices different checkout paths equally" {
+    // Regression: p2a compaction shadowedTokenCount moved with the workspace
+    // path length (488 at the frozen 46-character /src path, 502 on the CI
+    // checkout path) because runtime-context prompts embed the absolute cwd.
+    const allocator = testing.allocator;
+    // 46 characters: the workspace length the p2a fixtures were frozen with
+    // (`/src/.zig-cache/tmp/<16>/workspace`).
+    const placeholder = "{{cwd}}/00000000000000000000000000000000000000";
+    const short_workspace = "C:\\work\\a";
+    const long_workspace = "C:\\work\\checkout\\with\\a\\much\\longer\\workspace";
+    const short_text = "cwd: \"C:\\\\work\\\\a\" and <path>C:\\work\\a/big.txt</path>";
+    const long_text = "cwd: \"C:\\\\work\\\\checkout\\\\with\\\\a\\\\much\\\\longer\\\\workspace\" and " ++
+        "<path>C:\\work\\checkout\\with\\a\\much\\longer\\workspace/big.txt</path>";
+    const expected_text = try std.fmt.allocPrint(
+        allocator,
+        "cwd: \"{s}\" and <path>{s}/big.txt</path>",
+        .{ placeholder, placeholder },
+    );
+    defer allocator.free(expected_text);
+
+    const short_blocks = [_]types.ContentBlock{textBlock(short_text)};
+    const long_blocks = [_]types.ContentBlock{textBlock(long_text)};
+    const expected_blocks = [_]types.ContentBlock{textBlock(expected_text)};
+    const short_total = try estimateMessageWithWorkspace(
+        allocator,
+        systemMessage(&short_blocks),
+        .{ .workspace = short_workspace, .placeholder = placeholder },
+    );
+    const long_total = try estimateMessageWithWorkspace(
+        allocator,
+        systemMessage(&long_blocks),
+        .{ .workspace = long_workspace, .placeholder = placeholder },
+    );
+    try testing.expectEqual(short_total, long_total);
+    try testing.expectEqual(
+        try estimateMessage(allocator, systemMessage(&expected_blocks)),
+        short_total,
+    );
+
+    // The substitution allocates through an internal arena; keep the 64KB+
+    // input path leak-checked by std.testing.allocator.
+    const filler = try repeatAlloc(allocator, "a", 65_536);
+    defer allocator.free(filler);
+    const large_text = try std.fmt.allocPrint(
+        allocator,
+        "<path>{s}/big.txt</path>\n{s}",
+        .{ short_workspace, filler },
+    );
+    defer allocator.free(large_text);
+    const large_blocks = [_]types.ContentBlock{textBlock(large_text)};
+    const large_total = try estimateMessageWithWorkspace(
+        allocator,
+        systemMessage(&large_blocks),
+        .{ .workspace = short_workspace, .placeholder = placeholder },
+    );
+    try testing.expect(large_total > 16_000);
 }
 
 fn renderBlock(allocator: Allocator, block: types.ContentBlock) ![]u8 {
