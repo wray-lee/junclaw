@@ -620,7 +620,10 @@ pub const AgentConfig = struct {
     /// Whether a tool call that needs approval prompts the host. Non-interactive
     /// channels behave as `never` regardless of this value.
     dsh_approval_policy: DshApprovalPolicy = .ask,
-    /// File-sandbox mode shown to the model and enforced by dsh-native tools.
+    /// File-policy sentence shown to the model. dsh-native enforces it for the
+    /// file tools: `read-only` refuses write/edit, and every mode stays inside
+    /// the junclaw workspace/allowed_paths/system-blocklist boundary
+    /// (`danger-full-access` does not widen it).
     dsh_sandbox: DshSandbox = .workspace_write,
     /// Parallel tool pool size; dsh's default is 10.
     dsh_max_parallel_tools: usize = DEFAULT_DSH_MAX_PARALLEL_TOOLS,
