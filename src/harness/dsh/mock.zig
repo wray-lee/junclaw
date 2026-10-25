@@ -23,14 +23,29 @@ pub const turn_aborted_frame =
     "\"event\":{\"type\":\"turn/end\",\"data\":{\"reason\":{\"kind\":\"aborted\"," ++
     "\"reason\":{\"kind\":\"user\"}}}}}}";
 
-/// One `assistant-stream` text-delta frame in the `item` envelope.
-pub fn textDeltaFrame(allocator: Allocator, index: u32, text: []const u8) ![]u8 {
+/// One `assistant-stream` delta frame in the `item` envelope.
+fn assistantDeltaFrame(
+    allocator: Allocator,
+    kind: []const u8,
+    index: u32,
+    text: []const u8,
+) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         "{{\"type\":\"item\",\"streamId\":\"follow\",\"value\":{{\"type\":\"assistant-stream\"," ++
-            "\"data\":{{\"type\":\"text-delta\",\"index\":{d},\"text\":{f}}}}}}}",
-        .{ index, std.json.fmt(text, .{}) },
+            "\"data\":{{\"type\":\"{s}\",\"index\":{d},\"text\":{f}}}}}}}",
+        .{ kind, index, std.json.fmt(text, .{}) },
     );
+}
+
+/// One `assistant-stream` text-delta frame in the `item` envelope.
+pub fn textDeltaFrame(allocator: Allocator, index: u32, text: []const u8) ![]u8 {
+    return assistantDeltaFrame(allocator, "text-delta", index, text);
+}
+
+/// One `assistant-stream` reasoning-delta frame in the `item` envelope.
+pub fn reasoningDeltaFrame(allocator: Allocator, index: u32, text: []const u8) ![]u8 {
+    return assistantDeltaFrame(allocator, "reasoning-delta", index, text);
 }
 
 /// One committed `assistant/message` frame in the `item` envelope. dsh sets

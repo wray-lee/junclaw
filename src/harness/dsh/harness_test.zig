@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const std_compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
+const config_types = @import("../../config_types.zig");
 const port = @import("../port.zig");
 const harness_mod = @import("harness.zig");
 const client_mod = @import("client.zig");
@@ -2214,4 +2215,471 @@ test "empty configured bin resolves from env and the sweep spares the gateway" {
     sidecar_mod.reapOrphansIn(allocator, root, engine.opts.sidecar.bin_js, engine.opts.sidecar.dsh_home, null, recordProcKill, &log);
 
     try std.testing.expectEqualSlices(i32, &.{101}, log.pids.items);
+}
+
+// ── P4b: sidecar reasoning display ──────────────────────────────────────────
+
+test "dsh reasoning streams inline think tags before visible text" {
+    // Regression: reasoning-delta chunks were left as `.other`, so the sidecar
+    // dropped every trace and Info.reasoning_mode was hardcoded to off.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .stream);
+    try std.testing.expectEqual(config_types.ReasoningMode.stream, h.harness().info().reasoning_mode);
+
+    const first = try mock_mod.reasoningDeltaFrame(allocator, 0, "trace ");
+    defer allocator.free(first);
+    const second = try mock_mod.reasoningDeltaFrame(allocator, 1, "more");
+    defer allocator.free(second);
+    const text = try mock_mod.textDeltaFrame(allocator, 2, "answer");
+    defer allocator.free(text);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ first, second, text, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("<think>trace more</think>answer", sink.text());
+    try std.testing.expectEqualStrings("answer", result.reply);
+    try std.testing.expectEqualStrings("answer", result.persisted_reply.?);
+    try std.testing.expectEqual(port.EndReason.completed, result.end_reason);
+}
+
+test "dsh closes each reasoning block before the next one and before its text" {
+    // Regression: the sidecar had no reasoning state machine, so multiple
+    // reasoning-delta blocks could never be framed as separate tags.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .stream);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "first");
+    defer allocator.free(r1);
+    const t1 = try mock_mod.textDeltaFrame(allocator, 1, "a");
+    defer allocator.free(t1);
+    const r2 = try mock_mod.reasoningDeltaFrame(allocator, 2, "second");
+    defer allocator.free(r2);
+    const t2 = try mock_mod.textDeltaFrame(allocator, 3, "b");
+    defer allocator.free(t2);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ r1, t1, r2, t2, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("<think>first</think>a<think>second</think>b", sink.text());
+    try std.testing.expectEqualStrings("ab", result.reply);
+    try std.testing.expectEqualStrings("ab", result.persisted_reply.?);
+}
+
+test "dsh abort mid-reasoning closes the think tag" {
+    // Regression: abort/timeout returned the partial reply without closing a
+    // tag the relay had already opened, leaving the channel draft unbalanced.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .stream);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "trace");
+    defer allocator.free(r1);
+    try mock.setTurnFrames(&.{r1});
+
+    // Park the turn inside the opening tag emit until the test has seen it and
+    // armed /stop, so the abort cannot race the first reasoning delta.
+    var sink = RecordingSink{ .block_after = "<think>".len, .released = std.atomic.Value(bool).init(false) };
+    var turn = TurnThread{ .harness = &h, .input = .{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+
+    waitForPrompt(mock, 1);
+    waitForSink(&sink, "<think>".len);
+    _ = (try h.harness().handleLocalCommand("/stop")).?;
+    sink.released.store(true, .release);
+
+    thread.join();
+    try std.testing.expect(turn.failure == null);
+    const result = turn.result.?;
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("<think>trace</think>", sink.text());
+    try std.testing.expectEqualStrings("", result.reply);
+    try std.testing.expectEqualStrings("", result.persisted_reply.?);
+    try std.testing.expectEqual(port.EndReason.interrupted, result.end_reason);
+}
+
+test "dsh failed turn mid-reasoning closes the think tag" {
+    // Regression: the error turn/end path returned before closing an open
+    // block, unlike the completed path.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .stream);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "trace");
+    defer allocator.free(r1);
+    const fail = try errorEndFrame(allocator, "boom");
+    defer allocator.free(fail);
+    try mock.setTurnFrames(&.{ r1, fail });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+    defer allocator.free(result.@"error".?);
+
+    try std.testing.expectEqualStrings("<think>trace</think>", sink.text());
+    try std.testing.expectEqual(port.EndReason.failed, result.end_reason);
+    try std.testing.expectEqualStrings("boom", result.@"error".?);
+    try std.testing.expectEqualStrings("", result.reply);
+}
+
+test "dsh socket death mid-reasoning closes the think tag" {
+    // Regression: a reader/socket failure returned before closing an open
+    // block, so the channel kept rendering the rest of the turn as thinking.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .stream);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "trace");
+    defer allocator.free(r1);
+    try mock.setTurnFrames(&.{r1});
+
+    var sink = RecordingSink{ .block_after = "<think>".len, .released = std.atomic.Value(bool).init(false) };
+    var turn = TurnThread{ .harness = &h, .input = .{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    } };
+    const thread = try std.Thread.spawn(.{}, TurnThread.main, .{&turn});
+
+    waitForPrompt(mock, 1);
+    waitForSink(&sink, "<think>".len);
+    mock.kill();
+    sink.released.store(true, .release);
+
+    thread.join();
+    try std.testing.expect(turn.failure != null);
+    try std.testing.expectEqualStrings("<think>trace</think>", sink.text());
+}
+
+test "dsh reasoning_mode off filters every reasoning delta" {
+    // Regression: Info.reasoning_mode was hardcoded off while traces were
+    // dropped unconditionally, so no test proved off really filtered.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .off);
+    try std.testing.expectEqual(config_types.ReasoningMode.off, h.harness().info().reasoning_mode);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "hidden");
+    defer allocator.free(r1);
+    const text = try mock_mod.textDeltaFrame(allocator, 1, "answer");
+    defer allocator.free(text);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ r1, text, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("answer", sink.text());
+    try std.testing.expectEqualStrings("answer", result.reply);
+    try std.testing.expectEqualStrings("answer", result.persisted_reply.?);
+}
+
+test "dsh reasoning_mode on quotes the trace and keeps persisted text clean" {
+    // Regression: `.on` fell through to the off path, so the sidecar never
+    // produced the native `Reasoning:` block.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .on);
+    try std.testing.expectEqual(config_types.ReasoningMode.on, h.harness().info().reasoning_mode);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "hidden\n");
+    defer allocator.free(r1);
+    const r2 = try mock_mod.reasoningDeltaFrame(allocator, 1, "trace");
+    defer allocator.free(r2);
+    const text = try mock_mod.textDeltaFrame(allocator, 2, "answer");
+    defer allocator.free(text);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ r1, r2, text, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("<think>hidden\ntrace</think>answer", sink.text());
+    try std.testing.expectEqualStrings("Reasoning:\n> hidden\n> trace\n\n\nanswer", result.reply);
+    try std.testing.expectEqualStrings("answer", result.persisted_reply.?);
+    try std.testing.expect(std.mem.indexOf(u8, result.reply, "<think>") == null);
+}
+
+test "dsh empty reasoning deltas create no think tags or quotes" {
+    // Regression: an empty delta would have opened a tag (and an empty
+    // Reasoning block) if the state machine keyed on any reasoning event.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .on);
+
+    const empty1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "");
+    defer allocator.free(empty1);
+    const empty2 = try mock_mod.reasoningDeltaFrame(allocator, 1, "");
+    defer allocator.free(empty2);
+    const text = try mock_mod.textDeltaFrame(allocator, 2, "answer");
+    defer allocator.free(text);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ empty1, empty2, text, end });
+
+    var sink = RecordingSink{};
+    const result = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(result.reply);
+
+    try std.testing.expectEqualStrings("answer", sink.text());
+    try std.testing.expectEqualStrings("answer", result.reply);
+    try std.testing.expect(std.mem.indexOf(u8, result.reply, "Reasoning:") == null);
+}
+
+test "dsh reasoning mode is per session key and per turn" {
+    // Regression: a process-wide engine mode would have let one key filter or
+    // quote another key on the same shared sidecar.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h1 = try DshHarness.init(engine, "key-a");
+    defer h1.deinit();
+    var h2 = try DshHarness.init(engine, "key-b");
+    defer h2.deinit();
+    h1.setCallConfig("dsh", null, .stream);
+    h2.setCallConfig("dsh", null, .off);
+    try std.testing.expectEqual(config_types.ReasoningMode.stream, h1.harness().info().reasoning_mode);
+    try std.testing.expectEqual(config_types.ReasoningMode.off, h2.harness().info().reasoning_mode);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "one");
+    defer allocator.free(r1);
+    const t1 = try mock_mod.textDeltaFrame(allocator, 1, "1");
+    defer allocator.free(t1);
+    const e1 = try endFrame(allocator, "completed");
+    defer allocator.free(e1);
+    try mock.setTurnFrames(&.{ r1, t1, e1 });
+    var sink1 = RecordingSink{};
+    const first = try h1.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink1.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(first.reply);
+    try std.testing.expectEqualStrings("<think>one</think>1", sink1.text());
+
+    const r2 = try mock_mod.reasoningDeltaFrame(allocator, 0, "two");
+    defer allocator.free(r2);
+    const t2 = try mock_mod.textDeltaFrame(allocator, 1, "2");
+    defer allocator.free(t2);
+    const e2 = try endFrame(allocator, "completed");
+    defer allocator.free(e2);
+    try mock.setTurnFrames(&.{ r2, t2, e2 });
+    var sink2 = RecordingSink{};
+    const second = try h2.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink2.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(second.reply);
+    try std.testing.expectEqualStrings("2", sink2.text());
+
+    // Switch key-a to `.on` for its next turn; key-b keeps `.off`.
+    h1.setCallConfig("dsh", null, .on);
+    try mock.setTurnFrames(&.{ r1, t1, e1 });
+    var sink3 = RecordingSink{};
+    const third = try h1.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink3.sink(),
+        .live_stream = true,
+    });
+    defer allocator.free(third.reply);
+    try std.testing.expectEqualStrings("<think>one</think>1", sink3.text());
+    try std.testing.expectEqualStrings("Reasoning:\n> one\n\n\n1", third.reply);
+    try std.testing.expectEqual(config_types.ReasoningMode.off, h2.harness().info().reasoning_mode);
+}
+
+test "dsh reasoning tags require a live stream and a sink" {
+    // Regression: a closer must never appear when no tag was opened (no sink
+    // or a progress-only sink with live_stream=false).
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .stream);
+
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, "trace");
+    defer allocator.free(r1);
+    const text = try mock_mod.textDeltaFrame(allocator, 1, "answer");
+    defer allocator.free(text);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ r1, text, end });
+
+    var sink = RecordingSink{};
+    const no_live = try h.harness().runTurn(.{
+        .user_message = "hi",
+        .sink = sink.sink(),
+        .live_stream = false,
+    });
+    defer allocator.free(no_live.reply);
+    try std.testing.expectEqualStrings("answer", sink.text());
+    try std.testing.expect(std.mem.indexOf(u8, sink.text(), "</think>") == null);
+
+    try mock.setTurnFrames(&.{ r1, text, end });
+    const no_sink = try h.harness().runTurn(.{ .user_message = "hi" });
+    defer allocator.free(no_sink.reply);
+    try std.testing.expectEqualStrings("answer", no_sink.reply);
+    try std.testing.expectEqualStrings("answer", no_sink.persisted_reply.?);
+}
+
+test "dsh 64 KiB reasoning trace is released and stays out of persisted text" {
+    // A large trace must not leak (testing allocator) and `.on` must quote it
+    // without putting a byte of it into `persisted_reply`.
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    const mock = try MockDsh.init(allocator);
+    defer mock.deinit();
+
+    const boot_url = try bootUrl(allocator, mock);
+    defer allocator.free(boot_url);
+    const engine = try newEngine(allocator, boot_url, null);
+    defer freeEngine(engine);
+    var h = try DshHarness.init(engine, "test-key");
+    defer h.deinit();
+    h.setCallConfig("dsh", null, .on);
+
+    const trace = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(trace);
+    @memset(trace, 'r');
+    const r1 = try mock_mod.reasoningDeltaFrame(allocator, 0, trace);
+    defer allocator.free(r1);
+    const text = try mock_mod.textDeltaFrame(allocator, 1, "answer");
+    defer allocator.free(text);
+    const end = try endFrame(allocator, "completed");
+    defer allocator.free(end);
+    try mock.setTurnFrames(&.{ r1, text, end });
+
+    const result = try h.harness().runTurn(.{ .user_message = "hi" });
+    defer allocator.free(result.reply);
+
+    try std.testing.expect(result.reply.len > 64 * 1024);
+    try std.testing.expect(std.mem.startsWith(u8, result.reply, "Reasoning:\n> "));
+    try std.testing.expectEqualStrings("answer", result.persisted_reply.?);
 }

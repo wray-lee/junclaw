@@ -221,6 +221,7 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 - 在 `-Dharness_dsh=true` 构建中，整个进程共用一个 dsh sidecar，并在第一个 sidecar 回合惰性启动，启动过程不在会话表锁内。因此会话创建保持很快，所有 `dsh-sidecar` 会话共用同一个 sidecar。
 - `NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。未设置或 sidecar 启动失败时，该回合返回错误（呈现给用户），下一个回合会重试启动。sidecar 使用配置的 agent 工作目录，profile 保存在 `<配置目录>/.dsh`，每个会话的 dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
 - P1 的 sidecar 模式覆盖聊天回合、流式回复，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话。它不包含 steer 注入、审批和用户提问；junclaw 仍会为自己的通道历史保留一份对话记录。
+- 推理显示对 `native`、`dsh`（及别名 `dsh-native`）和 `dsh-sidecar` 一样按会话遵循 `agent.reasoning_mode`：`off` 丢弃推理，`on` 在最终回复前加 `Reasoning:` 引用块，`stream` 把推理作为内联 `<think>…</think>` 文本增量转发，由通道的实时草稿按模式过滤。sidecar 只中继它实际收到的 `reasoning-delta` 帧；sidecar 没有上报的推理无法显示。该行为由确定性的 mock sidecar 测试覆盖，不是真实模型验证。
 
 示例：
 
@@ -289,6 +290,7 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 
 - 设置新建会话的推理展示模式。可选值为 `off`、`on` 和 `stream`，默认值为 `off`。
 - `off` 不展示推理内容；`on` 会在最终回复上方输出 `Reasoning:` 引用块；`stream` 会在模型生成时实时输出推理内容。
+- 该模式对所有引擎生效：`native`、`dsh`（及 `dsh-native`）和 `dsh-sidecar`。sidecar 的 `stream` 模式向实时草稿发送内联 `<think>…</think>` 标签，由通道决定是否显示；sidecar 的推理只来自它实际发出的 `reasoning-delta` 帧。任何模式下引擎持久化的回复正文（`persisted_reply`）都不包含推理或 `<think>` 标签。
 - `/reasoning <off|on|stream>` 可以覆盖当前会话的模式。`/restart` 和 `/debug reset` 会恢复这里配置的默认值，而不是一律重置为 `off`。
 - 会话会在 `agent.session_idle_timeout_secs` 空闲后被回收，因此配置默认值可以避免每次回收后都要重新执行 `/reasoning on`。
 - 修改后需要重启，新的会话才会使用新的默认值。

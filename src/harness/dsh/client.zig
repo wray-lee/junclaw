@@ -255,6 +255,7 @@ fn freeServerEvent(allocator: Allocator, event: protocol.ServerEvent) void {
     switch (event) {
         .assistant_chunk => |chunk| switch (chunk) {
             .text_delta => |delta| allocator.free(delta.text),
+            .reasoning_delta => |delta| allocator.free(delta.text),
             .tool_call => |call| {
                 allocator.free(call.call_id);
                 allocator.free(call.name);

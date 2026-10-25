@@ -241,6 +241,7 @@ Example:
 - In a `-Dharness_dsh=true` build, one dsh sidecar is shared by the whole process and starts lazily on the first sidecar turn, outside the session-table lock. Session creation therefore stays fast, and all `dsh-sidecar` sessions use the same sidecar.
 - `NULLCLAW_DSH_BIN` must point at dsh's `lib/bin.js`. If it is unset or the sidecar fails to boot, that turn returns an error (shown to the user) and the next turn retries the boot. The sidecar uses the configured agent workspace, keeps its profile in `<config dir>/.dsh`, and persists each session's dsh id in `<config dir>/dsh-sessions/`.
 - P1 sidecar mode covers chat turns, streamed replies, and routing host-side `/stop` and `/new` to the dsh session. It does not include steer injection, approvals, or user questions; junclaw still keeps its own transcript for channel history.
+- Reasoning display follows `agent.reasoning_mode` per session for `native`, `dsh` (and the `dsh-native` alias), and `dsh-sidecar` alike: `off` drops reasoning, `on` prepends the `Reasoning:` quote block to the final reply, and `stream` forwards reasoning as inline `<think>…</think>` text deltas that the channel's live draft filters by mode. The sidecar only relays `reasoning-delta` frames it actually receives; it cannot display reasoning the sidecar does not report. This behavior is covered by deterministic mock-sidecar tests, not by a real-model run.
 
 Example:
 
@@ -309,6 +310,7 @@ Example:
 
 - Sets the reasoning display mode for newly created sessions. Accepted values are `off`, `on`, and `stream`; the default is `off`.
 - `off` hides reasoning content, `on` prints a `Reasoning:` quote block above the final reply, and `stream` prints reasoning live while the model produces it.
+- The mode applies to every harness: `native`, `dsh` (and `dsh-native`), and `dsh-sidecar`. In sidecar `stream` mode the live draft receives inline `<think>…</think>` tags and the channel decides whether to show them; sidecar reasoning comes only from the `reasoning-delta` frames the sidecar actually emits. The engine's persisted reply (`persisted_reply`) never includes reasoning or `<think>` tags in any mode.
 - `/reasoning <off|on|stream>` overrides the mode for the current session. `/restart` and `/debug reset` restore this configured default instead of always resetting to `off`.
 - Sessions are evicted after `agent.session_idle_timeout_secs`, so setting this avoids re-running `/reasoning on` after every idle eviction.
 - Changes apply to sessions created after a restart.

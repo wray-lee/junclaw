@@ -24,6 +24,7 @@ const std_compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
 const agent_mod = @import("../../agent/root.zig");
+const config_types = @import("../../config_types.zig");
 const port = @import("../port.zig");
 const client_mod = @import("client.zig");
 const sidecar_mod = @import("sidecar.zig");
@@ -615,6 +616,89 @@ pub const DshEngine = struct {
     }
 };
 
+/// One turn's reasoning display state. `.on` accumulates the trace for the
+/// final quoted block; `.off` ignores it; `.stream` (and `.on`) forward it as
+/// `<think>…</think>` inline deltas when the host has a live draft, so the
+/// host's TagFilter decides what the channel shows. `composeFinalReply` is the
+/// native formatter, reused so the quoted block cannot drift from native.
+const ReasoningRelay = struct {
+    mode: config_types.ReasoningMode,
+    /// Non-null only for `sink != null and input.live_stream`; a progress-only
+    /// sink must never receive tags it would leave dangling.
+    sink: ?port.Sink,
+    open: bool = false,
+    trace: std.ArrayListUnmanaged(u8) = .empty,
+
+    fn deinit(self: *ReasoningRelay, allocator: Allocator) void {
+        self.trace.deinit(allocator);
+    }
+
+    fn push(self: *ReasoningRelay, allocator: Allocator, text: []const u8) !void {
+        // An empty fragment must not open a tag: `off`, empty traces and
+        // no-live-stream turns all leave the stream without `<think>`.
+        if (text.len == 0 or self.mode == .off) return;
+        if (self.mode == .on) try self.trace.appendSlice(allocator, text);
+        const sink = self.sink orelse return;
+        if (!self.open) {
+            sink.send(.{ .delta = providers.StreamChunk.textDelta("<think>") });
+            self.open = true;
+        }
+        sink.send(.{ .delta = providers.StreamChunk.textDelta(text) });
+    }
+
+    /// Close an open block before visible text or a turn end. Idempotent, and
+    /// never emits a closer that `push` did not open.
+    fn close(self: *ReasoningRelay) void {
+        const sink = self.sink orelse return;
+        if (!self.open) return;
+        sink.send(.{ .delta = providers.StreamChunk.textDelta("</think>") });
+        self.open = false;
+    }
+
+    /// Close the block and build the turn result. In `.on` the reply gets
+    /// native's quoted block while `persisted_reply` is the clean visible text;
+    /// it is a suffix of the returned reply, so the host still frees one buffer.
+    fn finish(
+        self: *ReasoningRelay,
+        allocator: Allocator,
+        text: *std.ArrayListUnmanaged(u8),
+        end_reason: port.EndReason,
+    ) !port.TurnResult {
+        self.close();
+        const visible = try text.toOwnedSlice(allocator);
+        var reply: []const u8 = visible;
+        var persisted: ?[]const u8 = visible;
+        if (self.mode == .on and self.trace.items.len > 0) {
+            const context = FinalReplyContext{
+                .allocator = allocator,
+                .reasoning_mode = .on,
+                .usage_mode = .off,
+            };
+            const prefix = try agent_mod.commands.composeFinalReply(&context, "", self.trace.items, .{});
+            defer allocator.free(prefix);
+            reply = agent_mod.commands.composeFinalReply(&context, visible, self.trace.items, .{}) catch |err| {
+                allocator.free(visible);
+                return err;
+            };
+            allocator.free(visible);
+            persisted = reply[prefix.len..];
+        }
+        return .{ .reply = reply, .persisted_reply = persisted, .end_reason = end_reason };
+    }
+};
+
+/// The surface `composeFinalReply` reads from its receiver. The sidecar reply
+/// never carries a usage footer; the extra variants exist because the shared
+/// formatter switches over them exhaustively.
+const FinalReplyContext = struct {
+    allocator: Allocator,
+    reasoning_mode: config_types.ReasoningMode,
+    usage_mode: FinalReplyUsageMode,
+    total_tokens: u64 = 0,
+};
+
+const FinalReplyUsageMode = enum { off, tokens, full, cost };
+
 /// Lightweight per-session handle over a shared `DshEngine`. The key is owned
 /// and immutable for the handle's life, so one session's turn can never
 /// retarget another session.
@@ -626,6 +710,9 @@ pub const DshHarness = struct {
     session_key: []u8,
     /// Owned copy of this key's mapping path; null disables resume.
     session_file: ?[]u8 = null,
+    /// `agent.reasoning_mode` for this key. Kept here, never on the shared
+    /// `DshEngine`, so two sessions cannot overwrite each other's display mode.
+    reasoning_mode: config_types.ReasoningMode = .off,
 
     pub fn init(engine: *DshEngine, session_key: []const u8) !Self {
         const allocator = engine.allocator;
@@ -649,6 +736,20 @@ pub const DshHarness = struct {
 
     pub fn harness(self: *Self) port.Harness {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+
+    /// Mirror the host's live `/model`, `/think` and `/reasoning` selection.
+    /// The sidecar's own request config chooses the model and effort; only the
+    /// reasoning display mode is host-owned here.
+    pub fn setCallConfig(
+        self: *Self,
+        model: []const u8,
+        reasoning_effort: ?[]const u8,
+        reasoning_mode: config_types.ReasoningMode,
+    ) void {
+        _ = model;
+        _ = reasoning_effort;
+        self.reasoning_mode = reasoning_mode;
     }
 
     /// True while a stop is waiting for the next turn to consume it. The host
@@ -737,25 +838,31 @@ pub const DshHarness = struct {
 
         var text: std.ArrayListUnmanaged(u8) = .empty;
         errdefer text.deinit(allocator);
+        // A progress-only sink gets no live tags; `.on` still accumulates the
+        // trace for the final block.
+        var relay = ReasoningRelay{
+            .mode = self.reasoning_mode,
+            .sink = if (input.live_stream) sink else null,
+        };
+        errdefer relay.close();
+        defer relay.deinit(allocator);
 
         const deadline = std_compat.time.milliTimestamp() +
             @as(i64, @intCast(engine.opts.turn_timeout_ms));
         while (true) {
             if (entry.interrupt_requested.swap(false, .acquire)) {
+                // Close before the cancel drain emits partial text, so visible
+                // text never lands inside an open thinking block.
+                relay.close();
                 // session/cancel is sent from this thread: the subscription's
                 // event queue has exactly one consumer, and cancelOn() drains
                 // it while waiting for the aborted turn/end.
-                var cancelled = (try self.cancelAndDrain(entry, session_id, &text, sink)) orelse return .{
+                var cancelled = (try self.cancelAndDrain(entry, session_id, &text, sink)) orelse return
                     // The turn may have ended between the flag and the RPC; the
                     // partial text is still the best reply we have.
-                    .reply = try text.toOwnedSlice(allocator),
-                    .end_reason = .interrupted,
-                };
+                    try relay.finish(allocator, &text, .interrupted);
                 defer client_mod.freeCancelResult(allocator, &cancelled);
-                return .{
-                    .reply = try text.toOwnedSlice(allocator),
-                    .end_reason = mapEndReason(cancelled.kind),
-                };
+                return try relay.finish(allocator, &text, mapEndReason(cancelled.kind));
             }
 
             const remaining = deadline - std_compat.time.milliTimestamp();
@@ -763,6 +870,7 @@ pub const DshHarness = struct {
                 // Cancel and drain the expired turn before reporting, so its
                 // frames cannot land in the next turn. A /stop armed while the
                 // cancel drained belonged to this turn, which is now over.
+                relay.close();
                 var cancelled = try self.cancelAndDrain(entry, session_id, &text, sink);
                 _ = entry.interrupt_requested.swap(false, .acquire);
                 if (cancelled) |*result| {
@@ -771,10 +879,7 @@ pub const DshHarness = struct {
                 }
                 // dsh never sent the aborted turn/end; return what the user
                 // already saw rather than an error that drops it.
-                return .{
-                    .reply = try text.toOwnedSlice(allocator),
-                    .end_reason = .failed,
-                };
+                return try relay.finish(allocator, &text, .failed);
             }
 
             var event = entry.sub.nextEvent(@min(@as(u64, @intCast(remaining)), poll_slice_ms)) catch |err| switch (err) {
@@ -786,37 +891,46 @@ pub const DshHarness = struct {
                     // saw (retrying the prompt would duplicate it).
                     try engine.recover(entry, entry.client);
                     if (text.items.len == 0) return err;
-                    return .{ .reply = try text.toOwnedSlice(allocator), .end_reason = .failed };
+                    return try relay.finish(allocator, &text, .failed);
                 },
             };
             defer client_mod.freeEvent(allocator, &event);
 
             switch (event.event) {
                 .assistant_chunk => |chunk| switch (chunk) {
+                    .reasoning_delta => |delta| try relay.push(allocator, delta.text),
                     .text_delta => |delta| {
+                        relay.close();
                         try text.appendSlice(allocator, delta.text);
                         if (sink) |s| s.send(.{ .delta = providers.StreamChunk.textDelta(delta.text) });
                     },
                     // The port union has no tool variant; native reports tools
                     // through `Event.progress`, so mirror that.
-                    .tool_call => |call| if (sink) |s| s.send(.{ .progress = .{
-                        .kind = .tool,
-                        .text = call.name,
-                        .arguments_json = call.arguments_json,
-                        .phase = .start,
-                    } }),
-                    .tool_result => |result| if (sink) |s| s.send(.{ .progress = .{
-                        .kind = .tool,
-                        .text = result.call_id,
-                        .phase = .end,
-                        .success = !result.is_error,
-                    } }),
+                    .tool_call => |call| {
+                        relay.close();
+                        if (sink) |s| s.send(.{ .progress = .{
+                            .kind = .tool,
+                            .text = call.name,
+                            .arguments_json = call.arguments_json,
+                            .phase = .start,
+                        } });
+                    },
+                    .tool_result => |result| {
+                        relay.close();
+                        if (sink) |s| s.send(.{ .progress = .{
+                            .kind = .tool,
+                            .text = result.call_id,
+                            .phase = .end,
+                            .success = !result.is_error,
+                        } });
+                    },
                     .other => {},
                 },
                 .committed => |message| {
                     // dsh's finalized step text replaces the delta view it
                     // finalizes, so a turn that streams and commits replies once.
                     // An empty commit (tool-call-only step) is not a reply.
+                    relay.close();
                     if (message.len > 0) {
                         text.clearRetainingCapacity();
                         try text.appendSlice(allocator, message);
@@ -824,16 +938,10 @@ pub const DshHarness = struct {
                 },
                 .turn_end => |turn| {
                     engine.noteTurnCompleted();
-                    const reply = try text.toOwnedSlice(allocator);
-                    errdefer allocator.free(reply);
-                    return .{
-                        .reply = reply,
-                        .end_reason = mapEndReason(turn.kind),
-                        .@"error" = if (turn.error_message) |message|
-                            try allocator.dupe(u8, message)
-                        else
-                            null,
-                    };
+                    var result = try relay.finish(allocator, &text, mapEndReason(turn.kind));
+                    errdefer allocator.free(result.reply);
+                    if (turn.error_message) |message| result.@"error" = try allocator.dupe(u8, message);
+                    return result;
                 },
                 // P1 has no approval/question UI. The payload can carry command
                 // text, so it is dropped rather than logged.
@@ -921,7 +1029,7 @@ pub const DshHarness = struct {
             .allowed_paths = &.{},
             .has_own_autonomy = false,
             .queue_mode = .serial,
-            .reasoning_mode = .off,
+            .reasoning_mode = self.reasoning_mode,
             .redactor = null,
         };
     }
