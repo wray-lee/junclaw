@@ -2527,10 +2527,9 @@ test "dsh-native adapter: plan state survives a poisoned restore and reset" {
         lastSystemContent(fx.provider.requests.items[3]),
         generated_system_prompt.plan_policy_text,
     ));
-    // The prompt arena must release the buffer behind the old prompt on every
-    // rebuild. With reset(.retain_capacity) that buffer stayed allocated and a
-    // dangling system_prompt still read the old policy text, so this test was
-    // green either way; probe the exact range the rebuild must release.
+    // Regression: reset(.retain_capacity) kept the buffer behind the old
+    // system_prompt allocated, so a dangling pointer still read the old policy
+    // text and this test stayed green. The rebuild must release that range.
     poison.probe = engine.system_prompt;
     _ = (try h.handleLocalCommand("/plan on")).?;
     try testing.expect(poison.probe_released);

@@ -208,6 +208,9 @@ test "encodeSegment mirrors dsh path escaping" {
 }
 
 test "encodeSegment escapes Windows device names and trailing dots" {
+    // Regression: Win32 treated "con"/"nul." session ids as devices or stripped
+    // the trailing dot, so the session directory could not be created or
+    // collided with the dotless id.
     const allocator = std.testing.allocator;
     const cases = [_]struct { raw: []const u8, posix: []const u8, windows: []const u8 }{
         .{ .raw = "con", .posix = "con", .windows = "~0063on" },
