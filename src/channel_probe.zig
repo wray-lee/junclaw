@@ -184,6 +184,7 @@ fn classifyProbeError(err: anyerror) []const u8 {
     if (err == error.CurlReadError or
         err == error.CurlWriteError or
         err == error.CurlWaitError or
+        err == error.CurlPreSendError or
         err == error.CurlDnsError or
         err == error.CurlConnectError or
         err == error.CurlTimeout or

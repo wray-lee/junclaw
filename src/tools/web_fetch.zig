@@ -256,6 +256,7 @@ fn transportFailureMessage(allocator: std.mem.Allocator, err: anyerror) ![]u8 {
         error.CurlTimeout => allocator.dupe(u8, "Fetch timed out after 30 seconds: the site did not respond"),
         error.CurlDnsError => allocator.dupe(u8, "Fetch failed: DNS lookup failed (host not found, or DNS is blocked)"),
         error.CurlConnectError => allocator.dupe(u8, "Fetch failed: connection refused or unreachable"),
+        error.CurlPreSendError => allocator.dupe(u8, "Fetch failed: request was not sent (invalid URL or unresolvable proxy)"),
         error.CurlTlsError => allocator.dupe(u8, "Fetch failed: TLS handshake failed (certificate or protocol problem)"),
         error.CurlReadError => allocator.dupe(u8, "Fetch failed: response could not be read (connection dropped)"),
         error.CurlInterrupted => allocator.dupe(u8, "Interrupted by /stop"),

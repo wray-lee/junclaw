@@ -35,6 +35,7 @@ fn classifyCurlExitCode(code: u8) []const u8 {
 
 pub fn mapCurlExitCodeToError(code: u8) anyerror {
     return switch (code) {
+        2, 3, 4, 5 => error.CurlPreSendError,
         6 => error.CurlDnsError,
         7 => error.CurlConnectError,
         28 => error.CurlTimeout,
@@ -45,6 +46,7 @@ pub fn mapCurlExitCodeToError(code: u8) anyerror {
 
 pub fn isCurlTransportError(err: anyerror) bool {
     return switch (err) {
+        error.CurlPreSendError,
         error.CurlDnsError,
         error.CurlConnectError,
         error.CurlTimeout,
@@ -68,15 +70,16 @@ pub fn preserveCurlTransportError(err: anyerror, fallback: anyerror) anyerror {
 /// after one of these — in another format, by the channel, or by the
 /// outbox/dispatch retry layers — can deliver the same message twice, so
 /// callers count it as one best-effort attempt. A definite pre-send failure
-/// (DNS/connect/TLS) is not in this set and can still be retried.
+/// (malformed URL, unresolvable proxy, DNS/connect/TLS) is not in this set and
+/// can still be retried.
 pub fn isIndeterminateSendError(err: anyerror) bool {
     return switch (err) {
         error.CurlTimeout,
         error.CurlReadError,
         error.CurlWriteError,
-        // exit 18/52/55/56 (partial transfer, empty reply, send/receive
-        // failure), and pre-send curl failures: the request may have been
-        // delivered, so a resend is not safe.
+        // exit 16/18/52/55/56/92 (partial or interrupted transfer, empty
+        // reply, send/receive failure) and unknown exit codes: the request may
+        // have been delivered, so a resend is not safe.
         error.CurlFailed,
         => true,
         else => false,
@@ -3005,6 +3008,17 @@ test "curl exit code mapping returns specific errors" {
     try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
     try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
     try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
+}
+
+test "curl pre-send failures are not treated as indeterminate sends" {
+    // Regression: exit 5 (unresolvable proxy) used to fall through to
+    // CurlFailed and count as possibly delivered, silently dropping a reply
+    // whose request never left the process.
+    try std.testing.expect(mapCurlExitCodeToError(2) == error.CurlPreSendError);
+    try std.testing.expect(mapCurlExitCodeToError(3) == error.CurlPreSendError);
+    try std.testing.expect(mapCurlExitCodeToError(5) == error.CurlPreSendError);
+    try std.testing.expect(!isIndeterminateSendError(error.CurlPreSendError));
+    try std.testing.expect(isCurlTransportError(error.CurlPreSendError));
 }
 
 test "preserveCurlTransportError preserves curl transport failures" {
