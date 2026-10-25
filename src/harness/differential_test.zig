@@ -36,6 +36,8 @@ fn testConfig() @import("../config.zig").Config {
         .config_path = "/tmp/junclaw_harness_diff/config.json",
         .default_model = "test/scripted-model",
         .allocator = std.testing.allocator,
+        // These golden traces pin the native engine; the product default is dsh.
+        .agent = .{ .harness = .native },
     };
 }
 

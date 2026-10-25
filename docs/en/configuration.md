@@ -235,12 +235,12 @@ Example:
 
 ### `agent.harness`
 
-- Selects the turn engine for newly created sessions: `native` (default), `dsh` (sidecar), or `dsh-native` (in-process). Omitting the key keeps `native`.
-- `dsh` and `dsh-native` are different engines. `dsh` runs the DeepSeek-Harness Node sidecar over its Remote API and needs a `-Dharness_dsh=true` build. `dsh-native` is a Zig reimplementation that runs in the nullclaw process, needs no build flag and no `NULLCLAW_DSH_BIN`, and is configured by the `agent.dsh_*` keys below. None of them changes the `native` path.
-- `dsh` requires a binary built with `-Dharness_dsh=true`. A default build ignores the value, logs one warning, and keeps running the native engine; it never starts a dsh sidecar.
-- In a dsh build, one dsh sidecar is shared by the whole process and starts lazily on the first dsh turn, outside the session-table lock. Session creation therefore stays fast, and all dsh sessions use the same sidecar.
+- Selects the turn engine for newly created sessions: `dsh` (default, in-process), `native`, or `dsh-sidecar` (DeepSeek-Harness sidecar). Omitting the key keeps `dsh`. `dsh-native` is accepted as an alias for `dsh`; saving the config writes `dsh`.
+- `dsh` is a Zig reimplementation that runs in the nullclaw process; it needs no build flag and no `NULLCLAW_DSH_BIN`, and is configured by the `agent.dsh_*` keys below. `native` keeps the original engine. Neither path changes the other.
+- `dsh-sidecar` runs the DeepSeek-Harness Node sidecar over its Remote API and requires a binary built with `-Dharness_dsh=true`. A default build ignores the value, logs one warning, and keeps running the native engine; it never starts a dsh sidecar. A config written for the old sidecar spelling (`"dsh"`) must change to `"dsh-sidecar"`.
+- In a `-Dharness_dsh=true` build, one dsh sidecar is shared by the whole process and starts lazily on the first sidecar turn, outside the session-table lock. Session creation therefore stays fast, and all `dsh-sidecar` sessions use the same sidecar.
 - `NULLCLAW_DSH_BIN` must point at dsh's `lib/bin.js`. If it is unset or the sidecar fails to boot, that turn returns an error (shown to the user) and the next turn retries the boot. The sidecar uses the configured agent workspace, keeps its profile in `<config dir>/.dsh`, and persists each session's dsh id in `<config dir>/dsh-sessions/`.
-- P1 dsh mode covers chat turns, streamed replies, and routing host-side `/stop` and `/new` to the dsh session. It does not include steer injection, approvals, or user questions; junclaw still keeps its own transcript for channel history.
+- P1 sidecar mode covers chat turns, streamed replies, and routing host-side `/stop` and `/new` to the dsh session. It does not include steer injection, approvals, or user questions; junclaw still keeps its own transcript for channel history.
 
 Example:
 
@@ -252,17 +252,17 @@ Example:
 }
 ```
 
-### `agent.dsh_*` (dsh-native engine)
+### `agent.dsh_*` (in-process dsh engine)
 
-These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` and the `dsh` sidecar ignore them.
+These keys only affect sessions whose `agent.harness` is `dsh` (or the `dsh-native` alias); `native` and the `dsh-sidecar` sidecar ignore them.
 
 - `agent.dsh_home` (string, default `<config dir>/.dsh`): dsh home root. Session JSONL logs live under it; the session-key mapping lives under `agent.dsh_session_dir`.
 - `agent.dsh_session_dir` (string, default `<config dir>/dsh-sessions`): where each host session key's dsh session id is persisted.
-- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): controls the pre-execute approval gate. Only calls that request `sandbox_permissions` escalation are asked for approval, after argument validation; ordinary tool calls are not prompted. `"ask"` prompts the host channel; `"never"` rejects without prompting. Every branch is fail-closed: a missing channel, a channel error, a cancellation, or an explicit rejection denies the call and returns the denial reason to the model, and each request appends exactly one `approval/asked` + `approval/decided` pair. A granted escalation still executes at the current sandbox level: dsh-native records the `sandboxRequest` but does not widen permissions yet. Non-interactive turns (cron, heartbeat, webhooks, A2A) are not yet forced to `"never"`; that rule is not enforced yet.
-- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): the file-policy sentence the model sees, also recorded as a `sandbox/mode` event in the session JSONL. The values are exactly dsh's `SandboxMode` names. dsh-native enforces it for its file tools: every mode keeps the junclaw boundary (workspace plus `autonomy.allowed_paths`, symlinks resolved, system paths always blocked), `read-only` additionally refuses `write` and `edit`, and `danger-full-access` does not widen the junclaw boundary. The mode does not cover `bash`; see the policy paragraph below.
+- `agent.dsh_approval_policy` (`"ask"` | `"never"`, default `"ask"`): controls the pre-execute approval gate. Only calls that request `sandbox_permissions` escalation are asked for approval, after argument validation; ordinary tool calls are not prompted. `"ask"` prompts the host channel; `"never"` rejects without prompting. Every branch is fail-closed: a missing channel, a channel error, a cancellation, or an explicit rejection denies the call and returns the denial reason to the model, and each request appends exactly one `approval/asked` + `approval/decided` pair. A granted escalation still executes at the current sandbox level: the in-process engine records the `sandboxRequest` but does not widen permissions yet. Non-interactive turns (cron, heartbeat, webhooks, A2A) are not yet forced to `"never"`; that rule is not enforced yet.
+- `agent.dsh_sandbox` (`"read-only"` | `"workspace-write"` | `"danger-full-access"`, default `"workspace-write"`): the file-policy sentence the model sees, also recorded as a `sandbox/mode` event in the session JSONL. The values are exactly dsh's `SandboxMode` names. The in-process engine enforces it for its file tools: every mode keeps the junclaw boundary (workspace plus `autonomy.allowed_paths`, symlinks resolved, system paths always blocked), `read-only` additionally refuses `write` and `edit`, and `danger-full-access` does not widen the junclaw boundary. The mode does not cover `bash`; see the policy paragraph below.
 - `agent.dsh_max_parallel_tools` (integer > 0, default `10`): size of the parallel tool pool. dsh's own default is 10; large values raise provider-side concurrency and timeout risk.
 - `agent.dsh_persona` (string, default unset): extra persona text appended to dsh's system prompt. Unset keeps dsh's built-in identity.
-- `agent.dsh_on_corrupt` (`"fail"` | `"native"`, default `"fail"`): what a session does when its dsh JSONL log cannot be read or repaired. `fail` refuses the turn and reports the parse error; `native` starts a new, empty dsh session and continues in it. dsh-native creation does not replay junclaw's stored native history, so the conversation context restarts from zero.
+- `agent.dsh_on_corrupt` (`"fail"` | `"native"`, default `"fail"`): what a session does when its dsh JSONL log cannot be read or repaired. `fail` refuses the turn and reports the parse error; `native` starts a new, empty dsh session and continues in it. The in-process engine's creation does not replay junclaw's stored native history, so the conversation context restarts from zero.
 - `agent.dsh_compaction_context_window` (integer >= 0, default `0`): the routed model's context window in tokens, used to derive compaction budgets. `0` disables the pre-step pressure probe; a provider-confirmed context overflow still compacts and retries once.
 - `agent.dsh_compaction_threshold_ratio` (number in `(0, 1]`, default `0.8`; unset keeps dsh's default): fraction of the context window at which automatic pressure compaction starts. The threshold is `floor(min(contextWindow * thresholdRatio, contextWindow - maxTokens - headroomTokens))`, where `maxTokens` is the routed completion budget and `messageBudget = contextWindow - maxTokens`.
 - `agent.dsh_compaction_retain_ratio` (number in `[0, 1]`, default `0.16`; unset keeps dsh's default): fraction of the message budget kept after compaction (`retainTokens = floor(messageBudget * retainRatio)`). It must be below the threshold ratio.
@@ -271,9 +271,9 @@ These keys only affect sessions whose `agent.harness` is `dsh-native`; `native` 
 
 Non-numeric or out-of-range ratios, `retain_ratio >= threshold_ratio`, and `headroom_tokens >= context_window` are also rejected at load time.
 
-dsh-native applies the junclaw security policy to its own tools, so a dsh-native session is never wider than a native one. Every tool call passes the native autonomy gate (a `read_only` autonomy level denies execution) and the per-hour action limit. `read`, `write`, `edit`, `grep`, `glob`, and `bash` resolve paths against the workspace and `autonomy.allowed_paths` with symlinks canonicalized, and always refuse system paths; `read` and `grep` may additionally read dsh's own spill directory, because dsh advertises those truncated-output files to the model. `bash` commands pass the same `allowed_commands` allowlist and low/medium/high risk checks as the native shell tool, and a model-supplied `workdir` must stay inside the same path boundary. When the native tool would ask for exec approval, dsh-native denies instead: it has no exec-approval channel yet.
+The in-process engine applies the junclaw security policy to its own tools, so a dsh session is never wider than a native one. Every tool call passes the native autonomy gate (a `read_only` autonomy level denies execution) and the per-hour action limit. `read`, `write`, `edit`, `grep`, `glob`, and `bash` resolve paths against the workspace and `autonomy.allowed_paths` with symlinks canonicalized, and always refuse system paths; `read` and `grep` may additionally read dsh's own spill directory, because dsh advertises those truncated-output files to the model. `bash` commands pass the same `allowed_commands` allowlist and low/medium/high risk checks as the native shell tool, and a model-supplied `workdir` must stay inside the same path boundary. When the native tool would ask for exec approval, the in-process engine denies instead: it has no exec-approval channel yet.
 
-P2a status: `dsh-native` is wired and runs in-process. Only a session whose `agent.harness` is set to `dsh-native` uses it; omitting the key keeps `native`, and the `dsh` sidecar and `-Dharness_dsh` builds behave as before. P2a adds the approval gate, user questions, automatic compaction, and six dsh slash commands:
+P3 status: the in-process engine is the default. Omitting `agent.harness` keeps `dsh`; `dsh-sidecar` and `-Dharness_dsh` builds behave as before. The engine provides the approval gate, user questions, automatic compaction, and these dsh slash commands:
 
 - `ask_user_question` is exposed to the model. It waits up to `agent.dsh_question_timeout` for an answer; when the deadline passes with no answer, the tool result is `pending` (not a denial) and the model may continue. With no answerer on the channel the call returns a `NO_PROVIDER` result.
 - `/compact` (no arguments): runs one manual compaction of older history; with nothing to compact it settles `No compactable history yet.` and writes no domain events.
@@ -290,7 +290,7 @@ Example:
 ```json
 {
   "agent": {
-    "harness": "dsh-native",
+    "harness": "dsh",
     "dsh_home": "/var/lib/nullclaw/dsh",
     "dsh_approval_policy": "never",
     "dsh_sandbox": "workspace-write",

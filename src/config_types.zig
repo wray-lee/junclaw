@@ -461,29 +461,33 @@ pub const ReasoningMode = enum {
     }
 };
 
-/// Turn engine for newly created sessions (`agent.harness`). `dsh` only takes
-/// effect in a binary built with `-Dharness_dsh=true`; the default build
-/// ignores it and keeps using `native`. `dsh-native` is the in-process Zig
-/// engine (`src/harness/dsh_native/`) and needs no build flag.
+/// Turn engine for newly created sessions (`agent.harness`). `dsh` is the
+/// in-process Zig engine (`src/harness/dsh_native/`) and the default.
+/// `dsh-sidecar` runs the DeepSeek-Harness Node sidecar over its Remote API
+/// and needs a `-Dharness_dsh=true` build. `dsh-native` is kept as an alias
+/// for `dsh`.
 pub const HarnessKind = enum {
     native,
-    /// dsh sidecar over the Remote API (needs `-Dharness_dsh=true`).
+    /// dsh reimplemented in Zig, in process (config value `dsh`).
     dsh,
-    /// dsh reimplemented in Zig, in process.
-    dsh_native,
+    /// dsh sidecar over the Remote API (config value `dsh-sidecar`, needs
+    /// `-Dharness_dsh=true`).
+    dsh_sidecar,
 
     pub fn toSlice(self: HarnessKind) []const u8 {
         return switch (self) {
             .native => "native",
             .dsh => "dsh",
-            .dsh_native => "dsh-native",
+            .dsh_sidecar => "dsh-sidecar",
         };
     }
 
     pub fn fromSlice(s: []const u8) ?HarnessKind {
         if (std.ascii.eqlIgnoreCase(s, "native")) return .native;
         if (std.ascii.eqlIgnoreCase(s, "dsh")) return .dsh;
-        if (std.ascii.eqlIgnoreCase(s, "dsh-native")) return .dsh_native;
+        // Pre-rename spelling of the in-process engine.
+        if (std.ascii.eqlIgnoreCase(s, "dsh-native")) return .dsh;
+        if (std.ascii.eqlIgnoreCase(s, "dsh-sidecar")) return .dsh_sidecar;
         return null;
     }
 };
@@ -579,9 +583,9 @@ pub const AgentConfig = struct {
     /// message that arrives mid-turn is injected into the active turn instead
     /// of being silently dropped.
     default_queue_mode: QueueMode = .steer,
-    /// Turn engine for newly created sessions. Defaults to the native agent;
-    /// `dsh` requires a build with `-Dharness_dsh=true`.
-    harness: HarnessKind = .native,
+    /// Turn engine for newly created sessions. Defaults to the in-process
+    /// dsh engine; `dsh-sidecar` requires a build with `-Dharness_dsh=true`.
+    harness: HarnessKind = .dsh,
     token_limit: u64 = DEFAULT_AGENT_TOKEN_LIMIT,
     /// Internal parse marker: true only when token_limit is explicitly set in config.
     /// Not serialized; used to distinguish override vs default fallback chain.
@@ -610,7 +614,7 @@ pub const AgentConfig = struct {
     /// Redact PII in outbound provider messages for the root agent.
     enable_pii_redaction: bool = true,
 
-    // ── dsh-native engine (`harness = "dsh-native"`) ──────────────
+    // ── dsh in-process engine (`harness = "dsh"`, alias "dsh-native") ──
     /// dsh home (session JSONL + session-key mapping root). Null means
     /// `<config dir>/.dsh`.
     dsh_home: ?[]const u8 = null,

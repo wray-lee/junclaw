@@ -215,12 +215,12 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 ### `agent.harness`
 
-- 选择新建会话使用的回合引擎，可选值为 `native`（默认）、`dsh`（sidecar）和 `dsh-native`（进程内）。省略该键即保持 `native`。
-- `dsh` 与 `dsh-native` 是两个不同的引擎。`dsh` 通过 Remote API 驱动 DeepSeek-Harness 的 Node sidecar，需要 `-Dharness_dsh=true` 构建；`dsh-native` 是用 Zig 重写、在 nullclaw 进程内运行的实现，不需要构建开关，也不需要 `NULLCLAW_DSH_BIN`，由下面一组 `agent.dsh_*` 键配置。两者都不改变 `native` 路径。
-- `dsh` 需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。
-- 在 dsh 构建中，整个进程共用一个 dsh sidecar，并在第一个 dsh 回合惰性启动，启动过程不在会话表锁内。因此会话创建保持很快，所有 dsh 会话共用同一个 sidecar。
+- 选择新建会话使用的回合引擎，可选值为 `dsh`（默认，进程内）、`native` 和 `dsh-sidecar`（DeepSeek-Harness sidecar）。省略该键即保持 `dsh`；`dsh-native` 作为 `dsh` 的别名继续接受，保存配置时统一写为 `dsh`。
+- `dsh` 是用 Zig 重写、在 nullclaw 进程内运行的实现，不需要构建开关，也不需要 `NULLCLAW_DSH_BIN`，由下面一组 `agent.dsh_*` 键配置。`native` 保留原来的引擎。两者互不改变对方路径。
+- `dsh-sidecar` 通过 Remote API 驱动 DeepSeek-Harness 的 Node sidecar，需要以 `-Dharness_dsh=true` 构建的二进制。默认构建会忽略该值、记录一条警告并继续使用 native 引擎，绝不会启动 dsh sidecar。旧配置里用 `"dsh"` 表示 sidecar 的，必须改为 `"dsh-sidecar"`。
+- 在 `-Dharness_dsh=true` 构建中，整个进程共用一个 dsh sidecar，并在第一个 sidecar 回合惰性启动，启动过程不在会话表锁内。因此会话创建保持很快，所有 `dsh-sidecar` 会话共用同一个 sidecar。
 - `NULLCLAW_DSH_BIN` 必须指向 dsh 的 `lib/bin.js`。未设置或 sidecar 启动失败时，该回合返回错误（呈现给用户），下一个回合会重试启动。sidecar 使用配置的 agent 工作目录，profile 保存在 `<配置目录>/.dsh`，每个会话的 dsh 会话 id 持久化到 `<配置目录>/dsh-sessions/`。
-- P1 的 dsh 模式覆盖聊天回合、流式回复，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话。它不包含 steer 注入、审批和用户提问；junclaw 仍会为自己的通道历史保留一份对话记录。
+- P1 的 sidecar 模式覆盖聊天回合、流式回复，以及把宿主侧 `/stop` 和 `/new` 路由到 dsh 会话。它不包含 steer 注入、审批和用户提问；junclaw 仍会为自己的通道历史保留一份对话记录。
 
 示例：
 
@@ -232,17 +232,17 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 }
 ```
 
-### `agent.dsh_*`（dsh-native 引擎）
+### `agent.dsh_*`（进程内 dsh 引擎）
 
-以下键只对 `agent.harness` 为 `dsh-native` 的会话生效；`native` 和 `dsh` sidecar 会忽略它们。
+以下键只对 `agent.harness` 为 `dsh`（或别名 `dsh-native`）的会话生效；`native` 和 `dsh-sidecar` sidecar 会忽略它们。
 
 - `agent.dsh_home`（字符串，默认 `<配置目录>/.dsh`）：dsh home 根目录。会话 JSONL 日志放在它下面；会话键映射放在 `agent.dsh_session_dir` 下。
 - `agent.dsh_session_dir`（字符串，默认 `<配置目录>/dsh-sessions`）：每个宿主会话键对应的 dsh 会话 id 的持久化目录。
-- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：控制执行前的审批门禁。只有请求 `sandbox_permissions` 升级的调用会在参数校验之后请求审批；普通工具调用不会询问。`"ask"` 向宿主通道发起询问；`"never"` 不询问直接拒绝。所有分支都是 fail-closed：没有可用通道、通道报错、用户取消或明确拒绝都会拒绝该调用，并把拒绝原因返回给模型；每次请求恰好写入一对 `approval/asked` + `approval/decided` 事件。即使升级获批，命令仍按当前沙箱级别执行：dsh-native 会记录 `sandboxRequest`，但尚未放宽权限。非交互回合（cron、heartbeat、webhook、A2A）尚未强制按 `"never"` 处理；该规则尚未执行。
-- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的文件策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。dsh-native 对其文件工具执行该模式：所有模式都保持 junclaw 的边界（工作区加 `autonomy.allowed_paths`，解析符号链接，系统路径始终拒绝），`read-only` 额外拒绝 `write` 与 `edit`，`danger-full-access` 不会放宽 junclaw 的边界。该模式不覆盖 `bash`，见下方策略段落。
+- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：控制执行前的审批门禁。只有请求 `sandbox_permissions` 升级的调用会在参数校验之后请求审批；普通工具调用不会询问。`"ask"` 向宿主通道发起询问；`"never"` 不询问直接拒绝。所有分支都是 fail-closed：没有可用通道、通道报错、用户取消或明确拒绝都会拒绝该调用，并把拒绝原因返回给模型；每次请求恰好写入一对 `approval/asked` + `approval/decided` 事件。即使升级获批，命令仍按当前沙箱级别执行：进程内引擎会记录 `sandboxRequest`，但尚未放宽权限。非交互回合（cron、heartbeat、webhook、A2A）尚未强制按 `"never"` 处理；该规则尚未执行。
+- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的文件策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。进程内引擎对其文件工具执行该模式：所有模式都保持 junclaw 的边界（工作区加 `autonomy.allowed_paths`，解析符号链接，系统路径始终拒绝），`read-only` 额外拒绝 `write` 与 `edit`，`danger-full-access` 不会放宽 junclaw 的边界。该模式不覆盖 `bash`，见下方策略段落。
 - `agent.dsh_max_parallel_tools`（大于 0 的整数，默认 `10`）：并行工具池大小。dsh 自身的默认值就是 10；设得过大将提高 provider 侧并发与超时风险。
 - `agent.dsh_persona`（字符串，默认未设置）：追加到 dsh 系统提示的 persona 文本。未设置时保留 dsh 内置身份。
-- `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个空的 dsh 会话并在其中继续。dsh-native 创建时不会回填 junclaw 存储的 native 历史，因此上下文从零开始。
+- `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个空的 dsh 会话并在其中继续。进程内引擎创建时不会回填 junclaw 存储的 native 历史，因此上下文从零开始。
 - `agent.dsh_compaction_context_window`（大于等于 0 的整数，默认 `0`）：路由模型的 context window（token 数），用于推导压缩预算。`0` 会关闭 pre-step 压力探测；provider 确认的 context 溢出仍会触发一次压缩并重试。
 - `agent.dsh_compaction_threshold_ratio`（`(0, 1]` 内的数字，默认 `0.8`，未设置时沿用 dsh 默认值）：自动压力压缩的触发比例。阈值为 `floor(min(contextWindow * thresholdRatio, contextWindow - maxTokens - headroomTokens))`，其中 `maxTokens` 是路由的补全预算，`messageBudget = contextWindow - maxTokens`。
 - `agent.dsh_compaction_retain_ratio`（`[0, 1]` 内的数字，默认 `0.16`，未设置时沿用 dsh 默认值）：压缩后保留的消息预算比例（`retainTokens = floor(messageBudget * retainRatio)`），必须小于阈值比例。
@@ -251,9 +251,9 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 比例不是数字或越界、`retain_ratio >= threshold_ratio`，以及非零 context window 下 `headroom_tokens >= context_window` 也会在加载配置时报错。
 
-dsh-native 对自己的工具执行 junclaw 安全策略，因此 dsh-native 会话不会比 native 更宽。每个工具调用都通过 native 的 autonomy 门禁（`read_only` 级别拒绝执行）和每小时动作上限。`read`、`write`、`edit`、`grep`、`glob`、`bash` 都把路径解析到工作区与 `autonomy.allowed_paths`（符号链接会被规范化），并始终拒绝系统路径；`read` 与 `grep` 额外可读 dsh 自己的 spill 目录，因为 dsh 会把这些截断输出文件告知模型。`bash` 命令通过与 native shell 工具相同的 `allowed_commands` 白名单与低/中/高风险检查，模型提供的 `workdir` 也必须落在同一路径边界内。native 工具需要执行审批时，dsh-native 直接拒绝：它目前没有执行审批通道。
+进程内引擎对自己的工具执行 junclaw 安全策略，因此 dsh 会话不会比 native 更宽。每个工具调用都通过 native 的 autonomy 门禁（`read_only` 级别拒绝执行）和每小时动作上限。`read`、`write`、`edit`、`grep`、`glob`、`bash` 都把路径解析到工作区与 `autonomy.allowed_paths`（符号链接会被规范化），并始终拒绝系统路径；`read` 与 `grep` 额外可读 dsh 自己的 spill 目录，因为 dsh 会把这些截断输出文件告知模型。`bash` 命令通过与 native shell 工具相同的 `allowed_commands` 白名单与低/中/高风险检查，模型提供的 `workdir` 也必须落在同一路径边界内。native 工具需要执行审批时，进程内引擎直接拒绝：它目前没有执行审批通道。
 
-P2a 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harness` 设为 `dsh-native` 的会话才会使用它；省略该键仍保持 `native`，`dsh` sidecar 与 `-Dharness_dsh` 构建的行为不变。P2a 增加了审批门禁、用户提问、自动压缩和六个 dsh 斜杠命令：
+P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `dsh`；`dsh-sidecar` 与 `-Dharness_dsh` 构建的行为不变。该引擎提供审批门禁、用户提问、自动压缩和以下 dsh 斜杠命令：
 
 - `ask_user_question` 已暴露给模型。它最多等待 `agent.dsh_question_timeout`；超时仍无回答时，工具结果是 `pending`（不是拒绝），模型可以继续。通道没有回答者时，调用返回 `NO_PROVIDER` 结果。
 - `/compact`（无参数）：对手头较旧的历史执行一次手动压缩；没有可压缩历史时结算为 `No compactable history yet.`，不写领域事件。
@@ -270,7 +270,7 @@ P2a 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harn
 ```json
 {
   "agent": {
-    "harness": "dsh-native",
+    "harness": "dsh",
     "dsh_home": "/var/lib/nullclaw/dsh",
     "dsh_approval_policy": "never",
     "dsh_sandbox": "workspace-write",

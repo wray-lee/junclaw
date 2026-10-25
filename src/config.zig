@@ -6970,13 +6970,13 @@ test "agent.default_queue_mode rejects invalid values" {
     );
 }
 
-test "agent.harness defaults to native" {
+test "agent.harness defaults to dsh" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson("{}");
-    try std.testing.expectEqual(config_types.HarnessKind.native, cfg.agent.harness);
+    try std.testing.expectEqual(config_types.HarnessKind.dsh, cfg.agent.harness);
 }
 
 test "parse agent.harness" {
@@ -6988,6 +6988,8 @@ test "parse agent.harness" {
     try std.testing.expectEqual(config_types.HarnessKind.native, cfg.agent.harness);
     try cfg.parseJson("{\"agent\":{\"harness\":\"dsh\"}}");
     try std.testing.expectEqual(config_types.HarnessKind.dsh, cfg.agent.harness);
+    try cfg.parseJson("{\"agent\":{\"harness\":\"dsh-sidecar\"}}");
+    try std.testing.expectEqual(config_types.HarnessKind.dsh_sidecar, cfg.agent.harness);
 }
 
 test "agent.harness rejects invalid values" {
@@ -7003,15 +7005,16 @@ test "agent.harness rejects invalid values" {
     );
 }
 
-test "parse agent.harness dsh-native" {
+test "agent.harness keeps dsh-native as an alias of dsh" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = arena.allocator() };
     try cfg.parseJson("{\"agent\":{\"harness\":\"dsh-native\"}}");
-    try std.testing.expectEqual(config_types.HarnessKind.dsh_native, cfg.agent.harness);
-    try std.testing.expectEqualStrings("dsh-native", cfg.agent.harness.toSlice());
-    // The sidecar's "dsh" must not be swallowed by the new spelling.
-    try std.testing.expectEqual(config_types.HarnessKind.dsh, config_types.HarnessKind.fromSlice("dsh").?);
+    try std.testing.expectEqual(config_types.HarnessKind.dsh, cfg.agent.harness);
+    // Saving canonicalizes the alias to the current spelling.
+    try std.testing.expectEqualStrings("dsh", cfg.agent.harness.toSlice());
+    // The alias must not swallow the sidecar's new spelling.
+    try std.testing.expectEqual(config_types.HarnessKind.dsh_sidecar, config_types.HarnessKind.fromSlice("dsh-sidecar").?);
     try std.testing.expectEqual(@as(?config_types.HarnessKind, null), config_types.HarnessKind.fromSlice("dsh_native"));
 }
 

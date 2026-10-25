@@ -47,8 +47,8 @@ const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const harness_port = @import("harness/port.zig");
 const native_harness = @import("harness/native.zig");
-/// The in-process dsh engine (`agent.harness = "dsh-native"`). No build flag
-/// gates it, so the import is unconditional.
+/// The in-process dsh engine (`agent.harness = "dsh"`, legacy alias
+/// `"dsh-native"`). No build flag gates it, so the import is unconditional.
 const dsh_native_mod = @import("harness/dsh_native/harness.zig");
 const dsh_bridge = @import("harness/dsh_native/tools/bridge.zig");
 const dsh_native_session_log = @import("harness/dsh_native/session_log.zig");
@@ -245,12 +245,12 @@ fn hostToolCall(
 /// instead of spawning a sidecar. Production never sets it.
 var dsh_test_boot_url: ?[]const u8 = null;
 
-/// Log the ignored `harness: "dsh"` selection once per process.
+/// Log the ignored `harness: "dsh-sidecar"` selection once per process.
 var warned_dsh_ignored = std.atomic.Value(bool).init(false);
 
 fn warnDshIgnored() void {
     if (!warned_dsh_ignored.swap(true, .acq_rel)) {
-        log.warn("agent.harness=\"dsh\" ignored: this build has no dsh harness (-Dharness_dsh=true); using native", .{});
+        log.warn("agent.harness=\"dsh-sidecar\" ignored: this build has no dsh harness (-Dharness_dsh=true); using native", .{});
     }
 }
 
@@ -592,11 +592,12 @@ pub const Session = struct {
     /// The turn port for this session. Wraps `agent` for now; the host reaches
     /// `agent` directly through `nativeAgent()` until every call site moves.
     harness: native_harness.NativeHarness = undefined,
-    /// Set only when `agent.harness = "dsh"`, this build has the adapter and
-    /// the sidecar started; `turnHarness()` prefers it over `harness`.
+    /// Set only when `agent.harness = "dsh-sidecar"`, this build has the
+    /// adapter and the sidecar started; `turnHarness()` prefers it over
+    /// `harness`.
     dsh: ?DshState = null,
-    /// Set only when `agent.harness = "dsh-native"`; `turnHarness()` prefers
-    /// it over everything else.
+    /// Set only when `agent.harness = "dsh"` (or its `"dsh-native"` alias);
+    /// `turnHarness()` prefers it over everything else.
     dsh_native: ?DshNativeState = null,
     provider_holder: ?providers.ProviderHolder = null,
     owned_provider_api_key: ?[]u8 = null,
@@ -2438,15 +2439,15 @@ pub const SessionManager = struct {
         key_owned_by_session = true;
         session_initialized = true;
 
-        if (selected_config.agent.harness == .dsh_native) {
+        if (selected_config.agent.harness == .dsh) {
             session.dsh_native = try DshNativeState.init(self.allocator, selected_config, session);
         }
         if (comptime dsh_enabled) {
-            if (selected_config.agent.harness == .dsh) {
+            if (selected_config.agent.harness == .dsh_sidecar) {
                 // Attach the handle now; the sidecar boots on the first turn.
                 session.dsh = try startDshHarness(self, owned_key);
             }
-        } else if (selected_config.agent.harness == .dsh) {
+        } else if (selected_config.agent.harness == .dsh_sidecar) {
             warnDshIgnored();
         }
 
@@ -2465,7 +2466,7 @@ pub const SessionManager = struct {
                 const restored = dropRowsBeforeLastCompactionSummary(
                     recentHistoryWindow(entries, session.agent.max_history_messages),
                 );
-                if (selected_config.agent.harness == .dsh_native) {
+                if (selected_config.agent.harness == .dsh) {
                     // First open imports this window as the seeded JSONL prefix;
                     // later opens resume the JSONL and ignore the store copy, so
                     // the import neither repeats nor loses rows.
@@ -2491,7 +2492,7 @@ pub const SessionManager = struct {
                 session.agent.compaction_count = count;
             }
         }
-        if (selected_config.agent.harness == .dsh_native and !dsh_native_restored) {
+        if (selected_config.agent.harness == .dsh and !dsh_native_restored) {
             // No readable store: still resume the engine's own JSONL. The
             // mapping is the resume source, exactly like the sidecar.
             try session.dsh_native.?.harness.harness().restore(.{
@@ -4931,6 +4932,9 @@ fn testConfig() Config {
         .config_path = "/tmp/yc_test/config.json",
         .default_model = "test/mock-model",
         .allocator = testing.allocator,
+        // Session tests exercise both engines explicitly; pin native so a
+        // future default switch cannot silently reroute them.
+        .agent = .{ .harness = .native },
     };
 }
 
@@ -6942,27 +6946,37 @@ test "processMessageStreaming does not rehydrate placeholders for group sessions
     }
 }
 
-test "agent.harness default keeps the native turn path" {
-    // Regression: adding a second engine must not change sessions that never
-    // opt in.
-    var mock = MockProvider{ .response = "ok" };
-    const cfg = testConfig();
-    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+test "agent.harness defaults to the in-process dsh engine" {
+    // Regression: the P3 default switch must select the in-process engine
+    // when `agent.harness` is omitted.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    // Drop the fixture's explicit choice so the compiled-in default applies.
+    fixture.cfg.agent = .{};
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "default engine" }});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
     defer sm.deinit();
 
-    const session = try sm.getOrCreate("cli:main:local");
+    const reply = try sm.processMessage("cli:main:default-harness", "hi", null);
+    defer testing.allocator.free(reply);
+    try testing.expectEqualStrings("default engine", reply);
+
+    const session = try sm.getOrCreate("cli:main:default-harness");
     try testing.expect(session.dsh == null);
-    try testing.expect(session.dsh_native == null);
-    const h = session.turnHarness();
-    try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), h.ptr);
-    try testing.expectEqualStrings(session.session_key, session.harness.session_key);
+    try testing.expect(session.dsh_native != null);
+    try testing.expectEqual(
+        @as(*anyopaque, @ptrCast(&session.dsh_native.?.harness)),
+        session.turnHarness().ptr,
+    );
 }
 
-test "agent.harness=dsh is ignored in a default build" {
+test "agent.harness=dsh-sidecar is ignored in a default build" {
     if (comptime dsh_enabled) return error.SkipZigTest;
     var mock = MockProvider{ .response = "ok" };
     var cfg = testConfig();
-    cfg.agent.harness = .dsh;
+    cfg.agent.harness = .dsh_sidecar;
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
@@ -7064,7 +7078,7 @@ test "dsh route maps openai api_mode responses to the responses protocol" {
     try testing.expectEqualStrings("openai-responses", openai.api);
 }
 
-test "agent.harness=dsh fails loudly for a provider dsh cannot route" {
+test "agent.harness=dsh-sidecar fails loudly for a provider dsh cannot route" {
     if (comptime !dsh_enabled) return error.SkipZigTest;
     // Regression: an unsupported provider left the profile empty, letting dsh
     // silently fall back to its built-in default model.
@@ -7072,7 +7086,7 @@ test "agent.harness=dsh fails loudly for a provider dsh cannot route" {
     var cfg = testConfig();
     cfg.default_provider = "gemini";
     cfg.default_model = "gemini/gemini-pro";
-    cfg.agent.harness = .dsh;
+    cfg.agent.harness = .dsh_sidecar;
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     defer sm.deinit();
 
@@ -7124,7 +7138,7 @@ test "dsh route strips anthropic version and messages suffixes" {
     }
 }
 
-test "agent.harness=dsh selects the dsh engine in a dsh build" {
+test "agent.harness=dsh-sidecar selects the sidecar engine in a dsh build" {
     if (comptime !dsh_enabled) return error.SkipZigTest;
     const mock_mod = @import("harness/dsh/mock.zig");
     var dsh_mock = try mock_mod.MockDsh.init(testing.allocator);
@@ -7140,7 +7154,7 @@ test "agent.harness=dsh selects the dsh engine in a dsh build" {
     var cfg = testConfig();
     cfg.workspace_dir = base;
     cfg.config_path = config_path;
-    cfg.agent.harness = .dsh;
+    cfg.agent.harness = .dsh_sidecar;
 
     const boot_url = try std.fmt.allocPrint(testing.allocator, "http://127.0.0.1:{d}/?token={s}", .{
         dsh_mock.port(),
@@ -7204,7 +7218,7 @@ fn dshSessionTestConfig(tmp: *std.testing.TmpDir) !struct { base: []u8, config_p
     var cfg = testConfig();
     cfg.workspace_dir = base;
     cfg.config_path = config_path;
-    cfg.agent.harness = .dsh;
+    cfg.agent.harness = .dsh_sidecar;
     return .{ .base = base, .config_path = config_path, .cfg = cfg };
 }
 
@@ -7362,7 +7376,7 @@ test "dsh boot does not block session creation under the manager lock" {
         @as(*anyopaque, @ptrCast(&native_session.harness)),
         native_session.turnHarness().ptr,
     );
-    setup.cfg.agent.harness = .dsh;
+    setup.cfg.agent.harness = .dsh_sidecar;
 
     gate.open();
     thread.join();
@@ -7444,7 +7458,7 @@ test "dsh upstream turn error reaches the user instead of an empty reply" {
     try testing.expectEqualStrings("上游模型服务返回错误：upstream provider returned 429", reply);
 }
 
-// ── dsh-native integration (agent.harness = "dsh-native") ──────────────────
+// ── dsh in-process integration (agent.harness = "dsh", alias "dsh-native") ──
 
 const DshNativeScriptedReply = struct {
     text: []const u8 = "",
@@ -7577,7 +7591,7 @@ const DshNativeFixture = struct {
         var cfg = testConfig();
         cfg.workspace_dir = base;
         cfg.config_path = config_path;
-        cfg.agent.harness = .dsh_native;
+        cfg.agent.harness = .dsh;
         return .{ .tmp = tmp, .base = base, .config_path = config_path, .cfg = cfg };
     }
 
@@ -11609,4 +11623,89 @@ test "dsh-native: store history seeds the JSONL once, windowed, and leaves the s
     try testing.expectEqual(@as(usize, 8), after.len);
     try testing.expectEqualStrings("next question", after[6].content);
     try testing.expectEqualStrings("next reply", after[7].content);
+}
+
+test "agent.harness switch between dsh and native keeps the store and restarts cleanly" {
+    // Regression: the P3 default switch must stay reversible. Restarting one
+    // session key under a different `agent.harness` may not crash, drop rows
+    // from the junclaw store, or wedge the in-process engine's JSONL resume.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const store = sqlite_mem.sessionStore();
+
+    const key = "telegram:main:harness-switch";
+    var dsh_provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "dsh answer one" },
+        .{ .text = "dsh answer two" },
+    });
+    defer dsh_provider.deinit();
+
+    {
+        var sm = fixture.managerWithStore(&dsh_provider, store);
+        defer sm.deinit();
+        const reply = try sm.processMessage(key, "dsh question one", null);
+        defer testing.allocator.free(reply);
+        try testing.expectEqualStrings("dsh answer one", reply);
+    }
+    {
+        const rows = try store.loadMessages(testing.allocator, key);
+        defer memory_mod.freeMessages(testing.allocator, rows);
+        try testing.expectEqual(@as(usize, 2), rows.len);
+        try testing.expectEqualStrings("dsh question one", rows[0].content);
+        try testing.expectEqualStrings("dsh answer one", rows[1].content);
+    }
+
+    // Restart the same key on the native engine with the same store.
+    fixture.cfg.agent.harness = .native;
+    var native_provider = MockProvider{ .response = "native answer" };
+    {
+        var sm = testSessionManagerWithMemory(testing.allocator, &native_provider, &fixture.cfg, null, store);
+        defer sm.deinit();
+        const session = try sm.getOrCreate(key);
+        try testing.expect(session.dsh_native == null);
+        try testing.expectEqual(@as(*anyopaque, @ptrCast(&session.harness)), session.turnHarness().ptr);
+        var restored_reply = false;
+        for (session.agent.history.items) |message| {
+            if (std.mem.eql(u8, message.content, "dsh answer one")) restored_reply = true;
+        }
+        try testing.expect(restored_reply);
+
+        const reply = try sm.processMessage(key, "native question", null);
+        defer testing.allocator.free(reply);
+        try testing.expectEqualStrings("native answer", reply);
+    }
+    {
+        const rows = try store.loadMessages(testing.allocator, key);
+        defer memory_mod.freeMessages(testing.allocator, rows);
+        try testing.expectEqual(@as(usize, 4), rows.len);
+        try testing.expectEqualStrings("native question", rows[2].content);
+        try testing.expectEqualStrings("native answer", rows[3].content);
+    }
+
+    // Switch back: the JSONL resumes and no store row is lost.
+    fixture.cfg.agent.harness = .dsh;
+    {
+        var sm = fixture.managerWithStore(&dsh_provider, store);
+        defer sm.deinit();
+        const reply = try sm.processMessage(key, "dsh question two", null);
+        defer testing.allocator.free(reply);
+        try testing.expectEqualStrings("dsh answer two", reply);
+    }
+    const rows = try store.loadMessages(testing.allocator, key);
+    defer memory_mod.freeMessages(testing.allocator, rows);
+    try testing.expectEqual(@as(usize, 6), rows.len);
+    const expected = [_]struct { role: []const u8, content: []const u8 }{
+        .{ .role = "user", .content = "dsh question one" },
+        .{ .role = "assistant", .content = "dsh answer one" },
+        .{ .role = "user", .content = "native question" },
+        .{ .role = "assistant", .content = "native answer" },
+        .{ .role = "user", .content = "dsh question two" },
+        .{ .role = "assistant", .content = "dsh answer two" },
+    };
+    for (expected, rows) |want, got| {
+        try testing.expectEqualStrings(want.role, got.role);
+        try testing.expectEqualStrings(want.content, got.content);
+    }
 }

@@ -140,7 +140,8 @@ COPY --from=full-dsh-deps /opt/dsh /opt/dsh
 COPY --from=config /nullclaw-data /nullclaw-data
 RUN mkdir -p /nullclaw-data/.dsh && chown -R 65534:65534 /nullclaw-data
 
-# The dsh harness is opt-in: agent.harness still defaults to native.
+# The dsh sidecar harness is opt-in: agent.harness defaults to the
+# in-process dsh engine; set "dsh-sidecar" to use the bundled sidecar.
 ENV NULLCLAW_DSH_BIN=/opt/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js
 ENV DSH_HOME=/nullclaw-data/.dsh
 ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace

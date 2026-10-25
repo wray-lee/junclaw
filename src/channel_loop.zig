@@ -3508,6 +3508,7 @@ test "polling subagent drain delivers only matching origin account" {
         .workspace_dir = "/tmp/yc",
         .config_path = "/tmp/yc/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
     };
     var mgr = subagent_mod.SubagentManager.init(allocator, &cfg, null, .{});
     defer mgr.deinit();
@@ -3965,6 +3966,7 @@ test "channel runtime wires security policy into session manager and shell tool"
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .memory = .{
             .profile = "minimal_none",
             .backend = "none",
@@ -4177,6 +4179,7 @@ test "resolveTelegramBaseRouteKey matches topic-specific telegram binding before
         .workspace_dir = "/tmp/nullclaw",
         .config_path = "/tmp/nullclaw/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .agents = &agents,
         .agent_bindings = &bindings,
     };
@@ -4205,6 +4208,7 @@ test "resolveTelegramBaseRouteKey falls back to base telegram group binding for 
         .workspace_dir = "/tmp/nullclaw",
         .config_path = "/tmp/nullclaw/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .agents = &agents,
         .agent_bindings = &bindings,
     };
@@ -4221,6 +4225,7 @@ test "resolveTelegramBaseRouteKey auto-provisions direct telegram peers" {
         .workspace_dir = "/tmp/nullclaw",
         .config_path = "/tmp/nullclaw/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .session = .{
             .auto_provision_direct_agents = true,
         },
@@ -4261,6 +4266,7 @@ test "buildTelegramBindingStatusReply distinguishes exact and inherited peer bin
         .workspace_dir = "/tmp/nullclaw",
         .config_path = "/tmp/nullclaw/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .agents = &agents,
         .agent_bindings = &bindings,
     };
@@ -4303,6 +4309,7 @@ test "telegram callback starts typing turn and cleans up on local slash miss" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -4365,6 +4372,7 @@ test "a slash callback that misses local handling keeps the pre-turn marker" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -4446,6 +4454,7 @@ test "a /stop racing the end of a turn does not cancel the next message" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -4562,6 +4571,7 @@ test "a /stop with a running turn also discards queued messages" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -4665,6 +4675,7 @@ test "buildTelegramBindingStatusReply shows synthetic peer agent for auto-provis
         .workspace_dir = "/tmp/nullclaw",
         .config_path = "/tmp/nullclaw/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .session = .{
             .auto_provision_direct_agents = true,
         },
@@ -4696,6 +4707,7 @@ test "applyTelegramBindingCommand refuses rebinding a peer routed to a restricte
         .workspace_dir = "/tmp/nullclaw",
         .config_path = "/tmp/nullclaw/config.json",
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .agents = &agents,
         .agent_bindings = &bindings,
     };
@@ -4732,6 +4744,7 @@ test "telegram update offset store roundtrip" {
         .workspace_dir = base,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
     };
 
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
@@ -4758,6 +4771,7 @@ test "telegram update offset path resolves relative config path" {
         .workspace_dir = base,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
     };
 
     const resolved = try telegramUpdateOffsetPath(allocator, &cfg, "default");
@@ -4790,6 +4804,7 @@ test "telegram update offset store returns null for mismatched bot id" {
         .workspace_dir = base,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
     };
 
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "11111:test-token-a", 123);
@@ -4812,6 +4827,7 @@ test "telegram update offset store treats legacy payload without bot_id as stale
         .workspace_dir = base,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
     };
 
     const offset_path = try telegramUpdateOffsetPath(allocator, &cfg, "default");
@@ -4850,6 +4866,7 @@ test "telegram offset persistence helper retries after write failure" {
         .workspace_dir = base,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
     };
 
     const blocked_state_path = try std_compat.fs.path.join(allocator, &.{ base, "state" });
@@ -4986,6 +5003,7 @@ test "telegram polling releases the progress draft before the final reply" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -5069,6 +5087,7 @@ test "telegram DM [NO_REPLY] is suppressed instead of sent literally" {
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -5166,6 +5185,7 @@ test "telegram steered message reaction is finalized when the consuming turn end
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",
@@ -5292,6 +5312,7 @@ test "telegram shared session finalizes a steered message through its original b
         .workspace_dir = workspace,
         .config_path = config_path,
         .allocator = allocator,
+        .agent = .{ .harness = .native },
         .default_model = "test/mock-model",
         .memory = .{
             .profile = "minimal_none",

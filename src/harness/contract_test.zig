@@ -24,6 +24,8 @@ fn testConfig() Config {
         .config_path = "/tmp/junclaw_harness_test/config.json",
         .default_model = "test/scripted-model",
         .allocator = std.testing.allocator,
+        // These golden traces pin the native engine; the product default is dsh.
+        .agent = .{ .harness = .native },
     };
 }
 

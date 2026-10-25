@@ -167,12 +167,12 @@ docker build --target full-dsh -t junclaw:full-dsh .
 
 Plan for at least 512 MB of memory per container; 1 GB is safer.
 
-**Enabling dsh:** `agent.harness` still defaults to `native`. The image sets `NULLCLAW_DSH_BIN` and `DSH_HOME=/nullclaw-data/.dsh`, but you must opt in explicitly:
+**Enabling the dsh sidecar:** `agent.harness` defaults to `dsh`, the in-process engine, which this image also runs. The image additionally bundles the DeepSeek-Harness sidecar and sets `NULLCLAW_DSH_BIN` and `DSH_HOME=/nullclaw-data/.dsh`; to use the bundled sidecar instead, opt in explicitly:
 
 ```json
 {
   "agent": {
-    "harness": "dsh"
+    "harness": "dsh-sidecar"
   }
 }
 ```

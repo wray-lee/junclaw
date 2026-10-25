@@ -2509,6 +2509,7 @@ test "dispatcher interrupts a busy session for /stop before enqueue" {
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
         .default_model = "test/mock-model",
+        .agent = .{ .harness = .native },
         .allocator = allocator,
     };
     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
@@ -2683,6 +2684,7 @@ test "daemon inbound dispatch suppresses [NO_REPLY] instead of publishing it" {
         .config_path = config_path,
         .allocator = allocator,
         .default_model = "test/mock-model",
+        .agent = .{ .harness = .native },
         .memory = .{
             .profile = "minimal_none",
             .backend = "none",
@@ -2769,6 +2771,7 @@ test "daemon inbound dispatch closes a streamed preview instead of publishing th
         .config_path = config_path,
         .allocator = allocator,
         .default_model = "test/mock-model",
+        .agent = .{ .harness = .native },
         .memory = .{
             .profile = "minimal_none",
             .backend = "none",
@@ -2905,6 +2908,7 @@ test "dispatcher cancels the stopped turn's queued stream chunks before enqueue"
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
         .default_model = "test/mock-model",
+        .agent = .{ .harness = .native },
         .allocator = allocator,
     };
     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
@@ -4660,6 +4664,7 @@ test "Slack slash /stop interrupts the busy channel and thread sessions before e
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
         .default_model = "test/mock-model",
+        .agent = .{ .harness = .native },
         .allocator = allocator,
     };
     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);
@@ -4800,6 +4805,7 @@ test "a steered daemon message is finalized when the consuming turn ends" {
         .workspace_dir = "/tmp",
         .config_path = "/tmp/config.json",
         .default_model = "test/mock-model",
+        .agent = .{ .harness = .native },
         .allocator = allocator,
     };
     var sm = session_mod.SessionManager.init(allocator, &config, provider, &.{}, null, noop.observer(), null, null);

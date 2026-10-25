@@ -163,12 +163,12 @@ docker build --target full-dsh -t junclaw:full-dsh .
 
 建议每容器至少 512 MB 内存，1 GB 更稳。
 
-**启用 dsh：** `agent.harness` 默认仍是 `native`。镜像已设置 `NULLCLAW_DSH_BIN` 与 `DSH_HOME=/nullclaw-data/.dsh`，但仍需显式开启：
+**启用 dsh sidecar：** `agent.harness` 默认是 `dsh`（进程内引擎），本镜像同样会运行它。镜像另外打包了 DeepSeek-Harness sidecar 并设置了 `NULLCLAW_DSH_BIN` 与 `DSH_HOME=/nullclaw-data/.dsh`；若要改用打包的 sidecar，需显式开启：
 
 ```json
 {
   "agent": {
-    "harness": "dsh"
+    "harness": "dsh-sidecar"
   }
 }
 ```

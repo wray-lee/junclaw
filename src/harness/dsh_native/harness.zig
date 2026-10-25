@@ -1240,7 +1240,7 @@ pub const DshNativeHarness = struct {
             .queue_mode = .steer,
             .reasoning_mode = self.opts.reasoning_mode,
             .redactor = null,
-            .harness_kind = .dsh_native,
+            .harness_kind = .dsh,
             .owns_inbox = true,
             .supports_commands = false,
             .dsh_session_id = if (self.session_id.len == 0) null else self.session_id,
