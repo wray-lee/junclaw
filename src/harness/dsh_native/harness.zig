@@ -7,9 +7,10 @@
 //! model-visible surface is rebuilt from the same messages the log stores.
 //!
 //! Deliberate P1b limits:
-//! - The provider bridge is blocking (`Provider.chatWithTools`); the kernel
-//!   sees one text chunk plus `done` per model call. Live deltas reach the host
-//!   as one `delta` per assistant message, not per provider token.
+//! - The provider bridge streams only when the host has a live draft and the
+//!   provider can stream native tool calls: every chunk then reaches the host
+//!   immediately and the kernel as a text/reasoning delta. Otherwise it blocks
+//!   on `chatWithTools` and the kernel sees one text chunk plus `done`.
 //! - junclaw's provider interface cannot carry an assistant `tool_calls`
 //!   message, so history uses the native harness convention (`<tool_call>` XML
 //!   in assistant text, `[Tool results]` as a user message). The request still
@@ -35,6 +36,8 @@ const dispatcher = @import("../../agent/dispatcher.zig");
 const native_prompt = @import("../../agent/prompt.zig");
 const bootstrap_mod = @import("../../bootstrap/root.zig");
 const providers = @import("../../providers/root.zig");
+const provider_helpers = @import("../../providers/helpers.zig");
+const http_util = @import("../../http_util.zig");
 const config_types = @import("../../config_types.zig");
 const memory_mod = @import("../../memory/root.zig");
 const port = @import("../port.zig");
@@ -223,11 +226,24 @@ pub const DshNativeHarness = struct {
     total_tokens: u64 = 0,
     turn_model_calls: u64 = 0,
     turn_text: std.ArrayListUnmanaged(u8) = .empty,
+    /// Last assistant message's reasoning for `reasoning_mode = .on`; copied
+    /// out of the kernel settlement, which dies with the step.
+    turn_reasoning: std.ArrayListUnmanaged(u8) = .empty,
     last_assistant_text: ?[]const u8 = null,
 
     // Per turn.
     sink: ?port.Sink = null,
     live_stream: bool = false,
+    /// Raised by `requestInterrupt`; a streaming provider sees it through the
+    /// thread interrupt flag, exactly like the native agent.
+    stream_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// A provider error raised after deltas were relayed. `providerNext`
+    /// reports it after the partial stream so the kernel settles the partial
+    /// assistant message (P3) instead of "request failed to start".
+    stream_error: ?anyerror = null,
+    /// True while `beginStreaming` relays the provider's chunks to the sink;
+    /// `forwardDelta` must not replay the same kernel events.
+    streamed_live: bool = false,
     drain: ?agent_mod.DrainCallback = null,
     drain_ctx: ?*anyopaque = null,
     /// Host-computed native memory recall block for this turn; borrowed.
@@ -269,6 +285,7 @@ pub const DshNativeHarness = struct {
         _ = allocator;
         self.closeSession();
         self.turn_text.deinit(self.allocator);
+        self.turn_reasoning.deinit(self.allocator);
         self.pending_calls.deinit(self.allocator);
         self.registry.deinit(self.allocator);
         if (self.builtins) |value| self.allocator.destroy(value);
@@ -1121,7 +1138,11 @@ pub const DshNativeHarness = struct {
         }
 
         self.turn_text.clearRetainingCapacity();
+        self.turn_reasoning.clearRetainingCapacity();
         self.last_assistant_text = null;
+        // A previous turn's stop must not abort this one's first provider
+        // call; the kernel flag below still ends a pre-turn stop.
+        self.stream_cancel.store(false, .monotonic);
         const calls_before = self.turn_model_calls;
 
         // A pre-turn /stop behaves like native's: the turn still runs and
@@ -1164,7 +1185,7 @@ pub const DshNativeHarness = struct {
 
         // `reply` and `error` are owned by the host's allocator (native.zig
         // hands back Agent-allocated memory); the engine's arena copies here.
-        const reply = try self.allocator.dupe(u8, self.turn_text.items);
+        const reply = try self.composeReply();
         errdefer self.allocator.free(reply);
         var result = port.TurnResult{
             .reply = reply,
@@ -1207,6 +1228,7 @@ pub const DshNativeHarness = struct {
     fn requestInterrupt(ptr: *anyopaque) void {
         const self: *Self = @ptrCast(@alignCast(ptr));
         self.interrupt = true;
+        self.stream_cancel.store(true, .release);
         if (self.loop) |*loop| loop.abort(.user);
     }
 
@@ -1536,6 +1558,15 @@ pub const DshNativeHarness = struct {
         // The host renders the turn's whole text; the log keeps every segment.
         const text = try textOf(arena, settlement.message.content);
         try self.turn_text.appendSlice(self.allocator, text);
+        // `.on` renders the last response's reasoning as a post-turn block,
+        // like native's `composeFinalReply`; copy it out of the step arena.
+        if (self.opts.reasoning_mode == .on) {
+            self.turn_reasoning.clearRetainingCapacity();
+            for (settlement.message.content) |block| switch (block) {
+                .reasoning => |trace| try self.turn_reasoning.appendSlice(self.allocator, trace),
+                else => {},
+            };
+        }
         if (countToolCalls(settlement.message.content) == 0) self.last_assistant_text = text;
         if (self.sink) |sink| {
             if (text.len > 0) sink.send(.{ .assistant_message = .{ .text = text } });
@@ -1660,6 +1691,10 @@ pub const DshNativeHarness = struct {
     }
 
     fn forwardDelta(self: *Self, event: stream.Event) void {
+        // The streaming bridge pushed every chunk from the provider callback,
+        // where the host saw it while the call was still running; replaying
+        // the kernel events here would duplicate the draft text.
+        if (self.streamed_live) return;
         // The blocking provider path yields one text chunk per attempt, which
         // `appendAssistant` already reports as an `assistant_message`.
         switch (event) {
@@ -1840,14 +1875,17 @@ pub const DshNativeHarness = struct {
 
     // ── provider bridge (kernel -> junclaw provider) ────────────────────────
 
-    /// One blocking provider call per attempt. The whole assistant message is
-    /// pushed as a synthetic stream (text chunk, tool-call chunks, done); the
-    /// kernel assembles it exactly like a live one.
+    /// One provider call per attempt: live streaming when the host has a draft
+    /// and the provider supports it, otherwise one blocking call whose whole
+    /// assistant message is pushed as a synthetic stream. The kernel assembles
+    /// either as deltas, tool calls and `done`.
     fn providerBegin(context_ptr: *anyopaque, view: loop_mod.RequestView) anyerror!void {
         const self = selfOf(context_ptr);
         self.cancelCall();
         self.pending.clearRetainingCapacity();
         self.pending_index = 0;
+        self.stream_error = null;
+        self.streamed_live = false;
 
         const arena = self.call_arena.allocator();
         const messages = try requestsFromMessages(arena, self.messages.items);
@@ -1862,6 +1900,8 @@ pub const DshNativeHarness = struct {
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
         };
         _ = view;
+
+        if (self.streamingEnabled()) return self.beginStreaming(arena, chat);
 
         var response = try self.opts.provider.chatWithTools(arena, chat);
         defer freeResponseFields(arena, &response);
@@ -1889,8 +1929,190 @@ pub const DshNativeHarness = struct {
                 .text = try arena.dupe(u8, content),
             } } });
         }
-        var done_calls = try arena.alloc(types.ToolCall, response.tool_calls.len);
-        for (response.tool_calls, 0..) |call, index| {
+        try self.pushDone(arena, response.tool_calls, response.usage, response.truncated);
+    }
+
+    /// Live streaming needs a host draft and a provider that returns native
+    /// tool calls from the stream; otherwise the blocking path stays the only
+    /// one that preserves tool calls.
+    fn streamingEnabled(self: *const Self) bool {
+        return self.live_stream and
+            self.opts.provider.supportsStreaming() and
+            (self.tool_specs.len == 0 or
+                self.opts.provider.supportsStreamingNativeToolsForModel(self.opts.model));
+    }
+
+    /// Streaming bridge state: one provider chunk becomes a host delta and a
+    /// kernel text/reasoning delta as it arrives.
+    const StreamRelay = struct {
+        harness: *Self,
+        arena: Allocator,
+        mode: config_types.ReasoningMode,
+        /// Bytes held because they may start a reasoning tag the next chunk
+        /// completes.
+        held: std.ArrayListUnmanaged(u8) = .empty,
+        in_reasoning: bool = false,
+        /// At least one delta reached the kernel/host, so a later provider
+        /// error settles a partial assistant message (P3).
+        saw_delta: bool = false,
+        output_bytes: usize = 0,
+        err: ?anyerror = null,
+
+        /// Reasoning and text need distinct indexes: the accumulator keys one
+        /// block per index, so a shared index folds the answer into reasoning.
+        const text_index: u32 = 0;
+        const reasoning_index: u32 = 1;
+
+        fn onChunk(ctx: *anyopaque, chunk: providers.StreamChunk) void {
+            const state: *StreamRelay = @ptrCast(@alignCast(ctx));
+            if (state.err != null) return;
+            state.relay(chunk) catch |err| {
+                state.err = err;
+            };
+        }
+
+        fn relay(self: *StreamRelay, chunk: providers.StreamChunk) !void {
+            if (chunk.is_final) {
+                self.toHost(chunk);
+                return;
+            }
+            if (chunk.delta.len == 0) return;
+            // Native hands the host the provider's raw chunk; the host's
+            // per-turn TagFilter applies `reasoning_mode`. Off mode drops
+            // reasoning here so nothing reaches the draft.
+            if (self.mode != .off) self.toHost(chunk);
+            try self.split(chunk.delta);
+        }
+
+        fn toHost(self: *StreamRelay, chunk: providers.StreamChunk) void {
+            if (self.harness.sink) |sink| sink.send(.{ .delta = chunk });
+        }
+
+        fn hostText(self: *StreamRelay, text: []const u8) void {
+            if (text.len == 0) return;
+            self.toHost(.{
+                .delta = text,
+                .is_final = false,
+                .token_count = @intCast((text.len + 3) / 4),
+            });
+        }
+
+        /// Split raw provider text into reasoning and visible runs. The SSE
+        /// parsers emit `<think>`/`</think>` as their own chunks, but a tag
+        /// inside content can straddle chunks, so a trailing partial tag waits
+        /// for the next call.
+        fn split(self: *StreamRelay, text: []const u8) !void {
+            try self.held.appendSlice(self.arena, text);
+            var i: usize = 0;
+            var start: usize = 0;
+            while (i < self.held.items.len) {
+                if (self.held.items[i] != '<') {
+                    i += 1;
+                    continue;
+                }
+                switch (provider_helpers.scanThinkTag(self.held.items[i..])) {
+                    .none => i += 1,
+                    .partial => {
+                        try self.emit(self.held.items[start..i]);
+                        const tail = self.held.items[i..];
+                        std.mem.copyForwards(u8, self.held.items[0..tail.len], tail);
+                        self.held.shrinkRetainingCapacity(tail.len);
+                        return;
+                    },
+                    .complete => |tag| {
+                        try self.emit(self.held.items[start..i]);
+                        self.in_reasoning = !tag.close;
+                        i += tag.len;
+                        start = i;
+                    },
+                }
+            }
+            try self.emit(self.held.items[start..]);
+            self.held.clearRetainingCapacity();
+        }
+
+        /// Flush a trailing partial tag: a response cut mid-tag is text.
+        fn flush(self: *StreamRelay) !void {
+            try self.emit(self.held.items);
+            self.held.clearRetainingCapacity();
+        }
+
+        fn emit(self: *StreamRelay, text: []const u8) !void {
+            if (text.len == 0) return;
+            if (self.in_reasoning and self.mode == .off) return;
+            self.saw_delta = true;
+            self.output_bytes += text.len;
+            const copied = try self.arena.dupe(u8, text);
+            if (self.in_reasoning) {
+                try self.harness.pending.append(self.arena, .{ .chunk = .{ .reasoning_delta = .{
+                    .index = reasoning_index,
+                    .text = copied,
+                } } });
+            } else {
+                try self.harness.pending.append(self.arena, .{ .chunk = .{ .text_delta = .{
+                    .index = text_index,
+                    .text = copied,
+                } } });
+                if (self.mode == .off) self.hostText(copied);
+            }
+        }
+    };
+
+    /// Relay `Provider.streamChat` into the kernel and the host as it arrives.
+    /// The provider invokes the callback synchronously on this thread, so the
+    /// call arena and `pending` need no locking; every chunk is copied or
+    /// forwarded before the callback returns, because its slice is borrowed.
+    fn beginStreaming(self: *Self, arena: Allocator, chat: providers.ChatRequest) anyerror!void {
+        self.turn_model_calls += 1;
+        self.streamed_live = true;
+        var relay = StreamRelay{ .harness = self, .arena = arena, .mode = self.opts.reasoning_mode };
+        // The transports poll this flag between deltas, so a `/stop` from the
+        // host thread ends the request instead of draining the rest.
+        http_util.setThreadInterruptFlag(&self.stream_cancel);
+        defer http_util.setThreadInterruptFlag(null);
+
+        var failed: ?anyerror = null;
+        var result = self.opts.provider.streamChat(
+            arena,
+            chat,
+            self.opts.model,
+            self.opts.temperature,
+            StreamRelay.onChunk,
+            @ptrCast(&relay),
+        ) catch |err| blk: {
+            failed = err;
+            break :blk providers.StreamChatResult{};
+        };
+        if (relay.err) |err| return err;
+        try relay.flush();
+
+        if (failed) |err| {
+            // Chunks already reached the sink and the kernel, so the kernel
+            // settles the partial assistant message when its `next` raises
+            // this error. A call that produced nothing keeps the blocking
+            // path's "request failed to start" outcome.
+            if (!relay.saw_delta) return err;
+            self.stream_error = err;
+            return;
+        }
+        // Mirrors the non-streaming fallback: no provider usage means the
+        // fixed-density estimate (4 chars per token).
+        if (result.usage.completion_tokens == 0 and relay.output_bytes > 0) {
+            const estimate = (relay.output_bytes + 3) / 4;
+            result.usage.completion_tokens = @intCast(@min(estimate, std.math.maxInt(u32)));
+        }
+        try self.pushDone(arena, result.tool_calls, result.usage, result.truncated);
+    }
+
+    fn pushDone(
+        self: *Self,
+        arena: Allocator,
+        calls: []const providers.ToolCall,
+        usage_in: providers.TokenUsage,
+        truncated: bool,
+    ) !void {
+        var done_calls = try arena.alloc(types.ToolCall, calls.len);
+        for (calls, 0..) |call, index| {
             done_calls[index] = .{
                 .id = try arena.dupe(u8, call.id),
                 .name = try arena.dupe(u8, call.name),
@@ -1898,14 +2120,14 @@ pub const DshNativeHarness = struct {
             };
         }
         const usage = stream.ProviderUsage{
-            .prompt_tokens = response.usage.prompt_tokens,
-            .completion_tokens = response.usage.completion_tokens,
-            .total_tokens = response.usage.total_tokens,
+            .prompt_tokens = usage_in.prompt_tokens,
+            .completion_tokens = usage_in.completion_tokens,
+            .total_tokens = usage_in.total_tokens,
         };
         self.last_usage = stream.normalizeUsage(usage);
-        const finish: stream.Finish = if (response.tool_calls.len > 0)
+        const finish: stream.Finish = if (calls.len > 0)
             .tool_calls
-        else if (response.truncated)
+        else if (truncated)
             .max_tokens
         else
             .stop;
@@ -1918,7 +2140,13 @@ pub const DshNativeHarness = struct {
 
     fn providerNext(context_ptr: *anyopaque) anyerror!?stream.Event {
         const self = selfOf(context_ptr);
-        if (self.pending_index >= self.pending.items.len) return null;
+        if (self.pending_index >= self.pending.items.len) {
+            if (self.stream_error) |err| {
+                self.stream_error = null;
+                return err;
+            }
+            return null;
+        }
         const event = self.pending.items[self.pending_index];
         self.pending_index += 1;
         return event;
@@ -1929,6 +2157,8 @@ pub const DshNativeHarness = struct {
     }
 
     fn cancelCall(self: *Self) void {
+        self.streamed_live = false;
+        self.stream_error = null;
         // The buffer lives in `call_arena`; drop it before the arena resets
         // (clearRetainingCapacity would keep a dangling capacity).
         self.pending = .empty;
@@ -2015,6 +2245,29 @@ pub const DshNativeHarness = struct {
             else => {},
         };
         return buffer.toOwnedSlice();
+    }
+
+    /// The turn's reply with native's `.on` reasoning quote. Stream mode
+    /// already showed the thinking live; `persisted_reply` stays clean either
+    /// way because the host derives it from `last_assistant_text`.
+    fn composeReply(self: *Self) ![]const u8 {
+        if (self.opts.reasoning_mode != .on or self.turn_reasoning.items.len == 0) {
+            return self.allocator.dupe(u8, self.turn_text.items);
+        }
+        const clean = try providers.stripToolCallMarkup(self.allocator, self.turn_reasoning.items);
+        defer self.allocator.free(clean);
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+        try out.appendSlice(self.allocator, "Reasoning:\n");
+        var lines = std.mem.splitScalar(u8, clean, '\n');
+        while (lines.next()) |line| {
+            try out.appendSlice(self.allocator, "> ");
+            try out.appendSlice(self.allocator, line);
+            try out.appendSlice(self.allocator, "\n");
+        }
+        try out.appendSlice(self.allocator, "\n\n");
+        try out.appendSlice(self.allocator, self.turn_text.items);
+        return out.toOwnedSlice(self.allocator);
     }
 
     fn countToolCalls(content: []const types.ContentBlock) usize {
