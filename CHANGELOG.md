@@ -12,3 +12,10 @@
   sidecar must change `"dsh"` to `"dsh-sidecar"`.
 - `"dsh-native"` is kept as an alias for `"dsh"`; saving a config writes the
   canonical `"dsh"`.
+
+### Fixed
+
+- Telegram no longer posts a reply twice when a rich, HTML or plain send fails
+  with an indeterminate transport error (for example a request timeout): such
+  a failure counts as one best-effort attempt and is not re-sent in another
+  format or retried by the outbox/dispatch layers.
