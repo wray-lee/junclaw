@@ -10,6 +10,7 @@ pub const json = @import("json.zig");
 pub const session_log = @import("session_log.zig");
 pub const session_store = @import("session_store.zig");
 pub const surface = @import("surface.zig");
+pub const repair = @import("repair.zig");
 pub const replay_provider = @import("replay_provider.zig");
 pub const inbox = @import("inbox.zig");
 pub const request = @import("request.zig");
@@ -49,6 +50,7 @@ test {
     _ = @import("session_log.zig");
     _ = @import("session_store.zig");
     _ = @import("surface.zig");
+    _ = @import("repair.zig");
     _ = @import("replay_provider.zig");
     _ = @import("inbox.zig");
     _ = @import("request.zig");

@@ -848,6 +848,14 @@ pub const Agent = struct {
         });
     }
 
+    /// Provider failures exit the turn with no assistant reply. Close the
+    /// transcript tail so the next request does not start from a half-finished
+    /// round (tool results and nudges are user-role messages).
+    fn failProviderTurn(self: *Agent, err: anyerror) anyerror {
+        self.appendFailedTurnClosing() catch {};
+        return err;
+    }
+
     /// Forward a provider retry notice to the live draft. Retry text is built
     /// here and borrowed only for the synchronous callback; a null `retry`
     /// clears the indicator after the retried call resumes.
@@ -2571,13 +2579,13 @@ pub const Agent = struct {
                             if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
-                            return retry_err;
+                            return self.failProviderTurn(retry_err);
                         };
                     }
 
                     if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
                     self.emitUsageFailure(turn_model_name);
-                    return err;
+                    return self.failProviderTurn(err);
                 };
                 response = ChatResponse{
                     .content = stream_result.content,
@@ -2656,7 +2664,7 @@ pub const Agent = struct {
                             if (isInterruptError(retry_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                             self.emitUsageFailure(turn_model_name);
-                            return retry_err;
+                            return self.failProviderTurn(retry_err);
                         };
                     }
 
@@ -2667,7 +2675,7 @@ pub const Agent = struct {
                         self.forceCompressHistory())
                     {
                         self.context_was_compacted = true;
-                        const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
+                        const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return self.failProviderTurn(prep_err);
                         const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                             recovery_msgs,
                             if (native_tools_enabled) turn_tool_specs else null,
@@ -2696,14 +2704,14 @@ pub const Agent = struct {
                             if (isInterruptError(retry_after_compact_err)) return self.interruptedReply(interim_text.items);
                             if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                             self.emitUsageFailure(turn_model_name);
-                            return retry_after_compact_err;
+                            return self.failProviderTurn(retry_after_compact_err);
                         };
                     }
 
                     if (self.routeShouldBeDegraded(err)) {
                         if (turn_route_selection) |selection| try self.markRouteDegraded(selection, err);
                         self.emitUsageFailure(turn_model_name);
-                        return err;
+                        return self.failProviderTurn(err);
                     }
 
                     // Retry once
@@ -2732,7 +2740,7 @@ pub const Agent = struct {
                         // force-compress and retry once more
                         if (self.history.items.len > compaction.CONTEXT_RECOVERY_MIN_HISTORY and self.forceCompressHistory()) {
                             self.context_was_compacted = true;
-                            const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return prep_err;
+                            const recovery_msgs = self.buildProviderMessagesForTurn(arena, turn_model_name, priority_tool) catch |prep_err| return self.failProviderTurn(prep_err);
                             const recovery_max_tokens = self.effectiveMaxTokensForTurn(
                                 recovery_msgs,
                                 if (native_tools_enabled) turn_tool_specs else null,
@@ -2761,12 +2769,12 @@ pub const Agent = struct {
                                 if (isInterruptError(retry_after_compact_err)) return self.interruptedReply(interim_text.items);
                                 if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_after_compact_err);
                                 self.emitUsageFailure(turn_model_name);
-                                return retry_after_compact_err;
+                                return self.failProviderTurn(retry_after_compact_err);
                             };
                         }
                         if (turn_route_selection) |selection| try self.markRouteDegraded(selection, retry_err);
                         self.emitUsageFailure(turn_model_name);
-                        return retry_err;
+                        return self.failProviderTurn(retry_err);
                     };
                 };
             }
@@ -6381,7 +6389,10 @@ test "turn /reset with argument stays slash-only command" {
     try std.testing.expectEqualStrings("gpt-4o-mini", agent.model_name);
 }
 
-test "turn retains user message on provider error" {
+test "a provider error closes the turn with an assistant history message" {
+    // Regression: a 5xx/timeout propagated out of turn() with the user row as
+    // the last history entry, so the next request replayed a half-finished
+    // round (and tool results made it end on a user-role message).
     const FailProvider = struct {
         fn chatWithSystem(_: *anyopaque, allocator: std.mem.Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
             return allocator.dupe(u8, "");
@@ -6444,8 +6455,19 @@ test "turn retains user message on provider error" {
     });
 
     try std.testing.expectError(error.ProviderFailed, agent.turn("hello"));
-    try std.testing.expectEqual(@as(usize, 2), agent.historyLen());
+    try std.testing.expectEqual(@as(usize, 3), agent.historyLen());
     try std.testing.expectEqualStrings("hello", agent.history.items[1].content);
+    try std.testing.expectEqual(providers.Role.assistant, agent.history.items[2].role);
+    try std.testing.expectEqualStrings(
+        "[No assistant reply was produced for this turn.]",
+        agent.history.items[2].content,
+    );
+
+    // A later failure still runs and closes its own turn instead of tripping
+    // over the marker left by the first.
+    try std.testing.expectError(error.ProviderFailed, agent.turn("again"));
+    try std.testing.expectEqual(@as(usize, 5), agent.historyLen());
+    try std.testing.expectEqual(providers.Role.assistant, agent.history.items[4].role);
 
     // Should not double-free when clearing history after a failed turn.
     agent.clearHistory();

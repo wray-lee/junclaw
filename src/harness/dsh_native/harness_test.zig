@@ -2855,3 +2855,299 @@ test "dsh-native adapter: call config updates reach the request and Info" {
     try testing.expectEqual(false, fx.provider.requests.items[1].include_reasoning.?);
     try testing.expect(fx.provider.requests.items[1].reasoning_effort == null);
 }
+
+// ── crash repair (P3-E) ─────────────────────────────────────────────────────
+
+/// A valid v4 log written by hand, so a test can stop exactly where a killed
+/// writer would: between any two events.
+fn createTestLog(allocator: Allocator, fx: *Fixture, id: []const u8) !session_log.Log {
+    return session_store.createLog(allocator, fx.dsh_home, fx.workspace, id, .{
+        .id = id,
+        .created_at = 1_000,
+        .cwd = fx.workspace,
+        .is_seeded = false,
+    });
+}
+
+fn appendTestEvent(
+    allocator: Allocator,
+    log: *session_log.Log,
+    event_type: []const u8,
+    json_data: []const u8,
+    opts: session_log.AppendOptions,
+) !u64 {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const value = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), json_data, .{
+        .allocate = .alloc_always,
+    });
+    return log.append(event_type, value, opts);
+}
+
+fn eventText(event: types.Event) ![]const u8 {
+    if (std.mem.eql(u8, event.event_type, "user/message")) {
+        return event.data.object.get("content").?.array.items[0].object.get("text").?.string;
+    }
+    return event.data.object.get("message").?.object.get("content").?.array.items[0].object.get("text").?.string;
+}
+
+test "dsh-native adapter: restore closes a half-written turn" {
+    // Regression: a process killed between turn/start and turn/end left an
+    // unbalanced log. Restore folded it as-is, so the next turn opened inside
+    // the crashed turn and no step/end or turn/end was ever logged for it.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after repair" }});
+    defer fx.deinit();
+
+    const id = "crash-half-turn";
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 1_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 1_001 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 1_002,
+            .surface_op = .append,
+        });
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 5), read.events.len);
+    try testing.expectEqualStrings("step/end", read.events[3].event_type);
+    try testing.expectEqualStrings("turn/end", read.events[4].event_type);
+    try testing.expectEqualStrings("interrupted", read.events[4].data.object.get("reason").?.object.get("kind").?.string);
+    try testing.expectEqual(@as(i64, 1_002), read.events[4].time_ms);
+
+    // The repaired session continues past the interrupted turn.
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("after repair", next.reply);
+
+    var after = try session_log.readLog(allocator, path);
+    defer after.deinit();
+    try testing.expect(after.torn_truncate_to == null);
+    const last = after.events[after.events.len - 1];
+    try testing.expectEqualStrings("turn/end", last.event_type);
+    try testing.expectEqual(@as(i64, 2), last.data.object.get("turn").?.integer);
+}
+
+test "dsh-native adapter: restore answers dangling tool calls before the next request" {
+    // Regression: a crash between assistant/message and tool/result left a
+    // dangling call. Repair appends the cause-tagged results the crashed
+    // writer never wrote, so later requests replay neither a dangling call
+    // nor a half-finished tool round.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after repair" }});
+    defer fx.deinit();
+
+    const id = "crash-half-tool";
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 2_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 2_001 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"read both\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 2_002,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "assistant/message", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"assistant-1-1\",\"role\":\"assistant\",\"source\":{\"kind\":\"model\",\"provider\":\"scripted\",\"model\":\"test-model\"},\"content\":[{\"type\":\"tool-call\",\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\"},{\"type\":\"tool-call\",\"id\":\"call-2\",\"name\":\"read\",\"arguments\":\"{}\"}]}}", .{
+            .time_ms = 2_003,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "tool/call", "{\"turn\":1,\"step\":1,\"callId\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\"}", .{ .time_ms = 2_004 });
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 9), read.events.len);
+
+    const started = read.events[5];
+    try testing.expectEqualStrings("tool/result", started.event_type);
+    try testing.expectEqualStrings("ToolOutcomeUnknownError", started.data.object.get("error").?.object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 1), started.source_event_seqs.?.len);
+    try testing.expectEqual(@as(u64, 4), started.source_event_seqs.?[0]);
+
+    const not_started = read.events[6];
+    try testing.expectEqualStrings("tool/result", not_started.event_type);
+    try testing.expectEqualStrings("ToolNotStartedError", not_started.data.object.get("error").?.object.get("name").?.string);
+    try testing.expect(not_started.source_event_seqs == null);
+
+    try testing.expectEqualStrings("step/end", read.events[7].event_type);
+    try testing.expectEqualStrings("turn/end", read.events[8].event_type);
+
+    // The folded surface now ends with the synthetic results, not a dangling
+    // assistant tool request.
+    try testing.expectEqual(types.MessageRole.tool, engine.messages.items[engine.messages.items.len - 1].role);
+    try testing.expectEqual(types.MessageRole.tool, engine.messages.items[engine.messages.items.len - 2].role);
+
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("after repair", next.reply);
+
+    // Tool results reach the provider in the native convention (a user-role
+    // `[Tool results]` block), so the resumed request carries both outcomes.
+    const request = fx.provider.requests.items[0];
+    try testing.expect(requestContains(request, "Its outcome is unknown"));
+    try testing.expect(requestContains(request, "Retry it if it is still needed"));
+    var result_blocks: usize = 0;
+    for (request.contents) |content| {
+        if (std.mem.indexOf(u8, content, "[Tool results]") != null) result_blocks += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), result_blocks);
+}
+
+test "dsh-native adapter: a torn tail is truncated and the session continues" {
+    // A crash between write and newline leaves an uncommitted final record;
+    // opening must truncate it and leave a session the next turn can use.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{ .{ .text = "first" }, .{ .text = "second" } });
+    defer fx.deinit();
+
+    const id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const result = try engine.harness().runTurn(turnInput("hello"));
+        defer allocator.free(result.reply);
+        try testing.expectEqual(port.EndReason.completed, result.end_reason);
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(id);
+
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    {
+        const file = try fs_compat.openPath(path, .{ .mode = .read_write });
+        defer file.close();
+        try file.seekFromEnd(0);
+        try file.writeAll("{\"type\":\"user/message\",\"seq\":");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expect(read.torn_truncate_to == null);
+    var user_texts: usize = 0;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (std.mem.eql(u8, try eventText(event), "hello")) user_texts += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), user_texts);
+
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("second", next.reply);
+}
+
+test "dsh-native adapter: a corrupt line fails closed and native fallback starts fresh" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "fresh answer" }});
+    defer fx.deinit();
+
+    const id = "corrupt-line";
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 3_000 });
+        _ = try appendTestEvent(allocator, &log, "turn/end", "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}", .{ .time_ms = 3_001 });
+    }
+
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    {
+        const file = try fs_compat.openPath(path, .{ .mode = .read_write });
+        defer file.close();
+        try file.seekFromEnd(0);
+        // Newline-terminated: this is corruption, not a torn tail.
+        try file.writeAll("not a json event\n");
+    }
+    const before = try readLogText(allocator, path);
+    defer allocator.free(before);
+
+    // Default policy is fail-closed and must not silently drop or truncate.
+    {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        try testing.expectError(error.CorruptLog, engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id }));
+    }
+    const after = try readLogText(allocator, path);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    // `dsh_on_corrupt = "native"` is the explicit fallback: start a fresh
+    // session (new id) instead of wedging every later open.
+    var options = fx.options();
+    options.on_corrupt = .native;
+    var engine = try DshNativeHarness.init(allocator, options);
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+    try testing.expect(!std.mem.eql(u8, engine.session_id, id));
+
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("fresh answer", next.reply);
+}
+
+test "dsh-native adapter: a provider failure appends a closing assistant message" {
+    // Regression: a 5xx/timeout ended the turn with the user row (and any tool
+    // results) as the surface tail. The next request then replayed a
+    // half-finished round with no assistant reply at all.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{ .{ .fail = true }, .{ .text = "recovered" } });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const failed = try h.runTurn(turnInput("first"));
+    defer allocator.free(failed.reply);
+    defer if (failed.@"error") |text| allocator.free(text);
+    try testing.expectEqual(port.EndReason.@"error", failed.end_reason);
+    try testing.expectEqualStrings("", failed.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_closer = false;
+    var saw_error_end = false;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "assistant/message")) {
+            try testing.expectEqualStrings("[No assistant reply was produced for this turn.]", try eventText(event));
+            saw_closer = true;
+        }
+        if (std.mem.eql(u8, event.event_type, "turn/end")) {
+            saw_error_end = std.mem.eql(u8, event.data.object.get("reason").?.object.get("kind").?.string, "error");
+        }
+    }
+    try testing.expect(saw_closer);
+    try testing.expect(saw_error_end);
+    try testing.expectEqual(types.MessageRole.assistant, engine.messages.items[engine.messages.items.len - 1].role);
+
+    // The next turn is well-formed and sees the closer in its history.
+    const second = try h.runTurn(turnInput("second"));
+    defer allocator.free(second.reply);
+    try testing.expectEqual(port.EndReason.completed, second.end_reason);
+    try testing.expectEqualStrings("recovered", second.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "[No assistant reply was produced for this turn.]"));
+}

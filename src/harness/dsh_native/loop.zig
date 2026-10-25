@@ -29,6 +29,9 @@ const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 
+/// Kept identical to the native adapter's failed-turn marker.
+const failure_closer_text = "[No assistant reply was produced for this turn.]";
+
 pub const Position = struct { turn: u64, step: u64 };
 
 /// One projected system message. dsh logs these through
@@ -77,6 +80,13 @@ pub const Event = union(enum) {
     assistant_attempt: struct {
         position: Position,
         settlement: stream.Settlement,
+    },
+    /// Synthetic assistant message that closes a turn whose provider call
+    /// failed. It joins the surface but not `turn_text`: the host renders the
+    /// user-visible error itself.
+    assistant_closer: struct {
+        position: Position,
+        message: types.Message,
     },
     tool_call: struct { position: Position, call: types.ToolCall },
     tool_result: struct { position: Position, result: registry.ToolResult },
@@ -671,6 +681,7 @@ pub const Loop = struct {
                 if (self.isAborted()) return .aborted;
                 if (err == error.ContextLengthExceeded and try self.retryOverflow(&attempt, position))
                     continue;
+                try self.emitFailureCloser(position);
                 _ = try self.emit(.{ .step_end = position });
                 return .{ .failure = .{
                     .message = "provider request failed to start",
@@ -730,6 +741,7 @@ pub const Loop = struct {
                     .assistant_attempt = .{ .position = position, .settlement = settlement },
                 });
             }
+            try self.emitFailureCloser(position);
             _ = try self.emit(.{ .step_end = position });
             return .{ .failure = .{
                 .message = "assistant stream failed",
@@ -798,6 +810,25 @@ pub const Loop = struct {
                 .assistant_message = .{ .position = position, .settlement = settlement },
             });
         }
+    }
+
+    /// A provider failure exits the step with user/tool rows as the surface
+    /// tail. Junclaw channels require an assistant reply in history, so close
+    /// the round with a neutral marker (the provider error text stays with
+    /// the host and never enters model context).
+    fn emitFailureCloser(self: *Loop, position: Position) !void {
+        const arena = self.allocator();
+        const blocks = try arena.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = failure_closer_text };
+        _ = try self.emit(.{ .assistant_closer = .{
+            .position = position,
+            .message = .{
+                .id = try std.fmt.allocPrint(arena, "assistant-{d}-{d}", .{ position.turn, position.step }),
+                .role = .assistant,
+                .content = blocks,
+                .source = .{ .model = .{ .provider = self.config.provider, .model = self.config.model } },
+            },
+        } });
     }
 
     fn collectToolCalls(self: *Loop, content: []const types.ContentBlock) ![]const types.ToolCall {
@@ -918,6 +949,7 @@ const RecKind = enum {
     assistant_stream,
     assistant_message,
     assistant_attempt,
+    assistant_closer,
     tool_call,
     tool_result,
     step_end,
@@ -1127,6 +1159,14 @@ fn emitEvent(context: *anyopaque, event: Event) anyerror!u64 {
                 .step = payload.position.step,
                 .interrupted = payload.settlement.interrupted,
                 .finish = payload.settlement.finish,
+            };
+        },
+        .assistant_closer => |payload| {
+            record = .{
+                .kind = .assistant_closer,
+                .turn = payload.position.turn,
+                .step = payload.position.step,
+                .text = try h.dup(firstText(payload.message.content)),
             };
         },
         .tool_call => |payload| {
@@ -1722,11 +1762,13 @@ test "stream break settles an attempt and ends the turn with an error" {
         .request_start,
         .assistant_stream,
         .assistant_attempt,
+        .assistant_closer,
         .step_end,
         .turn_end,
     });
     try testing.expect(!h.find(.assistant_attempt).?.interrupted);
     try testing.expectEqual(@as(usize, 0), h.count(.assistant_message));
+    try testing.expectEqualStrings(failure_closer_text, h.find(.assistant_closer).?.text);
     try testing.expectEqual(@as(usize, 1), h.requests.items.len);
     const reason = reasonOf(outcome);
     try testing.expect(isTag(reason, .failure));
@@ -1995,6 +2037,7 @@ test "provider start failure ends the turn with a typed error" {
         .system_message,
         .user_message,
         .request_start,
+        .assistant_closer,
         .step_end,
         .turn_end,
     });

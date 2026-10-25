@@ -236,6 +236,7 @@ fn hostEmit(context: *anyopaque, event: loop_mod.Event) anyerror!u64 {
             return d.append("assistant/message", .{ .object = data }, .append);
         },
         .assistant_attempt => return error.UnsupportedEvent,
+        .assistant_closer => return error.UnsupportedEvent,
         .tool_call => |payload| {
             var data = try positionValue(allocator, payload.position);
             try data.put(allocator, "callId", .{ .string = payload.call.id });

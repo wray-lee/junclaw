@@ -67,6 +67,7 @@ const tools_exit_plan = @import("tools/exit_plan.zig");
 const tools_todo = @import("tools/todo.zig");
 const execute = @import("tools/execute.zig");
 const scheduler = @import("tools/scheduler.zig");
+const repair = @import("repair.zig");
 const session_log = @import("session_log.zig");
 const session_store = @import("session_store.zig");
 const stream = @import("stream.zig");
@@ -669,12 +670,16 @@ pub const DshNativeHarness = struct {
         self.closeSession();
         const arena = self.arena.allocator();
         self.session_id = try arena.dupe(u8, id_copy);
-        self.log = try session_store.openLog(self.allocator, self.opts.dsh_home, self.workspace(), self.session_id);
+        self.log = session_store.openLog(self.allocator, self.opts.dsh_home, self.workspace(), self.session_id) catch |err| {
+            if (self.opts.on_corrupt != .native or !isLogCorruption(err)) return err;
+            try self.startFresh();
+            return;
+        };
         if (self.goal_store) |store| store.attachLog(&self.log.?);
         if (self.todo) |ctx| ctx.log = &self.log.?;
 
         var read = session_log.readLog(self.allocator, self.log.?.path) catch |err| {
-            if (self.opts.on_corrupt != .native) return err;
+            if (self.opts.on_corrupt != .native or !isLogCorruption(err)) return err;
             try self.startFresh();
             return;
         };
@@ -699,8 +704,25 @@ pub const DshNativeHarness = struct {
             const resumed = try self.appendSeedFrom(seed, seededMessageCount(read.events));
             events = try concatEvents(arena, read.events, resumed);
         }
+        // dsh crash repair: a writer killed inside a turn left no `turn/end`
+        // (and possibly an assistant tool call with no result). Append the
+        // closers it never wrote before folding, so a resumed request never
+        // replays a dangling call and the next turn continues past it.
+        const closers = try repair.openTurnClosers(arena, events);
+        if (closers.len > 0) {
+            const log = if (self.log) |*value| value else return error.NoSession;
+            for (closers) |closer| {
+                const seq = try log.append(closer.event_type, closer.data, .{
+                    .time_ms = closer.time_ms,
+                    .surface_op = closer.surface_op,
+                    .source_event_seqs = closer.source_event_seqs,
+                });
+                if (seq != closer.seq) return error.RepairSequenceMismatch;
+            }
+            events = try concatEvents(arena, events, closers);
+        }
         try self.rebuildSurface(events, arena);
-        if (self.goal_store) |store| store.rebuild(read.events) catch |err| {
+        if (self.goal_store) |store| store.rebuild(events) catch |err| {
             // Same policy as a corrupt log: a projection the log cannot
             // replay starts a fresh session instead of wedging every open.
             if (self.opts.on_corrupt != .native) return err;
@@ -711,12 +733,28 @@ pub const DshNativeHarness = struct {
         // dsh restores `turnBoundary.lastTurn` from the log; a resumed kernel
         // continues numbering instead of reusing turn 1 (and its
         // `system-1` id) in the same session.
-        self.loop.?.turn = lastTurn(read.events);
+        self.loop.?.turn = lastTurn(events);
         if (baseline) |header| {
             const loop = &self.loop.?;
             loop.last_header = header;
             loop.tracker.logged = true;
         }
+    }
+
+    /// Errors that mean the JSONL cannot be interpreted. Only these may fall
+    /// back to a fresh session under `on_corrupt = "native"`; lock, I/O and
+    /// allocation failures always propagate.
+    fn isLogCorruption(err: anyerror) bool {
+        return switch (err) {
+            error.CorruptLog,
+            error.SequenceGap,
+            error.UnsupportedSessionFormatVersion,
+            error.UnsupportedEventType,
+            error.InvalidSurfaceOp,
+            error.InvalidEvent,
+            => true,
+            else => false,
+        };
     }
 
     fn lastTurn(events: []const types.Event) u64 {
@@ -1321,6 +1359,7 @@ pub const DshNativeHarness = struct {
             },
             .assistant_message => |payload| return self.appendAssistant(payload.position, payload.settlement, false),
             .assistant_attempt => |payload| return self.appendAssistant(payload.position, payload.settlement, true),
+            .assistant_closer => |payload| return self.appendAssistantCloser(payload.position, payload.message),
             .tool_call => |payload| return self.appendToolCall(payload.position, payload.call),
             .tool_result => |payload| return self.appendToolResult(payload.position, payload.result),
             .step_end => |position| {
@@ -1599,6 +1638,19 @@ pub const DshNativeHarness = struct {
     fn addSurfaceSnapshot(self: *Self, arena: Allocator, seq: u64, message: types.Message) !void {
         try self.messages.append(arena, message);
         try self.surface_seqs.append(arena, seq);
+    }
+
+    /// Persist a kernel-authored failure closer as an ordinary assistant
+    /// message. It deliberately skips `turn_text` and the sink: the host owns
+    /// the user-visible error and must not receive the marker as a reply.
+    fn appendAssistantCloser(self: *Self, position: loop_mod.Position, message: types.Message) !u64 {
+        const arena = self.arena.allocator();
+        var data = try objectWithPosition(arena, position, 0, 0);
+        try data.put(arena, "message", try messageValue(arena, message));
+        try data.put(arena, "stream", try streamValue(arena, &.{}));
+        const seq = try self.appendEvent("assistant/message", .{ .object = data }, .append, null);
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, message));
+        return seq;
     }
 
     fn forwardDelta(self: *Self, event: stream.Event) void {
