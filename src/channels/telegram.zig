@@ -676,6 +676,8 @@ pub const TelegramChannel = struct {
     transcriber: ?voice.Transcriber = null,
     last_update_id: i64,
     proxy: ?[]const u8,
+    /// Bot API base URL; tests point this at a local stub server.
+    api_base: []const u8 = "https://api.telegram.org",
 
     bot_username: ?[]const u8 = null,
     bot_user_id: ?i64 = null,
@@ -801,6 +803,7 @@ pub const TelegramChannel = struct {
             .allocator = self.allocator,
             .bot_token = self.bot_token,
             .proxy = self.proxy,
+            .api_base = self.api_base,
         };
     }
 
@@ -1639,13 +1642,19 @@ pub const TelegramChannel = struct {
         };
         defer self.allocator.free(body);
 
-        const resp = self.api().editMessageRich(self.allocator, body) catch {
+        const resp = self.api().editMessageRich(self.allocator, body) catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram rich edit outcome unknown ({}); not falling back to avoid a duplicate reply", .{err});
+                return;
+            }
             self.noteRichFallback();
             return self.editMessageWithHtmlFallback(target, message_id, text, reply_markup_json);
         };
         defer self.allocator.free(resp);
 
         if (telegram_api.responseHasTelegramError(resp)) {
+            // The target already shows this text; re-sending would duplicate it.
+            if (telegram_api.responseIsMessageNotModified(resp)) return;
             if (!telegram_api.responseIsRichRelatedError(resp)) {
                 log.warn("telegram editMessageRich API error: {s}", .{util.previewUtf8(resp, 256).slice});
                 return error.TelegramApiError;
@@ -1704,7 +1713,7 @@ pub const TelegramChannel = struct {
             try self.editMessageWithMarkdownFallback(edit.target, message_id, edit.payload.text, reply_markup_json);
 
             const enforce_owner = false;
-            try self.registerPendingInteraction(
+            self.registerPendingInteraction(
                 token,
                 edit.target,
                 null,
@@ -1712,7 +1721,11 @@ pub const TelegramChannel = struct {
                 self.interactive.remove_on_click,
                 message_id,
                 directive,
-            );
+            ) catch |err| {
+                // The edit already landed; failing here would make the
+                // callback path post the reply a second time.
+                log.warn("telegram edit applied but interaction registration failed: {}", .{err});
+            };
             return;
         }
 
@@ -1752,8 +1765,12 @@ pub const TelegramChannel = struct {
         try telegram_api.appendRawReplyMarkup(&html_body, self.allocator, reply_markup_json);
         try html_body.appendSlice(self.allocator, "}");
 
-        const resp = self.api().sendMessage(self.allocator, html_body.items, "30") catch {
-            // Network error — fall through to plain send
+        const resp = self.api().sendMessage(self.allocator, html_body.items, "30") catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram HTML send outcome unknown ({}); not falling back to plain text to avoid a duplicate reply", .{err});
+                return .{};
+            }
+            // Definite failure before delivery — fall through to plain send.
             return try self.sendChunkPlainWithMarkup(target, text, reply_to, reply_markup_json);
         };
         defer self.allocator.free(resp);
@@ -1838,16 +1855,25 @@ pub const TelegramChannel = struct {
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
-        if (self.rich_messages_enabled) {
-            return self.sendSingleRichMessageWithFallback(target, text, reply_to, reply_markup_json);
-        }
-        return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
-            target,
-            text,
-            reply_to,
-            reply_markup_json,
-            outgoingChunkSplitLimit(text.len, null),
-        );
+        const meta = if (self.rich_messages_enabled)
+            self.sendSingleRichMessageWithFallback(target, text, reply_to, reply_markup_json)
+        else
+            self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        return meta catch |err| switch (err) {
+            // Earlier chunks are already delivered; an outbox/dispatch retry of
+            // the whole reply would repost them.
+            error.PartiallySent => blk: {
+                log.warn("telegram reply partially sent; not retrying to avoid duplicate chunks", .{});
+                break :blk .{};
+            },
+            else => err,
+        };
     }
 
     /// Send text as a single Telegram rich message (Bot API sendRichMessage)
@@ -1911,7 +1937,11 @@ pub const TelegramChannel = struct {
         };
         defer self.allocator.free(body);
 
-        const resp = self.api().sendRichMessage(self.allocator, body) catch {
+        const resp = self.api().sendRichMessage(self.allocator, body) catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram sendRichMessage outcome unknown ({}); not falling back to avoid a duplicate reply", .{err});
+                return .{};
+            }
             self.noteRichFallback();
             return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
                 target,
@@ -1940,6 +1970,14 @@ pub const TelegramChannel = struct {
         }
 
         return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
+    }
+
+    /// Transport errors where the request may already have reached Telegram:
+    /// re-sending in another format — or letting the outbox/dispatch retry —
+    /// would deliver the same reply twice. The predicate is shared with the
+    /// other channels so the send semantics stay identical.
+    fn isIndeterminateSendError(err: anyerror) bool {
+        return root.http_util.isIndeterminateSendError(err);
     }
 
     /// Log the first rich->legacy fallback per account, then stay quiet.
@@ -2048,7 +2086,13 @@ pub const TelegramChannel = struct {
         try telegram_api.appendRawReplyMarkup(&body_list, self.allocator, reply_markup_json);
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try self.api().sendMessage(self.allocator, body_list.items, "30");
+        const resp = self.api().sendMessage(self.allocator, body_list.items, "30") catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram plain send outcome unknown ({}); treating as best-effort sent", .{err});
+                return .{};
+            }
+            return err;
+        };
         defer self.allocator.free(resp);
         if (telegram_api.responseHasTelegramError(resp)) {
             if (telegram_api.responseIsMessageTooLong(resp)) return error.TelegramMessageTooLong;
@@ -2171,11 +2215,19 @@ pub const TelegramChannel = struct {
         }
         const owned_message_id = try std.fmt.allocPrint(self.allocator, "{d}", .{message_id});
         defer self.allocator.free(owned_message_id);
-        try self.editRichMessage(.{
+        self.editRichMessage(.{
             .target = target,
             .message_id = owned_message_id,
             .payload = payload.payload(),
-        });
+        }) catch |err| {
+            // Regression: an edit may already have been applied when its
+            // response is lost; re-sending the reply would duplicate it.
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram edit outcome unknown ({}); not resending the reply", .{err});
+                return;
+            }
+            return err;
+        };
     }
 
     fn nextAdaptiveSplitLimit(current_limit: usize, text_len: usize) usize {
@@ -7401,4 +7453,415 @@ test "telegram markdownToTelegramHtml renders tables as aligned pre blocks" {
         "<pre>| Name | Value |\n| ---- | ----- |\n| a    | 1     |\n</pre>",
         html,
     );
+}
+
+// ── Duplicate-send regression (transport outcome unknown) ────────────
+
+fn stubContentLength(head: []const u8) usize {
+    const key = "content-length:";
+    const at = std.ascii.indexOfIgnoreCase(head, key) orelse return 0;
+    var i = at + key.len;
+    while (i < head.len and (head[i] == ' ' or head[i] == '\t')) : (i += 1) {}
+    var len: usize = 0;
+    while (i < head.len and head[i] >= '0' and head[i] <= '9') : (i += 1) {
+        len = len * 10 + (head[i] - '0');
+    }
+    return len;
+}
+
+/// Read the request head and body before answering: responding while curl is
+/// still writing the body can make curl fail with a write error, which looks
+/// like a delivery with an unknown outcome.
+fn stubReadRequest(stream: std_compat.net.Stream, buf: []u8) ![]const u8 {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n")) |head_end| {
+            const header_len = head_end + 4;
+            const want = header_len + stubContentLength(buf[0..header_len]);
+            if (want > buf.len or filled >= want) return buf[0..filled];
+        }
+        const n = try stream.read(buf[filled..]);
+        if (n == 0) return buf[0..filled];
+        filled += n;
+    }
+    return buf[0..filled];
+}
+
+/// Non-blocking accept so a stub thread can exit when the test is done with
+/// it, even if the client made fewer requests than the stub expected.
+fn stubAcceptConnection(server: *std_compat.net.Server, stop: *const std.atomic.Value(bool)) !std_compat.net.Server.Connection {
+    while (!stop.load(.acquire)) {
+        const conn = server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                std_compat.thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        return conn;
+    }
+    return error.StubStopped;
+}
+
+const RichFallbackStubCtx = struct {
+    server: *std_compat.net.Server,
+    stop: *const std.atomic.Value(bool),
+    saw_rich: bool = false,
+    saw_html: bool = false,
+};
+
+/// Serve exactly two Bot API posts: `sendRichMessage` answers with a rich
+/// parse error (HTTP 200 + `ok:false`, the shape the channel inspects), any
+/// `sendMessage` answers with success.
+fn serveRichFallbackStub(ctx: *RichFallbackStubCtx) void {
+    var served: usize = 0;
+    while (served < 2) {
+        var conn = stubAcceptConnection(ctx.server, ctx.stop) catch return;
+        defer conn.stream.close();
+
+        var buf: [16384]u8 = undefined;
+        const filled = stubReadRequest(conn.stream, &buf) catch return;
+
+        const body = if (std.mem.indexOf(u8, filled, "sendRichMessage") != null) blk: {
+            ctx.saw_rich = true;
+            break :blk "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}";
+        } else blk: {
+            ctx.saw_html = true;
+            break :blk "{\"ok\":true,\"result\":{\"message_id\":42}}";
+        };
+
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{body.len},
+        ) catch return;
+        conn.stream.writeAll(head) catch {};
+        conn.stream.writeAll(body) catch {};
+        served += 1;
+    }
+}
+
+const PartialSendStubCtx = struct {
+    server: *std_compat.net.Server,
+    stop: *const std.atomic.Value(bool),
+    requests: usize = 0,
+};
+
+/// First `sendMessage` succeeds, every later one answers HTTP 500, so a
+/// multi-chunk reply fails after the first chunk was already delivered.
+fn servePartialSendStub(ctx: *PartialSendStubCtx) void {
+    var served: usize = 0;
+    while (served < 3) {
+        var conn = stubAcceptConnection(ctx.server, ctx.stop) catch return;
+        defer conn.stream.close();
+
+        var buf: [16384]u8 = undefined;
+        _ = stubReadRequest(conn.stream, &buf) catch return;
+
+        ctx.requests += 1;
+        const first = ctx.requests == 1;
+        const status = if (first) "200 OK" else "500 Internal Server Error";
+        const body = if (first)
+            "{\"ok\":true,\"result\":{\"message_id\":1}}"
+        else
+            "{\"ok\":false,\"error_code\":500,\"description\":\"server error\"}";
+
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{ status, body.len },
+        ) catch return;
+        conn.stream.writeAll(head) catch {};
+        conn.stream.writeAll(body) catch {};
+        served += 1;
+    }
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "sendRichMessage timeout sends one request and does not fall back" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = error.CurlTimeout;
+    defer {
+        telegram_api.test_post_failure = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.sendMessage("12345", "hello");
+
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+    try std.testing.expect(!ch.rich_fallback_warned.load(.monotonic));
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "telegram HTML send timeout sends one request and does not fall back to plain" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const failures = [_]?anyerror{error.CurlTimeout};
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failures = &failures;
+    defer {
+        telegram_api.test_post_failures = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.sendMessage("12345", "hello");
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+}
+
+// Regression: child.wait 失败后降级重发导致重复消息
+test "telegram HTML send CurlWaitError sends one request and does not fall back" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const failures = [_]?anyerror{error.CurlWaitError};
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failures = &failures;
+    defer {
+        telegram_api.test_post_failures = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.sendMessage("12345", "hello");
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+}
+
+const GatewayStatusStubCtx = struct {
+    server: *std_compat.net.Server,
+    stop: *const std.atomic.Value(bool),
+    status_line: []const u8,
+    requests: usize = 0,
+};
+
+/// Answer every Bot API post with a gateway status. Three slots cover the
+/// unfixed rich -> HTML -> plain fallback chain so a regression cannot hang.
+fn serveGatewayStatusStub(ctx: *GatewayStatusStubCtx) void {
+    var served: usize = 0;
+    while (served < 3) {
+        var conn = stubAcceptConnection(ctx.server, ctx.stop) catch return;
+        defer conn.stream.close();
+
+        var buf: [16384]u8 = undefined;
+        _ = stubReadRequest(conn.stream, &buf) catch return;
+
+        ctx.requests += 1;
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "{s}\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ctx.status_line},
+        ) catch return;
+        conn.stream.writeAll(head) catch {};
+        served += 1;
+    }
+}
+
+// Regression: 网关 502/504 后降级重发导致重复消息
+test "telegram gateway 502/504 on rich send sends one request" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    for ([_][]const u8{ "HTTP/1.1 502 Bad Gateway", "HTTP/1.1 504 Gateway Timeout" }) |status_line| {
+        const allocator = std.testing.allocator;
+        const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+        var server = try addr.listen(.{ .force_nonblocking = true });
+        defer server.deinit();
+
+        var stop = std.atomic.Value(bool).init(false);
+        var ctx = GatewayStatusStubCtx{
+            .server = &server,
+            .stop = &stop,
+            .status_line = status_line,
+        };
+        const thread = try std.Thread.spawn(.{}, serveGatewayStatusStub, .{&ctx});
+
+        const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+        defer allocator.free(url);
+
+        var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+        ch.api_base = url;
+        ch.rich_messages_enabled = true;
+        telegram_api.test_post_calls = 0;
+        telegram_api.test_post_failure = null;
+        telegram_api.test_post_failures = null;
+        defer {
+            telegram_api.test_post_failure = null;
+            telegram_api.test_post_failures = null;
+            telegram_api.test_post_calls = 0;
+        }
+
+        try ch.sendMessage("12345", "hello");
+        stop.store(true, .release);
+        thread.join();
+
+        try std.testing.expectEqual(@as(usize, 1), ctx.requests);
+        try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+    }
+}
+
+test "telegram definite transport and API errors still fall back to plain" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const definite = [_]anyerror{
+        error.CurlDnsError,
+        error.CurlConnectError,
+        error.CurlTlsError,
+        error.CurlPreSendError,
+        error.HttpStatusError,
+        error.TelegramApiError,
+    };
+    for (definite) |expected| {
+        const failures = [_]?anyerror{ expected, expected };
+        telegram_api.test_post_calls = 0;
+        telegram_api.test_post_failures = &failures;
+        defer {
+            telegram_api.test_post_failures = null;
+            telegram_api.test_post_calls = 0;
+        }
+
+        try std.testing.expectError(expected, ch.sendMessage("12345", "hello"));
+        try std.testing.expectEqual(@as(usize, 2), telegram_api.test_post_calls);
+    }
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "telegram plain send timeout is not returned to the retry layers" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const failures = [_]?anyerror{ error.TelegramApiError, error.CurlTimeout };
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failures = &failures;
+    defer {
+        telegram_api.test_post_failures = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.sendMessage("12345", "hello");
+    try std.testing.expectEqual(@as(usize, 2), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "telegram rich edit timeout does not fall back to an HTML edit" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+
+    const failures = [_]?anyerror{ error.CurlTimeout, error.CurlTimeout };
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failures = &failures;
+    defer {
+        telegram_api.test_post_failures = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.editAssistantMessage("12345", "12345", false, 7, "hello");
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "telegram edit timeout is not returned to the callback resend path" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const failures = [_]?anyerror{error.CurlTimeout};
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failures = &failures;
+    defer {
+        telegram_api.test_post_failures = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.editAssistantMessage("12345", "12345", false, 7, "hello");
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "deterministic rich parse error still falls back to HTML" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    var base_buf: [64]u8 = undefined;
+    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+    ch.api_base = api_base;
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = null;
+    defer telegram_api.test_post_calls = 0;
+
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = RichFallbackStubCtx{ .server = &server, .stop = &stop };
+    const thread = try std.Thread.spawn(.{}, serveRichFallbackStub, .{&ctx});
+
+    const result = ch.sendMessage("12345", "hello");
+    stop.store(true, .release);
+    thread.join();
+    try result;
+
+    try std.testing.expect(ctx.saw_rich);
+    try std.testing.expect(ctx.saw_html);
+    try std.testing.expectEqual(@as(usize, 2), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "connection failure still falls back to HTML and plain" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = error.CurlConnectError;
+    defer {
+        telegram_api.test_post_failure = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try std.testing.expectError(error.CurlConnectError, ch.sendMessage("12345", "hello"));
+    try std.testing.expectEqual(@as(usize, 3), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "partially sent reply is not returned for an upper-layer resend" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    var base_buf: [64]u8 = undefined;
+    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.api_base = api_base; // rich_messages stays off: exercise the split path.
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = null;
+    defer telegram_api.test_post_calls = 0;
+
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = PartialSendStubCtx{ .server = &server, .stop = &stop };
+    const thread = try std.Thread.spawn(.{}, servePartialSendStub, .{&ctx});
+
+    const result = ch.sendMessage("12345", "a" ** 5000);
+    stop.store(true, .release);
+    thread.join();
+    // PartiallySent must not reach the dispatcher/outbox retry layers, which
+    // would repost the chunk that was already delivered.
+    try result;
+    try std.testing.expectEqual(@as(usize, 3), telegram_api.test_post_calls);
+    try std.testing.expectEqual(@as(usize, 3), ctx.requests);
 }

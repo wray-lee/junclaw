@@ -155,6 +155,10 @@ pub const StreamState = struct {
     /// A live update failed; stop flushing this turn and let the final reply
     /// reconcile the message.
     send_failed: bool = false,
+    /// A preview/stream creation failed with an unknown outcome: Slack may
+    /// already have created the message even though its ts never reached us.
+    /// The final reply must not be posted as a second copy.
+    delivery_uncertain: bool = false,
     /// Current escaped preview budget. Slack may reject a nominally bounded
     /// update, so the fallback retries with a smaller bound for this turn.
     preview_limit: usize = STREAM_UPDATE_MAX_BYTES,
@@ -185,6 +189,7 @@ pub const StreamState = struct {
         self.last_flush_time = 0;
         self.started_at_ms = 0;
         self.send_failed = false;
+        self.delivery_uncertain = false;
         self.preview_limit = STREAM_UPDATE_MAX_BYTES;
         self.rendered_reasoning = false;
         self.finished_at_ms = now_ms;

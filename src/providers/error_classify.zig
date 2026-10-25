@@ -464,7 +464,7 @@ pub fn classifyUserError(err: anyerror, detail: ?[]const u8) UserErrorKind {
         error.NoResponseContent => return .empty_response,
         error.OutOfMemory => return .out_of_memory,
         error.CurlTimeout => return .timeout,
-        error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => return .network,
+        error.CurlPreSendError, error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTlsError => return .network,
         // Providers return these directly when no local credential is
         // configured (streaming path) or wrap them in AllProvidersFailed with
         // a "<provider>: CredentialsNotSet" detail (blocking path).
