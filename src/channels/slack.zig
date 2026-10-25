@@ -6179,6 +6179,7 @@ const SlackSendFailureProbe = struct {
     fail_start: bool = false,
     fail_append: bool = false,
     fail_update: bool = false,
+    update_error: anyerror = error.CurlTimeout,
     fail_post: bool = false,
     fail_complete: bool = false,
     posts: usize = 0,
@@ -6198,7 +6199,7 @@ const SlackSendFailureProbe = struct {
         }
         if (std.mem.eql(u8, endpoint, "chat.update")) {
             self.updates += 1;
-            if (self.fail_update) return error.CurlTimeout;
+            if (self.fail_update) return self.update_error;
             return .{};
         }
         if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
@@ -6261,6 +6262,28 @@ test "slack fallback final does not repost after an uncertain chat.update" {
     );
     try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
     try std.testing.expectEqual(@as(usize, 2), probe.updates);
+}
+
+test "slack fallback final still reposts after a definite chat.update rejection" {
+    // A definite API rejection means the edit never applied; posting the reply
+    // as a new message is safe and must still happen.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{
+        .fail_update = true,
+        .update_error = error.SlackStreamRejected,
+    };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+
+    try ch.deliverFallbackFinal(
+        .{ .channel_id = "C_TEST", .thread_ts = "1700.1" },
+        "1700.2",
+        "hello",
+        &.{},
+        "C_TEST:1700.1",
+    );
+    try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
 }
 
 test "slack native final does not repost after an uncertain appendStream" {
