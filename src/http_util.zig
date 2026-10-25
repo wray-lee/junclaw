@@ -63,6 +63,26 @@ pub fn preserveCurlTransportError(err: anyerror, fallback: anyerror) anyerror {
     return if (isCurlTransportError(err)) err else fallback;
 }
 
+/// Transport errors where the request may already have reached the service:
+/// a curl timeout, a broken/partial response, or an empty reply. Re-sending
+/// after one of these — in another format, by the channel, or by the
+/// outbox/dispatch retry layers — can deliver the same message twice, so
+/// callers count it as one best-effort attempt. A definite pre-send failure
+/// (DNS/connect/TLS) is not in this set and can still be retried.
+pub fn isIndeterminateSendError(err: anyerror) bool {
+    return switch (err) {
+        error.CurlTimeout,
+        error.CurlReadError,
+        error.CurlWriteError,
+        // exit 18/52/55/56 (partial transfer, empty reply, send/receive
+        // failure), and pre-send curl failures: the request may have been
+        // delivered, so a resend is not safe.
+        error.CurlFailed,
+        => true,
+        else => false,
+    };
+}
+
 const StderrCapture = struct {
     file: ?std_compat.fs.File = null,
     buffer: [MAX_CURL_STDERR_BYTES]u8 = undefined,
@@ -2046,6 +2066,17 @@ pub fn curlGetSSE(
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
+
+test "isIndeterminateSendError keeps definite pre-send failures resendable" {
+    try std.testing.expect(isIndeterminateSendError(error.CurlTimeout));
+    try std.testing.expect(isIndeterminateSendError(error.CurlReadError));
+    try std.testing.expect(isIndeterminateSendError(error.CurlWriteError));
+    try std.testing.expect(isIndeterminateSendError(error.CurlFailed));
+    try std.testing.expect(!isIndeterminateSendError(error.CurlDnsError));
+    try std.testing.expect(!isIndeterminateSendError(error.CurlConnectError));
+    try std.testing.expect(!isIndeterminateSendError(error.CurlTlsError));
+    try std.testing.expect(!isIndeterminateSendError(error.HttpStatusError));
+}
 
 test "credentialed curl argv validation rejects authorization header" {
     try std.testing.expectError(

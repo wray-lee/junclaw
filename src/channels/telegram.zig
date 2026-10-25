@@ -1963,22 +1963,11 @@ pub const TelegramChannel = struct {
     }
 
     /// Transport errors where the request may already have reached Telegram:
-    /// a curl timeout, a broken/partial response, or an empty reply. Re-sending
-    /// in another format — or letting the outbox/dispatch retry — would deliver
-    /// the same reply twice, so these count as one best-effort attempt. A
-    /// definite pre-send failure (DNS/connect/TLS) still falls back.
+    /// re-sending in another format — or letting the outbox/dispatch retry —
+    /// would deliver the same reply twice. The predicate is shared with the
+    /// other channels so the send semantics stay identical.
     fn isIndeterminateSendError(err: anyerror) bool {
-        return switch (err) {
-            error.CurlTimeout,
-            error.CurlReadError,
-            error.CurlWriteError,
-            // exit 18/52/55/56 (partial transfer, empty reply, send/receive
-            // failure), and pre-send curl failures: the request may have been
-            // delivered, so a resend is not safe.
-            error.CurlFailed,
-            => true,
-            else => false,
-        };
+        return root.http_util.isIndeterminateSendError(err);
     }
 
     /// Log the first rich->legacy fallback per account, then stay quiet.

@@ -489,6 +489,10 @@ pub const SlackChannel = struct {
     test_spawn_keepalive: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
     test_api_ctx: if (builtin.is_test) ?*anyopaque else void = if (builtin.is_test) null else {},
     test_api_call: if (builtin.is_test) ?*const fn (*anyopaque, std.mem.Allocator, []const u8, []const u8) anyerror!SlackApiResult else void = if (builtin.is_test) null else {},
+    /// Test seam: transport result for chat.postMessage sends (the network is
+    /// never touched under `zig build test`).
+    test_post_error: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
+    test_post_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
     bot_team_id: ?[]u8 = null,
@@ -2719,23 +2723,32 @@ pub const SlackChannel = struct {
         const ticket_body = try buildGetUploadUrlBody(self.allocator, file_name, data.len);
         defer self.allocator.free(ticket_body);
 
-        var ticket = try self.callSlackApi("files.getUploadURLExternal", ticket_body, channel_id, SLACK_API_TIMEOUT);
+        var ticket = self.callSlackApi("files.getUploadURLExternal", ticket_body, channel_id, SLACK_API_TIMEOUT) catch |err| {
+            // No bytes were uploaded yet, so text delivery cannot duplicate.
+            log.warn("Slack upload ticket failed ({s}); falling back to text delivery", .{@errorName(err)});
+            return error.SlackUploadNotStarted;
+        };
         defer ticket.deinit(self.allocator);
-        if (ticket.error_code != null) return error.SlackApiError;
-        const upload_url = ticket.upload_url orelse return error.SlackApiError;
-        const file_id = ticket.file_id orelse return error.SlackApiError;
+        if (ticket.error_code != null) return error.SlackUploadRejected;
+        const upload_url = ticket.upload_url orelse return error.SlackUploadNotStarted;
+        const file_id = ticket.file_id orelse return error.SlackUploadNotStarted;
 
         // Tests cover the upload through the callSlackApi stub; the raw POST
         // has no seam, so skip it under `zig build test`.
         if (!builtin.is_test) {
-            const upload_resp = try root.http_util.curlPostRawWithContentType(
+            const upload_resp = root.http_util.curlPostRawWithContentType(
                 self.allocator,
                 upload_url,
                 data,
                 content_type,
                 &.{},
                 "120",
-            );
+            ) catch |err| {
+                // Without completeUploadExternal this upload never becomes a
+                // visible file, so text delivery cannot duplicate it.
+                log.warn("Slack raw upload failed ({s}); falling back to text delivery", .{@errorName(err)});
+                return error.SlackUploadNotCompleted;
+            };
             self.allocator.free(upload_resp);
         }
 
@@ -2744,16 +2757,34 @@ pub const SlackChannel = struct {
 
         var completed = try self.callSlackApi("files.completeUploadExternal", complete_body, channel_id, SLACK_API_TIMEOUT);
         defer completed.deinit(self.allocator);
-        if (completed.error_code != null) return error.SlackApiError;
+        if (completed.error_code != null) return error.SlackUploadRejected;
+    }
+
+    /// True when a Slack Web API call may already have been applied: a curl
+    /// transport error that may have reached Slack, or a response we could not
+    /// parse after the request completed. API-level rejections use their own
+    /// error names, so they stay outside this set and can be retried or
+    /// delivered another way.
+    fn isUncertainSlackDelivery(err: anyerror) bool {
+        return err == error.SlackApiError or
+            err == error.SlackStreamUncertain or
+            root.http_util.isIndeterminateSendError(err);
+    }
+
+    /// POST a chat.postMessage body. Tests stub the transport so they never
+    /// reach the network.
+    fn postChatMessage(self: *SlackChannel, url: []const u8, body: []const u8, headers: []const []const u8) ![]u8 {
+        if (builtin.is_test) {
+            self.test_post_calls += 1;
+            if (self.test_post_error) |err| return err;
+            return self.allocator.dupe(u8, "{\"ok\":true}");
+        }
+        return root.http_util.curlPost(self.allocator, url, body, headers);
     }
 
     /// Send a message to a Slack channel via chat.postMessage API.
     /// The target may contain "channel_id:thread_ts" for threaded replies.
     pub fn sendMessage(self: *SlackChannel, target_channel: []const u8, text: []const u8) !void {
-        // Tests must never reach the network; payload builders are covered
-        // directly (see appendPostMessageBody tests).
-        if (builtin.is_test) return;
-
         const url = API_BASE ++ "/chat.postMessage";
 
         // Parse target for thread_ts (channel_id:thread_ts)
@@ -2771,7 +2802,14 @@ pub const SlackChannel = struct {
             defer body_list.deinit(self.allocator);
             try self.appendPostMessageBody(&body_list, actual_channel, self.thread_ts, text);
 
-            const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+            const resp = self.postChatMessage(url, body_list.items, &.{auth_header}) catch |err| {
+                if (root.http_util.isIndeterminateSendError(err)) {
+                    // Slack may already have accepted the post. Falling back
+                    // to mrkdwn or letting dispatch/outbox retry would post
+                    // the reply twice.
+                    log.warn("Slack chat.postMessage outcome unknown ({s}); not resending", .{@errorName(err)});
+                    return;
+                }
                 log.err("Slack API POST failed: {}", .{err});
                 return error.SlackApiError;
             };
@@ -2797,7 +2835,11 @@ pub const SlackChannel = struct {
         defer self.allocator.free(mrkdwn_text);
         try self.appendPostMessageMrkdwnBody(&body_list, actual_channel, self.thread_ts, mrkdwn_text);
 
-        const resp = root.http_util.curlPost(self.allocator, url, body_list.items, &.{auth_header}) catch |err| {
+        const resp = self.postChatMessage(url, body_list.items, &.{auth_header}) catch |err| {
+            if (root.http_util.isIndeterminateSendError(err)) {
+                log.warn("Slack chat.postMessage outcome unknown ({s}); not resending", .{@errorName(err)});
+                return;
+            }
             log.err("Slack API POST failed: {}", .{err});
             return error.SlackApiError;
         };
@@ -2835,7 +2877,13 @@ pub const SlackChannel = struct {
         try auth_writer.print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
         const auth_header = auth_writer.buffered();
 
-        const resp = root.http_util.curlPost(self.allocator, API_BASE ++ "/chat.postMessage", body_list.items, &.{auth_header}) catch |err| {
+        const resp = self.postChatMessage(API_BASE ++ "/chat.postMessage", body_list.items, &.{auth_header}) catch |err| {
+            if (root.http_util.isIndeterminateSendError(err)) {
+                // The interactive post may have landed; a retry would post the
+                // buttons again. Its interaction token stays unregistered.
+                log.warn("Slack interactive chat.postMessage outcome unknown ({s}); not resending", .{@errorName(err)});
+                return;
+            }
             log.err("Slack API POST failed: {}", .{err});
             return error.SlackApiError;
         };
@@ -3621,8 +3669,22 @@ pub const SlackChannel = struct {
                 state.mode = .fallback;
             } else if (state.message_ts.len == 0) {
                 self.startNativeStreamLocked(parsed, state, flush.text) catch |err| {
-                    log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
-                    state.mode = .fallback;
+                    if (state.message_ts.len > 0) {
+                        // The stream was created; only a follow-up append
+                        // failed. Edited messages can still finish it safely.
+                        log.warn("Slack chat.appendStream failed ({s}); finishing on edited messages", .{@errorName(err)});
+                        state.mode = .fallback;
+                    } else if (state.delivery_uncertain or isUncertainSlackDelivery(err)) {
+                        // The stream may exist even though its ts never reached
+                        // us. A second message would duplicate it.
+                        log.warn("Slack chat.startStream outcome unknown ({s}); not posting a second copy", .{@errorName(err)});
+                        state.delivery_uncertain = true;
+                        state.send_failed = true;
+                        return;
+                    } else {
+                        log.warn("Slack chat.startStream failed ({s}); using edited messages", .{@errorName(err)});
+                        state.mode = .fallback;
+                    }
                 };
             } else if (flush.rewrite) {
                 // The snapshot dropped earlier bytes (an orphan reasoning closer
@@ -3664,14 +3726,23 @@ pub const SlackChannel = struct {
 
         if (state.message_ts.len == 0) {
             const ts = self.postMessageForStream(parsed, flush.text) catch |err| {
-                log.warn("Slack streaming chat.postMessage failed ({s}); reply will be sent complete", .{@errorName(err)});
                 state.send_failed = true;
+                if (isUncertainSlackDelivery(err)) {
+                    // The preview may have landed without returning its ts.
+                    log.warn("Slack streaming chat.postMessage outcome unknown ({s}); not posting a second copy", .{@errorName(err)});
+                    state.delivery_uncertain = true;
+                } else {
+                    log.warn("Slack streaming chat.postMessage failed ({s}); reply will be sent complete", .{@errorName(err)});
+                }
                 return;
             };
             defer self.allocator.free(ts);
             state.setMessageTs(self.allocator, ts) catch |err| {
+                // The preview exists but its ts is lost: the final reply
+                // cannot update it, and posting would duplicate it.
                 log.warn("Slack streaming state allocation failed: {}", .{err});
                 state.send_failed = true;
+                state.delivery_uncertain = true;
             };
             return;
         }
@@ -3730,8 +3801,13 @@ pub const SlackChannel = struct {
             try self.recordNativeStreamFailure(code);
             return error.SlackStreamRejected;
         }
-        const ts = result.ts orelse return error.SlackStreamRejected;
-        try state.setMessageTs(self.allocator, ts);
+        const ts = result.ts orelse return error.SlackStreamUncertain;
+        state.setMessageTs(self.allocator, ts) catch |err| {
+            // Slack created the stream but its ts was lost; posting the final
+            // reply as a new message would duplicate it.
+            state.delivery_uncertain = true;
+            return err;
+        };
 
         for (chunks[1..]) |chunk| {
             try self.appendNativeStream(parsed, state.message_ts, chunk);
@@ -3792,7 +3868,10 @@ pub const SlackChannel = struct {
 
         var result = try self.callSlackApi("chat.postMessage", body_list.items, parsed.channel_id, SLACK_API_TIMEOUT);
         defer result.deinit(self.allocator);
-        return result.takeTs() orelse error.SlackStreamRejected;
+        // An explicit API error means the message was rejected; a success
+        // response without its ts leaves the outcome unknown.
+        if (result.error_code != null) return error.SlackStreamRejected;
+        return result.takeTs() orelse error.SlackStreamUncertain;
     }
 
     fn updateStreamMessage(
@@ -3884,6 +3963,7 @@ pub const SlackChannel = struct {
         var suffix_opt: ?[]const u8 = null;
         var over_budget = false;
         var rendered_reasoning = false;
+        var delivery_uncertain = false;
         var has_state = false;
 
         {
@@ -3898,6 +3978,7 @@ pub const SlackChannel = struct {
                 has_state = true;
                 mode = state.mode;
                 rendered_reasoning = state.rendered_reasoning;
+                delivery_uncertain = state.delivery_uncertain;
                 if (state.message_ts.len > 0 and state.message_ts.len <= ts_buf.len) {
                     @memcpy(ts_buf[0..state.message_ts.len], state.message_ts);
                     ts_len = state.message_ts.len;
@@ -3916,6 +3997,12 @@ pub const SlackChannel = struct {
         if (!has_state or ts_len == 0) {
             // Nothing was ever flushed (short reply inside the throttle window),
             // or the fallback message could not be created.
+            if (delivery_uncertain) {
+                // The preview post may have landed without returning its ts.
+                // Posting the full reply now would duplicate it.
+                log.warn("Slack streaming preview outcome unknown; not posting a second copy", .{});
+                return;
+            }
             return vtableSend(@ptrCast(self), target, message, media);
         }
 
@@ -3925,6 +4012,13 @@ pub const SlackChannel = struct {
         if (mode == .native) {
             const stream_completed = if (!force_rewrite and suffix_opt != null and !over_budget) blk: {
                 self.appendNativeStream(parsed, ts, suffix_opt.?) catch |err| {
+                    if (isUncertainSlackDelivery(err)) {
+                        // The append may have landed, leaving the streamed
+                        // message equal to the final reply. Posting the reply
+                        // again would duplicate it.
+                        log.warn("Slack chat.appendStream final delta outcome unknown ({s}); not resending", .{@errorName(err)});
+                        break :blk true;
+                    }
                     log.warn("Slack chat.appendStream final delta failed ({s})", .{@errorName(err)});
                     break :blk false;
                 };
@@ -3966,10 +4060,15 @@ pub const SlackChannel = struct {
         media: []const []const u8,
         target: []const u8,
     ) !void {
+        // An edit whose outcome is unknown may already have replaced the
+        // preview with the final reply; posting the reply again would
+        // duplicate it.
+        var update_uncertain = false;
         if (message.len <= stream_presenter.STREAM_MARKDOWN_MAX_BYTES) {
             if (self.updateStreamMessageMarkdown(parsed, ts, message)) |_| {
                 return;
             } else |err| {
+                update_uncertain = update_uncertain or isUncertainSlackDelivery(err);
                 log.warn("Slack streaming final chat.update(markdown_text) failed ({s}); falling back to mrkdwn delivery", .{@errorName(err)});
             }
         }
@@ -3988,9 +4087,16 @@ pub const SlackChannel = struct {
                 if (self.uploadExternal(parsed.channel_id, parsed.thread_ts, "reply.md", "text/markdown", message)) |_| {
                     return;
                 } else |err| {
+                    if (isUncertainSlackDelivery(err)) {
+                        // The completed upload may already be visible; text
+                        // fallback would deliver the same reply twice.
+                        log.warn("Slack long reply file upload outcome unknown ({s}); not falling back to text", .{@errorName(err)});
+                        return;
+                    }
                     log.warn("Slack long reply file upload failed ({s}); falling back to chunked delivery", .{@errorName(err)});
                 }
             } else |err| {
+                update_uncertain = update_uncertain or isUncertainSlackDelivery(err);
                 log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
             }
         }
@@ -4013,7 +4119,12 @@ pub const SlackChannel = struct {
 
         if (!first_delivered) {
             self.updateStreamMessageMrkdwn(parsed, ts, first_chunk) catch |err| {
-                log.warn("Slack streaming final chat.update failed ({s})", .{@errorName(err)});
+                if (update_uncertain or isUncertainSlackDelivery(err)) {
+                    // An earlier edit may already have delivered the reply.
+                    log.warn("Slack streaming final chat.update outcome unknown ({s}); not posting a second copy", .{@errorName(err)});
+                    return;
+                }
+                log.warn("Slack streaming final chat.update failed ({s}); posting the reply as a new message", .{@errorName(err)});
                 return vtableSend(@ptrCast(self), target, message, media);
             };
         }
@@ -4064,6 +4175,8 @@ pub const SlackChannel = struct {
     /// POST a Slack Web API method and return the parsed `ts` / `error` fields.
     /// Transport and JSON failures surface as errors; API-level failures are
     /// reported through `error_code` so callers can apply a retry policy.
+    /// curl transport errors keep their identity so callers can tell a
+    /// definite pre-send failure from an indeterminate one.
     fn callSlackApi(
         self: *SlackChannel,
         endpoint: []const u8,
@@ -4088,7 +4201,7 @@ pub const SlackChannel = struct {
 
         const resp = root.http_util.httpPostJsonWithProxyTimeout(self.allocator, url, body, &.{auth_header}, null, timeout_secs) catch |err| {
             log.err("Slack {s} POST failed: {}", .{ endpoint, err });
-            return error.SlackApiError;
+            return root.http_util.preserveCurlTransportError(err, error.SlackApiError);
         };
         defer self.allocator.free(resp);
 
@@ -6060,6 +6173,160 @@ test "slack streaming final splits overflowing fallback replies" {
 
     const state = ch.stream_states.getPtr("C1") orelse return error.TestUnexpectedResult;
     try std.testing.expect(state.finished_at_ms != 0);
+}
+
+const SlackSendFailureProbe = struct {
+    fail_start: bool = false,
+    fail_append: bool = false,
+    fail_update: bool = false,
+    fail_post: bool = false,
+    fail_complete: bool = false,
+    posts: usize = 0,
+    updates: usize = 0,
+
+    fn call(ctx: *anyopaque, allocator: std.mem.Allocator, endpoint: []const u8, body: []const u8) !SlackChannel.SlackApiResult {
+        _ = body;
+        const self: *@This() = @ptrCast(@alignCast(ctx));
+        if (std.mem.eql(u8, endpoint, "chat.startStream")) {
+            if (self.fail_start) return error.CurlTimeout;
+            return .{ .ts = try allocator.dupe(u8, "1700.2") };
+        }
+        if (std.mem.eql(u8, endpoint, "chat.stopStream")) return .{};
+        if (std.mem.eql(u8, endpoint, "chat.appendStream")) {
+            if (self.fail_append) return error.CurlTimeout;
+            return .{};
+        }
+        if (std.mem.eql(u8, endpoint, "chat.update")) {
+            self.updates += 1;
+            if (self.fail_update) return error.CurlTimeout;
+            return .{};
+        }
+        if (std.mem.eql(u8, endpoint, "chat.postMessage")) {
+            self.posts += 1;
+            if (self.fail_post) return error.CurlTimeout;
+            return .{ .ts = try allocator.dupe(u8, "1700.2") };
+        }
+        if (std.mem.eql(u8, endpoint, "files.getUploadURLExternal")) {
+            return .{
+                .upload_url = try allocator.dupe(u8, "https://example.com/upload"),
+                .file_id = try allocator.dupe(u8, "F_TEST"),
+            };
+        }
+        if (std.mem.eql(u8, endpoint, "files.completeUploadExternal")) {
+            if (self.fail_complete) return error.CurlTimeout;
+            return .{};
+        }
+        return error.UnexpectedEndpoint;
+    }
+};
+
+test "slack chat.postMessage does not surface an indeterminate transport error" {
+    // Regression: a timed-out post returned SlackApiError, so dispatch/outbox
+    // retried it and the reply was posted twice.
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+    ch.test_post_error = error.CurlTimeout;
+
+    try ch.sendMessage("C123", "hello");
+    try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
+}
+
+test "slack interactive chat.postMessage does not surface an indeterminate transport error" {
+    // Regression: a timed-out interactive post was retried with fresh buttons.
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+    ch.test_post_error = error.CurlTimeout;
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "a", .label = "A", .submit_text = "a" },
+        .{ .id = "b", .label = "B", .submit_text = "b" },
+    };
+
+    try ch.sendRichPayload("C123", .{ .text = "pick", .choices = &choices });
+    try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
+}
+
+test "slack fallback final does not repost after an uncertain chat.update" {
+    // Regression: chat.update timed out after Slack applied it; the fallback
+    // then posted the reply again as a new message.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{ .fail_update = true };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+
+    try ch.deliverFallbackFinal(
+        .{ .channel_id = "C_TEST", .thread_ts = "1700.1" },
+        "1700.2",
+        "hello",
+        &.{},
+        "C_TEST:1700.1",
+    );
+    try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.updates);
+}
+
+test "slack native final does not repost after an uncertain appendStream" {
+    // Regression: appendStream timed out after Slack appended the final text;
+    // the streamed message was already complete, and the reply was posted again.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{ .fail_append = true };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1:1700.1", ("x" ** 200) ++ " done", &.{}, .final);
+    try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
+    try std.testing.expectEqual(@as(u32, 1), ch.test_native_stop_calls);
+}
+
+test "slack streaming preview does not repost after an uncertain postMessage" {
+    // Regression: the preview post timed out after Slack created it; the final
+    // reply was then posted as a second message.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{ .fail_post = true };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1", "final reply", &.{}, .final);
+    try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
+}
+
+test "slack native stream does not repost after an uncertain startStream" {
+    // Regression: startStream timed out after Slack created the stream; the
+    // fallback posted the same turn as a second message.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{ .fail_start = true, .fail_post = true };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+    const iface = ch.channel();
+
+    try iface.sendEvent("C1:1700.1", "x" ** 200, &.{}, .chunk);
+    try iface.sendEvent("C1:1700.1", "final reply", &.{}, .final);
+    try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
+}
+
+test "slack long reply upload does not fall back to text after an uncertain complete" {
+    // Regression: the upload completed but its response was lost; the chunked
+    // text fallback delivered the same long reply a second time.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    ch.long_reply_file_threshold_chunks = 1;
+    var probe = SlackSendFailureProbe{ .fail_complete = true };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+
+    try ch.deliverFallbackFinal(
+        .{ .channel_id = "C_TEST", .thread_ts = "1700.1" },
+        "1700.2",
+        "x" ** 13_000,
+        &.{},
+        "C_TEST:1700.1",
+    );
+    try std.testing.expectEqual(@as(usize, 0), probe.posts);
 }
 
 test "slack final fallback chunks converted mrkdwn without losing content" {
