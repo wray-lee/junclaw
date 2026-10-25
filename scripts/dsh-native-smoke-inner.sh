@@ -94,7 +94,7 @@ case "$RESPONSE" in
 esac
 
 if [ "$MOCK" = "1" ]; then
-  requests=$(grep -c 'SMOKE_PING' "$MOCK_LOG" || echo 0)
+  requests=$(grep -c 'SMOKE_PING' "$MOCK_LOG" || true)
   [ "$requests" -eq 2 ] || fail "expected 2 provider requests for the webhook turn, got $requests"
   # The tool result must be in the follow-up request, not just the prompt.
   awk 'prev ~ /^REQ POST .*chat\/completions/ && /\[Tool results\]/ && /SMOKE_TOOL_OUTPUT/ { ok = 1 } { prev = $0 } END { exit !ok }' "$MOCK_LOG" ||
@@ -144,7 +144,7 @@ if [ "${SMOKE_STREAM_CHECK:-1}" != "skip" ]; then
   esac
   echo "$SSE_OUT"
   if [ "$MOCK" = "1" ]; then
-    requests=$(grep -c 'SMOKE_STREAM' "$MOCK_LOG" || echo 0)
+    requests=$(grep -c 'SMOKE_STREAM' "$MOCK_LOG" || true)
     [ "$requests" -eq 1 ] || fail "expected 1 provider request for the streaming turn, got $requests"
   fi
 else

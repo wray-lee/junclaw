@@ -694,6 +694,15 @@ pub const Loop = struct {
         while (!done) {
             if (self.isAborted()) {
                 aborted = true;
+                // An abort stops new provider work, but deltas the transport
+                // already delivered are pending and must settle: the host
+                // draft showed them (native's interruptedReply keeps the same
+                // prefix). They are not new stream events; the settlement
+                // records them, so no assistant/stream is emitted here.
+                while (self.host.provider.next(self.host.provider.context) catch null) |event| {
+                    const keep = try accumulator.push(self.now(), event);
+                    if (!keep) break;
+                }
                 break;
             }
             const maybe_event = self.host.provider.next(self.host.provider.context) catch |err| {

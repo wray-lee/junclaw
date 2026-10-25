@@ -1428,6 +1428,10 @@ pub const DshNativeHarness = struct {
                 return seq;
             },
             .step_start => |position| {
+                // `.on` quotes only the last response's reasoning; a step that
+                // aborts or fails before its assistant message must not
+                // inherit the previous step's block.
+                self.turn_reasoning.clearRetainingCapacity();
                 const seq = try self.appendPositional("step/start", position, 0, 0);
                 if (self.sink) |sink| sink.send(.{ .step_start = .{
                     .turn = position.turn,
@@ -2038,6 +2042,9 @@ pub const DshNativeHarness = struct {
         /// At least one delta reached the kernel/host, so a later provider
         /// error settles a partial assistant message (P3).
         saw_delta: bool = false,
+        /// A reasoning delta was already relayed, so a non-streaming fallback
+        /// result must not append the same reasoning again.
+        saw_reasoning: bool = false,
         output_bytes: usize = 0,
         err: ?anyerror = null,
 
@@ -2120,6 +2127,19 @@ pub const DshNativeHarness = struct {
             self.held.clearRetainingCapacity();
         }
 
+        /// A non-streaming fallback (large-request skip, curl fallback) hands
+        /// the answer to `content` as one delta and leaves reasoning only in
+        /// the result. The draft already got the content, so append reasoning
+        /// to the kernel stream only: JSONL and the `.on` reply keep it, and
+        /// the host never sees an answer followed by its thinking.
+        fn emitFallbackReasoning(self: *StreamRelay, reasoning: []const u8) !void {
+            if (self.saw_reasoning or self.mode == .off or reasoning.len == 0) return;
+            try self.harness.pending.append(self.arena, .{ .chunk = .{ .reasoning_delta = .{
+                .index = reasoning_index,
+                .text = try self.arena.dupe(u8, reasoning),
+            } } });
+        }
+
         fn emit(self: *StreamRelay, text: []const u8) !void {
             if (text.len == 0) return;
             if (self.in_reasoning and self.mode == .off) return;
@@ -2127,6 +2147,7 @@ pub const DshNativeHarness = struct {
             self.output_bytes += text.len;
             const copied = try self.arena.dupe(u8, text);
             if (self.in_reasoning) {
+                self.saw_reasoning = true;
                 try self.harness.pending.append(self.arena, .{ .chunk = .{ .reasoning_delta = .{
                     .index = reasoning_index,
                     .text = copied,
@@ -2170,9 +2191,12 @@ pub const DshNativeHarness = struct {
             self.last_provider_error = err;
             return err;
         }
-        try relay.flush();
 
         if (failed) |err| {
+            // A failure can cut inside a `<think>` tag. The held bytes are
+            // then only a tag prefix, not text: flushing them would show
+            // markup in the draft and turn a zero-output failure into a
+            // partial one.
             // Chunks already reached the sink and the kernel, so the kernel
             // settles the partial assistant message when its `next` raises
             // this error. A call that produced nothing keeps the blocking
@@ -2185,8 +2209,15 @@ pub const DshNativeHarness = struct {
             self.stream_error = err;
             return;
         }
-        // Mirrors the non-streaming fallback: no provider usage means the
-        // fixed-density estimate (4 chars per token).
+        try relay.flush();
+        if (result.reasoning_content) |reasoning| try relay.emitFallbackReasoning(reasoning);
+        // Only transports that leave usage at zero reach this fallback
+        // estimate; sse/gemini/openai_codex already estimate their raw
+        // accumulated bytes (tags and reasoning included). The two layers can
+        // therefore differ by markup bytes when a provider omits usage; this
+        // is a token-count nicety, not a compaction/statistics input.
+        // Mirrors the non-streaming fallback: the fixed density is 4 chars per
+        // token.
         if (result.usage.completion_tokens == 0 and relay.output_bytes > 0) {
             const estimate = (relay.output_bytes + 3) / 4;
             result.usage.completion_tokens = @intCast(@min(estimate, std.math.maxInt(u32)));

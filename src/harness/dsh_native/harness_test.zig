@@ -50,6 +50,9 @@ const Reply = struct {
     overflow: bool = false,
     /// Provider-returned reasoning/thinking text.
     reasoning: ?[]const u8 = null,
+    /// Reasoning a non-streaming fallback returns beside the callbacks, the
+    /// way `emitChatResponseAsStream` reports it.
+    stream_reasoning: ?[]const u8 = null,
     /// Streaming script, replayed only when the adapter streams the call.
     pieces: []const StreamPiece = &.{},
     /// Fire the `on_abort` seam (a `/stop`) after this many pieces, then stop
@@ -192,6 +195,10 @@ const FakeProvider = struct {
         }
         return .{
             .content = try allocator.dupe(u8, content.items),
+            .reasoning_content = if (reply.stream_reasoning) |text|
+                try allocator.dupe(u8, text)
+            else
+                null,
             .tool_calls = reply.tool_calls,
             .usage = .{
                 .prompt_tokens = reply.prompt_tokens,
@@ -4378,17 +4385,156 @@ test "dsh-native adapter: /stop aborts an in-flight stream at the next chunk" {
     defer allocator.free(draft);
     try testing.expectEqualStrings("onetwo", draft);
 
-    // The kernel aborted before consuming the pending deltas: it closes with
-    // its own contentless interrupted attempt, not the partial stream.
+    // Regression: the abort closed with a contentless attempt while the
+    // draft already showed "onetwo", so the reply and history lost text the
+    // user had seen. The pending prefix must settle as the interrupted
+    // assistant message.
+    try testing.expectEqualStrings("onetwo", result.reply);
     const path = try fx.logPath(allocator, engine.session_id);
     defer allocator.free(path);
     var read = try session_log.readLog(allocator, path);
     defer read.deinit();
-    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/message"));
-    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "assistant/attempt"));
-    const partial = try lastAssistantBlockText(allocator, read.events, "assistant/attempt", "text");
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "assistant/message"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/attempt"));
+    const partial = try lastAssistantBlockText(allocator, read.events, "assistant/message", "text");
     defer if (partial) |text| allocator.free(text);
-    try testing.expectEqual(@as(usize, 0), partial.?.len);
+    try testing.expectEqualStrings("onetwo", partial.?);
+    var interrupted = false;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "assistant/message")) {
+            interrupted = event.data.object.get("interrupted") != null;
+        }
+    }
+    try testing.expect(interrupted);
+}
+
+test "dsh-native adapter: a streaming fallback keeps result reasoning" {
+    // Regression: emitChatResponseAsStream reports the whole answer as one
+    // text delta and leaves `reasoning_content` only in StreamChatResult. The
+    // bridge ignored it, so `.on` lost its Reasoning block and JSONL lost the
+    // reasoning content.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "answer",
+        .stream_reasoning = "hidden trace",
+        .pieces = &.{.{ .text = "answer" }},
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .on);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expect(std.mem.startsWith(u8, result.reply, "Reasoning:\n> hidden trace\n"));
+    try testing.expect(std.mem.endsWith(u8, result.reply, "answer"));
+    try testing.expectEqualStrings("answer", result.persisted_reply.?);
+
+    // The fallback content is the only streamed piece; the draft must not get
+    // an answer-then-thinking ordering from the late result field.
+    const draft = try recorder.text(allocator);
+    defer allocator.free(draft);
+    try testing.expectEqualStrings("answer", draft);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const reasoning = try lastAssistantBlockText(allocator, read.events, "assistant/message", "reasoning");
+    defer if (reasoning) |text| allocator.free(text);
+    try testing.expectEqualStrings("hidden trace", reasoning.?);
+    const visible = try lastAssistantBlockText(allocator, read.events, "assistant/message", "text");
+    defer if (visible) |text| allocator.free(text);
+    try testing.expectEqualStrings("answer", visible.?);
+}
+
+test "dsh-native adapter: a failure inside a reasoning tag stays a zero-output failure" {
+    // Regression: flush() ran before the failure check, so a stream cut at
+    // "<thi" was settled as a partial assistant/attempt even though no text
+    // had reached the kernel.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "never seen",
+        .pieces = &.{ .{ .text = "<thi" }, .{ .text = "nk>" } },
+        .fail_after = 1,
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    defer if (result.@"error") |text| allocator.free(text);
+    try testing.expectEqual(port.EndReason.@"error", result.end_reason);
+    try testing.expectEqualStrings("", result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/attempt"));
+}
+
+test "dsh-native adapter: an aborted step drops the previous reasoning quote" {
+    // Regression: `turn_reasoning` kept step one's trace when step two
+    // aborted before producing an assistant message, so `.on` replies quoted
+    // stale reasoning ahead of the real turn text.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{
+            .text = "",
+            .pieces = &.{.{ .text = "<think>stale trace</think>" }},
+            .tool_calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"note.txt\"}" }},
+        },
+        .{ .text = "never", .pieces = &.{.{ .text = "never" }}, .abort_after = 0 },
+    });
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .on);
+    const h = engine.harness();
+    fx.provider.on_abort = struct {
+        fn hook(ctx: *anyopaque) void {
+            const target: *DshNativeHarness = @ptrCast(@alignCast(ctx));
+            target.harness().requestInterrupt();
+        }
+    }.hook;
+    fx.provider.abort_context = @ptrCast(&engine);
+
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("read note.txt");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.aborted, result.end_reason);
+    try testing.expectEqualStrings("", result.reply);
 }
 
 test "dsh-native adapter: a mid-stream failure settles the partial assistant message" {

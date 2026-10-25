@@ -7868,9 +7868,11 @@ test "dsh-native: host /stop aborts the in-process turn" {
 
     const resp = try sm.processMessage(key, "long task", null);
     defer testing.allocator.free(resp);
-    // The kernel closes a cancelled turn with an empty partial reply and a
-    // typed abort; the host's /stop tail keys off the agent flag.
-    try testing.expectEqualStrings("", resp);
+    // Regression: a blocking provider that completed after /stop was settled
+    // as an empty reply, dropping the answer it produced. The kernel now
+    // settles the produced prefix; the host's /stop tail keys off the agent
+    // flag.
+    try testing.expectEqualStrings("never delivered", resp);
     try testing.expectEqual(@as(usize, 1), provider.chat_calls);
     const session = try sm.getOrCreate(key);
     try testing.expect(session.agent.last_turn_interrupted);
