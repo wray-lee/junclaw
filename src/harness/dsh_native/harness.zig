@@ -1235,7 +1235,7 @@ pub const DshNativeHarness = struct {
                 std.mem.eql(u8, failure.code, @errorName(err)))
             {
                 var buf: [512]u8 = undefined;
-                const text = providers.error_classify.userErrorMessage(&buf, err, 0, true);
+                const text = providers.userErrorMessage(&buf, err, true);
                 return self.allocator.dupe(u8, text);
             }
         }

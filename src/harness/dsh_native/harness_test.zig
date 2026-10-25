@@ -4696,6 +4696,9 @@ test "dsh-native adapter: provider failure text is classified for the user" {
     input.live_stream = true;
     input.sink = recorder.sink();
 
+    // The scripted provider has no retry loop, so pin the thread-local
+    // counter the shared classifier reads.
+    providers.reliable.resetRetryStats();
     const result = try engine.harness().runTurn(input);
     defer if (result.@"error") |text| allocator.free(text);
     defer allocator.free(result.reply);
