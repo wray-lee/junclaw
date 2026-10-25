@@ -676,6 +676,8 @@ pub const TelegramChannel = struct {
     transcriber: ?voice.Transcriber = null,
     last_update_id: i64,
     proxy: ?[]const u8,
+    /// Bot API base URL; tests point this at a local stub server.
+    api_base: []const u8 = "https://api.telegram.org",
 
     bot_username: ?[]const u8 = null,
     bot_user_id: ?i64 = null,
@@ -801,6 +803,7 @@ pub const TelegramChannel = struct {
             .allocator = self.allocator,
             .bot_token = self.bot_token,
             .proxy = self.proxy,
+            .api_base = self.api_base,
         };
     }
 
@@ -1752,8 +1755,12 @@ pub const TelegramChannel = struct {
         try telegram_api.appendRawReplyMarkup(&html_body, self.allocator, reply_markup_json);
         try html_body.appendSlice(self.allocator, "}");
 
-        const resp = self.api().sendMessage(self.allocator, html_body.items, "30") catch {
-            // Network error — fall through to plain send
+        const resp = self.api().sendMessage(self.allocator, html_body.items, "30") catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram HTML send outcome unknown ({}); not falling back to plain text to avoid a duplicate reply", .{err});
+                return .{};
+            }
+            // Definite failure before delivery — fall through to plain send.
             return try self.sendChunkPlainWithMarkup(target, text, reply_to, reply_markup_json);
         };
         defer self.allocator.free(resp);
@@ -1838,16 +1845,25 @@ pub const TelegramChannel = struct {
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
-        if (self.rich_messages_enabled) {
-            return self.sendSingleRichMessageWithFallback(target, text, reply_to, reply_markup_json);
-        }
-        return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
-            target,
-            text,
-            reply_to,
-            reply_markup_json,
-            outgoingChunkSplitLimit(text.len, null),
-        );
+        const meta = if (self.rich_messages_enabled)
+            self.sendSingleRichMessageWithFallback(target, text, reply_to, reply_markup_json)
+        else
+            self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
+                target,
+                text,
+                reply_to,
+                reply_markup_json,
+                outgoingChunkSplitLimit(text.len, null),
+            );
+        return meta catch |err| switch (err) {
+            // Earlier chunks are already delivered; an outbox/dispatch retry of
+            // the whole reply would repost them.
+            error.PartiallySent => blk: {
+                log.warn("telegram reply partially sent; not retrying to avoid duplicate chunks", .{});
+                break :blk .{};
+            },
+            else => err,
+        };
     }
 
     /// Send text as a single Telegram rich message (Bot API sendRichMessage)
@@ -1911,7 +1927,11 @@ pub const TelegramChannel = struct {
         };
         defer self.allocator.free(body);
 
-        const resp = self.api().sendRichMessage(self.allocator, body) catch {
+        const resp = self.api().sendRichMessage(self.allocator, body) catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram sendRichMessage outcome unknown ({}); not falling back to avoid a duplicate reply", .{err});
+                return .{};
+            }
             self.noteRichFallback();
             return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
                 target,
@@ -1940,6 +1960,25 @@ pub const TelegramChannel = struct {
         }
 
         return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
+    }
+
+    /// Transport errors where the request may already have reached Telegram:
+    /// a curl timeout, a broken/partial response, or an empty reply. Re-sending
+    /// in another format — or letting the outbox/dispatch retry — would deliver
+    /// the same reply twice, so these count as one best-effort attempt. A
+    /// definite pre-send failure (DNS/connect/TLS) still falls back.
+    fn isIndeterminateSendError(err: anyerror) bool {
+        return switch (err) {
+            error.CurlTimeout,
+            error.CurlReadError,
+            error.CurlWriteError,
+            // exit 18/52/55/56 (partial transfer, empty reply, send/receive
+            // failure), and pre-send curl failures: the request may have been
+            // delivered, so a resend is not safe.
+            error.CurlFailed,
+            => true,
+            else => false,
+        };
     }
 
     /// Log the first rich->legacy fallback per account, then stay quiet.
@@ -2048,7 +2087,13 @@ pub const TelegramChannel = struct {
         try telegram_api.appendRawReplyMarkup(&body_list, self.allocator, reply_markup_json);
         try body_list.appendSlice(self.allocator, "}");
 
-        const resp = try self.api().sendMessage(self.allocator, body_list.items, "30");
+        const resp = self.api().sendMessage(self.allocator, body_list.items, "30") catch |err| {
+            if (isIndeterminateSendError(err)) {
+                log.warn("telegram plain send outcome unknown ({}); treating as best-effort sent", .{err});
+                return .{};
+            }
+            return err;
+        };
         defer self.allocator.free(resp);
         if (telegram_api.responseHasTelegramError(resp)) {
             if (telegram_api.responseIsMessageTooLong(resp)) return error.TelegramMessageTooLong;
@@ -7401,4 +7446,117 @@ test "telegram markdownToTelegramHtml renders tables as aligned pre blocks" {
         "<pre>| Name | Value |\n| ---- | ----- |\n| a    | 1     |\n</pre>",
         html,
     );
+}
+
+// ── Duplicate-send regression (transport outcome unknown) ────────────
+
+const RichFallbackStubCtx = struct {
+    server: *std_compat.net.Server,
+    saw_rich: bool = false,
+    saw_html: bool = false,
+};
+
+/// Serve exactly two Bot API posts: `sendRichMessage` answers with a rich
+/// parse error (HTTP 200 + `ok:false`, the shape the channel inspects), any
+/// `sendMessage` answers with success.
+fn serveRichFallbackStub(ctx: *RichFallbackStubCtx) void {
+    var served: usize = 0;
+    while (served < 2) : (served += 1) {
+        var conn = ctx.server.accept() catch return;
+        defer conn.stream.close();
+
+        var buf: [4096]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const n = conn.stream.read(buf[filled..]) catch return;
+            if (n == 0) break;
+            filled += n;
+            if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+        }
+
+        const body = if (std.mem.indexOf(u8, buf[0..filled], "sendRichMessage") != null) blk: {
+            ctx.saw_rich = true;
+            break :blk "{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}";
+        } else blk: {
+            ctx.saw_html = true;
+            break :blk "{\"ok\":true,\"result\":{\"message_id\":42}}";
+        };
+
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{body.len},
+        ) catch return;
+        conn.stream.writeAll(head) catch {};
+        conn.stream.writeAll(body) catch {};
+    }
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "sendRichMessage timeout sends one request and does not fall back" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = error.CurlTimeout;
+    defer {
+        telegram_api.test_post_failure = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.sendMessage("12345", "hello");
+
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+    try std.testing.expect(!ch.rich_fallback_warned.load(.monotonic));
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "deterministic rich parse error still falls back to HTML" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = RichFallbackStubCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, serveRichFallbackStub, .{&ctx});
+
+    var base_buf: [64]u8 = undefined;
+    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+    ch.api_base = api_base;
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = null;
+    defer telegram_api.test_post_calls = 0;
+
+    const result = ch.sendMessage("12345", "hello");
+    thread.join();
+    try result;
+
+    try std.testing.expect(ctx.saw_rich);
+    try std.testing.expect(ctx.saw_html);
+    try std.testing.expectEqual(@as(usize, 2), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "connection failure still falls back to HTML and plain" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.rich_messages_enabled = true;
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = error.CurlConnectError;
+    defer {
+        telegram_api.test_post_failure = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try std.testing.expectError(error.CurlConnectError, ch.sendMessage("12345", "hello"));
+    try std.testing.expectEqual(@as(usize, 3), telegram_api.test_post_calls);
 }

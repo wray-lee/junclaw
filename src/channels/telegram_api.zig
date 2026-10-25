@@ -5,6 +5,12 @@ const root = @import("root.zig");
 
 const log = std.log.scoped(.telegram_api);
 
+/// Test seam: when set, `post` returns this error instead of performing HTTP,
+/// and `test_post_calls` counts every `post` attempt. Lets channel send-path
+/// tests simulate transport failures (e.g. error.CurlTimeout) deterministically.
+pub var test_post_failure: ?anyerror = null;
+pub var test_post_calls: usize = 0;
+
 pub const SentMessageMeta = struct {
     message_id: ?i64 = null,
 };
@@ -329,6 +335,10 @@ pub const Client = struct {
     }
 
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
+        if (builtin.is_test) {
+            test_post_calls += 1;
+            if (test_post_failure) |err| return err;
+        }
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
         // Bound every Bot API call. `getUpdates` long-polls for up to 30s, and
