@@ -53,7 +53,8 @@ smoke_run() {
     smoke_die "JUNCLAW_BIN does not run in $image (build -Dtarget=x86_64-linux-musl)"
   docker cp "$config" "$SMOKE_CONTAINER:/tmp/smoke-config.json"
   docker cp "$SMOKE_DIR/dsh-native-smoke-inner.sh" "$SMOKE_CONTAINER:/tmp/smoke-inner.sh"
-  docker exec "$SMOKE_CONTAINER" chmod +x /tmp/nullclaw /tmp/smoke-inner.sh
+  docker cp "$SMOKE_DIR/dsh-native-smoke-sse.sh" "$SMOKE_CONTAINER:/tmp/smoke-sse"
+  docker exec "$SMOKE_CONTAINER" chmod +x /tmp/nullclaw /tmp/smoke-inner.sh /tmp/smoke-sse
   if [ "$mock" = "1" ]; then
     docker cp "$SMOKE_MOCK_BIN" "$SMOKE_CONTAINER:/tmp/smoke-mock"
     docker exec "$SMOKE_CONTAINER" chmod +x /tmp/smoke-mock
@@ -63,6 +64,7 @@ smoke_run() {
   docker exec \
     -e SMOKE_MOCK="$mock" \
     -e SMOKE_TOKEN="$token" \
+    -e SMOKE_STREAM_CHECK="${SMOKE_STREAM_CHECK:-1}" \
     -e SMOKE_DATA=/smoke-data \
     "$SMOKE_CONTAINER" /bin/bash /tmp/smoke-inner.sh 2>&1 | tee "$log"
   rc=${PIPESTATUS[0]}

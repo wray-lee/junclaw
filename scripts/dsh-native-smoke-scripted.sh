@@ -82,6 +82,9 @@ cat >"$tmp/config.json" <<'JSON'
   },
   "channels": {
     "cli": false
+  },
+  "a2a": {
+    "enabled": true
   }
 }
 JSON

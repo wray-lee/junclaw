@@ -101,9 +101,19 @@ trap 'rm -rf "$tmp"; smoke_cleanup' EXIT INT TERM
   },
   "channels": {
     "cli": false
+  },
+  "a2a": {
+    "enabled": true
   }
 }
 JSON
 } >"$tmp/config.json"
+
+# `responses` mode has no streaming implementation, so the live-delta
+# assertion would always fail; the turn still runs end-to-end.
+if [ "${SMOKE_API_MODE:-}" = "responses" ]; then
+  echo "smoke: SMOKE_API_MODE=responses has no streaming; skipping the delta assertion" >&2
+  export SMOKE_STREAM_CHECK=skip
+fi
 
 smoke_run "$tmp/config.json" 0 "$SMOKE_DOCKER_NETWORK"

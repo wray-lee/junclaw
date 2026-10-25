@@ -1,11 +1,11 @@
 //! Scripted OpenAI-compatible provider for the dsh-native acceptance smoke.
 //!
-//! Serves one non-streaming `/chat/completions` endpoint on 127.0.0.1. The
-//! first request (which carries the user marker SMOKE_PING and no tool result)
-//! answers with a bash tool call; the follow-up request carries `[Tool
-//! results]` from the dsh engine and gets the final SMOKE_REPLY_OK. Every
-//! request is appended to MOCK_LOG so the smoke can assert the whole turn.
-//! No network, no keys.
+//! Serves `/chat/completions` on 127.0.0.1. A request that carries the user
+//! marker SMOKE_PING and no `[Tool results]` answers with a bash tool call;
+//! the follow-up (or any request without SMOKE_PING) gets the final
+//! SMOKE_REPLY_OK. When the request asks for `"stream":true` the final answer
+//! arrives as two SSE content deltas, so the smoke can prove live streaming.
+//! Every request is appended to MOCK_LOG. No network, no keys.
 
 const std = @import("std");
 
@@ -109,11 +109,16 @@ fn handle(
         return sendJson(io, stream, "200 OK", "{\"object\":\"list\",\"data\":[{\"id\":\"smoke-model\",\"object\":\"model\"}]}");
     }
     if (std.mem.eql(u8, method, "POST") and std.mem.endsWith(u8, path, "/chat/completions")) {
-        // `[Tool results]` only appears once the engine has run the tool.
-        if (std.mem.indexOf(u8, body, "[Tool results]") != null) {
-            return sendJson(io, stream, "200 OK", final_reply);
+        // `[Tool results]` only appears once the engine has run the tool. The
+        // streaming smoke message does not carry SMOKE_PING, so it takes the
+        // direct-answer path without a tool round.
+        const wants_tool = std.mem.indexOf(u8, body, "SMOKE_PING") != null and
+            std.mem.indexOf(u8, body, "[Tool results]") == null;
+        if (std.mem.indexOf(u8, body, "\"stream\":true") != null and !wants_tool) {
+            return sendReplyStream(io, stream);
         }
-        return sendJson(io, stream, "200 OK", tool_call);
+        if (wants_tool) return sendJson(io, stream, "200 OK", tool_call);
+        return sendJson(io, stream, "200 OK", final_reply);
     }
     return sendJson(io, stream, "404 Not Found", "{\"error\":\"not found\"}");
 }
@@ -142,6 +147,25 @@ fn appendLog(
     const line = std.fmt.allocPrint(allocator, "REQ {s} {s}\n{s}\n", .{ method, target, body }) catch return;
     defer allocator.free(line);
     file.writeStreamingAll(io, line) catch {};
+}
+
+/// Two content deltas then a finishing chunk: the caller can tell a live
+/// per-chunk relay (two events) from the blocking bridge's one synthesised
+/// delta.
+fn sendReplyStream(io: std.Io, stream: std.Io.net.Stream) !void {
+    try writeAll(io, stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n");
+    const events = [_][]const u8{
+        "{\"id\":\"chatcmpl-smoke\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"smoke-model\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"finish_reason\":null}]}",
+        "{\"id\":\"chatcmpl-smoke\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"smoke-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"SMOKE_\"},\"finish_reason\":null}]}",
+        "{\"id\":\"chatcmpl-smoke\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"smoke-model\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"REPLY_OK\"},\"finish_reason\":null}]}",
+        "{\"id\":\"chatcmpl-smoke\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"smoke-model\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":2,\"total_tokens\":3}}",
+    };
+    for (events) |event| {
+        try writeAll(io, stream, "data: ");
+        try writeAll(io, stream, event);
+        try writeAll(io, stream, "\n\n");
+    }
+    try writeAll(io, stream, "data: [DONE]\n\n");
 }
 
 fn sendJson(io: std.Io, stream: std.Io.net.Stream, status: []const u8, body: []const u8) !void {

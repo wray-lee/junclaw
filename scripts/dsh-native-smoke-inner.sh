@@ -94,8 +94,8 @@ case "$RESPONSE" in
 esac
 
 if [ "$MOCK" = "1" ]; then
-  requests=$(grep -c '^REQ POST .*chat/completions' "$MOCK_LOG" || true)
-  [ "$requests" -eq 2 ] || fail "expected 2 provider requests, got $requests"
+  requests=$(grep -c 'SMOKE_PING' "$MOCK_LOG" || echo 0)
+  [ "$requests" -eq 2 ] || fail "expected 2 provider requests for the webhook turn, got $requests"
   # The tool result must be in the follow-up request, not just the prompt.
   awk 'prev ~ /^REQ POST .*chat\/completions/ && /\[Tool results\]/ && /SMOKE_TOOL_OUTPUT/ { ok = 1 } { prev = $0 } END { exit !ok }' "$MOCK_LOG" ||
     fail "the follow-up provider request has no tool result"
@@ -121,5 +121,34 @@ case "$SESSIONS" in
 esac
 # SQLite keeps the newest rows in the WAL until a checkpoint.
 grep -aq 'SMOKE_REPLY_OK' "$DATA"/workspace/memory.db* || fail "junclaw store does not contain the mirrored reply"
+
+# Streaming contract: A2A `message/stream` drives the same host sink a live
+# draft uses. The helper asserts the provider deltas reached the client before
+# the task's final event; a batched (blocking) bridge produces one delta and
+# fails the count. `set -o pipefail` above makes a dropped socket fail too.
+if [ "${SMOKE_STREAM_CHECK:-1}" != "skip" ]; then
+  STREAM_MESSAGE="SMOKE_STREAM: reply with exactly the sentence SMOKE_REPLY_OK is the smoke reply."
+  A2A_BODY=$(printf '{"jsonrpc":"2.0","id":1,"method":"message/stream","params":{"message":{"messageId":"smoke-stream-1","role":"user","parts":[{"kind":"text","text":"%s"}]}}}' "$STREAM_MESSAGE")
+  A2A_LEN=${#A2A_BODY}
+  exec 3<>/dev/tcp/127.0.0.1/3001
+  printf 'POST /a2a HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer %s\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' \
+    "$TOKEN" "$A2A_LEN" "$A2A_BODY" >&3
+  if ! SSE_OUT=$(cat <&3 | /tmp/smoke-sse --min-deltas 2); then
+    exec 3>&-
+    fail "A2A stream did not prove live deltas before completion"
+  fi
+  exec 3>&-
+  case "$SSE_OUT" in
+    *SMOKE_SSE_OK*) ;;
+    *) fail "A2A stream helper did not report SMOKE_SSE_OK" ;;
+  esac
+  echo "$SSE_OUT"
+  if [ "$MOCK" = "1" ]; then
+    requests=$(grep -c 'SMOKE_STREAM' "$MOCK_LOG" || echo 0)
+    [ "$requests" -eq 1 ] || fail "expected 1 provider request for the streaming turn, got $requests"
+  fi
+else
+  echo "smoke: streaming assertion skipped (provider mode has no stream)"
+fi
 
 echo "SMOKE_OK"
