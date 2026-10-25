@@ -49,6 +49,8 @@ smoke_run() {
   # BusyBox sleep (the nc-zig image) has no "infinity"; a day is plenty.
   docker run -d --name "$SMOKE_CONTAINER" --network "$network" --entrypoint sleep "$image" 86400 >/dev/null
   docker cp "$JUNCLAW_BIN" "$SMOKE_CONTAINER:/tmp/nullclaw"
+  docker exec "$SMOKE_CONTAINER" /tmp/nullclaw version >/dev/null 2>&1 ||
+    smoke_die "JUNCLAW_BIN does not run in $image (build -Dtarget=x86_64-linux-musl)"
   docker cp "$config" "$SMOKE_CONTAINER:/tmp/smoke-config.json"
   docker cp "$SMOKE_DIR/dsh-native-smoke-inner.sh" "$SMOKE_CONTAINER:/tmp/smoke-inner.sh"
   docker exec "$SMOKE_CONTAINER" chmod +x /tmp/nullclaw /tmp/smoke-inner.sh
