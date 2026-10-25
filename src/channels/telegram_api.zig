@@ -9,6 +9,9 @@ const log = std.log.scoped(.telegram_api);
 /// and `test_post_calls` counts every `post` attempt. Lets channel send-path
 /// tests simulate transport failures (e.g. error.CurlTimeout) deterministically.
 pub var test_post_failure: ?anyerror = null;
+/// Test seam: per-attempt errors. A null entry performs the real HTTP call, so
+/// one test can mix a definite API error with a later transport timeout.
+pub var test_post_failures: ?[]const ?anyerror = null;
 pub var test_post_calls: usize = 0;
 
 pub const SentMessageMeta = struct {
@@ -337,7 +340,13 @@ pub const Client = struct {
     fn post(self: Client, allocator: std.mem.Allocator, method: []const u8, body: []const u8, timeout: []const u8) ![]u8 {
         if (builtin.is_test) {
             test_post_calls += 1;
-            if (test_post_failure) |err| return err;
+            if (test_post_failures) |failures| {
+                if (test_post_calls <= failures.len) {
+                    if (failures[test_post_calls - 1]) |err| return err;
+                }
+            } else if (test_post_failure) |err| {
+                return err;
+            }
         }
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, method);
@@ -487,6 +496,13 @@ pub fn responseHasTelegramError(resp: []const u8) bool {
 pub fn responseIsMessageTooLong(resp: []const u8) bool {
     return std.mem.indexOf(u8, resp, "MESSAGE_TOO_LONG") != null or
         std.mem.indexOf(u8, resp, "message is too long") != null;
+}
+
+/// Telegram rejects an edit whose text equals the current message content with
+/// a 400 error. The edit target already shows the wanted text.
+pub fn responseIsMessageNotModified(resp: []const u8) bool {
+    return responseHasTelegramError(resp) and
+        std.mem.indexOf(u8, resp, "message is not modified") != null;
 }
 
 /// Returns true if a Telegram error response is likely caused by rich-message formatting,
@@ -674,6 +690,12 @@ test "telegram getUpdates returns a bounded error on a stalled socket" {
 
     ctx.release.store(true, .release);
     thread.join();
+}
+
+test "telegram api responseIsMessageNotModified detects the benign edit rejection" {
+    try std.testing.expect(responseIsMessageNotModified("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: message is not modified\"}"));
+    try std.testing.expect(!responseIsMessageNotModified("{\"ok\":false,\"error_code\":400,\"description\":\"Bad Request: can't parse entities\"}"));
+    try std.testing.expect(!responseIsMessageNotModified("{\"ok\":true,\"result\":{}}"));
 }
 
 test "telegram api responseHasTelegramError matches error payloads" {

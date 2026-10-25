@@ -19,6 +19,12 @@
   with an indeterminate transport error (for example a request timeout): such
   a failure counts as one best-effort attempt and is not re-sent in another
   format or retried by the outbox/dispatch layers.
+- Telegram inline-button callback edits no longer post the whole reply again
+  when the edit outcome is unknown, and a `message is not modified` rejection
+  from a rich edit is treated as success.
+- Curl pre-send failures (for example an unresolvable proxy, exit 5) are no
+  longer treated as "may have been delivered", so a reply that definitely was
+  not sent is retried instead of being silently dropped.
 - Slack no longer posts a reply twice when a send or streaming update fails
   with an indeterminate transport error (for example a request timeout or a
   broken/partial response): such a failure counts as one best-effort attempt
