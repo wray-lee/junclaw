@@ -234,7 +234,7 @@ pub const DshNativeHarness = struct {
     // Per turn.
     sink: ?port.Sink = null,
     live_stream: bool = false,
-    /// Raised by `requestInterrupt`; a streaming provider sees it through the
+    /// Raised by `requestInterrupt`; provider transports see it through the
     /// thread interrupt flag, exactly like the native agent.
     stream_cancel: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     /// A provider error raised after deltas were relayed. `providerNext`
@@ -1985,6 +1985,14 @@ pub const DshNativeHarness = struct {
         };
         _ = view;
 
+        // Both paths run on this thread until the request ends, so either one
+        // must expose the stop flag to the transport: a /stop from the host
+        // thread cancels an in-flight curl request instead of letting it run
+        // to completion. Restore the caller's flag for nested harness calls.
+        const outer_interrupt = http_util.currentThreadInterruptFlag();
+        http_util.setThreadInterruptFlag(&self.stream_cancel);
+        defer http_util.setThreadInterruptFlag(outer_interrupt);
+
         if (self.streamingEnabled()) return self.beginStreaming(arena, chat);
 
         var response = self.opts.provider.chatWithTools(arena, chat) catch |err| {
@@ -1992,6 +2000,12 @@ pub const DshNativeHarness = struct {
             return err;
         };
         defer freeResponseFields(arena, &response);
+        // A provider that ignores the flag can still finish after the stop;
+        // never hand that late body to the kernel as the turn's answer.
+        if (self.stream_cancel.load(.acquire)) {
+            self.last_provider_error = error.Interrupted;
+            return error.Interrupted;
+        }
 
         self.turn_model_calls += 1;
         // Reasoning and text need distinct stream indexes: the accumulator
@@ -2170,10 +2184,7 @@ pub const DshNativeHarness = struct {
         self.turn_model_calls += 1;
         self.streamed_live = true;
         var relay = StreamRelay{ .harness = self, .arena = arena, .mode = self.opts.reasoning_mode };
-        // The transports poll this flag between deltas, so a `/stop` from the
-        // host thread ends the request instead of draining the rest.
-        http_util.setThreadInterruptFlag(&self.stream_cancel);
-        defer http_util.setThreadInterruptFlag(null);
+        // `providerBegin` installed the stop flag for this whole call.
 
         var failed: ?anyerror = null;
         var result = self.opts.provider.streamChat(

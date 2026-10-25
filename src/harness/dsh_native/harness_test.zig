@@ -245,8 +245,15 @@ const FakeProvider = struct {
             // The adapter aborts its own loop; this test seam reaches it
             // through the provider the same way a `/stop` would.
             if (self.on_abort) |hook| hook(self.abort_context.?);
+            // A real blocking transport polls the adapter's stop flag and
+            // reports Interrupted; only a provider that ignores it returns the
+            // scripted body as a late, complete reply.
+            if (http_util.interruptRequested()) {
+                self.saw_interrupt = true;
+                return error.Interrupted;
+            }
             return .{
-                .content = try allocator.dupe(u8, ""),
+                .content = try allocator.dupe(u8, reply.text),
                 .usage = .{ .prompt_tokens = reply.prompt_tokens, .completion_tokens = reply.completion_tokens },
             };
         }
@@ -915,9 +922,12 @@ test "dsh-native adapter: tool turn runs the read tool and feeds the result back
     try testing.expect(saw_call and saw_result);
 }
 
-test "dsh-native adapter: requestInterrupt ends the turn aborted" {
+test "dsh-native adapter: requestInterrupt cancels a blocking provider call" {
     const allocator = testing.allocator;
-    var fx = try Fixture.init(allocator, &.{.{ .text = "never seen", .abort = true }});
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "late complete answer", .abort = true },
+        .{ .text = "next turn ok" },
+    });
     defer fx.deinit();
 
     var engine = try fx.harness();
@@ -934,21 +944,43 @@ test "dsh-native adapter: requestInterrupt ends the turn aborted" {
     }.hook;
     fx.provider.abort_context = @ptrCast(&engine);
 
+    // Regression: 阻塞 provider 收到 /stop 后仍等待完整响应并返回完整回答
+    // (the blocking call never saw the stop flag, so it ran to completion and
+    // the late body became the turn's reply). The transport must observe the
+    // flag, report Interrupted, and leave no assistant reply behind.
     const result = try h.runTurn(turnInput("do work"));
     defer allocator.free(result.reply);
-
     try testing.expectEqual(port.EndReason.aborted, result.end_reason);
     try testing.expectEqualStrings("user", result.abort_cause.?);
     try testing.expectEqualStrings("", result.reply);
+    try testing.expect(fx.provider.saw_interrupt);
+    try testing.expectEqual(@as(usize, 1), fx.provider.requests.items.len);
 
-    // The next turn is not poisoned by the consumed interrupt: it reaches the
-    // provider again (which has no second reply scripted) instead of aborting
-    // before the call.
+    // The aborted step settles without a late assistant message or attempt.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/message"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/attempt"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "step/end"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "turn/end"));
+    const late = try lastAssistantBlockText(allocator, read.events, "assistant/message", "text");
+    defer if (late) |text| allocator.free(text);
+    try testing.expect(late == null);
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "turn/end")) continue;
+        try testing.expectEqualStrings(
+            "aborted",
+            event.data.object.get("reason").?.object.get("kind").?.string,
+        );
+    }
+
+    // The next turn is not poisoned by the consumed interrupt.
     const second = try h.runTurn(turnInput("again"));
     defer allocator.free(second.reply);
-    defer if (second.@"error") |text| allocator.free(text);
-    try testing.expectEqual(port.EndReason.@"error", second.end_reason);
-    try testing.expectEqualStrings("UnscriptedCall", second.error_code.?);
+    try testing.expectEqual(port.EndReason.completed, second.end_reason);
+    try testing.expectEqualStrings("next turn ok", second.reply);
     try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
 }
 
