@@ -62,25 +62,56 @@ pub fn isCurlTransportError(err: anyerror) bool {
 }
 
 pub fn preserveCurlTransportError(err: anyerror, fallback: anyerror) anyerror {
-    return if (isCurlTransportError(err)) err else fallback;
+    // Gateway uncertainty is not a curl exit, but it must keep its identity so
+    // the channel guards can treat it like the other indeterminate outcomes.
+    return if (isCurlTransportError(err) or err == error.HttpStatusIndeterminate) err else fallback;
+}
+
+/// Gateway statuses a proxy can return after it already forwarded the request:
+/// 502 (bad gateway) and 504 (gateway timeout). The send outcome is unknown, so
+/// senders must not resend. Other 4xx/5xx — including Telegram's own API
+/// rejections and 429/503 — stay `HttpStatusError` and keep the existing
+/// fallback/retry behavior.
+pub fn isIndeterminateHttpStatus(status_code: u16) bool {
+    return status_code == 502 or status_code == 504;
+}
+
+/// Map a non-2xx response to the shared send-boundary error identity.
+pub fn httpStatusError(status_code: u16) error{ HttpStatusError, HttpStatusIndeterminate } {
+    return if (isIndeterminateHttpStatus(status_code)) error.HttpStatusIndeterminate else error.HttpStatusError;
+}
+
+/// Reads keep the old `HttpStatusError` identity; only mutating requests can
+/// have an indeterminate delivery outcome.
+fn sendErrorForMethod(method: std.http.Method, status_code: u16) error{ HttpStatusError, HttpStatusIndeterminate } {
+    return if (method != .GET and method != .HEAD and isIndeterminateHttpStatus(status_code))
+        error.HttpStatusIndeterminate
+    else
+        error.HttpStatusError;
 }
 
 /// Transport errors where the request may already have reached the service:
-/// a curl timeout, a broken/partial response, or an empty reply. Re-sending
-/// after one of these — in another format, by the channel, or by the
-/// outbox/dispatch retry layers — can deliver the same message twice, so
-/// callers count it as one best-effort attempt. A definite pre-send failure
-/// (malformed URL, unresolvable proxy, DNS/connect/TLS) is not in this set and
-/// can still be retried.
+/// a curl timeout, a broken/partial response, an empty reply, or a child.wait
+/// failure after curl started. Re-sending after one of these — in another
+/// format, by the channel, or by the outbox/dispatch retry layers — can deliver
+/// the same message twice, so callers count it as one best-effort attempt. A
+/// definite pre-send failure (malformed URL, unresolvable proxy, DNS/connect/
+/// TLS) is not in this set and can still be retried.
 pub fn isIndeterminateSendError(err: anyerror) bool {
     return switch (err) {
         error.CurlTimeout,
         error.CurlReadError,
         error.CurlWriteError,
+        // child.wait failed after curl was spawned: the request may have gone
+        // out even though its output stream is already closed.
+        error.CurlWaitError,
         // exit 16/18/52/55/56/92 (partial or interrupted transfer, empty
         // reply, send/receive failure) and unknown exit codes: the request may
         // have been delivered, so a resend is not safe.
         error.CurlFailed,
+        // A gateway answered after forwarding the request (see
+        // `isIndeterminateHttpStatus`).
+        error.HttpStatusIndeterminate,
         => true,
         else => false,
     };
@@ -1060,7 +1091,7 @@ pub fn httpRequest(
 ) ![]u8 {
     const resp = try httpRequestWithStatus(allocator, method, url, body, headers, content_type, proxy);
     errdefer allocator.free(resp.body);
-    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
+    if (resp.status_code < 200 or resp.status_code >= 300) return sendErrorForMethod(method, resp.status_code);
     return resp.body;
 }
 
@@ -1162,9 +1193,9 @@ pub fn httpRequestWithTimeout(
     });
     allocator.free(resp.headers);
     errdefer allocator.free(resp.body);
-    // Mirror `httpRequest` exactly: a non-2xx response is error.HttpStatusError,
-    // not curl --fail's error.CurlFailed, so callers see the same error identity.
-    if (resp.status_code < 200 or resp.status_code >= 300) return error.HttpStatusError;
+    // Mirror `httpRequest` exactly: a non-2xx response is an error, not curl
+    // --fail's error.CurlFailed, so callers see the same error identity.
+    if (resp.status_code < 200 or resp.status_code >= 300) return sendErrorForMethod(method, resp.status_code);
     return resp.body;
 }
 
@@ -1538,6 +1569,8 @@ fn curlRequestWithProxy(
     const content_type = contentTypeHeaderValue(content_type_header) orelse return error.InvalidHeader;
     if (credentialedCurlUsesHttpFallback(url, headers, resolve_entry)) {
         const response = try httpRequestWithStatus(allocator, method_enum, url, body, headers, content_type, proxy);
+        errdefer allocator.free(response.body);
+        if (isIndeterminateHttpStatus(response.status_code)) return error.HttpStatusIndeterminate;
         return response.body;
     }
     const response = try secureCurlRequestWithStatusAndHeaders(allocator, .{
@@ -1552,6 +1585,10 @@ fn curlRequestWithProxy(
         .resolve_entry = resolve_entry,
     });
     allocator.free(response.headers);
+    errdefer allocator.free(response.body);
+    // A gateway that answers 502/504 may already have forwarded the request.
+    // Other statuses keep returning the body so callers can parse API errors.
+    if (isIndeterminateHttpStatus(response.status_code)) return error.HttpStatusIndeterminate;
     return response.body;
 }
 
@@ -2074,11 +2111,30 @@ test "isIndeterminateSendError keeps definite pre-send failures resendable" {
     try std.testing.expect(isIndeterminateSendError(error.CurlTimeout));
     try std.testing.expect(isIndeterminateSendError(error.CurlReadError));
     try std.testing.expect(isIndeterminateSendError(error.CurlWriteError));
+    try std.testing.expect(isIndeterminateSendError(error.CurlWaitError));
     try std.testing.expect(isIndeterminateSendError(error.CurlFailed));
+    try std.testing.expect(isIndeterminateSendError(error.HttpStatusIndeterminate));
     try std.testing.expect(!isIndeterminateSendError(error.CurlDnsError));
     try std.testing.expect(!isIndeterminateSendError(error.CurlConnectError));
     try std.testing.expect(!isIndeterminateSendError(error.CurlTlsError));
+    try std.testing.expect(!isIndeterminateSendError(error.CurlPreSendError));
     try std.testing.expect(!isIndeterminateSendError(error.HttpStatusError));
+}
+
+test "gateway uncertainty keeps its identity through channel error wrapping" {
+    try std.testing.expectEqual(
+        error.HttpStatusIndeterminate,
+        preserveCurlTransportError(error.HttpStatusIndeterminate, error.SlackApiError),
+    );
+}
+
+test "gateway statuses map to the shared indeterminate send error" {
+    try std.testing.expectEqual(error.HttpStatusIndeterminate, httpStatusError(502));
+    try std.testing.expectEqual(error.HttpStatusIndeterminate, httpStatusError(504));
+    try std.testing.expectEqual(error.HttpStatusError, httpStatusError(500));
+    try std.testing.expectEqual(error.HttpStatusError, httpStatusError(503));
+    try std.testing.expectEqual(error.HttpStatusError, httpStatusError(429));
+    try std.testing.expectEqual(error.HttpStatusError, httpStatusError(400));
 }
 
 test "credentialed curl argv validation rejects authorization header" {
@@ -3271,6 +3327,69 @@ test "bounded http get maps a non-2xx to HttpStatusError" {
         return error.TestUnexpectedResult;
     } else |err| {
         try std.testing.expectEqual(@as(anyerror, error.HttpStatusError), err);
+    }
+}
+
+fn expectBoundedPostError(status_line: []const u8, expected: anyerror) !void {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = status_line, .body = "" };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/send", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const result = httpRequestWithTimeout(allocator, .POST, url, null, &.{}, null, null, "5");
+    thread.join();
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(expected, @as(anyerror, err));
+    }
+}
+
+test "bounded POST maps gateway 502/504 to an indeterminate send error" {
+    try expectBoundedPostError("HTTP/1.1 502 Bad Gateway", error.HttpStatusIndeterminate);
+    try expectBoundedPostError("HTTP/1.1 504 Gateway Timeout", error.HttpStatusIndeterminate);
+}
+
+test "bounded POST keeps definite 4xx/429/503 as HttpStatusError" {
+    try expectBoundedPostError("HTTP/1.1 400 Bad Request", error.HttpStatusError);
+    try expectBoundedPostError("HTTP/1.1 429 Too Many Requests", error.HttpStatusError);
+    try expectBoundedPostError("HTTP/1.1 503 Service Unavailable", error.HttpStatusError);
+}
+
+// Slack's chat.postMessage goes through curlPost, whose credentialed (std)
+// backend previously discarded the status before the channel could classify it.
+test "curlPost maps gateway 502 to an indeterminate send error" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 502 Bad Gateway", .body = "" };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/chat.postMessage", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const result = curlPost(allocator, url, "{}", &.{"Authorization: Bearer test-token"});
+    thread.join();
+
+    if (result) |body| {
+        allocator.free(body);
+        return error.TestUnexpectedResult;
+    } else |err| {
+        try std.testing.expectEqual(@as(anyerror, error.HttpStatusIndeterminate), err);
     }
 }
 
