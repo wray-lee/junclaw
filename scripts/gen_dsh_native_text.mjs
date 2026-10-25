@@ -24,11 +24,10 @@
 // tool-bash defaults enableRunInBackground/promoteOnTimeout=true; no sandbox
 // escalation modes are advertised without a confining backend.
 //
-// todo_write is the documented exception: P2b stage 2 selects the single-active
-// discipline (allowParallelInProgress=false) for junclaw's todo executor, so its
-// description composes DESCRIPTION_SINGLE. The base bundle file currently sets
-// allowParallelInProgress: true; switch the composed clause to
-// DESCRIPTION_PARALLEL if junclaw adopts that deployment policy.
+// todo_write composes DESCRIPTION_PARALLEL because the base bundle sets
+// allowParallelInProgress: true, and that is the description the reference
+// deployment advertises (snapshots/session/todo-write also accepts two
+// in_progress items). junclaw's executor accepts the same list.
 //
 // If the source checkout is unavailable, run this against the mirror image
 // junclaw:full-dsh-test's /opt/dsh/node_modules instead (same relative paths).
@@ -694,7 +693,6 @@ const renderGroups = [
       E('todo_write.error_duplicate_content', TOOL_TODO, 90, 90, {
         subs: { 'JSON.stringify(content)': '{s}' },
       }),
-      E('todo_write.error_parallel_in_progress', TOOL_TODO, 97, 97, { subs: { active: '{d}' } }),
       E('todo_write.error_requires_agent', TOOL_TODO, 197, 197),
     ],
   },
@@ -787,12 +785,12 @@ function generateToolSchemas() {
     out += '};\n'
   }
   // todo_write's nested item schema is beyond the flat parameter DSL, so its
-  // JSON is composed here. The description uses DESCRIPTION_SINGLE (see the
+  // JSON is composed here. The description uses DESCRIPTION_PARALLEL (see the
   // todo policy note at the top of this file).
   const todoHead = extract(E('todo_write.head', TOOL_TODO, 45, 47)).value
-  const todoSingle = extract(E('todo_write.single_clause', TOOL_TODO, 52, 53)).value
+  const todoParallel = extract(E('todo_write.parallel_clause', TOOL_TODO, 49, 50)).value
   const todoTail = extract(E('todo_write.tail', TOOL_TODO, 55, 55)).value
-  const todoDescription = C('todo_write.description', TOOL_TODO, 45, 55, todoHead + todoSingle + todoTail)
+  const todoDescription = C('todo_write.description', TOOL_TODO, 45, 55, todoHead + todoParallel + todoTail)
   const todoSchema = JSON.stringify({
     type: 'object',
     properties: {
@@ -983,6 +981,7 @@ function generateInteraction() {
     ['exit_no_channel', 309],
     ['exit_reloaded', 345],
     ['exit_keep_planning', 352],
+    ['exit_keep_planning_feedback', 353, undefined, { feedback: '{s}' }],
   ]
   for (const [name, line, pick, subs] of planTexts) {
     const opts = {}

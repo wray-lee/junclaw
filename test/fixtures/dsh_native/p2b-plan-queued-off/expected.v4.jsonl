@@ -10,7 +10,7 @@
 {"type":"assistant/message","data":{"turn":1,"step":1,"message":{"role":"assistant","content":[{"type":"text","text":"The repository is small."}],"source":{"kind":"model","provider":"fake","model":"fake"},"id":"{{message:3}}"},"usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35},"stream":[{"type":"text-chunks","time0":0,"index":0,"dt":[],"texts":["The repository is small."]},{"type":"chunk","time":0,"chunk":{"type":"usage","usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35}}},{"type":"chunk","time":0,"chunk":{"type":"finish","reason":"stop"}}]},"surfaceOp":"append"}
 {"type":"step/end","data":{"turn":1,"step":1}}
 {"type":"turn/end","data":{"turn":1,"reason":{"kind":"completed"}}}
-{"type":"command/run","data":{"commandId":"command-2","name":"plan","args":" on","source":{"kind":"user"}}}
+{"type":"command/run","data":{"commandId":"command-2","name":"plan","args":"","source":{"kind":"user"}}}
 {"type":"plan/mode","data":{"active":true}}
 {"type":"command/done","data":{"commandId":"command-2","kind":"success","text":"Plan mode on. Use /plan off to leave."}}
 {"type":"turn/start","data":{"turn":2}}
@@ -18,7 +18,7 @@
 {"type":"system/message","data":{"turn":2,"step":1,"message":{"role":"system","content":[{"type":"text","text":"{{system}}"}],"source":{"kind":"system-prompt"},"id":"{{message:4}}"}},"surfaceOp":"append"}
 {"type":"user/message","data":{"content":[{"type":"text","text":"The user switched this session to plan mode."}],"source":{"kind":"plan-mode","form":"notice","summary":"The user switched this session to plan mode."},"role":"user","id":"{{message:5}}"},"surfaceOp":"append"}
 {"type":"user/message","data":{"content":[{"type":"text","text":"Read the note."}],"source":{"kind":"user"},"role":"user","id":"{{message:6}}"},"surfaceOp":"append"}
-{"type":"request/header","data":{"header":{"config":{"provider":"fake","model":"fake"},"tools":"{{tools}}"},"reason":"change"}}
+{"type":"request/header","data":{"header":{"config":{"provider":"fake","model":"fake"},"tools":"{{tools}}"},"reason":"series"}}
 {"type":"command/run","data":{"commandId":"command-5","name":"plan","args":" off","source":{"kind":"user"}}}
 {"type":"command/done","data":{"commandId":"command-5","kind":"success","text":"Leaving plan mode (applies from the next step)."}}
 {"type":"assistant/message","data":{"turn":2,"step":1,"message":{"role":"assistant","content":[{"type":"tool-call","id":"call_read","name":"read","arguments":"{\"file_path\": \"note.txt\"}"}],"source":{"kind":"model","provider":"fake","model":"fake"},"id":"{{message:7}}"},"usage":{"inputTokens":50,"outputTokens":5,"totalTokens":55},"stream":[{"type":"chunk","time":0,"chunk":{"type":"block-start","index":0,"blockType":"tool-call"}},{"type":"tool-call-chunks","time0":0,"index":0,"dt":[],"id":"call_read","name":"read","args":["{\"file_path\": \"note.txt\"}"]},{"type":"chunk","time":0,"chunk":{"type":"block-end","index":0,"block":[{"type":"tool-call","id":"call_read","name":"read","arguments":"{\"file_path\": \"note.txt\"}"}]}},{"type":"chunk","time":0,"chunk":{"type":"usage","usage":{"inputTokens":50,"outputTokens":5,"totalTokens":55}}},{"type":"chunk","time":0,"chunk":{"type":"finish","reason":"tool-calls"}}]},"surfaceOp":"append"}
@@ -29,7 +29,7 @@
 {"type":"step/start","data":{"turn":2,"step":2}}
 {"type":"system/message","data":{"turn":2,"step":2,"message":{"role":"system","content":[{"type":"text","text":"{{system}}"}],"source":{"kind":"system-prompt"},"id":"{{message:4}}"}},"surfaceOp":"append"}
 {"type":"user/message","data":{"content":[{"type":"text","text":"The user switched this session back to the default mode."}],"source":{"kind":"plan-mode","form":"notice","summary":"The user switched this session back to the default mode."},"role":"user","id":"{{message:9}}"},"surfaceOp":"append"}
-{"type":"request/header","data":{"header":{"config":{"provider":"fake","model":"fake"},"tools":"{{tools}}"},"reason":"change"}}
+{"type":"request/header","data":{"header":{"config":{"provider":"fake","model":"fake"},"tools":"{{tools}}"},"reason":"series"}}
 {"type":"assistant/message","data":{"turn":2,"step":2,"message":{"role":"assistant","content":[{"type":"text","text":"Done."}],"source":{"kind":"model","provider":"fake","model":"fake"},"id":"{{message:10}}"},"usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35},"stream":[{"type":"text-chunks","time0":0,"index":0,"dt":[],"texts":["Done."]},{"type":"chunk","time":0,"chunk":{"type":"usage","usage":{"inputTokens":30,"outputTokens":5,"totalTokens":35}}},{"type":"chunk","time":0,"chunk":{"type":"finish","reason":"stop"}}]},"surfaceOp":"append"}
 {"type":"step/end","data":{"turn":2,"step":2}}
 {"type":"turn/end","data":{"turn":2,"reason":{"kind":"completed"}}}

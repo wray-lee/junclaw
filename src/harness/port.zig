@@ -130,6 +130,18 @@ pub const Interaction = struct {
     askQuestions: *const fn (ctx: *anyopaque, questions: []const Question) anyerror![]const Answer,
     /// Plan-mode review; `approve = false` keeps the plan active.
     planReview: *const fn (ctx: *anyopaque, plan: []const u8) anyerror!bool,
+    /// Optional richer plan review (additive, P3-G). When set, the engine uses
+    /// it instead of `planReview` so a keep-planning review can carry the
+    /// reviewer's feedback back to the model. Hosts that do not set it keep the
+    /// boolean behavior.
+    planReviewDetailed: ?*const fn (ctx: *anyopaque, plan: []const u8) anyerror!PlanReview = null,
+};
+
+/// Host answer to a plan review. `feedback` is borrowed for the callback
+/// duration; empty means "no feedback" (dsh's no-feedback wording).
+pub const PlanReview = struct {
+    approved: bool,
+    feedback: []const u8 = "",
 };
 
 pub const ApprovalRequest = struct {

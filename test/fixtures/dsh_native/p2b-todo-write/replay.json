@@ -20,7 +20,7 @@
           "id": "call_todo_1",
           "name": "todo_write",
           "args": [
-            "{\"todos\": [{\"content\": \"read the code\", \"status\": \"in_progress\"}, {\"content\": \"watch the background build\", \"status\": \"pending\"}, {\"content\": \"write the fix\", \"status\": \"pending\"}]}"
+            "{\"todos\": [{\"content\": \"read the code\", \"status\": \"in_progress\"}, {\"content\": \"watch the background build\", \"status\": \"in_progress\"}, {\"content\": \"write the fix\", \"status\": \"pending\"}]}"
           ]
         },
         {

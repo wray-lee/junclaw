@@ -474,6 +474,18 @@ fn headerHasTool(event: types.Event, name: []const u8) bool {
     return false;
 }
 
+/// The request tool catalog is part of the request-cache key; dsh keeps it
+/// byte-identical across plan modes (live recording p2b-plan-off).
+fn headerToolNamesEqual(a: types.Event, b: types.Event) bool {
+    const left = a.data.object.get("header").?.object.get("tools").?.array.items;
+    const right = b.data.object.get("header").?.object.get("tools").?.array.items;
+    if (left.len != right.len) return false;
+    for (left, right) |l, r| {
+        if (!std.mem.eql(u8, l.object.get("name").?.string, r.object.get("name").?.string)) return false;
+    }
+    return true;
+}
+
 fn eventIndex(events: []const types.Event, event_type: []const u8, from: usize) ?usize {
     var index = from;
     while (index < events.len) : (index += 1) {
@@ -1923,6 +1935,8 @@ test "dsh-native adapter: /permission sandbox mode reaches the runtime context" 
 
 const ReviewChannel = struct {
     approve: bool,
+    feedback: []const u8 = "",
+    detailed: bool = false,
     calls: usize = 0,
     plan_len: usize = 0,
 
@@ -1932,6 +1946,7 @@ const ReviewChannel = struct {
             .requestApproval = rejectApproval,
             .askQuestions = noAnswers,
             .planReview = reviewPlan,
+            .planReviewDetailed = if (self.detailed) reviewPlanDetailed else null,
         };
     }
 
@@ -1948,6 +1963,13 @@ const ReviewChannel = struct {
         self.calls += 1;
         self.plan_len = plan_text.len;
         return self.approve;
+    }
+
+    fn reviewPlanDetailed(ctx: *anyopaque, plan_text: []const u8) anyerror!port.PlanReview {
+        const self: *ReviewChannel = @ptrCast(@alignCast(ctx));
+        self.calls += 1;
+        self.plan_len = plan_text.len;
+        return .{ .approved = self.approve, .feedback = self.feedback };
     }
 };
 
@@ -2031,13 +2053,57 @@ test "dsh-native adapter: plan mode toggles the policy section and exit_plan_mod
         }
     }
     try testing.expectEqual(@as(usize, 3), header_count);
-    try testing.expect(headerHasTool(headers[0].?, tool_schemas.todo_write.name));
-    try testing.expect(!headerHasTool(headers[0].?, tool_schemas.exit_plan_mode.name));
-    try testing.expect(headerHasTool(headers[1].?, tool_schemas.exit_plan_mode.name));
-    try testing.expect(headerHasTool(headers[1].?, tool_schemas.todo_write.name));
-    try testing.expect(!headerHasTool(headers[2].?, tool_schemas.exit_plan_mode.name));
+    // The catalog includes exit_plan_mode in every mode and stays identical
+    // across the off -> on -> off transitions (dsh live recording).
+    for (headers) |header| {
+        try testing.expect(headerHasTool(header.?, tool_schemas.todo_write.name));
+        try testing.expect(headerHasTool(header.?, tool_schemas.exit_plan_mode.name));
+    }
+    try testing.expect(headerToolNamesEqual(headers[0].?, headers[1].?));
+    try testing.expect(headerToolNamesEqual(headers[1].?, headers[2].?));
     try testing.expectEqual(@as(usize, 1), on_narrations);
     try testing.expectEqual(@as(usize, 1), off_narrations);
+}
+
+test "dsh-native adapter: /plan <message> steers the message into the next turn" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "start" },
+        .{ .text = "planned" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("start"));
+    allocator.free(first.reply);
+
+    try testing.expectEqualStrings(
+        generated.plan_mode.on_committed,
+        (try h.handleLocalCommand("/plan focus on the parser")).?,
+    );
+    const result = try h.runTurn(turnInput("go"));
+    defer allocator.free(result.reply);
+    // dsh `agent.steer(createUserMessage(...))`: the trimmed non-`off` input
+    // joins the next request as an ordinary user message.
+    try testing.expect(requestContains(fx.provider.requests.items[1], "focus on the parser"));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var notice: ?usize = null;
+    var steered: ?usize = null;
+    for (read.events, 0..) |event, index| {
+        if (!std.mem.eql(u8, event.event_type, "user/message")) continue;
+        if (std.mem.eql(u8, userMessageKind(event), "plan-mode")) notice = index;
+        if (std.mem.eql(u8, userMessageText(event), "focus on the parser")) steered = index;
+    }
+    try testing.expect(notice != null);
+    try testing.expect(steered != null);
+    try testing.expect(notice.? < steered.?);
 }
 
 test "dsh-native adapter: a mid-turn /plan off commits at the next pre-step" {
@@ -2128,8 +2194,11 @@ test "dsh-native adapter: a mid-turn /plan off commits at the next pre-step" {
     try testing.expect(tool_result.? < plan_off.?);
     try testing.expect(plan_off.? < header_indexes[2]);
     try testing.expect(plan_off.? < narration.?);
-    try testing.expect(headerHasTool(headers[1].?, tool_schemas.exit_plan_mode.name));
-    try testing.expect(!headerHasTool(headers[2].?, tool_schemas.exit_plan_mode.name));
+    // dsh opens a new request series after a plan-mode change even though the
+    // catalog is identical (live plan-off/plan-exit-approved recordings).
+    for (headers) |header| try testing.expect(headerHasTool(header.?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(headerToolNamesEqual(headers[0].?, headers[1].?));
+    try testing.expect(headerToolNamesEqual(headers[1].?, headers[2].?));
 }
 
 test "dsh-native adapter: exit_plan_mode approval defers plan/mode to the pre-step" {
@@ -2199,7 +2268,7 @@ test "dsh-native adapter: exit_plan_mode approval defers plan/mode to the pre-st
         if (std.mem.eql(u8, event.event_type, "tool/result")) {
             tool_result = index;
             try testing.expect(!toolResultFailed(event));
-            try testing.expectEqualStrings("{\"approved\":true}", toolResultText(event));
+            try testing.expectEqualStrings(generated.plan_mode.exit_approved_result, toolResultText(event));
         } else if (std.mem.eql(u8, event.event_type, "plan/mode")) {
             plan_off = index;
         } else if (std.mem.eql(u8, event.event_type, "request/header")) {
@@ -2217,8 +2286,11 @@ test "dsh-native adapter: exit_plan_mode approval defers plan/mode to the pre-st
     try testing.expectEqual(@as(usize, 3), header_count);
     try testing.expect(tool_result.? < plan_off.?);
     try testing.expect(plan_off.? < header_indexes[2]);
-    try testing.expect(headerHasTool(headers[1].?, tool_schemas.exit_plan_mode.name));
-    try testing.expect(!headerHasTool(headers[2].?, tool_schemas.exit_plan_mode.name));
+    // Same catalog after approval, but the mode change opens a new series
+    // (live plan-exit-approved logs reason "series" for that request).
+    for (headers) |header| try testing.expect(headerHasTool(header.?, tool_schemas.exit_plan_mode.name));
+    try testing.expect(headerToolNamesEqual(headers[0].?, headers[1].?));
+    try testing.expect(headerToolNamesEqual(headers[1].?, headers[2].?));
     try testing.expect(!off_narration);
 }
 
@@ -2249,7 +2321,7 @@ test "dsh-native adapter: exit_plan_mode rejection keeps plan mode and returns t
     allocator.free(first.reply);
     try testing.expectEqualStrings(generated.plan_mode.on_committed, (try h.handleLocalCommand("/plan on")).?);
 
-    var channel = ReviewChannel{ .approve = false };
+    var channel = ReviewChannel{ .approve = false, .feedback = "make it shorter", .detailed = true };
     var input = turnInput("present the plan");
     input.interaction = channel.interaction();
     const second = try h.runTurn(input);
@@ -2266,11 +2338,14 @@ test "dsh-native adapter: exit_plan_mode rejection keeps plan mode and returns t
     var read = try session_log.readLog(allocator, path);
     defer read.deinit();
 
-    const keep_planning = try std.fmt.allocPrint(
-        allocator,
-        "Error: {s}",
-        .{generated.plan_mode.exit_keep_planning},
+    // The additive `planReviewDetailed` callback puts the reviewer's words in
+    // the tool error (dsh `plan-mode/src/index.ts:353`).
+    const feedback = try std.fmt.allocPrint(
+        a,
+        generated.plan_mode.exit_keep_planning_feedback,
+        .{"make it shorter"},
     );
+    const keep_planning = try std.fmt.allocPrint(allocator, "Error: {s}", .{feedback});
     defer allocator.free(keep_planning);
     var saw_result = false;
     for (read.events) |event| {
@@ -2482,6 +2557,43 @@ test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
     }
     try testing.expect(saw_header);
     try testing.expect(saw_result);
+    // P3-G: the dsh approval gate covers only bash's sandbox escalation, so a
+    // bridged junclaw tool never asks it.
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/asked"));
+}
+
+test "dsh-native adapter: bridged host tools stay outside the dsh escalation gate" {
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "ran" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "deploy",
+            .arguments = "{\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}",
+        }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.host_tools = &.{.{ .name = "deploy", .description = "Deploy", .input_schema_json = "{\"type\":\"object\"}" }};
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const result = try h.runTurn(turnInput("deploy"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    // Without a turn interaction, an approval-gated call would be denied before
+    // the executor; junclaw's own policy owns this tool instead.
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("deploy", fake.last_name);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/asked"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/decided"));
 }
 
 test "dsh-native adapter: bridged tool fails closed without an interaction channel" {

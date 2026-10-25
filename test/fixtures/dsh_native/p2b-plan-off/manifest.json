@@ -72,9 +72,9 @@
   "comparison": {},
   "modelVisible": {
     "planTools": [
-      false,
       true,
-      false
+      true,
+      true
     ],
     "planPolicy": [
       false,
@@ -88,10 +88,7 @@
   },
   "openIssues": [
     "dsh logs agent/inbox/spliced bookkeeping and runtime-context user messages; the adapter's v4 log omits them (P2a fixture convention).",
-    "The adapter appends a system/message per step; dsh replaces the changed prompt node in place (packages/plan/plan-mode/tests/integration.spec.ts:130-180). Compaction can select a mid-conversation system node.",
-    "dsh keeps exit_plan_mode in the request tool catalog in every mode; the adapter advertises it only while plan mode is active (packages/plan/plan-mode/tests/integration.spec.ts:130-180).",
-    "Because the adapter appends system nodes and changes the tool catalog per mode, its request/header reason is change where dsh's replacement bumps the generation and logs series.",
-    "dsh treats /plan <text> as a mode selection plus a user message, so /plan on also submits the word \"on\"; the port documents /plan [on|off] and drops the message, so this fixture uses on as a selection alias and the comparison recording used a bare /plan."
+    "The adapter appends a system/message per step; dsh replaces the changed prompt node in place (packages/plan/plan-mode/tests/integration.spec.ts:130-180). Compaction can select a mid-conversation system node."
   ],
   "files": [
     "input.json",

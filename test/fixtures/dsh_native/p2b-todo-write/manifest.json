@@ -62,7 +62,7 @@
     "pending": false
   },
   "openIssues": [
-    "The port validates the single-active discipline (allowParallelInProgress=false, matching its generated description); dsh's base deployment sets it true, and snapshots/session/todo-write accepts two in_progress items.",
+    "The replay marks two todos in_progress, matching the base deployment's allowParallelInProgress=true and snapshots/session/todo-write.",
     "dsh records only the rendered sentence in tool/result; the adapter also records the structured output under data.meta (todos + counts)."
   ],
   "files": [

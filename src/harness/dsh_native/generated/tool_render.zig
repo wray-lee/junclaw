@@ -78,6 +78,5 @@ pub const todo_write = struct {
     pub const success = "Updated todo list: {d} pending, {d} in progress, {d} completed.";
     pub const error_empty_content = "invalid todo: `content` must be a non-empty string";
     pub const error_duplicate_content = "invalid todos: duplicate content {s}";
-    pub const error_parallel_in_progress = "invalid todos: at most one task may be in_progress (got {d})";
     pub const error_requires_agent = "todo_write requires an owning agent session";
 };

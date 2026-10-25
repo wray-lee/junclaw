@@ -1,5 +1,5 @@
 {"type":"session","version":4,"id":"{{session:1}}","createdAt":200,"cwd":"{{cwd}}","isSeeded":false,"delegationDepth":0}
-{"type":"command/run","data":{"commandId":"command-1","name":"plan","args":" on","source":{"kind":"user"}}}
+{"type":"command/run","data":{"commandId":"command-1","name":"plan","args":"","source":{"kind":"user"}}}
 {"type":"plan/mode","data":{"active":true}}
 {"type":"command/done","data":{"commandId":"command-1","kind":"success","text":"Plan mode on. Use /plan off to leave."}}
 {"type":"permission/preset","data":{"preset":"workspace-write"}}

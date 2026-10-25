@@ -66,6 +66,6 @@ pub const exit_plan_mode = struct {
 
 pub const todo_write = struct {
     pub const name = "todo_write";
-    pub const description = "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one todo per concrete step before you start. While work remains, keep exactly one todo `in_progress`. Mark each todo `completed` as soon as it is done.";
+    pub const description = "Record and update a task list to plan multi-step work and show progress; skip it for trivial single-step tasks. Add one todo per concrete step before you start. While work remains, keep the todos being worked on `in_progress`, several only when work runs in parallel. Mark each todo `completed` as soon as it is done.";
     pub const input_schema_json = "{\"type\":\"object\",\"properties\":{\"todos\":{\"type\":\"array\",\"description\":\"The COMPLETE task list, replacing any previous list.\",\"items\":{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"content\":{\"type\":\"string\",\"description\":\"What the task is — a short imperative line.\"},\"status\":{\"type\":\"string\",\"description\":\"pending (not started) | in_progress (now) | completed (done).\",\"enum\":[\"pending\",\"in_progress\",\"completed\"]}},\"required\":[\"content\",\"status\"]}}},\"required\":[\"todos\"]}";
 };

@@ -8,7 +8,8 @@
 //! dsh constants. The execute pipeline enforces the argument shape (known item
 //! keys, string content, status enum) before the handler runs, mirroring dsh
 //! `defineTool`; the value constraints dsh applies in `toTodoList` live here:
-//! trimmed non-empty unique content and the single-active discipline.
+//! trimmed non-empty unique content. The base deployment sets
+//! `allowParallelInProgress: true`, so several todos may be `in_progress`.
 
 const std = @import("std");
 const compat = @import("compat");
@@ -20,11 +21,6 @@ const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
-
-/// dsh `allowParallelInProgress`: the base deployment sets it true, but the
-/// generated description and error text encode the single-active discipline,
-/// so this port validates against the text the model actually sees.
-pub const allow_parallel_in_progress = false;
 
 /// ASCII whitespace, what JSON tool arguments carry in practice. dsh trims the
 /// full Unicode space set; non-ASCII padding is left in place here.
@@ -59,7 +55,6 @@ const Counts = struct {
 const Invalid = union(enum) {
     empty_content,
     duplicate: []const u8,
-    parallel_in_progress: usize,
 };
 
 fn call(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!registry.ToolResult {
@@ -72,7 +67,6 @@ fn call(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!regist
     if (validate(raw)) |invalid| return switch (invalid) {
         .empty_content => failure(allocator, "INVALID_TODO", render.todo_write.error_empty_content),
         .duplicate => |content| duplicateFailure(allocator, content),
-        .parallel_in_progress => |count| parallelFailure(allocator, count),
     };
 
     const log = self.log orelse
@@ -98,10 +92,9 @@ fn call(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!regist
 }
 
 /// dsh `toTodoList` constraints, in its order: per-item trimmed non-empty
-/// content, then duplicate trimmed content, then at most one `in_progress`
-/// when parallel work is off.
+/// content, then duplicate trimmed content. With the base deployment's
+/// `allowParallelInProgress: true`, several items may be `in_progress`.
 fn validate(raw: []const Value) ?Invalid {
-    var active: usize = 0;
     for (raw, 0..) |entry, index| {
         const content = trimmedContent(entry);
         if (content.len == 0) return .empty_content;
@@ -110,10 +103,6 @@ fn validate(raw: []const Value) ?Invalid {
                 return .{ .duplicate = content };
             }
         }
-        if (std.mem.eql(u8, entry.object.get("status").?.string, "in_progress")) active += 1;
-    }
-    if (active > 1 and !allow_parallel_in_progress) {
-        return .{ .parallel_in_progress = active };
     }
     return null;
 }
@@ -164,11 +153,6 @@ fn duplicateFailure(allocator: Allocator, content: []const u8) !registry.ToolRes
     const quoted = try std.json.Stringify.valueAlloc(allocator, content, .{});
     defer allocator.free(quoted);
     const message = try std.fmt.allocPrint(allocator, render.todo_write.error_duplicate_content, .{quoted});
-    return failure(allocator, "INVALID_TODO", message);
-}
-
-fn parallelFailure(allocator: Allocator, count: usize) !registry.ToolResult {
-    const message = try std.fmt.allocPrint(allocator, render.todo_write.error_parallel_in_progress, .{count});
     return failure(allocator, "INVALID_TODO", message);
 }
 
@@ -398,7 +382,11 @@ test "todo_write rejects empty and duplicate content without appending" {
     try testing.expectEqual(@as(usize, 0), read.events.len);
 }
 
-test "todo_write rejects more than one in_progress todo" {
+test "todo_write accepts several in_progress todos like the reference deployment" {
+    // dsh base sets allowParallelInProgress: true and its recorded
+    // `snapshots/session/todo-write` session accepts two in_progress items;
+    // the advertised description says "several only when work runs in
+    // parallel", so the executor must not reject that list.
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -411,13 +399,16 @@ test "todo_write rejects more than one in_progress todo" {
     try context.register(&reg, testing.allocator);
 
     const result = try execute.execute(&reg, arena, callArgs(
-        "{\"todos\":[{\"content\":\"one\",\"status\":\"in_progress\"},{\"content\":\"two\",\"status\":\"in_progress\"}]}",
+        "{\"todos\":[{\"content\":\"read the code\",\"status\":\"in_progress\"},{\"content\":\"watch the background build\",\"status\":\"in_progress\"},{\"content\":\"write the fix\",\"status\":\"pending\"}]}",
     ));
-    try expectFailure(result, "INVALID_TODO", "Error: invalid todos: at most one task may be in_progress (got 2)");
+    try expectSuccessText(result, "Updated todo list: 1 pending, 2 in progress, 0 completed.");
 
     var read = try readEvents(&fixture);
     defer read.deinit();
-    try testing.expectEqual(@as(usize, 0), read.events.len);
+    try testing.expectEqual(@as(usize, 1), read.events.len);
+    const todos = read.events[0].data.object.get("todos").?.array.items;
+    try testing.expectEqual(@as(usize, 3), todos.len);
+    try testing.expectEqualStrings("in_progress", todos[1].object.get("status").?.string);
 }
 
 test "todo_write requires an owning agent session after value validation" {

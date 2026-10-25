@@ -42,4 +42,5 @@ pub const plan_mode = struct {
     pub const exit_no_channel = "no user-questions channel is available to review the plan; ask the user to switch the session mode instead";
     pub const exit_reloaded = "the plan-mode service was reloaded while the plan was under review; present the plan again";
     pub const exit_keep_planning = "The user chose to keep planning; revise the plan and present it again.";
+    pub const exit_keep_planning_feedback = "The user chose to keep planning; their feedback: {s}";
 };

@@ -360,6 +360,15 @@ pub fn reviewPlan(interaction: ?port.Interaction, plan: []const u8) !bool {
     return host.planReview(host.ctx, plan);
 }
 
+/// Detailed plan review (P3-G additive): prefers the host's
+/// `planReviewDetailed` callback so keep-planning feedback reaches the model,
+/// and falls back to the boolean `planReview` for hosts that do not set it.
+pub fn reviewPlanDetailed(interaction: ?port.Interaction, plan: []const u8) !port.PlanReview {
+    const host = interaction orelse return error.NoChannel;
+    if (host.planReviewDetailed) |review| return review(host.ctx, plan);
+    return .{ .approved = try host.planReview(host.ctx, plan) };
+}
+
 // ── tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
@@ -384,6 +393,8 @@ const Channel = struct {
     answers: []const port.Answer = &.{},
     fail: bool = false,
     plan_answer: bool = false,
+    plan_feedback: []const u8 = "",
+    detailed_review: bool = false,
     last_plan: []const u8 = "",
     seen_questions: usize = 0,
     clock: ?*Clock = null,
@@ -395,6 +406,7 @@ const Channel = struct {
             .requestApproval = noApproval,
             .askQuestions = askFn,
             .planReview = planFn,
+            .planReviewDetailed = if (self.detailed_review) detailedPlanFn else null,
         };
     }
 
@@ -411,6 +423,12 @@ const Channel = struct {
         const self: *Channel = @ptrCast(@alignCast(context.?));
         self.last_plan = plan;
         return self.plan_answer;
+    }
+
+    fn detailedPlanFn(context: ?*anyopaque, plan: []const u8) anyerror!port.PlanReview {
+        const self: *Channel = @ptrCast(@alignCast(context.?));
+        self.last_plan = plan;
+        return .{ .approved = self.plan_answer, .feedback = self.plan_feedback };
     }
 };
 
@@ -620,6 +638,24 @@ test "reviewPlan exposes the host plan-review callback" {
     try testing.expect(try reviewPlan(channel.interaction(), "the plan"));
     try testing.expectEqualStrings("the plan", channel.last_plan);
     try testing.expectError(error.NoChannel, reviewPlan(null, "the plan"));
+}
+
+test "reviewPlanDetailed prefers the feedback callback and falls back to planReview" {
+    var detailed = Channel{
+        .plan_answer = false,
+        .plan_feedback = "make it shorter",
+        .detailed_review = true,
+    };
+    const review = try reviewPlanDetailed(detailed.interaction(), "the plan");
+    try testing.expect(!review.approved);
+    try testing.expectEqualStrings("make it shorter", review.feedback);
+    try testing.expectEqualStrings("the plan", detailed.last_plan);
+
+    var legacy = Channel{ .plan_answer = true };
+    const fallback = try reviewPlanDetailed(legacy.interaction(), "the plan");
+    try testing.expect(fallback.approved);
+    try testing.expectEqualStrings("", fallback.feedback);
+    try testing.expectError(error.NoChannel, reviewPlanDetailed(null, "the plan"));
 }
 
 test "large question and answer JSON is built without leaks" {

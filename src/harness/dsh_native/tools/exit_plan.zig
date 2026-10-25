@@ -2,14 +2,15 @@
 //!
 //! Mirrors dsh 0.2.1-rc.2 `packages/plan/plan-mode/src/index.ts:277-372`:
 //! the plan must start with a `#` heading, review goes through the
-//! user-questions channel, approval returns `{"approved":true}` and queues a
-//! silent `plan/mode=false` for the next in-turn pre-step, and any failure is
-//! a model-visible error result (fail-closed without a channel). The tool stays
-//! registered while plan mode is inactive, matching dsh's stable tool catalog.
+//! user-questions channel, approval returns dsh's rendered result sentence and
+//! queues a silent `plan/mode=false` for the next in-turn pre-step, and any
+//! failure is a model-visible error result (fail-closed without a channel). The
+//! tool stays registered while plan mode is inactive, matching dsh's stable
+//! catalog (live recording p2b-plan-off lists it).
 //!
-//! The host's `port.Interaction.planReview` returns only a boolean, so the
-//! keep-planning feedback text is unavailable; the no-feedback dsh wording is
-//! returned instead.
+//! Keep-planning feedback comes from the additive
+//! `port.Interaction.planReviewDetailed`; hosts that only set the boolean
+//! `planReview` get dsh's no-feedback wording.
 
 const std = @import("std");
 const generated = @import("../generated/root.zig");
@@ -23,7 +24,6 @@ const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const schema = generated.tool_schemas.exit_plan_mode;
 const text = generated.interaction.plan_mode;
-const approved_json = "{\"approved\":true}";
 
 /// Per-call tool state. The harness owns the plan session and the optional
 /// interaction channel.
@@ -61,13 +61,20 @@ pub fn handle(context: ?*anyopaque, allocator: Allocator, args: Value) anyerror!
         return failureFormat(allocator, "INVALID_PLAN", text.exit_requires_heading, .{schema.name});
     }
 
-    const approved = questions.reviewPlan(self.interaction, plan_text) catch |err| {
+    const review = questions.reviewPlanDetailed(self.interaction, plan_text) catch |err| {
         if (err == error.NoChannel) return failureLiteral(allocator, "NO_CHANNEL", text.exit_no_channel);
         return failureFormat(allocator, "REVIEW_FAILED", "plan review failed: {s}", .{@errorName(err)});
     };
-    if (!approved) return failureLiteral(allocator, "PLAN_NOT_APPROVED", text.exit_keep_planning);
+    if (!review.approved) {
+        if (review.feedback.len != 0) {
+            return failureFormat(allocator, "PLAN_NOT_APPROVED", text.exit_keep_planning_feedback, .{review.feedback});
+        }
+        return failureLiteral(allocator, "PLAN_NOT_APPROVED", text.exit_keep_planning);
+    }
 
-    const owned = try allocator.dupe(u8, approved_json);
+    // dsh renders the tool output to this sentence; the stored result is that
+    // text, not the raw `{"approved":true}` value.
+    const owned = try allocator.dupe(u8, text.exit_approved_result);
     errdefer allocator.free(owned);
     const blocks = try allocator.alloc(types.ContentBlock, 1);
     blocks[0] = .{ .text = owned };
@@ -129,6 +136,8 @@ const testing = std.testing;
 const Channel = struct {
     approve: bool = true,
     calls: usize = 0,
+    feedback: []const u8 = "",
+    detailed: bool = false,
 };
 
 fn approveFn(context: *anyopaque, plan_text: []const u8) anyerror!bool {
@@ -136,6 +145,13 @@ fn approveFn(context: *anyopaque, plan_text: []const u8) anyerror!bool {
     _ = plan_text;
     self.calls += 1;
     return self.approve;
+}
+
+fn detailedFn(context: *anyopaque, plan_text: []const u8) anyerror!port.PlanReview {
+    const self: *Channel = @ptrCast(@alignCast(context));
+    _ = plan_text;
+    self.calls += 1;
+    return .{ .approved = self.approve, .feedback = self.feedback };
 }
 
 fn noApproval(context: *anyopaque, request: port.ApprovalRequest) anyerror!port.ApprovalDecision {
@@ -156,6 +172,7 @@ fn interaction(channel: *Channel) port.Interaction {
         .requestApproval = noApproval,
         .askQuestions = noQuestions,
         .planReview = approveFn,
+        .planReviewDetailed = if (channel.detailed) detailedFn else null,
     };
 }
 
@@ -236,7 +253,9 @@ test "exit_plan_mode approval queues the silent mode change" {
     var result = try handle(&context, a, try planArgs(a, "# Ship it\n\nSteps"));
     defer freeResult(a, result);
     try testing.expect(!result.isError());
-    try testing.expectEqualStrings(approved_json, result.content()[0].text);
+    // dsh live recording p2b-plan-exit-approved: the stored tool result is the
+    // rendered sentence, not the structured `{"approved":true}` value.
+    try testing.expectEqualStrings(text.exit_approved_result, result.content()[0].text);
     try testing.expectEqual(@as(?bool, false), plan_session.pending.?.active);
     try testing.expect(!plan_session.pending.?.narrate);
 
@@ -266,6 +285,40 @@ test "exit_plan_mode rejection keeps plan mode" {
     try testing.expect(plan_session.pending == null);
     try testing.expect(plan_session.state.active);
     try testing.expect(plan_session.projection().active);
+}
+
+test "exit_plan_mode returns reviewer feedback to the model" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var plan_session = plan.Session{};
+    plan_session.state.active = true;
+    var channel = Channel{
+        .approve = false,
+        .feedback = "make it shorter",
+        .detailed = true,
+    };
+    var context = Context{ .plan = &plan_session, .interaction = interaction(&channel) };
+
+    var result = try handle(&context, a, try planArgs(a, "# Ship it"));
+    defer freeResult(a, result);
+    try testing.expect(result.isError());
+    // dsh `plan-mode/src/index.ts:353`: the feedback sentence is thrown as the
+    // tool error, so the model sees the reviewer's words.
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(a, "Error: {s}", .{try std.fmt.allocPrint(
+            a,
+            text.exit_keep_planning_feedback,
+            .{"make it shorter"},
+        )}),
+        result.content()[0].text,
+    );
+    switch (result) {
+        .failure => |failure| try testing.expectEqualStrings("PLAN_NOT_APPROVED", failure.error_info.code),
+        .success => return error.TestUnexpectedResult,
+    }
+    try testing.expect(plan_session.state.active);
 }
 
 test "exit_plan_mode fails closed without an interaction channel" {
@@ -355,7 +408,7 @@ test "exit_plan_mode keeps a 64 KiB plan intact without leaking" {
     var result = try handle(&context, testing.allocator, args);
     defer freeResult(testing.allocator, result);
     try testing.expect(!result.isError());
-    try testing.expectEqualStrings(approved_json, result.content()[0].text);
+    try testing.expectEqualStrings(text.exit_approved_result, result.content()[0].text);
     try testing.expectEqual(@as(usize, 1), channel.calls);
 }
 

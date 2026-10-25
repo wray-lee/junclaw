@@ -181,11 +181,11 @@ pub const DshNativeHarness = struct {
     /// The model-visible surface (arena-owned), in request order.
     messages: std.ArrayListUnmanaged(types.Message) = .empty,
 
+    /// The model-visible catalog. It includes `exit_plan_mode` in every mode:
+    /// dsh keeps that tool registered while plan mode is inactive, so switching
+    /// modes changes only the prompt section (live recording p2b-plan-off).
     tool_schemas: []const request.ToolSchema = &.{},
     tool_specs: []const providers.ToolSpec = &.{},
-    /// The same catalog plus `exit_plan_mode`; only plan mode advertises it.
-    plan_tool_schemas: []const request.ToolSchema = &.{},
-    plan_tool_specs: []const providers.ToolSpec = &.{},
     registry: registry.Registry = .{},
     builtins: ?*builtins_mod.Builtins = null,
     bash: ?*bash_mod.Context = null,
@@ -409,19 +409,12 @@ pub const DshNativeHarness = struct {
         for (registry.core_schemas) |schema| try names.append(perm, schema.name);
         try names.append(perm, generated_interaction.ask_user_question.name);
         try names.append(perm, generated.todo_write.name);
+        try names.append(perm, generated.exit_plan_mode.name);
         try names.appendSlice(perm, host_names);
         const ordered = try prompt.orderTools(perm, names.items, null);
-        const base = try self.assembleCatalog(perm, ordered);
-        self.tool_schemas = base.schemas;
-        self.tool_specs = base.specs;
-
-        const plan_names = try perm.alloc([]const u8, names.items.len + 1);
-        @memcpy(plan_names[0..names.items.len], names.items);
-        plan_names[names.items.len] = generated.exit_plan_mode.name;
-        const plan_ordered = try prompt.orderTools(perm, plan_names, null);
-        const plan_catalog = try self.assembleCatalog(perm, plan_ordered);
-        self.plan_tool_schemas = plan_catalog.schemas;
-        self.plan_tool_specs = plan_catalog.specs;
+        const catalog = try self.assembleCatalog(perm, ordered);
+        self.tool_schemas = catalog.schemas;
+        self.tool_specs = catalog.specs;
     }
 
     const Catalog = struct {
@@ -1710,7 +1703,6 @@ pub const DshNativeHarness = struct {
         claimed: loop_mod.Claimed,
         out: *std.ArrayListUnmanaged(loop_mod.UserMessage),
     ) anyerror!loop_mod.PreStepDecision {
-        _ = position;
         _ = claimed;
         const self = selfOf(context_ptr);
         // dsh checks `signal.aborted` before committing a queued selection; the
@@ -1720,6 +1712,11 @@ pub const DshNativeHarness = struct {
             if (loop.isAborted()) return .{};
         }
         const boundary = self.plan_session.preStep();
+        // A committed plan-mode change bumps dsh's surface projection
+        // generation, so the next request opens a new series even when the
+        // catalog and header are unchanged (live plan-exit-approved: the
+        // post-approval request logs reason "series").
+        const plan_changed = boundary.emit != null;
         if (boundary.emit) |active| {
             var data: std.json.ObjectMap = .empty;
             try data.put(allocator, "active", .{ .bool = active });
@@ -1733,14 +1730,17 @@ pub const DshNativeHarness = struct {
             self.plan_session.pendingCommitted();
         }
         if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
-        if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
         if (boundary.narration) |text| {
             const id = try self.nextMessageId();
             const json = try planNarrationJson(allocator, id, text);
             try out.append(allocator, .{ .json = json });
         }
         try self.appendModelContext(allocator, out);
-        return .{};
+        // A new turn opens a new request series: dsh appends request/header
+        // with reason "series" even when the header is unchanged (live
+        // recording p2b-plan-off). Without this, an unchanged catalog would
+        // hide the per-turn requests from the log.
+        return .{ .starts_request_series = plan_changed or (position.step == 1 and position.turn > 1) };
     }
 
     /// Pre-step context dsh appends after the claimed user messages: the
@@ -1843,7 +1843,7 @@ pub const DshNativeHarness = struct {
             .model = self.opts.model,
             .temperature = self.opts.temperature,
             .max_tokens = self.opts.max_tokens,
-            .tools = self.planCatalogSpecs(),
+            .tools = self.tool_specs,
             .reasoning_effort = self.opts.reasoning_effort,
             .include_reasoning = self.opts.reasoning_mode != .off,
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
@@ -2156,6 +2156,10 @@ pub const DshNativeHarness = struct {
             if (meta.requires_interaction and self.interaction == null) {
                 return "tool requires an interactive channel that is unavailable on this turn";
             }
+            // Bridged junclaw tools keep junclaw's autonomy/risk policy and
+            // never enter the dsh approval gate: dsh reviews only the bash
+            // escalation carrying `sandbox_permissions`.
+            return null;
         }
         const object = switch (args) {
             .object => |value| value,
@@ -2218,7 +2222,7 @@ pub const DshNativeHarness = struct {
         }
         try self.applyPermissionEvents(result.events);
         try self.applyManualCompaction(result.events, seqs);
-        if (result.plan_decision) |decision| try self.applyPlanDecision(decision, result.events);
+        if (result.plan_decision) |decision| try self.applyPlanDecision(decision, result.events, result.steer);
         return try arena.dupe(u8, result.text);
     }
 
@@ -2228,25 +2232,30 @@ pub const DshNativeHarness = struct {
         return if (self.plan_session.pending) |pending| pending.active else self.plan_session.state.active;
     }
 
-    fn planCatalogSchemas(self: *const Self) []const request.ToolSchema {
-        return if (self.planActive()) self.plan_tool_schemas else self.tool_schemas;
-    }
-
-    fn planCatalogSpecs(self: *const Self) []const providers.ToolSpec {
-        return if (self.planActive()) self.plan_tool_specs else self.tool_specs;
-    }
-
-    /// `/plan` settlement: fold the command lifecycle and mode, inject the
-    /// narration the command decided on, and republish the prompt and catalog.
-    fn applyPlanDecision(self: *Self, decision: plan_mod.Decision, events: []const types.Event) !void {
+    /// `/plan` settlement: fold the command lifecycle and mode, then inject the
+    /// narration the command decided on and, for `/plan <message>`, steer the
+    /// message as a user turn (dsh `agent.steer`). The prompt is republished;
+    /// the tool catalog never changes with the mode.
+    fn applyPlanDecision(
+        self: *Self,
+        decision: plan_mod.Decision,
+        events: []const types.Event,
+        message: ?[]const u8,
+    ) !void {
         self.plan_session.applyDecision(decision);
         for (events) |event| try self.plan_session.foldEvent(event);
         if (self.planActive() != self.prompt_plan_active) try self.buildPrompt();
-        if (self.loop) |*loop| loop.config.tools = self.planCatalogSchemas();
-        const narration = decision.narration orelse return;
-        const id = try self.nextMessageId();
-        const json = try planNarrationJson(self.arena.allocator(), id, narration);
-        if (self.loop) |*loop| _ = try loop.inject(.{ .id = id, .data = json });
+        const loop = if (self.loop) |*value| value else return;
+        if (decision.narration) |narration| {
+            const id = try self.nextMessageId();
+            const json = try planNarrationJson(self.arena.allocator(), id, narration);
+            _ = try loop.inject(.{ .id = id, .data = json });
+        }
+        if (message) |text| {
+            const id = try self.nextMessageId();
+            const json = try self.userMessageJson(self.arena.allocator(), id, text);
+            _ = try loop.steer(.{ .id = id, .data = json });
+        }
     }
 
     /// dsh plan-mode narration user message (`source.kind="plan-mode"`).

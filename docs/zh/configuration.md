@@ -259,9 +259,9 @@ P2a 状态：`dsh-native` 已接好并在进程内运行。只有把 `agent.harn
 - `/compact`（无参数）：对手头较旧的历史执行一次手动压缩；没有可压缩历史时结算为 `No compactable history yet.`，不写领域事件。
 - `/permission [preset]`：不带参数时报告当前 preset 和可选值；`read-only`、`workspace-write`、`danger-full-access` 会记录会话的沙箱模式与审批策略（`read-only`/`workspace-write` 用 `ask`，`danger-full-access` 用 `never`），且只写入发生变化的 knob。
 - `/feedback <text>`：写入 `feedback/record` 事件；空文本报错。
-- `/export`（无参数）：请求下载会话日志，并写入命令生命周期事件。
+- `/export`（无参数）：报告此客户端无法导出会话日志（dsh 的下载由 Web 宿主提供，这里没有该路由），并写入命令生命周期事件。
 - `/goal [<objective>|clear|edit <objective>|pause|resume]`：查看当前目标，或用 objective 创建目标，以及编辑、暂停、恢复、清除；每次调用写入命令生命周期，中间夹 `goal/change` 事件。
-- `/plan [on|off]`：参数为 `on` 或省略时进入 plan 模式（除 `off` 外的参数均进入），为 `off` 时退出。turn 正在运行时，切换会排队到下一个被接受的 in-turn pre-step；否则立即写入。plan 模式下模型可调用 `exit_plan_mode` 提交计划供用户审阅；批准后退出 plan 模式，拒绝则保持并向模型返回继续规划的工具结果。
+- `/plan [on|off|<message>]`：参数为 `on` 或省略时进入 plan 模式，为 `off` 时退出。turn 正在运行时，切换会排队到下一个被接受的 in-turn pre-step；否则立即写入。其他参数还会进入 plan 模式，并把去除首尾空白的消息作为 steer 注入会话（同 dsh 的 `agent.steer`）。plan 模式下模型可调用 `exit_plan_mode` 提交计划供用户审阅；批准后写入 dsh 的批准文案并退出 plan 模式，拒绝则保持并向模型返回继续规划的工具结果；宿主提供时该结果会带上审阅者反馈。
 - 自动压缩在 agent pre-step 阶段、测得 token 数达到阈值时运行；请求开始时的 provider context 溢出错误会触发一次压缩并重试一次。`/compact` 是手动入口。
 - 其余斜杠命令留给宿主处理。
 

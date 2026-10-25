@@ -19,8 +19,9 @@
 //! commands are never claimed. `/goal` is claimed through the wired goal seam;
 //! its `goal/change` events come from the goal domain and its lifecycle
 //! payloads are `recordInput:false`, so neither event carries `args`. `/plan`
-//! carries the user's verbatim args and returns its selection decision so the
-//! harness can queue a pre-step commit (`plan.zig`).
+//! carries the user's verbatim args, returns its selection decision so the
+//! harness can queue a pre-step commit (`plan.zig`), and returns the trimmed
+//! non-`off` input for the harness to steer as a user message.
 //!
 //! `/compact` delegates the transaction to an injected seam; the harness plugs
 //! in `compaction.zig`. When the seam reports no useful range, the command
@@ -69,7 +70,7 @@ pub const builtins = [_]Definition{
         .input_hint = "<text>",
         .record_input = false,
     },
-    .{ .name = "export", .description = "Download this Session log as a ZIP archive" },
+    .{ .name = "export", .description = "Export this Session log" },
     .{
         .name = "goal",
         .description = "Set or view the goal for a long-running task",
@@ -315,6 +316,9 @@ pub const Result = struct {
     /// immediate `plan/mode` event is already in `events`; a queued target
     /// carries `queue`.
     plan_decision: ?plan.Decision = null,
+    /// `/plan <message>` input the harness steers into the session as a user
+    /// message (dsh `agent.steer`).
+    steer: ?[]const u8 = null,
 
     pub fn deinit(self: *Result) void {
         self.arena.deinit();
@@ -338,6 +342,7 @@ const Settlement = struct {
     source_event_seq: ?u64 = null,
     domain: []const types.Event = &.{},
     plan: ?plan.Decision = null,
+    steer: ?[]const u8 = null,
 };
 
 fn assemble(allocator: Allocator, ctx: Context, definition: Definition, parsed: Parsed) !Result {
@@ -359,6 +364,7 @@ fn assemble(allocator: Allocator, ctx: Context, definition: Definition, parsed: 
         .kind = settlement.kind,
         .text = settlement.text,
         .plan_decision = settlement.plan,
+        .steer = settlement.steer,
     };
 }
 
@@ -383,11 +389,13 @@ fn executeGoal(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settl
     return .{ .kind = outcome.kind, .text = outcome.text, .domain = outcome.events };
 }
 
-/// `/plan [on|off]`: dsh treats only the exact word `off` as an exit; every
-/// other input (including `on` and a bare `/plan`) selects plan mode.
+/// `/plan [off|message]`: dsh treats only the exact word `off` as an exit;
+/// every other input (including `on` and a bare `/plan`) selects plan mode and
+/// steers the trimmed input into the session as a user message.
 fn executePlan(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settlement {
     const text = generated.plan_mode;
-    const target = !std.mem.eql(u8, std.mem.trim(u8, raw_input, whitespace), "off");
+    const message = std.mem.trim(u8, raw_input, whitespace);
+    const target = !std.mem.eql(u8, message, "off");
     const decision = plan.decide(ctx.plan, target);
     const settlement = if (target) switch (decision.outcome) {
         .committed, .cancelled => text.on_committed,
@@ -406,7 +414,13 @@ fn executePlan(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settl
         events[0] = try boolEvent(allocator, "plan/mode", "active", active);
         domain = events;
     }
-    return .{ .kind = .success, .text = settlement, .domain = domain, .plan = decision };
+    return .{
+        .kind = .success,
+        .text = settlement,
+        .domain = domain,
+        .plan = decision,
+        .steer = if (target and message.len != 0) try allocator.dupe(u8, message) else null,
+    };
 }
 
 fn executeCompact(allocator: Allocator, ctx: Context, raw_input: []const u8) !Settlement {
@@ -535,7 +549,9 @@ fn executeExport(raw_input: []const u8) Settlement {
     if (std.mem.trim(u8, raw_input, whitespace).len != 0) {
         return .{ .kind = .@"error", .text = "The Web /export command does not accept a path." };
     }
-    return .{ .kind = .success, .text = "Session log download requested." };
+    // dsh's Web host serves the ZIP itself; junclaw has no download route, so
+    // do not claim one was requested.
+    return .{ .kind = .@"error", .text = "Session log export is not available in this client." };
 }
 
 fn runEvent(allocator: Allocator, ctx: Context, definition: Definition, raw_input: []const u8) !types.Event {
@@ -996,14 +1012,16 @@ test "/feedback without an anonymous id omits that acknowledgement line" {
     try std.testing.expectEqualStrings("Feedback recorded for session session-2.", result.text);
 }
 
-test "/export requests a session-log download and records empty args" {
+test "/export records empty args without promising a download" {
     var result = try claimed("/export", .{ .command_id = "cmd-17" });
     defer result.deinit();
 
     try expectTypes(result.events, &.{ "command/run", "command/done" });
     try assertLifecycle(result.events);
     try std.testing.expectEqualStrings("", stringField(result.events[0], "args"));
-    try std.testing.expectEqualStrings("Session log download requested.", result.text);
+    try std.testing.expectEqual(Kind.@"error", result.kind);
+    try std.testing.expectEqualStrings("Session log export is not available in this client.", result.text);
+    try std.testing.expectEqualStrings("Export this Session log", findDefinition("export").?.description);
 }
 
 test "/export rejects a path without domain events" {
@@ -1122,6 +1140,27 @@ test "/plan on commits plan/mode in the command lifecycle" {
     try std.testing.expectEqual(true, eventBool(result.events[1], "active").?);
     try std.testing.expectEqual(plan.Outcome.committed, result.plan_decision.?.outcome);
     try std.testing.expectEqual(@as(?bool, true), result.plan_decision.?.emit);
+    // dsh parses only the exact word "off"; every other input, including
+    // "on", is also steered into the session as a user message.
+    try std.testing.expectEqualStrings("on", result.steer.?);
+}
+
+test "/plan <message> steers the trimmed message into the session" {
+    var result = try claimed("/plan   focus on the parser  ", .{
+        .command_id = "cmd-40",
+        .plan = .{ .active = false },
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(Kind.success, result.kind);
+    try std.testing.expectEqualStrings("focus on the parser", result.steer.?);
+
+    var bare = try claimed("/plan", .{
+        .command_id = "cmd-41",
+        .plan = .{ .active = false },
+    });
+    defer bare.deinit();
+    try std.testing.expect(bare.steer == null);
 }
 
 test "/plan off commits plan/mode=false" {
@@ -1134,6 +1173,7 @@ test "/plan off commits plan/mode=false" {
     try std.testing.expectEqualStrings(" off", stringField(result.events[0], "args"));
     try std.testing.expectEqual(false, eventBool(result.events[1], "active").?);
     try std.testing.expectEqual(plan.Outcome.committed, result.plan_decision.?.outcome);
+    try std.testing.expect(result.steer == null);
 }
 
 test "/plan queues a mode switch while a turn is open" {
@@ -1166,6 +1206,7 @@ test "/plan off is idempotent when plan mode is inactive" {
     try expectTypes(result.events, &.{ "command/run", "command/done" });
     try std.testing.expectEqualStrings(generated.plan_mode.off_already_inactive, result.text);
     try std.testing.expectEqual(plan.Outcome.noop, result.plan_decision.?.outcome);
+    try std.testing.expect(result.steer == null);
 }
 
 test "/plan cancels a queued entry when switched back during the turn" {
@@ -1203,6 +1244,8 @@ test "/plan accepts a 64 KiB message without leaking" {
 
     try expectTypes(result.events, &.{ "command/run", "plan/mode", "command/done" });
     try std.testing.expectEqual(size + 1, stringField(result.events[0], "args").len);
+    // `/plan ` leaves one leading space in `raw_input`; the steer is trimmed.
+    try std.testing.expectEqual(size, result.steer.?.len);
 }
 
 test "parseCommand preserves separator whitespace and enforces the name grammar" {

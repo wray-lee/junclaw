@@ -15,7 +15,7 @@
     },
     {
       "op": "command",
-      "text": "/plan on"
+      "text": "/plan"
     },
     {
       "op": "prompt",
