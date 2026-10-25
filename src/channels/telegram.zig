@@ -7493,6 +7493,47 @@ fn serveRichFallbackStub(ctx: *RichFallbackStubCtx) void {
     }
 }
 
+const PartialSendStubCtx = struct {
+    server: *std_compat.net.Server,
+    requests: usize = 0,
+};
+
+/// First `sendMessage` succeeds, every later one answers HTTP 500, so a
+/// multi-chunk reply fails after the first chunk was already delivered.
+fn servePartialSendStub(ctx: *PartialSendStubCtx) void {
+    var served: usize = 0;
+    while (served < 3) : (served += 1) {
+        var conn = ctx.server.accept() catch return;
+        defer conn.stream.close();
+
+        var buf: [4096]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const n = conn.stream.read(buf[filled..]) catch return;
+            if (n == 0) break;
+            filled += n;
+            if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+        }
+
+        ctx.requests += 1;
+        const first = ctx.requests == 1;
+        const status = if (first) "200 OK" else "500 Internal Server Error";
+        const body = if (first)
+            "{\"ok\":true,\"result\":{\"message_id\":1}}"
+        else
+            "{\"ok\":false,\"error_code\":500,\"description\":\"server error\"}";
+
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "HTTP/1.1 {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+            .{ status, body.len },
+        ) catch return;
+        conn.stream.writeAll(head) catch {};
+        conn.stream.writeAll(body) catch {};
+    }
+}
+
 // Regression: 超时后降级重发导致重复消息
 test "sendRichMessage timeout sends one request and does not fall back" {
     const allocator = std.testing.allocator;
@@ -7559,4 +7600,35 @@ test "connection failure still falls back to HTML and plain" {
 
     try std.testing.expectError(error.CurlConnectError, ch.sendMessage("12345", "hello"));
     try std.testing.expectEqual(@as(usize, 3), telegram_api.test_post_calls);
+}
+
+// Regression: 超时后降级重发导致重复消息
+test "partially sent reply is not returned for an upper-layer resend" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+
+    var ctx = PartialSendStubCtx{ .server = &server };
+    const thread = try std.Thread.spawn(.{}, servePartialSendStub, .{&ctx});
+
+    var base_buf: [64]u8 = undefined;
+    const api_base = try std.fmt.bufPrint(&base_buf, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+    ch.api_base = api_base; // rich_messages stays off: exercise the split path.
+
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failure = null;
+    defer telegram_api.test_post_calls = 0;
+
+    const result = ch.sendMessage("12345", "a" ** 5000);
+    thread.join();
+    // PartiallySent must not reach the dispatcher/outbox retry layers, which
+    // would repost the chunk that was already delivered.
+    try result;
+    try std.testing.expectEqual(@as(usize, 3), telegram_api.test_post_calls);
+    try std.testing.expectEqual(@as(usize, 3), ctx.requests);
 }
