@@ -241,6 +241,9 @@ pub const DshNativeHarness = struct {
     /// reports it after the partial stream so the kernel settles the partial
     /// assistant message (P3) instead of "request failed to start".
     stream_error: ?anyerror = null,
+    /// The provider error behind the current kernel failure, kept so the
+    /// user-facing copy can be classified like the native engine's.
+    last_provider_error: ?anyerror = null,
     /// True while `beginStreaming` relays the provider's chunks to the sink;
     /// `forwardDelta` must not replay the same kernel events.
     streamed_live: bool = false,
@@ -1111,6 +1114,15 @@ pub const DshNativeHarness = struct {
         }
         self.sink = input.sink;
         self.live_stream = input.live_stream;
+        self.last_provider_error = null;
+        // Native turns install this per turn so retry notices reach the live
+        // draft; the kernel calls the provider directly and would not see them.
+        const prev_retry_observer = providers.reliable.retryObserver();
+        providers.reliable.setRetryObserver(.{
+            .callback = forwardRetryProgress,
+            .ctx = @ptrCast(self),
+        });
+        defer providers.reliable.setRetryObserver(prev_retry_observer);
         self.drain = input.drain;
         self.drain_ctx = input.drain_ctx;
         self.interaction = input.interaction;
@@ -1205,12 +1217,29 @@ pub const DshNativeHarness = struct {
                 .legacy => "legacy",
             },
             .failure => |failure| {
-                result.@"error" = try self.allocator.dupe(u8, failure.message);
+                result.@"error" = try self.failureText(failure);
                 result.error_code = failure.code;
             },
             else => {},
         }
         return result;
+    }
+
+    /// The kernel reports a provider failure with a fixed internal message and
+    /// the Zig error name. Native users get `error_classify` copy; classify the
+    /// original provider error so dsh-native users do too instead of seeing
+    /// the internal label or an unsanitized upstream detail.
+    fn failureText(self: *Self, failure: types.Failure) ![]const u8 {
+        if (self.last_provider_error) |err| {
+            if (isProviderFailureMessage(failure.message) and
+                std.mem.eql(u8, failure.code, @errorName(err)))
+            {
+                var buf: [512]u8 = undefined;
+                const text = providers.error_classify.userErrorMessage(&buf, err, 0, true);
+                return self.allocator.dupe(u8, text);
+            }
+        }
+        return self.allocator.dupe(u8, failure.message);
     }
 
     fn mapEndReason(reason: types.EndReason) port.EndReason {
@@ -1369,14 +1398,42 @@ pub const DshNativeHarness = struct {
         return @ptrCast(@alignCast(context_ptr));
     }
 
+    /// Mirrors native's retry progress hook: one borrowed hint per retry, and
+    /// an attempt of 0 clears the host's retry indicator.
+    fn forwardRetryProgress(context_ptr: *anyopaque, notice: providers.reliable.RetryNotice) void {
+        const self = selfOf(context_ptr);
+        const sink = self.sink orelse return;
+        if (notice.attempt == 0) {
+            sink.send(.{ .progress = .{ .kind = .retry, .retry = null } });
+            return;
+        }
+        var buf: [40]u8 = undefined;
+        const text = std.fmt.bufPrint(&buf, "Retrying ({d}/{d})\u{2026}", .{
+            notice.attempt,
+            notice.max,
+        }) catch "Retrying\u{2026}";
+        sink.send(.{ .progress = .{
+            .kind = .retry,
+            .text = text,
+            .retry = .{ .attempt = notice.attempt, .max = notice.max },
+        } });
+    }
+
     fn hostEmit(context_ptr: *anyopaque, event: loop_mod.Event) anyerror!u64 {
         const self = selfOf(context_ptr);
         switch (event) {
             .turn_start => |payload| {
-                return self.appendPositional("turn/start", null, payload.turn, 0);
+                const seq = try self.appendPositional("turn/start", null, payload.turn, 0);
+                if (self.sink) |sink| sink.send(.{ .turn_start = .{ .turn = payload.turn } });
+                return seq;
             },
             .step_start => |position| {
-                return self.appendPositional("step/start", position, 0, 0);
+                const seq = try self.appendPositional("step/start", position, 0, 0);
+                if (self.sink) |sink| sink.send(.{ .step_start = .{
+                    .turn = position.turn,
+                    .step = position.step,
+                } });
+                return seq;
             },
             .system_message => |payload| return self.appendSystemMessage(payload.position, payload.message),
             .user_message => |payload| return self.appendUserMessage(payload.position, payload.message),
@@ -1392,6 +1449,10 @@ pub const DshNativeHarness = struct {
             .tool_result => |payload| return self.appendToolResult(payload.position, payload.result),
             .step_end => |position| {
                 const seq = try self.appendPositional("step/end", position, 0, 0);
+                if (self.sink) |sink| sink.send(.{ .step_end = .{
+                    .turn = position.turn,
+                    .step = position.step,
+                } });
                 // Pull a host steer here, not in `pre_step`: the kernel claims
                 // next-step input *before* calling `pre_step`, so a steer added
                 // there would only reach the step after next.
@@ -1402,7 +1463,9 @@ pub const DshNativeHarness = struct {
                 const arena = self.arena.allocator();
                 var data = try objectWithPosition(arena, null, payload.turn, 0);
                 try data.put(arena, "reason", try endReasonValue(arena, payload.reason));
-                return self.appendEvent("turn/end", .{ .object = data }, null, null);
+                const seq = try self.appendEvent("turn/end", .{ .object = data }, null, null);
+                if (self.sink) |sink| sink.send(.{ .turn_end = .{ .turn = payload.turn } });
+                return seq;
             },
         }
     }
@@ -1619,11 +1682,21 @@ pub const DshNativeHarness = struct {
             },
             .seq = seq,
         });
-        if (self.sink) |sink| sink.send(.{ .tool_call = .{
-            .call_id = call.id,
-            .name = call.name,
-            .arguments_json = call.arguments,
-        } });
+        if (self.sink) |sink| {
+            sink.send(.{ .tool_call = .{
+                .call_id = call.id,
+                .name = call.name,
+                .arguments_json = call.arguments,
+            } });
+            // Same hint native emits before running a tool. `text` is the tool
+            // name; the raw arguments stay in `arguments_json`, which the host
+            // only reads for a short safe summary.
+            sink.send(.{ .progress = .{
+                .text = call.name,
+                .arguments_json = call.arguments,
+                .phase = .start,
+            } });
+        }
         return seq;
     }
 
@@ -1661,12 +1734,19 @@ pub const DshNativeHarness = struct {
         const seqs = [1]u64{call.seq};
         const seq = try self.appendEvent("tool/result", .{ .object = data }, .append, &seqs);
         try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, message));
-        if (self.sink) |sink| sink.send(.{ .tool_result = .{
-            .call_id = call.call.id,
-            .name = call.call.name,
-            .output = try toolOutputText(arena, result),
-            .is_error = result.isError(),
-        } });
+        if (self.sink) |sink| {
+            sink.send(.{ .tool_result = .{
+                .call_id = call.call.id,
+                .name = call.call.name,
+                .output = try toolOutputText(arena, result),
+                .is_error = result.isError(),
+            } });
+            sink.send(.{ .progress = .{
+                .text = call.call.name,
+                .phase = .end,
+                .success = !result.isError(),
+            } });
+        }
         return seq;
     }
 
@@ -1903,7 +1983,10 @@ pub const DshNativeHarness = struct {
 
         if (self.streamingEnabled()) return self.beginStreaming(arena, chat);
 
-        var response = try self.opts.provider.chatWithTools(arena, chat);
+        var response = self.opts.provider.chatWithTools(arena, chat) catch |err| {
+            self.last_provider_error = err;
+            return err;
+        };
         defer freeResponseFields(arena, &response);
 
         self.turn_model_calls += 1;
@@ -2083,7 +2166,10 @@ pub const DshNativeHarness = struct {
             failed = err;
             break :blk providers.StreamChatResult{};
         };
-        if (relay.err) |err| return err;
+        if (relay.err) |err| {
+            self.last_provider_error = err;
+            return err;
+        }
         try relay.flush();
 
         if (failed) |err| {
@@ -2091,7 +2177,11 @@ pub const DshNativeHarness = struct {
             // settles the partial assistant message when its `next` raises
             // this error. A call that produced nothing keeps the blocking
             // path's "request failed to start" outcome.
-            if (!relay.saw_delta) return err;
+            if (!relay.saw_delta) {
+                self.last_provider_error = err;
+                return err;
+            }
+            self.last_provider_error = err;
             self.stream_error = err;
             return;
         }
@@ -2268,6 +2358,13 @@ pub const DshNativeHarness = struct {
         try out.appendSlice(self.allocator, "\n\n");
         try out.appendSlice(self.allocator, self.turn_text.items);
         return out.toOwnedSlice(self.allocator);
+    }
+
+    /// The two `failure.message` values loop.zig uses when the provider call
+    /// itself failed (as opposed to a tool or scheduling failure).
+    fn isProviderFailureMessage(message: []const u8) bool {
+        return std.mem.eql(u8, message, "provider request failed to start") or
+            std.mem.eql(u8, message, "assistant stream failed");
     }
 
     fn countToolCalls(content: []const types.ContentBlock) usize {

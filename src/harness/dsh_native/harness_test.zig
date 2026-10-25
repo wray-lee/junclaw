@@ -22,6 +22,7 @@ const SecurityPolicy = @import("../../security/policy.zig").SecurityPolicy;
 const generated = @import("generated/interaction.zig");
 const generated_system_prompt = @import("generated/system_prompt.zig");
 const tool_schemas = @import("generated/tool_schemas.zig");
+const tool_progress = @import("../../channels/tool_progress.zig");
 
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
@@ -54,8 +55,10 @@ const Reply = struct {
     /// Fire the `on_abort` seam (a `/stop`) after this many pieces, then stop
     /// the way a transport that sees the interrupt flag does.
     abort_after: ?usize = null,
-    /// Fail with `error.ScriptedFailure` after this many pieces.
+    /// Fail after this many pieces. `fail_error` lets a test pick the error
+    /// the transport reports; null keeps the generic scripted failure.
     fail_after: ?usize = null,
+    fail_error: ?anyerror = null,
 };
 
 const FakeProvider = struct {
@@ -173,7 +176,7 @@ const FakeProvider = struct {
                 self.saw_interrupt = true;
                 return error.Interrupted;
             }
-            if (reply.fail_after) |limit| if (index == limit) return error.ScriptedFailure;
+            if (reply.fail_after) |limit| if (index == limit) return reply.fail_error orelse error.ScriptedFailure;
             self.pieces_delivered = index + 1;
             // Borrowed for the callback only: poison and free it right after,
             // so a relay that keeps the slice reads 0xAA instead of the text.
@@ -281,12 +284,26 @@ const RecordingSink = struct {
     allocator: Allocator,
     provider: *FakeProvider,
     deltas: std.ArrayListUnmanaged(Delta) = .empty,
+    progress: std.ArrayListUnmanaged(Progress) = .empty,
+    timeline: std.ArrayListUnmanaged(Timeline) = .empty,
 
     const Delta = struct {
         text: []u8,
         is_final: bool,
         at_piece: usize,
     };
+
+    const Progress = struct {
+        text: []u8,
+        arguments_json: ?[]u8,
+        is_start: bool,
+        is_retry: bool,
+        success: bool,
+        attempt: u32,
+        max: u32,
+    };
+
+    const Timeline = enum { turn_start, turn_end, step_start, step_end };
 
     fn sink(self: *RecordingSink) port.Sink {
         return .{ .ctx = @ptrCast(self), .emit = emit };
@@ -300,6 +317,22 @@ const RecordingSink = struct {
                 .is_final = chunk.is_final,
                 .at_piece = self.provider.pieces_delivered,
             }) catch unreachable,
+            .progress => |hint| self.progress.append(self.allocator, .{
+                .text = self.allocator.dupe(u8, hint.text) catch unreachable,
+                .arguments_json = if (hint.arguments_json) |args|
+                    self.allocator.dupe(u8, args) catch unreachable
+                else
+                    null,
+                .is_start = hint.phase == .start,
+                .is_retry = hint.kind == .retry,
+                .success = hint.success,
+                .attempt = if (hint.retry) |retry| retry.attempt else 0,
+                .max = if (hint.retry) |retry| retry.max else 0,
+            }) catch unreachable,
+            .turn_start => self.timeline.append(self.allocator, .turn_start) catch unreachable,
+            .turn_end => self.timeline.append(self.allocator, .turn_end) catch unreachable,
+            .step_start => self.timeline.append(self.allocator, .step_start) catch unreachable,
+            .step_end => self.timeline.append(self.allocator, .step_end) catch unreachable,
             else => {},
         }
     }
@@ -307,11 +340,19 @@ const RecordingSink = struct {
     fn reset(self: *RecordingSink) void {
         for (self.deltas.items) |delta| self.allocator.free(delta.text);
         self.deltas.clearRetainingCapacity();
+        for (self.progress.items) |hint| {
+            self.allocator.free(hint.text);
+            if (hint.arguments_json) |args| self.allocator.free(args);
+        }
+        self.progress.clearRetainingCapacity();
+        self.timeline.clearRetainingCapacity();
     }
 
     fn deinit(self: *RecordingSink) void {
         self.reset();
         self.deltas.deinit(self.allocator);
+        self.progress.deinit(self.allocator);
+        self.timeline.deinit(self.allocator);
     }
 
     fn text(self: *RecordingSink, allocator: Allocator) ![]u8 {
@@ -4521,4 +4562,155 @@ test "dsh-native adapter: a streamed tool call runs and feeds its result back" {
     defer read.deinit();
     try testing.expectEqual(@as(usize, 1), eventCount(read.events, "tool/call"));
     try testing.expectEqual(@as(usize, 1), eventCount(read.events, "tool/result"));
+}
+
+test "dsh-native adapter: turn boundaries and tool progress reach the sink" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "read",
+            .arguments = "{\"file_path\":\"note.txt\",\"api_key\":\"test-key-SECRET\"}",
+        }} },
+        .{ .text = "the file says alpha" },
+    });
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("read note.txt");
+    input.sink = recorder.sink();
+
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("the file says alpha", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+
+    // Both step boundaries arrive, and the turn is bracketed exactly once.
+    try testing.expectEqual(RecordingSink.Timeline.turn_start, recorder.timeline.items[0]);
+    try testing.expectEqual(
+        RecordingSink.Timeline.turn_end,
+        recorder.timeline.items[recorder.timeline.items.len - 1],
+    );
+    var step_starts: usize = 0;
+    var step_ends: usize = 0;
+    var turn_starts: usize = 0;
+    var turn_ends: usize = 0;
+    for (recorder.timeline.items) |item| switch (item) {
+        .turn_start => turn_starts += 1,
+        .turn_end => turn_ends += 1,
+        .step_start => step_starts += 1,
+        .step_end => step_ends += 1,
+    };
+    try testing.expectEqual(@as(usize, 1), turn_starts);
+    try testing.expectEqual(@as(usize, 1), turn_ends);
+    try testing.expectEqual(@as(usize, 2), step_starts);
+    try testing.expectEqual(@as(usize, 2), step_ends);
+
+    // Native emits one start and one end hint per tool call.
+    try testing.expectEqual(@as(usize, 2), recorder.progress.items.len);
+    try testing.expectEqualStrings("read", recorder.progress.items[0].text);
+    try testing.expect(recorder.progress.items[0].is_start);
+    try testing.expect(!recorder.progress.items[0].is_retry);
+    try testing.expectEqualStrings("read", recorder.progress.items[1].text);
+    try testing.expect(!recorder.progress.items[1].is_start);
+    try testing.expect(recorder.progress.items[1].success);
+
+    // The hint carries the raw arguments for the host's safe summariser, but
+    // the rendered text is the tool name alone: arguments never leak into it.
+    const start_hint = recorder.progress.items[0];
+    try testing.expect(std.mem.indexOf(u8, start_hint.arguments_json.?, "test-key-SECRET") != null);
+    try testing.expect(std.mem.indexOf(u8, start_hint.text, "test-key-SECRET") == null);
+
+    var block = tool_progress.ToolProgress{};
+    defer block.deinit(allocator);
+    _ = try block.record(allocator, .{
+        .tool = start_hint.text,
+        .arguments_json = start_hint.arguments_json,
+    }, 0);
+    try testing.expectEqual(@as(usize, 1), block.lines.items.len);
+    try testing.expect(std.mem.indexOf(u8, block.lines.items[0].text, "test-key-SECRET") == null);
+}
+
+test "dsh-native adapter: provider retry notices reach the sink as progress" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "done" }});
+    defer fx.deinit();
+
+    const Hook = struct {
+        fn fire(_: *anyopaque) void {
+            const observer = providers.reliable.retryObserver() orelse return;
+            observer.callback(observer.ctx, .{ .attempt = 2, .max = 3 });
+            observer.callback(observer.ctx, .{ .attempt = 0, .max = 0 });
+        }
+    };
+    fx.provider.on_call = Hook.fire;
+    fx.provider.call_context = @ptrCast(&fx.provider);
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.sink = recorder.sink();
+
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    try testing.expectEqual(@as(usize, 2), recorder.progress.items.len);
+    try testing.expect(recorder.progress.items[0].is_retry);
+    try testing.expectEqual(@as(u32, 2), recorder.progress.items[0].attempt);
+    try testing.expectEqual(@as(u32, 3), recorder.progress.items[0].max);
+    try testing.expect(std.mem.indexOf(u8, recorder.progress.items[0].text, "Retrying (2/3)") != null);
+    try testing.expect(recorder.progress.items[1].is_retry);
+    try testing.expectEqual(@as(u32, 0), recorder.progress.items[1].attempt);
+    try testing.expectEqual(@as(usize, 0), recorder.progress.items[1].text.len);
+}
+
+test "dsh-native adapter: provider failure text is classified for the user" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .pieces = &.{ .{ .text = "partial" }, .{ .text = "never sent" } },
+        .fail_after = 1,
+        .fail_error = error.RateLimited,
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try engine.harness().runTurn(input);
+    defer if (result.@"error") |text| allocator.free(text);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.@"error", result.end_reason);
+    try testing.expectEqualStrings("RateLimited", result.error_code.?);
+    // Native users see the same error_classify copy; the kernel's internal
+    // label and the raw error name never reach the reply path.
+    try testing.expectEqualStrings(
+        "Rate limited by the provider. Wait a minute and try again.",
+        result.@"error".?,
+    );
+    try testing.expectEqual(@as(usize, 0), result.reply.len);
+
+    // The draft still saw the piece that arrived before the failure.
+    const draft = try recorder.text(allocator);
+    defer allocator.free(draft);
+    try testing.expectEqualStrings("partial", draft);
 }

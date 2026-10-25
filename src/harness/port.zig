@@ -45,8 +45,12 @@ pub const Event = union(enum) {
     usage: agent_mod.Agent.UsageRecord,
     /// A turn began. Emitted by engines that own their own loop (dsh-native).
     turn_start: struct { turn: u64 },
+    /// The turn ended; the host already has the reply and end reason.
+    turn_end: struct { turn: u64 },
     /// One model request started inside a turn.
     step_start: struct { turn: u64, step: u64 },
+    /// One model request ended.
+    step_end: struct { turn: u64, step: u64 },
     /// A complete assistant message (the non-delta form of `delta`). Borrowed.
     assistant_message: struct { text: []const u8 },
     /// A tool call the engine is about to run. Borrowed; arguments are
