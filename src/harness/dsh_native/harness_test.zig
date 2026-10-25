@@ -10,6 +10,7 @@ const compat = @import("compat");
 const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
+const http_util = @import("../../http_util.zig");
 const port = @import("../port.zig");
 const harness_mod = @import("harness.zig");
 const bridge = @import("tools/bridge.zig");
@@ -26,6 +27,13 @@ const Allocator = std.mem.Allocator;
 const testing = std.testing;
 const DshNativeHarness = harness_mod.DshNativeHarness;
 
+/// One scripted streaming chunk. Reasoning rides `<think>`/`</think>` text,
+/// the same convention the SSE parsers hand to the callback.
+const StreamPiece = struct {
+    text: []const u8,
+    final: bool = false,
+};
+
 /// One scripted model call.
 const Reply = struct {
     text: []const u8 = "",
@@ -41,6 +49,13 @@ const Reply = struct {
     overflow: bool = false,
     /// Provider-returned reasoning/thinking text.
     reasoning: ?[]const u8 = null,
+    /// Streaming script, replayed only when the adapter streams the call.
+    pieces: []const StreamPiece = &.{},
+    /// Fire the `on_abort` seam (a `/stop`) after this many pieces, then stop
+    /// the way a transport that sees the interrupt flag does.
+    abort_after: ?usize = null,
+    /// Fail with `error.ScriptedFailure` after this many pieces.
+    fail_after: ?usize = null,
 };
 
 const FakeProvider = struct {
@@ -56,6 +71,14 @@ const FakeProvider = struct {
     /// recorded, so a command can land mid-turn.
     on_call: ?*const fn (ctx: *anyopaque) void = null,
     call_context: ?*anyopaque = null,
+    /// False makes the adapter fall back to the blocking path.
+    streaming: bool = true,
+    /// Provider pieces delivered so far. The recording sink tags each delta
+    /// with it, so a delta with `at_piece < total` arrived mid-call.
+    pieces_delivered: usize = 0,
+    /// True when the provider observed the adapter's interrupt flag after the
+    /// scripted `/stop`.
+    saw_interrupt: bool = false,
 
     /// Owned copy of what the adapter sent, so assertions stay valid after
     /// the adapter's per-call arena is reset.
@@ -100,14 +123,87 @@ const FakeProvider = struct {
         .supportsNativeTools = supportsNativeTools,
         .getName = getName,
         .deinit = deinitFn,
+        .stream_chat = streamChat,
+        .supports_streaming = supportsStreaming,
+        .supports_streaming_native_tools = supportsStreamingTools,
+        .supports_streaming_native_tools_for_model = supportsStreamingToolsForModel,
     };
+
+    fn supportsStreaming(ptr: *anyopaque) bool {
+        const self: *FakeProvider = @ptrCast(@alignCast(ptr));
+        return self.streaming;
+    }
+
+    fn supportsStreamingTools(_: *anyopaque) bool {
+        return true;
+    }
+
+    fn supportsStreamingToolsForModel(_: *anyopaque, _: []const u8) bool {
+        return true;
+    }
+
+    fn streamChat(
+        ptr: *anyopaque,
+        allocator: Allocator,
+        request: providers.ChatRequest,
+        model: []const u8,
+        _: f64,
+        callback: providers.StreamCallback,
+        callback_ctx: *anyopaque,
+    ) anyerror!providers.StreamChatResult {
+        const self: *FakeProvider = @ptrCast(@alignCast(ptr));
+        try self.recordRequest(request);
+        if (self.next >= self.replies.len) return error.UnscriptedCall;
+        const reply = self.replies[self.next];
+        self.next += 1;
+        if (self.on_call) |hook| hook(self.call_context.?);
+
+        var content: std.ArrayListUnmanaged(u8) = .empty;
+        defer content.deinit(self.allocator);
+        for (reply.pieces, 0..) |piece, index| {
+            if (reply.abort_after) |limit| {
+                if (index == limit) {
+                    const hook = self.on_abort orelse return error.TestUnexpectedResult;
+                    hook(self.abort_context.?);
+                }
+            }
+            // A real transport polls the flag between deltas; if the adapter
+            // never raised it the stream would run to completion.
+            if (http_util.interruptRequested()) {
+                self.saw_interrupt = true;
+                return error.Interrupted;
+            }
+            if (reply.fail_after) |limit| if (index == limit) return error.ScriptedFailure;
+            self.pieces_delivered = index + 1;
+            // Borrowed for the callback only: poison and free it right after,
+            // so a relay that keeps the slice reads 0xAA instead of the text.
+            const borrowed = try self.allocator.dupe(u8, piece.text);
+            callback(callback_ctx, .{
+                .delta = borrowed,
+                .is_final = piece.final,
+                .token_count = @intCast((borrowed.len + 3) / 4),
+            });
+            @memset(borrowed, 0xAA);
+            self.allocator.free(borrowed);
+            if (!piece.final) try content.appendSlice(self.allocator, piece.text);
+        }
+        return .{
+            .content = try allocator.dupe(u8, content.items),
+            .tool_calls = reply.tool_calls,
+            .usage = .{
+                .prompt_tokens = reply.prompt_tokens,
+                .completion_tokens = reply.completion_tokens,
+                .total_tokens = reply.prompt_tokens + reply.completion_tokens,
+            },
+            .model = model,
+        };
+    }
 
     fn chatWithSystem(_: *anyopaque, allocator: Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
         return allocator.dupe(u8, "");
     }
 
-    fn chat(ptr: *anyopaque, allocator: Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
-        const self: *FakeProvider = @ptrCast(@alignCast(ptr));
+    fn recordRequest(self: *FakeProvider, request: providers.ChatRequest) !void {
         const contents = try self.allocator.alloc([]const u8, request.messages.len);
         const roles = try self.allocator.alloc(providers.Role, request.messages.len);
         for (request.messages, 0..) |message, index| {
@@ -124,6 +220,11 @@ const FakeProvider = struct {
                 null,
             .include_reasoning = request.include_reasoning,
         });
+    }
+
+    fn chat(ptr: *anyopaque, allocator: Allocator, request: providers.ChatRequest, _: []const u8, _: f64) anyerror!providers.ChatResponse {
+        const self: *FakeProvider = @ptrCast(@alignCast(ptr));
+        try self.recordRequest(request);
         if (self.next >= self.replies.len) return error.UnscriptedCall;
         const reply = self.replies[self.next];
         self.next += 1;
@@ -171,6 +272,54 @@ const FakeProvider = struct {
     }
 
     fn deinitFn(_: *anyopaque) void {}
+};
+
+/// Captures the live deltas a turn pushed, tagging each with the provider
+/// piece count at the moment it arrived (a delta seen before the call returns
+/// has `at_piece < pieces.len`).
+const RecordingSink = struct {
+    allocator: Allocator,
+    provider: *FakeProvider,
+    deltas: std.ArrayListUnmanaged(Delta) = .empty,
+
+    const Delta = struct {
+        text: []u8,
+        is_final: bool,
+        at_piece: usize,
+    };
+
+    fn sink(self: *RecordingSink) port.Sink {
+        return .{ .ctx = @ptrCast(self), .emit = emit };
+    }
+
+    fn emit(ctx: *anyopaque, event: port.Event) void {
+        const self: *RecordingSink = @ptrCast(@alignCast(ctx));
+        switch (event) {
+            .delta => |chunk| self.deltas.append(self.allocator, .{
+                .text = self.allocator.dupe(u8, chunk.delta) catch unreachable,
+                .is_final = chunk.is_final,
+                .at_piece = self.provider.pieces_delivered,
+            }) catch unreachable,
+            else => {},
+        }
+    }
+
+    fn reset(self: *RecordingSink) void {
+        for (self.deltas.items) |delta| self.allocator.free(delta.text);
+        self.deltas.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *RecordingSink) void {
+        self.reset();
+        self.deltas.deinit(self.allocator);
+    }
+
+    fn text(self: *RecordingSink, allocator: Allocator) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(allocator);
+        for (self.deltas.items) |delta| if (!delta.is_final) try out.appendSlice(allocator, delta.text);
+        return out.toOwnedSlice(allocator);
+    }
 };
 
 /// Wraps a child allocator (here the testing allocator) and fills every freed
@@ -510,6 +659,41 @@ fn eventCount(events: []const types.Event, event_type: []const u8) usize {
         if (std.mem.eql(u8, event.event_type, event_type)) count += 1;
     }
     return count;
+}
+
+/// Concatenated `block_type` text of the last `event_type` record; caller
+/// frees. Empty when the record has no such block.
+fn lastAssistantBlockText(
+    allocator: Allocator,
+    events: []const types.Event,
+    event_type: []const u8,
+    block_type: []const u8,
+) !?[]u8 {
+    var found: ?[]u8 = null;
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.event_type, event_type)) continue;
+        if (found) |old| allocator.free(old);
+        found = null;
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        const content = event.data.object.get("message").?.object.get("content").?.array.items;
+        for (content) |block| {
+            if (std.mem.eql(u8, block.object.get("type").?.string, block_type)) {
+                try out.appendSlice(allocator, block.object.get("text").?.string);
+            }
+        }
+        found = try out.toOwnedSlice(allocator);
+    }
+    return found;
+}
+
+/// `stream` records of the last assistant/message (borrowed from `events`).
+fn lastAssistantStream(events: []const types.Event) ?[]const std.json.Value {
+    var found: ?[]const std.json.Value = null;
+    for (events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "assistant/message")) continue;
+        found = event.data.object.get("stream").?.array.items;
+    }
+    return found;
 }
 
 fn toolResultText(event: types.Event) []const u8 {
@@ -3948,4 +4132,393 @@ test "dsh-native adapter: a 96KB tool output survives the log and a restore unde
     // The restored history replays the 64KB result to the model.
     try testing.expect(requestContains(fx.provider.requests.items[0], "TAIL-MARKER-0001"));
     try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: streaming relays deltas to the host and kernel as they arrive" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "visible answer",
+        .pieces = &.{
+            .{ .text = "<think>" },
+            .{ .text = "secret trace" },
+            .{ .text = "</think>" },
+            .{ .text = "vis" },
+            .{ .text = "ible answer" },
+        },
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("visible answer", result.reply);
+    try testing.expectEqualStrings("test-model", fx.provider.requests.items[0].model);
+    try testing.expectEqual(true, fx.provider.requests.items[0].include_reasoning.?);
+
+    // Native's convention: the draft gets the raw `<think>`-tagged chunks.
+    // The first delta arrived after the first provider piece, i.e. while the
+    // provider call was still running, not after it returned.
+    const draft = try recorder.text(allocator);
+    defer allocator.free(draft);
+    try testing.expectEqualStrings("<think>secret trace</think>visible answer", draft);
+    try testing.expectEqual(@as(usize, 1), recorder.deltas.items[0].at_piece);
+    try testing.expectEqual(@as(usize, 5), recorder.deltas.items.len);
+
+    // The kernel got chunk-granular deltas, reasoning in its own block.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const reasoning = try lastAssistantBlockText(allocator, read.events, "assistant/message", "reasoning");
+    defer if (reasoning) |text| allocator.free(text);
+    try testing.expectEqualStrings("secret trace", reasoning.?);
+    const visible = try lastAssistantBlockText(allocator, read.events, "assistant/message", "text");
+    defer if (visible) |text| allocator.free(text);
+    try testing.expectEqualStrings("visible answer", visible.?);
+    var text_runs: usize = 0;
+    var reasoning_runs: usize = 0;
+    for (lastAssistantStream(read.events).?) |record| {
+        const kind = record.object.get("type").?.string;
+        if (std.mem.eql(u8, kind, "text-chunks")) {
+            text_runs += 1;
+            // Two content chunks, not one synthetic block.
+            try testing.expectEqual(@as(usize, 2), record.object.get("texts").?.array.items.len);
+        } else if (std.mem.eql(u8, kind, "reasoning-chunks")) {
+            reasoning_runs += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), text_runs);
+    try testing.expectEqual(@as(usize, 1), reasoning_runs);
+}
+
+test "dsh-native adapter: streaming reasoning follows native reasoning_mode visibility" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "visible", .pieces = &.{.{ .text = "<think>secret trace</think>visible" }} },
+        .{ .text = "visible", .pieces = &.{.{ .text = "<think>secret trace</think>visible" }} },
+        .{ .text = "visible", .reasoning = "blocking trace" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("first");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    // `.on`: the reply carries native's post-turn Reasoning block, while the
+    // persisted reply (session store) stays clean.
+    engine.setCallConfig("test-model", null, .on);
+    const on_result = try h.runTurn(input);
+    defer allocator.free(on_result.reply);
+    try testing.expect(std.mem.startsWith(u8, on_result.reply, "Reasoning:\n> secret trace\n"));
+    try testing.expect(std.mem.endsWith(u8, on_result.reply, "visible"));
+    try testing.expectEqualStrings("visible", on_result.persisted_reply.?);
+
+    // `.off`: the provider's reasoning never reaches the draft or the kernel.
+    recorder.reset();
+    engine.setCallConfig("test-model", null, .off);
+    const off_result = try h.runTurn(input);
+    defer allocator.free(off_result.reply);
+    try testing.expectEqualStrings("visible", off_result.reply);
+    const draft = try recorder.text(allocator);
+    defer allocator.free(draft);
+    try testing.expectEqualStrings("visible", draft);
+    try testing.expectEqual(false, fx.provider.requests.items[1].include_reasoning.?);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const reasoning = try lastAssistantBlockText(allocator, read.events, "assistant/message", "reasoning");
+    defer if (reasoning) |text| allocator.free(text);
+    try testing.expectEqual(@as(usize, 0), reasoning.?.len);
+
+    // The blocking path composes the same `.on` block from the settlement.
+    engine.setCallConfig("test-model", null, .on);
+    fx.provider.streaming = false;
+    const blocking = try h.runTurn(turnInput("blocking"));
+    defer allocator.free(blocking.reply);
+    try testing.expect(std.mem.startsWith(u8, blocking.reply, "Reasoning:\n> blocking trace\n"));
+    try testing.expect(std.mem.endsWith(u8, blocking.reply, "visible"));
+    try testing.expectEqualStrings("visible", blocking.persisted_reply.?);
+}
+
+test "dsh-native adapter: the blocking fallback is unchanged" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "answer" },
+        .{ .text = "answer" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+
+    // A provider without streaming support keeps the synthetic single chunk.
+    fx.provider.streaming = false;
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+    const blocked = try h.runTurn(input);
+    defer allocator.free(blocked.reply);
+    try testing.expectEqualStrings("answer", blocked.reply);
+    try testing.expectEqual(@as(usize, 1), recorder.deltas.items.len);
+    try testing.expectEqualStrings("answer", recorder.deltas.items[0].text);
+    try testing.expectEqual(@as(usize, 0), fx.provider.pieces_delivered);
+
+    // Without a live draft a streaming provider is not streamed at all.
+    recorder.reset();
+    fx.provider.streaming = true;
+    input.live_stream = false;
+    const silent = try h.runTurn(input);
+    defer allocator.free(silent.reply);
+    try testing.expectEqualStrings("answer", silent.reply);
+    try testing.expectEqual(@as(usize, 0), recorder.deltas.items.len);
+    try testing.expectEqual(@as(usize, 0), fx.provider.pieces_delivered);
+}
+
+test "dsh-native adapter: /stop aborts an in-flight stream at the next chunk" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "never seen",
+        .pieces = &.{ .{ .text = "one" }, .{ .text = "two" }, .{ .text = "three" } },
+        .abort_after = 2,
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+
+    // Same seam as the blocking abort test: `/stop` reaches the engine while
+    // the provider call is in flight.
+    fx.provider.on_abort = struct {
+        fn hook(ctx: *anyopaque) void {
+            const target: *DshNativeHarness = @ptrCast(@alignCast(ctx));
+            target.harness().requestInterrupt();
+        }
+    }.hook;
+    fx.provider.abort_context = @ptrCast(&engine);
+
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("do work");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.aborted, result.end_reason);
+    try testing.expectEqualStrings("user", result.abort_cause.?);
+    // The transport saw the adapter's interrupt flag, so the request ended at
+    // chunk two instead of draining the third.
+    try testing.expect(fx.provider.saw_interrupt);
+    try testing.expectEqual(@as(usize, 2), fx.provider.pieces_delivered);
+    const draft = try recorder.text(allocator);
+    defer allocator.free(draft);
+    try testing.expectEqualStrings("onetwo", draft);
+
+    // The kernel aborted before consuming the pending deltas: it closes with
+    // its own contentless interrupted attempt, not the partial stream.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/message"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "assistant/attempt"));
+    const partial = try lastAssistantBlockText(allocator, read.events, "assistant/attempt", "text");
+    defer if (partial) |text| allocator.free(text);
+    try testing.expectEqual(@as(usize, 0), partial.?.len);
+}
+
+test "dsh-native adapter: a mid-stream failure settles the partial assistant message" {
+    // Regression: the provider error was returned from `providerBegin`, so the
+    // kernel treated the call as never started and dropped the deltas the host
+    // had already seen. The bridge reports it from `providerNext` after the
+    // relayed chunks, which is the P3 partial-attempt settlement.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "never seen",
+        .pieces = &.{ .{ .text = "part one " }, .{ .text = "part two" }, .{ .text = " never" } },
+        .fail_after = 2,
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    defer if (result.@"error") |text| allocator.free(text);
+    try testing.expectEqual(port.EndReason.@"error", result.end_reason);
+    try testing.expectEqualStrings("ScriptedFailure", result.error_code.?);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "assistant/attempt"));
+    const partial = try lastAssistantBlockText(allocator, read.events, "assistant/attempt", "text");
+    defer if (partial) |text| allocator.free(text);
+    try testing.expectEqualStrings("part one part two", partial.?);
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "assistant/message"));
+
+    // Counter-proof: the blocking provider fails before any output, so the
+    // kernel records no partial attempt for the same error.
+    var fx2 = try Fixture.init(allocator, &.{.{ .text = "", .fail = true }});
+    defer fx2.deinit();
+    var engine2 = try fx2.harness();
+    defer engine2.deinit(allocator);
+    const failed = try engine2.harness().runTurn(turnInput("hello"));
+    defer allocator.free(failed.reply);
+    defer if (failed.@"error") |text| allocator.free(text);
+    try testing.expectEqual(port.EndReason.@"error", failed.end_reason);
+    const path2 = try fx2.logPath(allocator, engine2.session_id);
+    defer allocator.free(path2);
+    var read2 = try session_log.readLog(allocator, path2);
+    defer read2.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read2.events, "assistant/attempt"));
+}
+
+test "dsh-native adapter: streaming usage matches the provider and estimates when absent" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "answer", .pieces = &.{.{ .text = "answer" }}, .prompt_tokens = 7, .completion_tokens = 3 },
+        .{ .text = "answer", .pieces = &.{.{ .text = "answer" }}, .prompt_tokens = 7, .completion_tokens = 0 },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("one");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const first = try h.runTurn(input);
+    defer allocator.free(first.reply);
+    try testing.expectEqual(@as(u64, 7 + 3), first.total_tokens);
+
+    // No provider completion count: the fixed-density estimate (4 chars per
+    // token) matches the non-streaming fallback. "answer" = 6 chars -> 2.
+    const second = try h.runTurn(input);
+    defer allocator.free(second.reply);
+    try testing.expectEqual(@as(u64, 10 + 7 + 2), second.total_tokens);
+}
+
+test "dsh-native adapter: streaming copies borrowed chunks (64 KiB poisoned buffers)" {
+    // The scripted provider poisons and frees its chunk buffer right after the
+    // callback returns; a relay that kept the slice would surface 0xAA bytes
+    // in the reply and the log. A poisoned fixture allocator also covers the
+    // arena resets around the call.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    const big = try testing.allocator.alloc(u8, 64 * 1024);
+    defer testing.allocator.free(big);
+    for (big, 0..) |*byte, index| byte.* = 'a' + @as(u8, @intCast(index % 26));
+
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "big",
+        .pieces = &.{.{ .text = big }},
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("hello");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings(big, result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const logged = try lastAssistantBlockText(allocator, read.events, "assistant/message", "text");
+    defer if (logged) |text| allocator.free(text);
+    try testing.expectEqualStrings(big, logged.?);
+    try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: a streamed tool call runs and feeds its result back" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{
+            .text = "",
+            .tool_calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"note.txt\"}" }},
+            .pieces = &.{ .{ .text = "checking " }, .{ .text = "the file" } },
+        },
+        .{ .text = "the file says alpha", .pieces = &.{.{ .text = "the file says alpha" }} },
+    });
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("read note.txt");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    // Interim text from the tool round is part of the reply (native merges it).
+    try testing.expectEqualStrings("checking the filethe file says alpha", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(u64, 2), result.turn_count);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "alpha"));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "tool/call"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "tool/result"));
 }
