@@ -6231,6 +6231,18 @@ test "slack chat.postMessage does not surface an indeterminate transport error" 
     try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
 }
 
+test "slack chat.postMessage does not resend on a gateway status" {
+    // Regression: a proxy 502/504 after forwarding chat.postMessage was
+    // reported as SlackApiError, so dispatch/outbox posted the reply twice.
+    for ([_]u16{ 502, 504 }) |status| {
+        var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+        ch.test_post_error = root.http_util.httpStatusError(status);
+
+        try ch.sendMessage("C123", "hello");
+        try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
+    }
+}
+
 test "slack interactive chat.postMessage does not surface an indeterminate transport error" {
     // Regression: a timed-out interactive post was retried with fresh buttons.
     var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
@@ -6250,6 +6262,29 @@ test "slack fallback final does not repost after an uncertain chat.update" {
     var ch = initStreamingChannel(true);
     defer ch.channel().stop();
     var probe = SlackSendFailureProbe{ .fail_update = true };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+
+    try ch.deliverFallbackFinal(
+        .{ .channel_id = "C_TEST", .thread_ts = "1700.1" },
+        "1700.2",
+        "hello",
+        &.{},
+        "C_TEST:1700.1",
+    );
+    try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
+    try std.testing.expectEqual(@as(usize, 2), probe.updates);
+}
+
+test "slack fallback final does not repost after a gateway chat.update" {
+    // Regression: a proxy 502/504 on chat.update can arrive after Slack applied
+    // the edit; reposting the reply would duplicate it.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{
+        .fail_update = true,
+        .update_error = root.http_util.httpStatusError(502),
+    };
     ch.test_api_ctx = &probe;
     ch.test_api_call = SlackSendFailureProbe.call;
 

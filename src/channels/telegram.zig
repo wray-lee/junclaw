@@ -7615,6 +7615,121 @@ test "telegram HTML send timeout sends one request and does not fall back to pla
     try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
 }
 
+// Regression: child.wait 失败后降级重发导致重复消息
+test "telegram HTML send CurlWaitError sends one request and does not fall back" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const failures = [_]?anyerror{error.CurlWaitError};
+    telegram_api.test_post_calls = 0;
+    telegram_api.test_post_failures = &failures;
+    defer {
+        telegram_api.test_post_failures = null;
+        telegram_api.test_post_calls = 0;
+    }
+
+    try ch.sendMessage("12345", "hello");
+    try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+}
+
+const GatewayStatusStubCtx = struct {
+    server: *std_compat.net.Server,
+    stop: *const std.atomic.Value(bool),
+    status_line: []const u8,
+    requests: usize = 0,
+};
+
+/// Answer every Bot API post with a gateway status. Three slots cover the
+/// unfixed rich -> HTML -> plain fallback chain so a regression cannot hang.
+fn serveGatewayStatusStub(ctx: *GatewayStatusStubCtx) void {
+    var served: usize = 0;
+    while (served < 3) {
+        var conn = stubAcceptConnection(ctx.server, ctx.stop) catch return;
+        defer conn.stream.close();
+
+        var buf: [16384]u8 = undefined;
+        _ = stubReadRequest(conn.stream, &buf) catch return;
+
+        ctx.requests += 1;
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(
+            &head_buf,
+            "{s}\r\nContent-Type: application/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            .{ctx.status_line},
+        ) catch return;
+        conn.stream.writeAll(head) catch {};
+        served += 1;
+    }
+}
+
+// Regression: 网关 502/504 后降级重发导致重复消息
+test "telegram gateway 502/504 on rich send sends one request" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    for ([_][]const u8{ "HTTP/1.1 502 Bad Gateway", "HTTP/1.1 504 Gateway Timeout" }) |status_line| {
+        const allocator = std.testing.allocator;
+        const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+        var server = try addr.listen(.{ .force_nonblocking = true });
+        defer server.deinit();
+
+        var stop = std.atomic.Value(bool).init(false);
+        var ctx = GatewayStatusStubCtx{
+            .server = &server,
+            .stop = &stop,
+            .status_line = status_line,
+        };
+        const thread = try std.Thread.spawn(.{}, serveGatewayStatusStub, .{&ctx});
+
+        const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
+        defer allocator.free(url);
+
+        var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+        ch.api_base = url;
+        ch.rich_messages_enabled = true;
+        telegram_api.test_post_calls = 0;
+        telegram_api.test_post_failure = null;
+        telegram_api.test_post_failures = null;
+        defer {
+            telegram_api.test_post_failure = null;
+            telegram_api.test_post_failures = null;
+            telegram_api.test_post_calls = 0;
+        }
+
+        try ch.sendMessage("12345", "hello");
+        stop.store(true, .release);
+        thread.join();
+
+        try std.testing.expectEqual(@as(usize, 1), ctx.requests);
+        try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
+    }
+}
+
+test "telegram definite transport and API errors still fall back to plain" {
+    const allocator = std.testing.allocator;
+    var ch = TelegramChannel.init(allocator, "test-key", &.{}, &.{}, "allowlist");
+
+    const definite = [_]anyerror{
+        error.CurlDnsError,
+        error.CurlConnectError,
+        error.CurlTlsError,
+        error.CurlPreSendError,
+        error.HttpStatusError,
+        error.TelegramApiError,
+    };
+    for (definite) |expected| {
+        const failures = [_]?anyerror{ expected, expected };
+        telegram_api.test_post_calls = 0;
+        telegram_api.test_post_failures = &failures;
+        defer {
+            telegram_api.test_post_failures = null;
+            telegram_api.test_post_calls = 0;
+        }
+
+        try std.testing.expectError(expected, ch.sendMessage("12345", "hello"));
+        try std.testing.expectEqual(@as(usize, 2), telegram_api.test_post_calls);
+    }
+}
+
 // Regression: 超时后降级重发导致重复消息
 test "telegram plain send timeout is not returned to the retry layers" {
     const allocator = std.testing.allocator;
