@@ -492,6 +492,8 @@ pub const SlackChannel = struct {
     /// Test seam: transport result for chat.postMessage sends (the network is
     /// never touched under `zig build test`).
     test_post_error: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
+    /// Test seam: raw response body for chat.postMessage sends.
+    test_post_response: if (builtin.is_test) ?[]const u8 else void = if (builtin.is_test) null else {},
     test_post_calls: if (builtin.is_test) u32 else void = if (builtin.is_test) 0 else {},
     ws_fd: std.atomic.Value(SocketFd) = std.atomic.Value(SocketFd).init(invalid_socket),
     bot_user_id: ?[]u8 = null,
@@ -2777,9 +2779,35 @@ pub const SlackChannel = struct {
         if (builtin.is_test) {
             self.test_post_calls += 1;
             if (self.test_post_error) |err| return err;
+            if (self.test_post_response) |resp| return self.allocator.dupe(u8, resp);
             return self.allocator.dupe(u8, "{\"ok\":true}");
         }
         return root.http_util.curlPost(self.allocator, url, body, headers);
+    }
+
+    /// Parse the response to a Slack request that has already completed. A
+    /// response we cannot read means Slack may still have applied the request,
+    /// so callers treat it as one best-effort delivery rather than returning
+    /// an error that dispatch/outbox would retry into a duplicate post. Local
+    /// allocation failures still propagate.
+    fn parseCompletedSlackResponse(
+        self: *SlackChannel,
+        resp: []const u8,
+        endpoint: []const u8,
+    ) !?std.json.Parsed(std.json.Value) {
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                log.warn("Slack {s} response unreadable ({s}); treating as one best-effort delivery", .{ endpoint, @errorName(err) });
+                return null;
+            },
+        };
+        if (parsed.value != .object) {
+            parsed.deinit();
+            log.warn("Slack {s} response was not a JSON object; treating as one best-effort delivery", .{endpoint});
+            return null;
+        }
+        return parsed;
     }
 
     /// Send a message to a Slack channel via chat.postMessage API.
@@ -2815,9 +2843,9 @@ pub const SlackChannel = struct {
             };
             defer self.allocator.free(resp);
 
-            const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+            const parsed_opt = try self.parseCompletedSlackResponse(resp, "chat.postMessage");
+            const parsed = parsed_opt orelse return;
             defer parsed.deinit();
-            if (parsed.value != .object) return error.SlackApiError;
             if (isSlackApiOk(parsed.value.object)) return;
             if (!first_used_markdown) {
                 try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
@@ -2845,9 +2873,9 @@ pub const SlackChannel = struct {
         };
         defer self.allocator.free(resp);
 
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        const parsed_opt = try self.parseCompletedSlackResponse(resp, "chat.postMessage");
+        const parsed = parsed_opt orelse return;
         defer parsed.deinit();
-        if (parsed.value != .object) return error.SlackApiError;
         try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
     }
 
@@ -2889,9 +2917,9 @@ pub const SlackChannel = struct {
         };
         defer self.allocator.free(resp);
 
-        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        const parsed_opt = try self.parseCompletedSlackResponse(resp, "chat.postMessage");
+        const parsed = parsed_opt orelse return;
         defer parsed.deinit();
-        if (parsed.value != .object) return error.SlackApiError;
         try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
 
         try self.registerPendingInteraction(token, target_channel, null, payload.choices);
@@ -6254,6 +6282,81 @@ test "slack interactive chat.postMessage does not surface an indeterminate trans
 
     try ch.sendRichPayload("C123", .{ .text = "pick", .choices = &choices });
     try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
+}
+
+test "slack chat.postMessage treats an unreadable response as one delivery" {
+    // Regression: 超时后降级重发导致重复消息 — the request completed but its
+    // response was unreadable; returning SlackApiError let dispatch/outbox
+    // retry and post the reply twice.
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+    ch.test_post_response = "{\"ok\":true";
+
+    try ch.sendMessage("C123", "hello");
+    try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
+}
+
+test "slack interactive chat.postMessage treats an unreadable response as one delivery" {
+    // Regression: 超时后降级重发导致重复消息 — an interactive post whose response
+    // was unreadable was retried with fresh buttons.
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+    ch.test_post_response = "{\"ok\":true";
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "a", .label = "A", .submit_text = "a" },
+        .{ .id = "b", .label = "B", .submit_text = "b" },
+    };
+
+    try ch.sendRichPayload("C123", .{ .text = "pick", .choices = &choices });
+    try std.testing.expectEqual(@as(u32, 1), ch.test_post_calls);
+}
+
+test "slack chat.postMessage still reports an explicit API rejection" {
+    // Positive control: only an unreadable response is final; an explicit
+    // ok:false rejection remains a retryable error.
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+    ch.test_post_response = "{\"ok\":false,\"error\":\"channel_not_found\"}";
+
+    try std.testing.expectError(error.SlackApiError, ch.sendMessage("C123", "hello"));
+}
+
+test "slack definite transport failures stay outside the uncertain set" {
+    // Positive control: failures that definitely never reached Slack must
+    // keep their retryable classification.
+    try std.testing.expect(!SlackChannel.isUncertainSlackDelivery(error.CurlConnectError));
+    try std.testing.expect(!SlackChannel.isUncertainSlackDelivery(error.CurlDnsError));
+}
+
+test "slack unreadable-response handling still propagates allocation failure" {
+    // A local allocation failure is not an unreadable response and must not be
+    // swallowed as a successful best-effort delivery.
+    var ch = SlackChannel.init(std.testing.allocator, "xoxb-test", null, "C123", &.{});
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    ch.allocator = failing.allocator();
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        ch.parseCompletedSlackResponse("{\"ok\":true}", "chat.postMessage"),
+    );
+}
+
+test "slack streaming final does not repost when an update response is unreadable" {
+    // A completed chat.update with an unreadable response maps to
+    // SlackApiError, which the streaming guard already treats as uncertain.
+    var ch = initStreamingChannel(true);
+    defer ch.channel().stop();
+    var probe = SlackSendFailureProbe{ .fail_update = true, .update_error = error.SlackApiError };
+    ch.test_api_ctx = &probe;
+    ch.test_api_call = SlackSendFailureProbe.call;
+
+    try ch.deliverFallbackFinal(
+        .{ .channel_id = "C_TEST", .thread_ts = "1700.1" },
+        "1700.2",
+        "hello",
+        &.{},
+        "C_TEST:1700.1",
+    );
+    try std.testing.expectEqual(@as(u32, 0), ch.test_post_calls);
+    try std.testing.expectEqual(@as(usize, 0), probe.posts);
+    try std.testing.expectEqual(@as(usize, 2), probe.updates);
 }
 
 test "slack fallback final does not repost after an uncertain chat.update" {
