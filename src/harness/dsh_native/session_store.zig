@@ -8,6 +8,7 @@
 //! `session.lock` in the session directory is the cross-process write lease.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const json = @import("json.zig");
@@ -27,6 +28,11 @@ pub fn sessionRootAlloc(allocator: Allocator, dsh_home: []const u8) ![]u8 {
 /// Encode one arbitrary string as a single safe path segment (dsh's
 /// `encodeSegment`). Empty input is refused; `.` and `..` are escaped.
 pub fn encodeSegmentAlloc(allocator: Allocator, raw: []const u8) ![]u8 {
+    return encodeSegmentFor(allocator, raw, builtin.os.tag == .windows);
+}
+
+/// `windows` is explicit so the Win32 naming rules stay testable on POSIX.
+fn encodeSegmentFor(allocator: Allocator, raw: []const u8, windows: bool) ![]u8 {
     if (raw.len == 0) return error.EmptySegment;
     if (std.mem.eql(u8, raw, ".")) return allocator.dupe(u8, "~002E");
     if (std.mem.eql(u8, raw, "..")) return allocator.dupe(u8, "~002E~002E");
@@ -41,7 +47,37 @@ pub fn encodeSegmentAlloc(allocator: Allocator, raw: []const u8) ![]u8 {
             try appendEscapedUnit(allocator, &out, unit);
         }
     }
+    if (windows) try escapeWindowsSegment(allocator, raw, &out);
     return out.toOwnedSlice(allocator);
+}
+
+/// Win32 strips a trailing dot (so `x.` collides with `x`) and reserves device
+/// names with any extension (`NUL.txt` is the NUL device). Escape through the
+/// existing `~XXXX` scheme so decoding still round-trips.
+fn escapeWindowsSegment(allocator: Allocator, raw: []const u8, out: *std.ArrayListUnmanaged(u8)) !void {
+    if (out.items.len > 0 and out.items[out.items.len - 1] == '.') {
+        out.items.len -= 1;
+        try out.appendSlice(allocator, "~002E");
+    }
+    const stem_end = std.mem.indexOfScalar(u8, raw, '.') orelse raw.len;
+    const stem = std.mem.trimEnd(u8, raw[0..stem_end], " ");
+    if (!isReservedDeviceName(stem) or out.items.len == 0) return;
+    var buffer: [5]u8 = undefined;
+    const escaped = std.fmt.bufPrint(&buffer, "~{X:0>4}", .{out.items[0]}) catch unreachable;
+    try out.insertSlice(allocator, 0, escaped);
+    _ = out.orderedRemove(escaped.len);
+}
+
+fn isReservedDeviceName(name: []const u8) bool {
+    const devices = [_][]const u8{
+        "con",  "prn",  "aux",  "nul",  "com1", "com2", "com3", "com4", "com5",
+        "com6", "com7", "com8", "com9", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5",
+        "lpt6", "lpt7", "lpt8", "lpt9",
+    };
+    for (devices) |device| {
+        if (std.ascii.eqlIgnoreCase(name, device)) return true;
+    }
+    return false;
 }
 
 /// Human-navigable project directory key (dsh's `projectKey`): separators and
@@ -169,6 +205,27 @@ test "encodeSegment mirrors dsh path escaping" {
     const astral = try encodeSegmentAlloc(allocator, "😀");
     defer allocator.free(astral);
     try std.testing.expectEqualStrings("~D83D~DE00", astral);
+}
+
+test "encodeSegment escapes Windows device names and trailing dots" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { raw: []const u8, posix: []const u8, windows: []const u8 }{
+        .{ .raw = "con", .posix = "con", .windows = "~0063on" },
+        .{ .raw = "CON.txt", .posix = "CON.txt", .windows = "~0043ON.txt" },
+        .{ .raw = "nul.", .posix = "nul.", .windows = "~006Eul~002E" },
+        .{ .raw = "Lpt9.log", .posix = "Lpt9.log", .windows = "~004Cpt9.log" },
+        .{ .raw = "plain.", .posix = "plain.", .windows = "plain~002E" },
+        .{ .raw = "com10", .posix = "com10", .windows = "com10" },
+        .{ .raw = "sess-1.a_b", .posix = "sess-1.a_b", .windows = "sess-1.a_b" },
+    };
+    for (cases) |case| {
+        const posix = try encodeSegmentFor(allocator, case.raw, false);
+        defer allocator.free(posix);
+        try std.testing.expectEqualStrings(case.posix, posix);
+        const windows = try encodeSegmentFor(allocator, case.raw, true);
+        defer allocator.free(windows);
+        try std.testing.expectEqualStrings(case.windows, windows);
+    }
 }
 
 test "projectKey mirrors dsh directory naming" {

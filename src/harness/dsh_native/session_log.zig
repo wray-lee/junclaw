@@ -50,7 +50,20 @@ pub const Log = struct {
     lock_file: compat.fs.File,
     header: types.Header,
     next_seq: u64,
+    /// Byte length of the last committed record; a failed append rewinds here.
+    end_pos: u64 = 0,
+    /// Set after a write failure: the tail is untrusted, so later appends
+    /// refuse instead of gluing a record onto a partial line.
+    broken: bool = false,
+    /// Test-only short-write injection: fail the first append of `event_type`
+    /// after writing `cut` bytes. Production leaves this null.
+    fault: ?Fault = null,
     path: []const u8,
+
+    pub const Fault = struct {
+        event_type: []const u8,
+        cut: usize,
+    };
 
     /// Create a new log, refusing an existing artifact or a held lock.
     pub fn create(allocator: Allocator, path: []const u8, header: types.Header) !Log {
@@ -75,6 +88,7 @@ pub const Log = struct {
         defer allocator.free(line);
         try file.writeAll(line);
         try file.sync();
+        const end_pos: u64 = @intCast(line.len);
 
         // Regression: copy before moving the arena into the result; allocating
         // after the move left the new buffer node out of the returned arena (leak).
@@ -86,6 +100,7 @@ pub const Log = struct {
             .lock_file = lock_file,
             .header = header_copy,
             .next_seq = 0,
+            .end_pos = end_pos,
             .path = path_copy,
         };
     }
@@ -110,6 +125,7 @@ pub const Log = struct {
         const file = try fs_compat.openPath(path_copy, .{ .mode = .read_write });
         errdefer file.close();
         try file.seekFromEnd(0);
+        const end_pos = (try file.stat()).size;
 
         const header_copy = try copyHeader(arena_allocator, result.header);
         return .{
@@ -119,6 +135,7 @@ pub const Log = struct {
             .lock_file = lock_file,
             .header = header_copy,
             .next_seq = @intCast(result.events.len),
+            .end_pos = end_pos,
             .path = path_copy,
         };
     }
@@ -126,6 +143,7 @@ pub const Log = struct {
     /// Append one event, fsync it, and return its sequence number.
     pub fn append(self: *Log, event_type: []const u8, data: std.json.Value, opts: AppendOptions) !u64 {
         if (!isKnownEventType(event_type) and !opts.ignorable) return error.UnsupportedEventType;
+        if (self.broken) return error.LogBroken;
         const event = types.Event{
             .event_type = event_type,
             .seq = self.next_seq,
@@ -139,10 +157,36 @@ pub const Log = struct {
 
         const line = try json.eventLineAlloc(self.allocator, event);
         defer self.allocator.free(line);
-        try self.file.writeAll(line);
-        try self.file.sync();
+        const start = self.end_pos;
+        self.writeLine(event_type, line) catch |err| {
+            // Regression: a short write left a partial JSON line; the next
+            // append glued a full record onto it and made the log unreadable.
+            self.rollback(start) catch {};
+            self.broken = true;
+            return err;
+        };
+        self.end_pos = start + line.len;
         self.next_seq += 1;
         return event.seq;
+    }
+
+    fn writeLine(self: *Log, event_type: []const u8, line: []const u8) !void {
+        if (self.fault) |fault| {
+            if (std.mem.eql(u8, fault.event_type, event_type)) {
+                try self.file.writeAll(line[0..@min(fault.cut, line.len)]);
+                return error.SimulatedShortWrite;
+            }
+        }
+        try self.file.writeAll(line);
+        try self.file.sync();
+    }
+
+    /// Rewind a failed write so no partial record survives. A failure here
+    /// leaves bytes in place, so the caller latches `broken`.
+    fn rollback(self: *Log, length: u64) !void {
+        try self.file.toInner().setLength(compat.io(), length);
+        try self.file.seekTo(length);
+        try self.file.sync();
     }
 
     pub fn close(self: *Log) void {

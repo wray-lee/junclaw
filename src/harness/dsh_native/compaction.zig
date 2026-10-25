@@ -164,9 +164,11 @@ pub const Trigger = enum {
 
 /// Durable compaction lock state (`region.ts:301-334,566-600`).
 ///
-/// dsh never auto-closes a torn transaction. On load an unmatched
-/// `compaction/start` keeps the lock active (new attempts fail `busy`) unless a
-/// later `session/end-seed` proves it belongs to an earlier lifecycle. The
+/// dsh never auto-closes a torn transaction: an unmatched `compaction/start`
+/// keeps the lock active (new attempts fail `busy`) unless a later
+/// `session/end-seed` proves it belongs to an earlier lifecycle. junclaw adds
+/// one recovery: `deadWriterEnd` closes such a start while the exclusive
+/// session lock proves the old writer is gone. The
 /// successful path (see `snapshots/session/compaction-recovery/session.v4.jsonl`)
 /// is always start -> summary -> replacement user/message -> end, adjacent.
 pub const LockState = struct {
@@ -197,6 +199,38 @@ pub fn scanLock(events: []const types.Event) LockState {
         if (seed > marker.seq) return .{};
     }
     return .{ .locked_start_seq = marker.seq };
+}
+
+/// Synthetic `compaction/end` for a transaction whose writer died before
+/// closing it. Only call this while holding the session's exclusive write
+/// lock: that lease proves no live writer can still append the real end.
+/// Returns null when the last marker is already closed. The payload mirrors
+/// `compactionEdgeData`; a legacy start row without ids still closes because
+/// `scanLock` keys on event types alone.
+pub fn deadWriterEnd(allocator: Allocator, events: []const types.Event) !?types.Event {
+    const start_seq = scanLock(events).locked_start_seq orelse return null;
+    const start = for (events) |event| {
+        if (event.seq == start_seq and std.mem.eql(u8, event.event_type, "compaction/start")) break event;
+    } else return null;
+
+    var data: std.json.ObjectMap = .empty;
+    switch (start.data) {
+        .object => |object| {
+            if (object.get("compactionId")) |id| switch (id) {
+                .string => |text| try data.put(allocator, "compactionId", .{ .string = try allocator.dupe(u8, text) }),
+                else => {},
+            };
+            if (object.get("turn")) |turn| try data.put(allocator, "turn", turn);
+        },
+        else => {},
+    }
+    if (data.get("turn") == null) try data.put(allocator, "turn", .{ .null = {} });
+    return .{
+        .event_type = "compaction/end",
+        .seq = events[events.len - 1].seq + 1,
+        .time_ms = start.time_ms,
+        .data = .{ .object = data },
+    };
 }
 
 pub fn assertInactive(lock: LockState) !void {

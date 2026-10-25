@@ -57,6 +57,9 @@ pub fn openTurnClosers(allocator: Allocator, events: []const types.Event) ![]typ
     for (events) |event| {
         _ = scratch.reset(.retain_capacity);
         if (std.mem.eql(u8, event.event_type, "turn/start")) {
+            // Regression: a second start without a turn/end was silently
+            // accepted and dropped the first turn's pending calls.
+            if (open_turn != null) return error.InvalidEvent;
             pending.clearRetainingCapacity();
             open_step = null;
             open_turn = try numberField(event.data, "turn");
@@ -65,11 +68,19 @@ pub fn openTurnClosers(allocator: Allocator, events: []const types.Event) ![]typ
             open_step = null;
             open_turn = null;
         } else if (std.mem.eql(u8, event.event_type, "step/start")) {
+            // Regression: a step outside a turn never closed on resume.
+            if (open_turn == null) return error.InvalidEvent;
             open_step = try numberField(event.data, "step");
         } else if (std.mem.eql(u8, event.event_type, "step/end")) {
             pending.clearRetainingCapacity();
             open_step = null;
         } else if (std.mem.eql(u8, event.event_type, "assistant/message")) {
+            // Regression: repair read a compaction replacement's tool calls as
+            // unanswered and resumed with fake ToolNotStartedError results.
+            if (event.surface_op) |op| switch (op) {
+                .append => {},
+                .replace => continue,
+            };
             const message = try surface.messageFromEvent(scratch.allocator(), event);
             const turn = (try numberField(event.data, "turn")) orelse 0;
             const step = (try numberField(event.data, "step")) orelse 0;
@@ -346,6 +357,46 @@ test "unanswered calls get cause-tagged error results in assistant order" {
     try testing.expectEqual(@as(u64, 6), closers[2].seq);
     try testing.expectEqualStrings("turn/end", closers[3].event_type);
     try testing.expectEqual(@as(u64, 7), closers[3].seq);
+}
+
+test "a replaced assistant message contributes no pending calls" {
+    // Regression: repair treated a compaction replacement's tool call as an
+    // unanswered call and answered it with a fake ToolNotStartedError result.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const events = try parseEvents(arena.allocator(),
+        \\{"type":"turn/start","seq":0,"time":10,"data":{"turn":1}}
+        \\{"type":"step/start","seq":1,"time":11,"data":{"turn":1,"step":1}}
+        \\{"type":"assistant/message","seq":2,"time":12,"data":{"turn":1,"step":1,"message":{"id":"a1","role":"assistant","source":{"kind":"model","provider":"p","model":"m"},"content":[{"type":"tool-call","id":"call-1","name":"read","arguments":"{}"}]}}}
+    );
+    events[2].surface_op = .{ .replace = .{ .start_seq = 0, .end_seq = 1 } };
+    const closers = try openTurnClosers(arena.allocator(), events);
+    try testing.expectEqual(@as(usize, 2), closers.len);
+    try testing.expectEqualStrings("step/end", closers[0].event_type);
+    try testing.expectEqualStrings("turn/end", closers[1].event_type);
+}
+
+test "a step outside a turn is rejected instead of accepted" {
+    // Regression: step/start without turn/start restored silently and the step
+    // never closed.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const events = try parseEvents(arena.allocator(),
+        \\{"type":"step/start","seq":0,"time":10,"data":{"turn":1,"step":1}}
+    );
+    try testing.expectError(error.InvalidEvent, openTurnClosers(arena.allocator(), events));
+}
+
+test "a second turn/start without a turn/end is rejected" {
+    // Regression: the duplicate start silently discarded the first turn's
+    // pending calls.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const events = try parseEvents(arena.allocator(),
+        \\{"type":"turn/start","seq":0,"time":10,"data":{"turn":1}}
+        \\{"type":"turn/start","seq":1,"time":11,"data":{"turn":2}}
+    );
+    try testing.expectError(error.InvalidEvent, openTurnClosers(arena.allocator(), events));
 }
 
 test "a recorded result settles its call; step end discards the rest" {

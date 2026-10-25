@@ -479,7 +479,9 @@ pub const DshNativeHarness = struct {
     /// policy). Runtime context is a per-step `user/message`, never mixed in:
     /// dsh re-renders it on every pre-step (design B15/B16).
     fn buildPrompt(self: *Self) !void {
-        _ = self.prompt_arena.reset(.retain_capacity);
+        // free_all, not retain_capacity: a retained buffer kept stale prompt
+        // bytes readable and hid dangling slices from PoisonAllocator.
+        _ = self.prompt_arena.reset(.free_all);
         self.prompt_generation += 1;
         const perm = self.prompt_arena.allocator();
         const plan_active = self.planActive();
@@ -696,6 +698,17 @@ pub const DshNativeHarness = struct {
         if (read.header.is_seeded and !hasEndSeedMarker(read.events) and seedableCount(seed) != 0) {
             const resumed = try self.appendSeedFrom(seed, seededMessageCount(read.events));
             events = try concatEvents(arena, read.events, resumed);
+        }
+        // Regression: a crash between `compaction/start` and `compaction/end`
+        // left the durable lock active, so every later compaction failed with
+        // CompactionLocked while the context kept growing. The exclusive session
+        // lock acquired above proves the old writer is gone, so close the dead
+        // transaction here. dsh keeps it busy instead; junclaw-only recovery.
+        if (try compaction_mod.deadWriterEnd(arena, events)) |end_event| {
+            const log = if (self.log) |*value| value else return error.NoSession;
+            const seq = try log.append(end_event.event_type, end_event.data, .{ .time_ms = end_event.time_ms });
+            if (seq != end_event.seq) return error.RepairSequenceMismatch;
+            events = try concatEvents(arena, events, &.{end_event});
         }
         // dsh crash repair: a writer killed inside a turn left no `turn/end`
         // (and possibly an assistant tool call with no result). Append the
@@ -1920,7 +1933,7 @@ pub const DshNativeHarness = struct {
         // (clearRetainingCapacity would keep a dangling capacity).
         self.pending = .empty;
         self.pending_index = 0;
-        _ = self.call_arena.reset(.retain_capacity);
+        _ = self.call_arena.reset(.free_all);
     }
 
     fn freeResponseFields(allocator: Allocator, response: *providers.ChatResponse) void {

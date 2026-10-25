@@ -182,6 +182,11 @@ pub const PoisonAllocator = struct {
     /// Releases that passed through the poison hook; tests assert this to
     /// prove an arena reset really poisoned its bytes.
     free_calls: usize = 0,
+    /// Optional test probe: the free hook sets `probe_released` when the
+    /// released buffer contains this slice, proving an arena reset let go of
+    /// the allocation behind it.
+    probe: ?[]const u8 = null,
+    probe_released: bool = false,
 
     pub fn allocator(self: *PoisonAllocator) Allocator {
         return .{ .ptr = self, .vtable = &vtable };
@@ -211,6 +216,11 @@ pub const PoisonAllocator = struct {
 
     fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
+        if (self.probe) |probe| {
+            const start = @intFromPtr(memory.ptr);
+            const address = @intFromPtr(probe.ptr);
+            if (address >= start and address < start + memory.len) self.probe_released = true;
+        }
         @memset(memory, 0xAA);
         self.free_calls += 1;
         self.child.rawFree(memory, alignment, ret_addr);
@@ -1036,6 +1046,35 @@ test "dsh-native adapter: goal complete waits for the wrap-up reply" {
     try testing.expectEqual(@as(usize, 1), wrapups);
     // The wrap-up reply closed the last kernel turn normally, not by a hard stop.
     try testing.expectEqualStrings("completed", last_turn_end.?);
+}
+
+test "dsh-native adapter: a failed goal append rewinds and aborts the turn" {
+    // Regression: a short write left a partial goal/change line; the goal tool
+    // reported an ordinary failure, the loop kept appending, and the glued
+    // record made the session unreadable on the next restore.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":4}" }} },
+        .{ .text = "unused" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{} });
+    engine.log.?.fault = .{ .event_type = "goal/change", .cut = 7 };
+
+    try testing.expectError(error.LogBroken, engine.harness().runTurn(turnInput("ship the goal")));
+
+    // The partial row was rewound: the log is still a clean record stream.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expect(read.torn_truncate_to == null);
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "goal/change"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "tool/result"));
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "tool/call"));
 }
 
 test "dsh-native adapter: goal blocked waits for the wrap-up reply" {
@@ -2488,7 +2527,14 @@ test "dsh-native adapter: plan state survives a poisoned restore and reset" {
         lastSystemContent(fx.provider.requests.items[3]),
         generated_system_prompt.plan_policy_text,
     ));
-    try testing.expect(poison.free_calls > 0);
+    // The prompt arena must release the buffer behind the old prompt on every
+    // rebuild. With reset(.retain_capacity) that buffer stayed allocated and a
+    // dangling system_prompt still read the old policy text, so this test was
+    // green either way; probe the exact range the rebuild must release.
+    poison.probe = engine.system_prompt;
+    _ = (try h.handleLocalCommand("/plan on")).?;
+    try testing.expect(poison.probe_released);
+    try testing.expect(contains(engine.system_prompt, generated_system_prompt.plan_policy_text));
 }
 
 test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
@@ -3430,8 +3476,8 @@ test "dsh-native adapter: an assistant event torn inside its content array leave
 
 test "dsh-native adapter: a compaction replacement torn mid-write keeps the pre-compaction surface" {
     // Crash injection inside the checkpoint replacement `writeAll`: the torn
-    // user/message never joins the surface. The durable compaction/start stays
-    // an open transaction, so the lock must still read as active.
+    // user/message never joins the surface. Restore closes the dead compaction
+    // transaction, so a later compaction is no longer refused.
     var poison = PoisonAllocator{ .child = testing.allocator };
     const allocator = poison.allocator();
     var fx = try Fixture.init(allocator, &.{.{ .text = "after replacement crash" }});
@@ -3476,8 +3522,9 @@ test "dsh-native adapter: a compaction replacement torn mid-write keeps the pre-
     var read = try session_log.readLog(allocator, path);
     defer read.deinit();
     try testing.expect(read.torn_truncate_to == null);
-    try testing.expectEqual(@as(usize, 8), read.events.len);
-    try testing.expectEqual(@as(u64, 6), engine.compaction_lock.locked_start_seq.?);
+    try testing.expectEqual(@as(usize, 9), read.events.len);
+    try testing.expectEqualStrings("compaction/end", read.events[8].event_type);
+    try testing.expect(engine.compaction_lock.locked_start_seq == null);
     // The replacement never landed: the pre-compaction exchange is the surface.
     try testing.expectEqual(@as(usize, 2), engine.messages.items.len);
 
@@ -3491,8 +3538,8 @@ test "dsh-native adapter: a compaction replacement torn mid-write keeps the pre-
 
 test "dsh-native adapter: a compaction end torn mid-write keeps the durable replacement" {
     // Crash injection between the replacement and compaction/end: the
-    // replacement was fsynced, so it stays on the surface, and the unmatched
-    // start keeps the compaction lock active for the next attempt to refuse.
+    // replacement was fsynced, so it stays on the surface; restore appends the
+    // missing end, so the next attempt is no longer refused.
     var poison = PoisonAllocator{ .child = testing.allocator };
     const allocator = poison.allocator();
     var fx = try Fixture.init(allocator, &.{.{ .text = "after end crash" }});
@@ -3538,9 +3585,10 @@ test "dsh-native adapter: a compaction end torn mid-write keeps the durable repl
     var read = try session_log.readLog(allocator, path);
     defer read.deinit();
     try testing.expect(read.torn_truncate_to == null);
-    try testing.expectEqual(@as(usize, 9), read.events.len);
+    try testing.expectEqual(@as(usize, 10), read.events.len);
     try testing.expectEqualStrings("user/message", read.events[8].event_type);
-    try testing.expectEqual(@as(u64, 6), engine.compaction_lock.locked_start_seq.?);
+    try testing.expectEqualStrings("compaction/end", read.events[9].event_type);
+    try testing.expect(engine.compaction_lock.locked_start_seq == null);
     try testing.expectEqual(@as(usize, 1), engine.messages.items.len);
 
     const next = try engine.harness().runTurn(turnInput("after crash"));
@@ -3549,6 +3597,63 @@ test "dsh-native adapter: a compaction end torn mid-write keeps the durable repl
     try testing.expect(requestContains(fx.provider.requests.items[0], "summary replacement"));
     try testing.expect(!requestContains(fx.provider.requests.items[0], "original answer"));
     try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: resume twice closes one dead compaction and the next compaction runs" {
+    // Regression: a leftover compaction/start kept the durable lock active, so
+    // every /compact after resume answered "unavailable" and the context grew
+    // without bound.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "condensed again" }});
+    defer fx.deinit();
+
+    const id = "crash-compaction-resume";
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 9_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 9_001 });
+        const long_text = try allocator.alloc(u8, 2_000);
+        defer allocator.free(long_text);
+        @memset(long_text, 'q');
+        const user_json = try std.fmt.allocPrint(allocator, "{{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"source\":{{\"kind\":\"user\"}}}}", .{long_text});
+        defer allocator.free(user_json);
+        _ = try appendTestEvent(allocator, &log, "user/message", user_json, .{
+            .time_ms = 9_002,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "assistant/message", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"assistant-1\",\"role\":\"assistant\",\"source\":{\"kind\":\"model\",\"provider\":\"scripted\",\"model\":\"test-model\"},\"content\":[{\"type\":\"text\",\"text\":\"original answer\"}]}}", .{
+            .time_ms = 9_003,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "step/end", "{\"turn\":1,\"step\":1}", .{ .time_ms = 9_004 });
+        _ = try appendTestEvent(allocator, &log, "turn/end", "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}", .{ .time_ms = 9_005 });
+        _ = try appendTestEvent(allocator, &log, "compaction/start", "{\"compactionId\":\"compaction-dead\",\"turn\":1}", .{ .time_ms = 9_006 });
+    }
+
+    {
+        var first = try fx.harness();
+        defer first.deinit(allocator);
+        try first.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+        try testing.expect(first.compaction_lock.locked_start_seq == null);
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+    try testing.expect(engine.compaction_lock.locked_start_seq == null);
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    // One recovery end, not one per resume.
+    try testing.expectEqual(@as(usize, 1), eventCount(read.events, "compaction/end"));
+    try testing.expectEqualStrings("compaction/end", read.events[read.events.len - 1].event_type);
+
+    const settlement = (try engine.harness().handleLocalCommand("/compact")) orelse return error.CommandNotClaimed;
+    try testing.expect(std.mem.indexOf(u8, settlement, "Compacted ") != null);
+    try testing.expect(std.mem.indexOf(u8, settlement, "unavailable") == null);
 }
 
 test "dsh-native adapter: a dead writer's leftover lock file does not block resume" {
