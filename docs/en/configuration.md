@@ -1314,6 +1314,8 @@ Parameters:
 - `reaction_emojis` (default: `eyes`, `hourglass_flowing_sand`, `white_check_mark`, `x`) - Per-state overrides for `accepted`, `running`, `done`, `failed`. Slack takes short names, not the emoji themselves; an empty string clears the reaction for that state
 - `slash_command` (default: disabled) - Single-command Slack integration: register one slash command and handle its text like a normal message. See below
 
+An outbound Slack request whose outcome is unknown (a request timeout, a broken/partial response, or an unreadable response after the request completed) counts as one best-effort attempt: nullclaw does not resend it in another format, retry it through the outbox/dispatch layers, or post the reply again from a streaming fallback, because Slack may already have accepted it. Definite pre-send failures (DNS, connect, TLS) and API-level rejections still fall back or retry.
+
 #### Slack media
 
 Replies can attach files with the same markers the Telegram channel uses:

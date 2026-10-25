@@ -1117,6 +1117,8 @@ Slack 示例：
 - `streaming`（默认 `false`）——在回复仍在生成时就展示，见下文
 - `long_reply_file_threshold_chunks`（默认 `9`）——最终回复所需分片超过该值时，只发送可读的首片，并把完整回复作为 `reply.md` 上传到同一线程/DM。`0` 表示禁用上传。见下文
 
+结果不确定的出站 Slack 请求（请求超时、响应中断/不完整，或请求完成后响应无法解析）只算一次尽力投递：nullclaw 不会换一种格式重发、不会让 outbox/dispatch 层重试，也不会在流式降级路径中再发一遍完整回复，因为 Slack 可能已经接受了该请求。确定发生在发送前的失败（DNS、连接、TLS）和 API 层明确拒绝仍会降级或重试。
+
 #### Slack 媒体
 
 回复可以用与 Telegram 相同的附件标记：`[IMAGE:/abs/path.png]`、`[FILE:/abs/path.pdf]`（也支持 `DOCUMENT`、`VIDEO`、`AUDIO`、`VOICE`）。nullclaw 依次调用 `files.getUploadURLExternal`、上传文件、`files.completeUploadExternal`，把文件发到同一频道/线程，并从文本中移除标记。仅接受本地路径；单个文件上限 20 MB。与 Telegram 不同，Slack 需要 nullclaw 自己读取文件，因此标记中的 `http(s)` URL 会被拒绝，不会在服务端抓取。需要交付文件、报告或文档时，用 `[FILE:/abs/path]` 发送附件，不要把文件内容粘贴到消息里。

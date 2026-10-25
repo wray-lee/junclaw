@@ -19,3 +19,8 @@
   with an indeterminate transport error (for example a request timeout): such
   a failure counts as one best-effort attempt and is not re-sent in another
   format or retried by the outbox/dispatch layers.
+- Slack no longer posts a reply twice when a send or streaming update fails
+  with an indeterminate transport error (for example a request timeout or a
+  broken/partial response): such a failure counts as one best-effort attempt
+  and is not re-sent in another format, retried by the outbox/dispatch layers,
+  or posted again by a streaming fallback.
