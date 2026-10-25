@@ -72,6 +72,14 @@ const FakeProvider = struct {
     }
 
     fn deinit(self: *FakeProvider) void {
+        self.clearRequests();
+        self.requests.deinit(self.allocator);
+    }
+
+    /// Drops recorded requests and their list capacity. The soak test calls
+    /// this per turn so the test's own recording is not the memory growth it
+    /// measures.
+    fn clearRequests(self: *FakeProvider) void {
         for (self.requests.items) |request| {
             for (request.contents) |content| self.allocator.free(content);
             self.allocator.free(request.contents);
@@ -79,7 +87,7 @@ const FakeProvider = struct {
             self.allocator.free(request.model);
             if (request.reasoning_effort) |effort| self.allocator.free(effort);
         }
-        self.requests.deinit(self.allocator);
+        self.requests.clearAndFree(self.allocator);
     }
 
     fn provider(self: *FakeProvider) providers.Provider {
@@ -205,6 +213,57 @@ pub const PoisonAllocator = struct {
         const self: *PoisonAllocator = @ptrCast(@alignCast(ctx));
         @memset(memory, 0xAA);
         self.free_calls += 1;
+        self.child.rawFree(memory, alignment, ret_addr);
+    }
+};
+
+/// Wraps a child allocator and tracks outstanding bytes/blocks. The soak test
+/// uses it to assert retention grows linearly with the log instead of with
+/// turn count, so a per-turn leak fails on every host without a clock.
+pub const CountingAllocator = struct {
+    child: Allocator,
+    live_bytes: usize = 0,
+    live_allocs: usize = 0,
+
+    pub fn allocator(self: *CountingAllocator) Allocator {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable = Allocator.VTable{
+        .alloc = alloc,
+        .resize = resize,
+        .remap = remap,
+        .free = free,
+    };
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawAlloc(len, alignment, ret_addr);
+        if (result != null) {
+            self.live_bytes += len;
+            self.live_allocs += 1;
+        }
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        self.live_bytes = self.live_bytes - memory.len + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.child.rawRemap(memory, alignment, new_len, ret_addr);
+        if (result != null) self.live_bytes = self.live_bytes - memory.len + new_len;
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *CountingAllocator = @ptrCast(@alignCast(ctx));
+        self.live_bytes -= memory.len;
+        self.live_allocs -= 1;
         self.child.rawFree(memory, alignment, ret_addr);
     }
 };
@@ -837,8 +896,11 @@ test "dsh-native adapter: steer enters the kernel inbox at a step boundary" {
 test "dsh-native adapter: a 64KB+ prompt round-trips without leaking" {
     // Regression: an adapter that borrows the host's input across turns keeps
     // the caller's buffer alive; testing.allocator fails the test if anything
-    // allocated here is not freed.
-    const allocator = testing.allocator;
+    // allocated here is not freed. PoisonAllocator also covers the
+    // `self.arena` release/replace path in `reset`/`restore`: any read of a
+    // freed session-arena byte sees 0xAA instead of a still-mapped page.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
     var fx = try Fixture.init(allocator, &.{.{ .text = "big ok" }});
     defer fx.deinit();
 
@@ -874,6 +936,7 @@ test "dsh-native adapter: a 64KB+ prompt round-trips without leaking" {
     // leak checker must still see every byte of that temporary returned.
     h.reset();
     try h.restore(.{ .messages = &.{} });
+    try testing.expect(poison.free_calls > 0);
 }
 
 test "dsh-native adapter: session paths are built with the native separator" {
@@ -2537,7 +2600,6 @@ test "dsh-native adapter: bash creates dsh_home/spill before spawning" {
     // createTempFile failed and every bash call returned a tool error instead
     // of running the command.
     const builtin = @import("builtin");
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const allocator = testing.allocator;
     var fx = try Fixture.init(allocator, &.{
         .{ .tool_calls = &.{.{
@@ -2551,6 +2613,13 @@ test "dsh-native adapter: bash creates dsh_home/spill before spawning" {
 
     var engine = try fx.harness();
     defer engine.deinit(allocator);
+    // Creating the session's tools is platform-neutral, so the regression is
+    // asserted before the Windows skip: the Windows bash tool reports
+    // UNSUPPORTED_PLATFORM, but buildTools must still have made the directory.
+    const spill = try std.fs.path.join(allocator, &.{ fx.dsh_home, "spill" });
+    defer allocator.free(spill);
+    try fs_compat.accessPath(spill, .{});
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const result = try engine.harness().runTurn(turnInput("probe"));
     defer allocator.free(result.reply);
     try testing.expectEqualStrings("done", result.reply);
@@ -2567,9 +2636,6 @@ test "dsh-native adapter: bash creates dsh_home/spill before spawning" {
         saw_result = true;
     }
     try testing.expect(saw_result);
-    const spill = try std.fs.path.join(allocator, &.{ fx.dsh_home, "spill" });
-    defer allocator.free(spill);
-    try fs_compat.accessPath(spill, .{});
 }
 
 test "dsh-native adapter: read-only autonomy denies dsh tool calls" {
@@ -2891,6 +2957,19 @@ fn eventText(event: types.Event) ![]const u8 {
     return event.data.object.get("message").?.object.get("content").?.array.items[0].object.get("text").?.string;
 }
 
+fn testLogLength(path: []const u8) !u64 {
+    return (try fs_compat.statPath(path)).size;
+}
+
+/// Cut the file at a byte offset, the way a process killed inside one
+/// `writeAll` leaves it. Deterministic: no timer and no second process.
+fn truncateTestLog(path: []const u8, length: u64) !void {
+    const file = try fs_compat.openPath(path, .{ .mode = .read_write });
+    defer file.close();
+    try file.toInner().setLength(compat.io(), length);
+    try file.sync();
+}
+
 test "dsh-native adapter: restore closes a half-written turn" {
     // Regression: a process killed between turn/start and turn/end left an
     // unbalanced log. Restore folded it as-is, so the next turn opened inside
@@ -3107,6 +3186,332 @@ test "dsh-native adapter: a corrupt line fails closed and native fallback starts
     try testing.expectEqualStrings("fresh answer", next.reply);
 }
 
+test "dsh-native adapter: a tool result torn mid-write is repaired on resume" {
+    // Crash injection: the writer dies inside the tool/result `writeAll`, so
+    // the file ends half a line in. Open must drop the torn tail and repair
+    // must answer the recorded call; folding the dangling call instead would
+    // replay a half-finished tool round to the model.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after crash" }});
+    defer fx.deinit();
+
+    const id = "crash-torn-tool-result";
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var cut: u64 = 0;
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 4_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 4_001 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"run it\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 4_002,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "assistant/message", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"assistant-1-1\",\"role\":\"assistant\",\"source\":{\"kind\":\"model\",\"provider\":\"scripted\",\"model\":\"test-model\"},\"content\":[{\"type\":\"tool-call\",\"id\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\"}]}}", .{
+            .time_ms = 4_003,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "tool/call", "{\"turn\":1,\"step\":1,\"callId\":\"call-1\",\"name\":\"read\",\"arguments\":\"{}\"}", .{ .time_ms = 4_004 });
+        const before = try testLogLength(path);
+        _ = try appendTestEvent(allocator, &log, "tool/result", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"tool-1\",\"role\":\"tool\",\"content\":[{\"type\":\"text\",\"text\":\"half-written output\"}],\"source\":{\"kind\":\"tool\",\"callId\":\"call-1\"},\"toolCallId\":\"call-1\"},\"callId\":\"call-1\"}", .{
+            .time_ms = 4_005,
+            .surface_op = .append,
+            .source_event_seqs = &.{4},
+        });
+        const after = try testLogLength(path);
+        cut = before + (after - before) / 2;
+    }
+    try truncateTestLog(path, cut);
+    try testing.expectEqual(cut, try testLogLength(path));
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expect(read.torn_truncate_to == null);
+    // Five complete rows, then the repaired result, step/end and turn/end.
+    try testing.expectEqual(@as(usize, 8), read.events.len);
+    const repaired = read.events[5];
+    try testing.expectEqualStrings("tool/result", repaired.event_type);
+    try testing.expectEqualStrings("ToolOutcomeUnknownError", repaired.data.object.get("error").?.object.get("name").?.string);
+    try testing.expectEqual(@as(usize, 1), repaired.source_event_seqs.?.len);
+    try testing.expectEqual(@as(u64, 4), repaired.source_event_seqs.?[0]);
+    try testing.expectEqualStrings("step/end", read.events[6].event_type);
+    try testing.expectEqualStrings("turn/end", read.events[7].event_type);
+    try testing.expectEqualStrings("interrupted", read.events[7].data.object.get("reason").?.object.get("kind").?.string);
+
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("after crash", next.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "Its outcome is unknown"));
+    try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: an assistant event torn inside its content array leaves no partial turn" {
+    // Crash injection inside an event that carries arrays: the truncated line
+    // is never interpreted, so the model must not see a partial assistant
+    // message or the tool call it announced.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after array crash" }});
+    defer fx.deinit();
+
+    const id = "crash-torn-assistant-array";
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var cut: u64 = 0;
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 5_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 5_001 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"show the array\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 5_002,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "assistant/message", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"assistant-1-1\",\"role\":\"assistant\",\"source\":{\"kind\":\"model\",\"provider\":\"scripted\",\"model\":\"test-model\"},\"content\":[{\"type\":\"tool-call\",\"id\":\"call-torn\",\"name\":\"read\",\"arguments\":\"{}\"}]},\"stream\":[]}", .{
+            .time_ms = 5_003,
+            .surface_op = .append,
+        });
+        // Cut 15 bytes into the assistant's content array, so the torn write
+        // really stops inside an array rather than at an arbitrary offset.
+        const full = try readLogText(allocator, path);
+        defer allocator.free(full);
+        const content_at = std.mem.lastIndexOf(u8, full, "\"content\":[") orelse return error.MissingContentArray;
+        cut = @intCast(content_at + 15);
+        try testing.expect(cut < full.len);
+    }
+    try truncateTestLog(path, cut);
+    const raw = try readLogText(allocator, path);
+    defer allocator.free(raw);
+    try testing.expect(raw.len > 0 and raw[raw.len - 1] != '\n');
+    const line_start = (std.mem.lastIndexOfScalar(u8, raw, '\n') orelse 0) + 1;
+    try testing.expect(std.mem.indexOf(u8, raw[line_start..], "\"content\":[") != null);
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expect(read.torn_truncate_to == null);
+    try testing.expectEqual(@as(usize, 5), read.events.len);
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "assistant/message"));
+    try testing.expectEqualStrings("step/end", read.events[3].event_type);
+    try testing.expectEqualStrings("turn/end", read.events[4].event_type);
+    try testing.expectEqual(@as(usize, 1), engine.messages.items.len);
+    try testing.expectEqual(types.MessageRole.user, engine.messages.items[0].role);
+
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("after array crash", next.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "show the array"));
+    try testing.expect(!requestContains(fx.provider.requests.items[0], "call-torn"));
+    try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: a compaction replacement torn mid-write keeps the pre-compaction surface" {
+    // Crash injection inside the checkpoint replacement `writeAll`: the torn
+    // user/message never joins the surface. The durable compaction/start stays
+    // an open transaction, so the lock must still read as active.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after replacement crash" }});
+    defer fx.deinit();
+
+    const id = "crash-torn-replacement";
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var cut: u64 = 0;
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 6_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 6_001 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"original question\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 6_002,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "assistant/message", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"assistant-1\",\"role\":\"assistant\",\"source\":{\"kind\":\"model\",\"provider\":\"scripted\",\"model\":\"test-model\"},\"content\":[{\"type\":\"text\",\"text\":\"original answer\"}]}}", .{
+            .time_ms = 6_003,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "step/end", "{\"turn\":1,\"step\":1}", .{ .time_ms = 6_004 });
+        _ = try appendTestEvent(allocator, &log, "turn/end", "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}", .{ .time_ms = 6_005 });
+        _ = try appendTestEvent(allocator, &log, "compaction/start", "{}", .{ .time_ms = 6_006 });
+        _ = try appendTestEvent(allocator, &log, "compaction/summary", "{}", .{ .time_ms = 6_007 });
+        const before = try testLogLength(path);
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"summary-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"summary replacement\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 6_008,
+            .surface_op = .{ .replace = .{ .start_seq = 2, .end_seq = 3 } },
+            .source_event_seqs = &.{ 0, 1, 2, 3 },
+        });
+        const after = try testLogLength(path);
+        cut = before + (after - before) / 2;
+    }
+    try truncateTestLog(path, cut);
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expect(read.torn_truncate_to == null);
+    try testing.expectEqual(@as(usize, 8), read.events.len);
+    try testing.expectEqual(@as(u64, 6), engine.compaction_lock.locked_start_seq.?);
+    // The replacement never landed: the pre-compaction exchange is the surface.
+    try testing.expectEqual(@as(usize, 2), engine.messages.items.len);
+
+    const next = try engine.harness().runTurn(turnInput("after crash"));
+    defer allocator.free(next.reply);
+    try testing.expectEqualStrings("after replacement crash", next.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "original question"));
+    try testing.expect(!requestContains(fx.provider.requests.items[0], "summary replacement"));
+    try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: a compaction end torn mid-write keeps the durable replacement" {
+    // Crash injection between the replacement and compaction/end: the
+    // replacement was fsynced, so it stays on the surface, and the unmatched
+    // start keeps the compaction lock active for the next attempt to refuse.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after end crash" }});
+    defer fx.deinit();
+
+    const id = "crash-torn-compaction-end";
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var cut: u64 = 0;
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 7_000 });
+        _ = try appendTestEvent(allocator, &log, "step/start", "{\"turn\":1,\"step\":1}", .{ .time_ms = 7_001 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"user-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"original question\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 7_002,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "assistant/message", "{\"turn\":1,\"step\":1,\"message\":{\"id\":\"assistant-1\",\"role\":\"assistant\",\"source\":{\"kind\":\"model\",\"provider\":\"scripted\",\"model\":\"test-model\"},\"content\":[{\"type\":\"text\",\"text\":\"original answer\"}]}}", .{
+            .time_ms = 7_003,
+            .surface_op = .append,
+        });
+        _ = try appendTestEvent(allocator, &log, "step/end", "{\"turn\":1,\"step\":1}", .{ .time_ms = 7_004 });
+        _ = try appendTestEvent(allocator, &log, "turn/end", "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}", .{ .time_ms = 7_005 });
+        _ = try appendTestEvent(allocator, &log, "compaction/start", "{}", .{ .time_ms = 7_006 });
+        _ = try appendTestEvent(allocator, &log, "compaction/summary", "{}", .{ .time_ms = 7_007 });
+        _ = try appendTestEvent(allocator, &log, "user/message", "{\"id\":\"summary-1\",\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"summary replacement\"}],\"source\":{\"kind\":\"user\"}}", .{
+            .time_ms = 7_008,
+            .surface_op = .{ .replace = .{ .start_seq = 2, .end_seq = 3 } },
+            .source_event_seqs = &.{ 0, 1, 2, 3 },
+        });
+        const before = try testLogLength(path);
+        _ = try appendTestEvent(allocator, &log, "compaction/end", "{}", .{ .time_ms = 7_009 });
+        const after = try testLogLength(path);
+        cut = before + (after - before) / 2;
+    }
+    try truncateTestLog(path, cut);
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expect(read.torn_truncate_to == null);
+    try testing.expectEqual(@as(usize, 9), read.events.len);
+    try testing.expectEqualStrings("user/message", read.events[8].event_type);
+    try testing.expectEqual(@as(u64, 6), engine.compaction_lock.locked_start_seq.?);
+    try testing.expectEqual(@as(usize, 1), engine.messages.items.len);
+
+    const next = try engine.harness().runTurn(turnInput("after crash"));
+    defer allocator.free(next.reply);
+    try testing.expectEqualStrings("after end crash", next.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "summary replacement"));
+    try testing.expect(!requestContains(fx.provider.requests.items[0], "original answer"));
+    try testing.expect(poison.free_calls > 0);
+}
+
+test "dsh-native adapter: a dead writer's leftover lock file does not block resume" {
+    // A killed writer leaves session.lock on disk; only the kernel lease dies
+    // with it. Resume must take the lease, while a live writer keeps refusing.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "after lock" }});
+    defer fx.deinit();
+
+    const id = "lock-residue";
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        defer log.close();
+        _ = try appendTestEvent(allocator, &log, "turn/start", "{\"turn\":1}", .{ .time_ms = 8_000 });
+        _ = try appendTestEvent(allocator, &log, "turn/end", "{\"turn\":1,\"reason\":{\"kind\":\"completed\"}}", .{ .time_ms = 8_001 });
+    }
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    const lock_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(path).?, "session.lock" });
+    defer allocator.free(lock_path);
+    try fs_compat.accessPath(lock_path, .{});
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+
+    var second = try fx.harness();
+    defer second.deinit(allocator);
+    try testing.expectError(error.SessionLocked, second.harness().restore(.{ .messages = &.{}, .dsh_session_id = id }));
+
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("after lock", next.reply);
+}
+
+test "dsh-native adapter: a half-written header fails closed and native fallback starts fresh" {
+    // Crash injection during session creation: the first write never finished,
+    // so there is no newline-terminated header. Fail-closed keeps the file
+    // byte-identical; the explicit native policy starts a different session.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "fresh after header" }});
+    defer fx.deinit();
+
+    const id = "torn-header";
+    {
+        var log = try createTestLog(allocator, &fx, id);
+        log.close();
+    }
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    try truncateTestLog(path, 20);
+    const before = try readLogText(allocator, path);
+    defer allocator.free(before);
+
+    {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        try testing.expectError(error.CorruptLog, engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id }));
+    }
+    const after = try readLogText(allocator, path);
+    defer allocator.free(after);
+    try testing.expectEqualStrings(before, after);
+
+    var options = fx.options();
+    options.on_corrupt = .native;
+    var engine = try DshNativeHarness.init(allocator, options);
+    defer engine.deinit(allocator);
+    try engine.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+    try testing.expect(!std.mem.eql(u8, engine.session_id, id));
+    const next = try engine.harness().runTurn(turnInput("continue"));
+    defer allocator.free(next.reply);
+    try testing.expectEqualStrings("fresh after header", next.reply);
+}
+
 test "dsh-native adapter: a provider failure appends a closing assistant message" {
     // Regression: a 5xx/timeout ended the turn with the user row (and any tool
     // results) as the surface tail. The next request then replayed a
@@ -3150,4 +3555,181 @@ test "dsh-native adapter: a provider failure appends a closing assistant message
     try testing.expectEqual(port.EndReason.completed, second.end_reason);
     try testing.expectEqualStrings("recovered", second.reply);
     try testing.expect(requestContains(fx.provider.requests.items[1], "[No assistant reply was produced for this turn.]"));
+}
+
+// ── soak / allocation hardening (P3-E) ──────────────────────────────────────
+
+test "dsh-native adapter: 300 turns keep events, tokens and retained memory linear" {
+    // Deterministic soak: no clock and no sleeps. Every turn is one model call
+    // with fixed usage, so cumulative tokens must stay exactly 15/turn, the
+    // event counts must stay proportional, and retained memory must stay
+    // bounded by the JSONL size instead of by turn count.
+    const turns: usize = 300;
+    var counter = CountingAllocator{ .child = testing.allocator };
+    const allocator = counter.allocator();
+    const replies = try allocator.alloc(Reply, turns + 1);
+    defer allocator.free(replies);
+    for (replies[0..turns]) |*reply| reply.* = .{ .text = "soak ok" };
+    replies[turns] = .{ .text = "restored soak ok" };
+
+    var fx = try Fixture.init(allocator, replies);
+    defer fx.deinit();
+    const fixture_bytes = counter.live_bytes;
+
+    var engine = try fx.harness();
+    const baseline_allocs = counter.live_allocs;
+    const h = engine.harness();
+    var index: usize = 0;
+    var mid_bytes: usize = 0;
+    while (index < turns) : (index += 1) {
+        const result = try h.runTurn(turnInput("soak turn"));
+        try testing.expectEqual(port.EndReason.completed, result.end_reason);
+        try testing.expectEqualStrings("soak ok", result.reply);
+        try testing.expectEqual(@as(u64, 1), result.turn_count);
+        // Token accounting is conserved across the whole run: one 10+5 call
+        // per turn, with no double counting and no loss.
+        try testing.expectEqual(@as(u64, @intCast(index + 1)) * 15, result.total_tokens);
+        allocator.free(result.reply);
+        // Drop the provider's request copy each turn: the test's own recording
+        // must not be what the memory assertion measures.
+        fx.provider.clearRequests();
+        if (index + 1 == turns / 2) mid_bytes = counter.live_bytes;
+    }
+
+    const id = try allocator.dupe(u8, engine.session_id);
+    defer allocator.free(id);
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    const log_bytes = try testLogLength(path);
+    const retained_bytes = counter.live_bytes;
+    const retained_allocs = counter.live_allocs;
+
+    // Retained memory tracks the log, not the turn history: session-arena
+    // chunks hold the event payloads, so the second half must not grow
+    // materially faster than the first (a request/history copy retained per
+    // turn would be quadratic) and the total stays within a fixed factor of
+    // the JSONL it mirrors.
+    const early = mid_bytes - fixture_bytes;
+    const late = retained_bytes - mid_bytes;
+    try testing.expect(late <= 2 * early + 1024 * 1024);
+    try testing.expect(retained_bytes <= fixture_bytes + 16 * @as(usize, @intCast(log_bytes)) + 1024 * 1024);
+    // Arena chunks hide most bytes from the block counter; it still catches a
+    // per-turn allocation that never goes back.
+    try testing.expect(retained_allocs - baseline_allocs <= 256);
+
+    {
+        // Scope the parsed log: its arena is as large as the JSONL and must not
+        // be counted when checking that the engine gave everything back.
+        var read = try session_log.readLog(allocator, path);
+        defer read.deinit();
+        try testing.expect(read.torn_truncate_to == null);
+        try testing.expectEqual(turns, eventCount(read.events, "turn/start"));
+        try testing.expectEqual(turns, eventCount(read.events, "turn/end"));
+        try testing.expectEqual(turns, eventCount(read.events, "step/start"));
+        try testing.expectEqual(turns, eventCount(read.events, "assistant/message"));
+        try testing.expectEqual(turns, countUserMessagesOfKind(read.events, "user"));
+        var completed_ends: usize = 0;
+        for (read.events) |event| {
+            if (!std.mem.eql(u8, event.event_type, "turn/end")) continue;
+            if (std.mem.eql(u8, event.data.object.get("reason").?.object.get("kind").?.string, "completed")) completed_ends += 1;
+        }
+        try testing.expectEqual(turns, completed_ends);
+    }
+
+    engine.deinit(allocator);
+    // Everything the engine retained is returned; only fixture-owned bytes
+    // (plus the short id copy kept for the restore below) remain.
+    try testing.expect(counter.live_bytes <= fixture_bytes + 4096);
+
+    // The soak JSONL restores and continues as turn N+1.
+    var second = try fx.harness();
+    defer second.deinit(allocator);
+    try second.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+    const next = try second.harness().runTurn(turnInput("after soak"));
+    defer allocator.free(next.reply);
+    try testing.expectEqual(port.EndReason.completed, next.end_reason);
+    try testing.expectEqualStrings("restored soak ok", next.reply);
+    try testing.expect(requestContains(fx.provider.requests.items[0], "soak turn"));
+    try testing.expect(requestContains(fx.provider.requests.items[0], "after soak"));
+    // A restored harness starts its counters over; the log still grows by one.
+    try testing.expectEqual(@as(u64, 15), next.total_tokens);
+
+    var after = try session_log.readLog(allocator, path);
+    defer after.deinit();
+    try testing.expectEqual(turns + 1, eventCount(after.events, "turn/start"));
+    try testing.expectEqual(turns + 1, eventCount(after.events, "turn/end"));
+}
+
+test "dsh-native adapter: a 96KB tool output survives the log and a restore under poison" {
+    // Long output path: the bridged tool hands the kernel 96KB, which passes
+    // through the retention copy, the tool/result event and the session arena.
+    // PoisonAllocator makes any read of reset-arena bytes fail deterministically.
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+    const big = try allocator.alloc(u8, 96 * 1024);
+    defer allocator.free(big);
+    @memset(big[0 .. big.len - 16], 'z');
+    @memcpy(big[big.len - 16 ..], "TAIL-MARKER-0001");
+    var fake = BridgeFake{ .output = big };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "web_search", .arguments = "{\"query\":\"x\"}" }} },
+        .{ .text = "big done" },
+        .{ .text = "restored done" },
+    });
+    defer fx.deinit();
+    fx.host_tools = &.{.{ .name = "web_search", .description = "Search", .input_schema_json = "{\"type\":\"object\"}", .concurrency_safe = true }};
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    const result = try engine.harness().runTurn(turnInput("big output"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("big done", result.reply);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+
+    const id = try allocator.dupe(u8, engine.session_id);
+    defer allocator.free(id);
+    const path = try fx.logPath(allocator, id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_result = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        const text = toolResultText(event);
+        // The model sees dsh's 64,000-byte tail plus the truncation notice.
+        try testing.expect(text.len > 64_000);
+        try testing.expect(std.mem.indexOf(u8, text, "TAIL-MARKER-0001") != null);
+        try testing.expect(std.mem.indexOf(u8, text, "output truncated") != null);
+        saw_result = true;
+    }
+    try testing.expect(saw_result);
+
+    // The spill kept the whole 96KB, proving the full input crossed the retain
+    // copy instead of being truncated before the write.
+    const spill = try std.fs.path.join(allocator, &.{ fx.dsh_home, "spill" });
+    defer allocator.free(spill);
+    var spill_dir = try fs_compat.openDirPath(spill, .{ .iterate = true });
+    defer spill_dir.close();
+    var iterator = spill_dir.iterate();
+    var spill_size: u64 = 0;
+    while (try iterator.next()) |entry| {
+        // Stat by name: the reported entry kind is not reliable on every host.
+        const full = try std.fs.path.join(allocator, &.{ spill, entry.name });
+        defer allocator.free(full);
+        const size = testLogLength(full) catch continue;
+        spill_size = @max(spill_size, size);
+    }
+    try testing.expectEqual(@as(u64, big.len), spill_size);
+
+    engine.deinit(allocator);
+    fx.provider.clearRequests();
+    var second = try fx.harness();
+    defer second.deinit(allocator);
+    try second.harness().restore(.{ .messages = &.{}, .dsh_session_id = id });
+    const next = try second.harness().runTurn(turnInput("after big"));
+    defer allocator.free(next.reply);
+    try testing.expectEqualStrings("restored done", next.reply);
+    // The restored history replays the 64KB result to the model.
+    try testing.expect(requestContains(fx.provider.requests.items[0], "TAIL-MARKER-0001"));
+    try testing.expect(poison.free_calls > 0);
 }
