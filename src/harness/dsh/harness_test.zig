@@ -2650,6 +2650,9 @@ test "dsh reasoning tags require a live stream and a sink" {
 }
 
 test "dsh 64 KiB reasoning trace is released and stays out of persisted text" {
+    // Regression: before reasoning-delta was relayed, `.on` returned plain
+    // "answer" (no quoted trace); the 64 KiB trace must now be released and
+    // stay out of `persisted_reply`.
     // A large trace must not leak (testing allocator) and `.on` must quote it
     // without putting a byte of it into `persisted_reply`.
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;

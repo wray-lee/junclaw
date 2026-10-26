@@ -666,6 +666,7 @@ const ReasoningRelay = struct {
     ) !port.TurnResult {
         self.close();
         const visible = try text.toOwnedSlice(allocator);
+        errdefer allocator.free(visible);
         var reply: []const u8 = visible;
         var persisted: ?[]const u8 = visible;
         if (self.mode == .on and self.trace.items.len > 0) {
@@ -676,10 +677,7 @@ const ReasoningRelay = struct {
             };
             const prefix = try agent_mod.commands.composeFinalReply(&context, "", self.trace.items, .{});
             defer allocator.free(prefix);
-            reply = agent_mod.commands.composeFinalReply(&context, visible, self.trace.items, .{}) catch |err| {
-                allocator.free(visible);
-                return err;
-            };
+            reply = try agent_mod.commands.composeFinalReply(&context, visible, self.trace.items, .{});
             allocator.free(visible);
             persisted = reply[prefix.len..];
         }
@@ -698,6 +696,29 @@ const FinalReplyContext = struct {
 };
 
 const FinalReplyUsageMode = enum { off, tokens, full, cost };
+
+test "dsh reasoning reply prefix allocation failure frees visible text" {
+    // Regression: .on reply prefix allocation failure leaked visible text after toOwnedSlice
+    const Probe = struct {
+        fn run(allocator: Allocator) !void {
+            var relay = ReasoningRelay{ .mode = .on, .sink = null };
+            defer relay.deinit(allocator);
+            try relay.push(allocator, "trace");
+            var text: std.ArrayListUnmanaged(u8) = .empty;
+            defer text.deinit(allocator);
+            try text.appendSlice(allocator, "answer");
+
+            // The allocating writer reports a failed allocation as WriteFailed.
+            const result = relay.finish(allocator, &text, .completed) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+            };
+            defer allocator.free(result.reply);
+            try std.testing.expectEqualStrings("answer", result.persisted_reply.?);
+            try std.testing.expectEqualStrings("Reasoning:\n> trace\n\n\nanswer", result.reply);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Probe.run, .{});
+}
 
 /// Lightweight per-session handle over a shared `DshEngine`. The key is owned
 /// and immutable for the handle's life, so one session's turn can never

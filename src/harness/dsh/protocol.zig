@@ -1095,6 +1095,8 @@ test "parseServerFrame keeps uninterpreted chunks verbatim" {
 }
 
 test "parseServerFrame parses reasoning-delta with owned text" {
+    // Regression: reasoning-delta fell through to opaque .other, so the relay
+    // never saw the trace; the text copy is owned so freeServerEvent frees it.
     const allocator = std.testing.allocator;
     const frame =
         "{\"type\":\"item\",\"value\":{\"type\":\"assistant-stream\",\"frame\":{\"type\":\"chunk\"," ++
@@ -1114,6 +1116,8 @@ test "parseServerFrame parses reasoning-delta with owned text" {
 }
 
 test "parseServerFrame rejects reasoning-delta without text" {
+    // Regression: a reasoning-delta missing text was accepted as opaque .other
+    // instead of rejecting the frame like text-delta does.
     const allocator = std.testing.allocator;
     const frame =
         "{\"type\":\"item\",\"value\":{\"type\":\"assistant-stream\",\"frame\":{\"type\":\"chunk\"," ++
