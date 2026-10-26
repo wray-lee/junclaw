@@ -62,7 +62,8 @@ NullClaw 支持 [Model Context Protocol](https://modelcontextprotocol.io/)，通
 }
 ```
 
-服务器未暴露的名字会被忽略并记录 warn 日志。
+服务器未暴露的名字会被忽略并记录 warn 日志。完整的浏览器配置见
+[浏览器自动化（Lightpanda）](./browser.md)。
 
 ## 工作原理
 
@@ -126,6 +127,7 @@ NullClaw 支持 [Model Context Protocol](https://modelcontextprotocol.io/)，通
 
 ## 相关页面
 
+- [浏览器自动化（Lightpanda）](./browser.md) — main-lightpanda 镜像与 MCP 配置
 - [配置指南](./configuration.md)
 - [架构总览](./architecture.md)
 - [安全机制](./security.md)
