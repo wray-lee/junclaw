@@ -567,6 +567,16 @@ pub const McpToolWrapper = struct {
 
 // ── Top-level init ──────────────────────────────────────────────
 
+/// True when `name` passes the server's optional allowlist.
+/// An empty allowlist admits every tool.
+fn toolAllowed(allow: []const []const u8, name: []const u8) bool {
+    if (allow.len == 0) return true;
+    for (allow) |allowed| {
+        if (std.mem.eql(u8, allowed, name)) return true;
+    }
+    return false;
+}
+
 /// Initialize MCP tools from config. Connects to each server, discovers
 /// tools, and returns them wrapped in the standard Tool vtable.
 /// Errors from individual servers are logged and skipped.
@@ -599,8 +609,9 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
         defer allocator.free(tool_defs);
 
         var transferred_count: usize = 0;
+        var processed_count: usize = 0;
         errdefer {
-            var i: usize = transferred_count;
+            var i: usize = processed_count;
             while (i < tool_defs.len) : (i += 1) {
                 allocator.free(tool_defs[i].name);
                 allocator.free(tool_defs[i].description);
@@ -612,7 +623,29 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             }
         }
 
-        for (tool_defs, 0..) |td, idx| {
+        if (cfg.tools.len > 0) {
+            for (cfg.tools) |allowed| {
+                var found = false;
+                for (tool_defs) |td| {
+                    if (std.mem.eql(u8, td.name, allowed)) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    log.warn("MCP server '{s}': configured tool '{s}' not found in tools/list; ignored", .{ cfg.name, allowed });
+                }
+            }
+        }
+
+        for (tool_defs) |td| {
+            if (!toolAllowed(cfg.tools, td.name)) {
+                allocator.free(td.name);
+                allocator.free(td.description);
+                allocator.free(td.input_schema);
+                processed_count += 1;
+                continue;
+            }
             var wrapper = try allocator.create(McpToolWrapper);
             errdefer allocator.destroy(wrapper);
             const prefixed_name = try std.fmt.allocPrint(allocator, "mcp_{s}_{s}", .{ cfg.name, td.name });
@@ -620,7 +653,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             wrapper.* = .{
                 .allocator = allocator,
                 .server = server,
-                .owns_server = idx == 0,
+                .owns_server = transferred_count == 0,
                 .original_name = td.name,
                 .prefixed_name = prefixed_name,
                 .desc = td.description,
@@ -628,6 +661,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             };
             try all_tools.append(allocator, wrapper.tool());
             transferred_count += 1;
+            processed_count += 1;
         }
 
         if (transferred_count == 0) {
@@ -635,7 +669,7 @@ pub fn initMcpTools(allocator: Allocator, configs: []const McpServerConfig) ![]t
             allocator.destroy(server);
         }
 
-        log.info("MCP server '{s}': {d} tools registered", .{ cfg.name, tool_defs.len });
+        log.info("MCP server '{s}': {d} of {d} tools registered", .{ cfg.name, transferred_count, tool_defs.len });
     }
 
     return all_tools.toOwnedSlice(allocator);
@@ -886,6 +920,23 @@ test "initMcpTools empty configs" {
     const tools = try initMcpTools(std.testing.allocator, &.{});
     defer std.testing.allocator.free(tools);
     try std.testing.expectEqual(@as(usize, 0), tools.len);
+}
+
+test "toolAllowed empty allowlist registers every tool" {
+    try std.testing.expect(toolAllowed(&.{}, "goto"));
+    try std.testing.expect(toolAllowed(&.{}, "some_unlisted_tool"));
+}
+
+test "toolAllowed non-empty allowlist registers only listed tools" {
+    const allow = [_][]const u8{ "goto", "click" };
+    try std.testing.expect(toolAllowed(&allow, "goto"));
+    try std.testing.expect(toolAllowed(&allow, "click"));
+    try std.testing.expect(!toolAllowed(&allow, "markdown"));
+}
+
+test "toolAllowed unknown configured name matches no tool" {
+    const allow = [_][]const u8{"not-a-real-tool"};
+    try std.testing.expect(!toolAllowed(&allow, "goto"));
 }
 
 test "buildJsonRpcRequest format" {

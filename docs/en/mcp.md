@@ -42,6 +42,27 @@ Add MCP servers to `~/.nullclaw/config.json` under `mcp_servers`:
 | `url` | string | — | HTTP endpoint URL (required for http transport) |
 | `timeout_ms` | number | `10000` | Per-request timeout in milliseconds |
 | `headers` | object | `{}` | Custom HTTP headers: string → string map |
+| `tools` | array | `[]` (all) | Optional allowlist of raw `tools/list` names (unprefixed, e.g. `goto`). Omitted or empty registers every tool; unknown names are ignored with a warning |
+
+### Tool Allowlist
+
+By default every tool returned by `tools/list` is registered. Set `tools` to register only
+the listed raw tool names (without the `mcp_<server>_` prefix), which keeps servers with
+many or large tools from flooding the model context:
+
+```json
+{
+  "mcp_servers": {
+    "browser": {
+      "command": "lightpanda",
+      "args": ["mcp"],
+      "tools": ["goto", "click", "markdown"]
+    }
+  }
+}
+```
+
+Names the server does not expose are ignored with a warning.
 
 ## How It Works
 

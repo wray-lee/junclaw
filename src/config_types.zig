@@ -2181,6 +2181,9 @@ pub const McpServerConfig = struct {
     args: []const []const u8 = &.{},
     env: []const McpEnvEntry = &.{},
     headers: []const McpHeaderEntry = &.{},
+    /// Optional allowlist of raw `tools/list` names (unprefixed, e.g. "goto").
+    /// Empty means every tool exposed by the server is registered.
+    tools: []const []const u8 = &.{},
 
     pub const McpEnvEntry = struct {
         key: []const u8,

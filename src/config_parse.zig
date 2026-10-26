@@ -1617,6 +1617,21 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                     }
                 }
 
+                // tools: optional allowlist of raw tools/list names (e.g. "goto").
+                if (val.object.get("tools")) |t| {
+                    if (t == .array) {
+                        for (t.array.items) |item| {
+                            if (item != .string) {
+                                log.warn("MCP server '{s}': non-string entry in tools ignored", .{server_name});
+                                break;
+                            }
+                        }
+                        mcp_cfg.tools = try parseStringArray(self.allocator, t.array);
+                    } else {
+                        log.warn("MCP server '{s}': tools must be an array of strings; ignored", .{server_name});
+                    }
+                }
+
                 try mcp_list.append(self.allocator, mcp_cfg);
             }
             self.mcp_servers = try mcp_list.toOwnedSlice(self.allocator);
@@ -3469,4 +3484,59 @@ test "parseJson keeps fallback-only custom url provider refs in defaults" {
     try std.testing.expectEqualStrings("custom:https://fb.example.com/qianfan", cfg.default_provider);
     try std.testing.expect(cfg.default_model != null);
     try std.testing.expectEqualStrings("custom-model", cfg.default_model.?);
+}
+
+/// Parse a minimal mcp_servers config snippet; results live in `allocator`.
+fn parseMcpServerConfigsForTest(allocator: std.mem.Allocator, json: []const u8) ![]const types.McpServerConfig {
+    var cfg = Config{
+        .workspace_dir = ".",
+        .config_path = "config.json",
+        .allocator = allocator,
+    };
+    try cfg.parseJson(json);
+    return cfg.mcp_servers;
+}
+
+test "parseJson mcp_servers tools allowlist parses configured names" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const servers = try parseMcpServerConfigsForTest(arena.allocator(),
+        \\{"mcp_servers":{"browser":{"command":"lightpanda","args":["mcp"],"tools":["goto","click"]}}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), servers.len);
+    try std.testing.expectEqual(@as(usize, 2), servers[0].tools.len);
+    try std.testing.expectEqualStrings("goto", servers[0].tools[0]);
+    try std.testing.expectEqualStrings("click", servers[0].tools[1]);
+}
+
+test "parseJson mcp_servers without tools leaves allowlist empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const servers = try parseMcpServerConfigsForTest(arena.allocator(),
+        \\{"mcp_servers":{"browser":{"command":"lightpanda"}}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), servers.len);
+    try std.testing.expectEqual(@as(usize, 0), servers[0].tools.len);
+}
+
+test "parseJson mcp_servers empty tools array leaves allowlist empty" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const servers = try parseMcpServerConfigsForTest(arena.allocator(),
+        \\{"mcp_servers":{"browser":{"command":"lightpanda","tools":[]}}}
+    );
+    try std.testing.expectEqual(@as(usize, 1), servers.len);
+    try std.testing.expectEqual(@as(usize, 0), servers[0].tools.len);
+}
+
+test "parseJson mcp_servers invalid tools values are ignored" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const servers = try parseMcpServerConfigsForTest(arena.allocator(),
+        \\{"mcp_servers":{"bad":{"command":"x","tools":"goto"},"mixed":{"command":"x","tools":["goto",3,true]}}}
+    );
+    try std.testing.expectEqual(@as(usize, 2), servers.len);
+    try std.testing.expectEqual(@as(usize, 0), servers[0].tools.len);
+    try std.testing.expectEqual(@as(usize, 1), servers[1].tools.len);
+    try std.testing.expectEqualStrings("goto", servers[1].tools[0]);
 }

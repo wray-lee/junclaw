@@ -31,6 +31,39 @@ NullClaw 支持 [Model Context Protocol](https://modelcontextprotocol.io/)，通
 }
 ```
 
+### 配置字段
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `transport` | string | `stdio` | `stdio` 或 `http` |
+| `command` | string | — | stdio 传输的可执行文件 |
+| `args` | array | `[]` | 命令参数 |
+| `env` | object | `{}` | 环境变量覆盖：string → string 映射（`{"KEY": "value"}`） |
+| `url` | string | — | HTTP 端点 URL（http 传输必需） |
+| `timeout_ms` | number | `10000` | 单请求超时（毫秒） |
+| `headers` | object | `{}` | 自定义 HTTP headers：string → string 映射 |
+| `tools` | array | `[]`（全部） | 可选白名单：`tools/list` 返回的原始工具名（不带 `mcp_<服务器>_` 前缀，如 `goto`）。省略或空数组注册全部工具；不存在的名字告警后忽略 |
+
+### 工具白名单
+
+默认注册 `tools/list` 返回的全部工具。设置 `tools` 后只注册列出的原始工具名
+（不含 `mcp_<服务器>_` 前缀），避免工具数量多或 schema 大的服务器（如 Lightpanda
+约 25 个工具）占满模型上下文：
+
+```json
+{
+  "mcp_servers": {
+    "browser": {
+      "command": "lightpanda",
+      "args": ["mcp"],
+      "tools": ["goto", "click", "markdown"]
+    }
+  }
+}
+```
+
+服务器未暴露的名字会被忽略并记录 warn 日志。
+
 ## 工作原理
 
 启动时，nullclaw 连接每个 MCP 服务器，执行 `initialize` 握手，通过 `tools/list` 发现工具，以 `mcp_<服务器>_<工具>` 前缀暴露给 agent。
