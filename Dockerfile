@@ -99,6 +99,58 @@ CMD ["gateway", "--port", "3000", "--host", "::"]
 FROM release-base AS release-root
 USER 0:0
 
+# ── Lightpanda image (optional, additive) ────────────────────
+# Same junclaw binary and entrypoint as `release`, plus the pinned Lightpanda
+# browser. Lightpanda is a glibc binary, so the runtime is Debian; junclaw
+# itself is still the static musl build from `builder`.
+#   docker build --target lightpanda -t junclaw:lightpanda .
+FROM debian:13-slim AS lightpanda
+
+LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
+
+ARG TARGETARCH
+ARG LIGHTPANDA_VERSION=1.0.2
+
+# Runtime packages match the alpine release image.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tzdata \
+ && rm -rf /var/lib/apt/lists/*
+
+# Official release asset, pinned per architecture. The build stops if the
+# download does not match, so a changed asset cannot ship silently.
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) lp_arch="x86_64"; lp_sha="ae7d01d261efb9e480e18ce3424533332883863bcf70b12a4321b5733f37e19e" ;; \
+      arm64) lp_arch="aarch64"; lp_sha="ac546dfc43c533430da92b75ab36f2a29da7d6324d5d38baf606ef2e0d849345" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /usr/local/bin/lightpanda \
+      "https://github.com/lightpanda-io/browser/releases/download/${LIGHTPANDA_VERSION}/lightpanda-${lp_arch}-linux"; \
+    echo "${lp_sha}  /usr/local/bin/lightpanda" | sha256sum -c -; \
+    chmod +x /usr/local/bin/lightpanda; \
+    test "$(LIGHTPANDA_DISABLE_TELEMETRY=true lightpanda version)" = "${LIGHTPANDA_VERSION}"
+
+COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
+COPY --from=config /nullclaw-data /nullclaw-data
+RUN chown -R 65534:65534 /nullclaw-data
+
+# AGPL-3.0: full license, version, source and "unmodified binary" notice.
+COPY assets/lightpanda/AGPL-3.0.txt assets/lightpanda/NOTICE.txt /usr/share/doc/lightpanda/
+
+ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+ENV NULLCLAW_HOME=/nullclaw-data
+ENV HOME=/nullclaw-data
+ENV SHELL=/bin/sh
+ENV NULLCLAW_GATEWAY_PORT=3000
+# Lightpanda collects usage telemetry by default; the image turns it off.
+ENV LIGHTPANDA_DISABLE_TELEMETRY=true
+
+WORKDIR /nullclaw-data
+EXPOSE 3000
+ENTRYPOINT ["nullclaw"]
+CMD ["gateway", "--port", "3000", "--host", "::"]
+USER 65534:65534
+
 # ── Full dsh image (optional, additive) ──────────────────────
 # The targets above are unchanged. This target adds the dsh sidecar harness:
 #   docker build --target full-dsh -t junclaw:full-dsh .
