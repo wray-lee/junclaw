@@ -6,7 +6,8 @@
 # lightpanda in PATH). A keyless scripted OpenAI-compatible provider, served by
 # the page container, drives real webhook turns through the default agent
 # engine; the agent calls the Lightpanda MCP server's goto and markdown tools.
-# The page and the provider are both local, so the smoke never leaves the box.
+# The page and the provider are both local, and the docker network is
+# --internal, so the containers cannot reach the internet at all.
 #
 # Asserts both sides of the private-network guard:
 #   A. with the default --block-private-networks, goto http://site:8080/
@@ -281,7 +282,7 @@ docker image inspect "$PY_IMAGE" >/dev/null 2>&1 ||
   die "image not found: $PY_IMAGE"
 
 # ── local static page + provider ─────────────────────────────────────────────
-docker network create --subnet "$SUBNET" "$NET" >/dev/null ||
+docker network create --internal --subnet "$SUBNET" "$NET" >/dev/null ||
   die "docker network create failed (subnet $SUBNET in use?)"
 docker run -d --name "$SITE" --network "$NET" --network-alias site \
   --ip "$SITE_IP" -v "$WORK:/site:ro" -w /site "$PY_IMAGE" \
