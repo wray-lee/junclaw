@@ -2802,6 +2802,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (br.object.get("allowed_domains")) |v| {
                 if (v == .array) self.browser.allowed_domains = try parseStringArray(self.allocator, v.array);
             }
+            if (br.object.get("webdriver_idle_timeout_ms")) |v| {
+                if (v == .integer and v.integer >= 0) self.browser.webdriver_idle_timeout_ms = @intCast(v.integer);
+            }
+            if (br.object.get("webdriver_geckodriver_path")) |v| {
+                if (v == .string) self.browser.webdriver_geckodriver_path = try self.allocator.dupe(u8, v.string);
+            }
         }
     }
 

@@ -1474,6 +1474,8 @@ pub const Config = struct {
             .native_webdriver_url = self.browser.native_webdriver_url,
             .native_chrome_path = self.browser.native_chrome_path,
             .allowed_domains = self.browser.allowed_domains,
+            .webdriver_idle_timeout_ms = self.browser.webdriver_idle_timeout_ms,
+            .webdriver_geckodriver_path = self.browser.webdriver_geckodriver_path,
         }, ",\n");
         try writePrettyField(self.allocator, w, "  ", "http_request", .{
             .enabled = self.http_request.enabled,
@@ -2839,6 +2841,8 @@ test "save roundtrip preserves extended config sections" {
     cfg.browser.native_webdriver_url = "http://127.0.0.1:9515";
     cfg.browser.native_chrome_path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
     cfg.browser.allowed_domains = &.{ "github.com", "docs.rs" };
+    cfg.browser.webdriver_idle_timeout_ms = 30_000;
+    cfg.browser.webdriver_geckodriver_path = "/usr/local/bin/geckodriver";
 
     cfg.http_request.enabled = true;
     cfg.http_request.max_response_size = 12345;
@@ -2951,6 +2955,8 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expect(!loaded.secrets.encrypt);
     try std.testing.expect(loaded.browser.enabled);
     try std.testing.expectEqual(@as(usize, 2), loaded.browser.allowed_domains.len);
+    try std.testing.expectEqual(@as(u64, 30_000), loaded.browser.webdriver_idle_timeout_ms);
+    try std.testing.expectEqualStrings("/usr/local/bin/geckodriver", loaded.browser.webdriver_geckodriver_path.?);
     try std.testing.expect(loaded.http_request.enabled);
     try std.testing.expectEqualStrings("socks5://127.0.0.1:1080", loaded.http_request.proxy.?);
     try std.testing.expectEqualStrings("https://searx.example.com", loaded.http_request.search_base_url.?);
