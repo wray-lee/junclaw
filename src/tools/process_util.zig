@@ -160,7 +160,11 @@ fn terminateLinuxChildProcesses(parent_pid: std.posix.pid_t, signal: std.posix.S
 fn terminateChild(child: *std_compat.process.Child) void {
     if (comptime builtin.os.tag == .windows) {
         terminateWindowsProcessTreeByPid(GetProcessId(child.id));
-        _ = child.kill() catch {};
+        // Regression: `Child.kill()` waits for the process and then closes its
+        // handle. This watcher races with run()'s child.wait(), whose
+        // NtWaitForSingleObject then fails with STATUS_INVALID_HANDLE
+        // (error.Unexpected). Terminate the handle only; wait() reaps.
+        _ = std.os.windows.ntdll.NtTerminateProcess(child.id, @enumFromInt(1));
     } else if (comptime builtin.os.tag == .wasi) {
         return;
     } else {
@@ -637,6 +641,35 @@ test "run timeout kills Windows shell descendants" {
     }
 
     try std.testing.expect(exited);
+}
+
+test "terminateChild keeps the Windows handle open for wait" {
+    if (comptime builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var child = std_compat.process.Child.init(&.{ "cmd.exe", "/c", "ping -n 30 127.0.0.1 >nul" }, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    var reaped = false;
+    defer if (!reaped) {
+        terminateChild(&child);
+        _ = child.wait() catch {};
+    };
+
+    const pid = GetProcessId(child.id);
+    try std.testing.expect(pid != 0);
+
+    terminateChild(&child);
+
+    // Regression: Child.kill() closed the process handle here, so a racing
+    // run() child.wait() returned error.Unexpected (NTSTATUS 0xc0000008).
+    try std.testing.expectEqual(pid, GetProcessId(child.id));
+
+    const term = try child.wait();
+    reaped = true;
+    try std.testing.expect(term == .exited);
 }
 
 test "run timeout kills spawned shell descendants" {
