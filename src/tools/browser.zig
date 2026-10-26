@@ -447,6 +447,7 @@ test "webdriver backend serves snapshot and close stops the manager" {
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[{\"tag\":\"button\",\"label\":\"Go\",\"detail\":\"\"}],\"more\":false}}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
         .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
     };
     const server = try fake.Server.start(std.testing.allocator, &routes);

@@ -43,6 +43,7 @@ test "webdriver integration runs the full session, snapshot, click, type and clo
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = snapshot_body },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fake-session/element", .body = "{\"value\":{\"element-6066-11e4-a52e-4f735466cecf\":\"el-1\"}}" },
         .{ .method = "POST", .path = "/session/fake-session/element/el-1/click", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
@@ -98,21 +99,24 @@ test "webdriver integration runs the full session, snapshot, click, type and clo
     try testing.expectEqualStrings("/session/fake-session/execute/sync", server.requests[4].path);
     try testing.expect(std.mem.indexOf(u8, server.requests[4].body, "data-junclaw-ref") != null);
 
+    // Snapshot post-script recheck, then the click pre-check.
     try testing.expectEqualStrings("GET", server.requests[5].method);
     try testing.expectEqualStrings("/session/fake-session/url", server.requests[5].path);
-    try testing.expectEqualStrings("/session/fake-session/element", server.requests[6].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[6].body, "data-junclaw-ref=\\\"0\\\"") != null);
-    try testing.expectEqualStrings("/session/fake-session/element/el-1/click", server.requests[7].path);
+    try testing.expectEqualStrings("GET", server.requests[6].method);
+    try testing.expectEqualStrings("/session/fake-session/url", server.requests[6].path);
+    try testing.expectEqualStrings("/session/fake-session/element", server.requests[7].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[7].body, "data-junclaw-ref=\\\"0\\\"") != null);
+    try testing.expectEqualStrings("/session/fake-session/element/el-1/click", server.requests[8].path);
 
-    try testing.expectEqualStrings("GET", server.requests[8].method);
-    try testing.expectEqualStrings("/session/fake-session/url", server.requests[8].path);
-    try testing.expectEqualStrings("/session/fake-session/element", server.requests[9].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[9].body, "data-junclaw-ref=\\\"1\\\"") != null);
-    try testing.expectEqualStrings("/session/fake-session/element/el-2/value", server.requests[10].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[10].body, "\"text\":\"hello\"") != null);
+    try testing.expectEqualStrings("GET", server.requests[9].method);
+    try testing.expectEqualStrings("/session/fake-session/url", server.requests[9].path);
+    try testing.expectEqualStrings("/session/fake-session/element", server.requests[10].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[10].body, "data-junclaw-ref=\\\"1\\\"") != null);
+    try testing.expectEqualStrings("/session/fake-session/element/el-2/value", server.requests[11].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[11].body, "\"text\":\"hello\"") != null);
 
-    try testing.expectEqualStrings("DELETE", server.requests[11].method);
-    try testing.expectEqualStrings("/session/fake-session", server.requests[11].path);
+    try testing.expectEqualStrings("DELETE", server.requests[12].method);
+    try testing.expectEqualStrings("/session/fake-session", server.requests[12].path);
 
     var session_posts: usize = 0;
     for (server.requests) |request| {
@@ -195,6 +199,49 @@ test "webdriver integration blocks a redirect to a metadata address and closes t
     try testing.expectEqual(routes.len, server.request_count);
     try testing.expectEqualStrings("POST", server.requests[3].method);
     try testing.expectEqualStrings("/session/redirect-session/window/close", server.requests[3].path);
+}
+
+// Regression: the snapshot only checked the URL before running its script, so
+// a page that navigated to a metadata address afterwards still returned its
+// content (F1 in the phase-2 security review).
+test "webdriver integration blocks a page that navigates away after the snapshot check" {
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"race-session\",\"capabilities\":{}}}" },
+        .{ .method = "POST", .path = "/session/race-session/url", .body = "{\"value\":null}" },
+        .{ .method = "GET", .path = "/session/race-session/url", .body = "{\"value\":\"https://8.8.8.8/page\"}" },
+        .{ .method = "GET", .path = "/session/race-session/url", .body = "{\"value\":\"https://8.8.8.8/page\"}" },
+        .{ .method = "POST", .path = "/session/race-session/execute/sync", .body = snapshot_body },
+        .{ .method = "GET", .path = "/session/race-session/url", .body = "{\"value\":\"https://169.254.169.254/latest/meta-data/\"}" },
+        .{ .method = "POST", .path = "/session/race-session/window/close", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base = try server.url(allocator);
+    defer allocator.free(base);
+
+    var bt = webdriverTool(base, &.{});
+    defer bt.shutdown();
+
+    // Public IP literals keep the URL checks offline; the driver reports the
+    // metadata address only on the post-script recheck.
+    const opened = try execute(&bt, "{\"action\":\"open\",\"url\":\"https://8.8.8.8/landing\"}");
+    defer allocator.free(opened.output);
+    try testing.expect(opened.success);
+
+    const result = try execute(&bt, "{\"action\":\"snapshot\"}");
+    defer allocator.free(result.error_msg.?);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings(
+        "Browser snapshot failed: Blocked local/private/metadata address",
+        result.error_msg.?,
+    );
+    try testing.expect(bt.manager.?.running == null);
+
+    server.stopAndJoin();
+    try testing.expectEqual(routes.len, server.request_count);
+    try testing.expectEqualStrings("GET", server.requests[5].method);
+    try testing.expectEqualStrings("/session/race-session/url", server.requests[5].path);
+    try testing.expectEqualStrings("/session/race-session/window/close", server.requests[6].path);
 }
 
 test "webdriver integration reports a missing geckodriver without failing the host" {

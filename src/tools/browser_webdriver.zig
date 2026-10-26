@@ -107,6 +107,9 @@ fn executeRead(allocator: Allocator, client: *WebDriverClient, ctx: Context, arg
 
     const json = try client.executeScript(allocator, read_script, noArgs(allocator));
     defer allocator.free(json);
+    // The page can navigate while the script runs; recheck before using the
+    // output so private content never leaves the browser.
+    try security.checkCurrentUrl(allocator, client, ctx.allowed_domains);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
         return ToolResult.fail("Browser returned an unreadable page document");
     defer parsed.deinit();
@@ -129,6 +132,8 @@ fn executeSnapshot(allocator: Allocator, client: *WebDriverClient, ctx: Context)
 
     const json = try client.executeScript(allocator, snapshot_script, noArgs(allocator));
     defer allocator.free(json);
+    // Same recheck after the script: the DOM it read may be a private page.
+    try security.checkCurrentUrl(allocator, client, ctx.allowed_domains);
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
         return ToolResult.fail("Browser returned an unreadable page snapshot");
     defer parsed.deinit();
@@ -242,6 +247,8 @@ fn executeScreenshot(allocator: Allocator, client: *WebDriverClient, ctx: Contex
     decoder.decode(bytes, encoded) catch
         return ToolResult.fail("WebDriver returned an invalid screenshot payload");
     if (bytes.len == 0) return ToolResult.fail("WebDriver returned an empty screenshot");
+    // Recheck after capture: do not write private pixels into the workspace.
+    try security.checkCurrentUrl(allocator, client, ctx.allowed_domains);
 
     const name = try std.fmt.allocPrint(allocator, "browser-screenshot-{x}.png", .{compat.crypto.random.int(u32)});
     defer allocator.free(name);
@@ -469,6 +476,7 @@ test "webdriver open and read navigate and return page text" {
         .{ .method = "POST", .path = "/session/fake-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"Example\",\"url\":\"https://example.com/page\",\"text\":\"hello page\"}}" },
+        urlRoute("{\"value\":\"https://example.com/page\"}"),
     };
     const server = try FakeServer.start(testing.allocator, &routes);
     defer server.deinit();
@@ -502,6 +510,7 @@ test "snapshot numbers elements and marks truncation" {
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
         urlRoute("{\"value\":\"https://example.com/\"}"),
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"Example\",\"url\":\"https://example.com/\",\"text\":\"short text\",\"elements\":[{\"tag\":\"a\",\"label\":\"Home\",\"detail\":\"href=/\"},{\"tag\":\"button\",\"label\":\"Go\",\"detail\":\"type=submit\"}],\"more\":true}}" },
+        urlRoute("{\"value\":\"https://example.com/\"}"),
     };
     const server = try FakeServer.start(testing.allocator, &routes);
     defer server.deinit();
@@ -549,6 +558,7 @@ test "snapshot caps long page text without splitting UTF-8" {
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
         urlRoute("{\"value\":\"https://example.com/\"}"),
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = body },
+        urlRoute("{\"value\":\"https://example.com/\"}"),
     };
     const server = try FakeServer.start(testing.allocator, &routes);
     defer server.deinit();
@@ -639,6 +649,7 @@ test "screenshot writes a PNG and returns an IMAGE marker" {
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
         urlRoute("{\"value\":\"https://example.com/\"}"),
         .{ .method = "GET", .path = "/session/fake-session/screenshot", .body = body },
+        urlRoute("{\"value\":\"https://example.com/\"}"),
     };
     const server = try FakeServer.start(testing.allocator, &routes);
     defer server.deinit();
