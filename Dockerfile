@@ -127,12 +127,12 @@ RUN --mount=type=cache,target=/root/.cache/zig \
 # dsh is installed from the committed lock file, so every package version and
 # integrity hash is pinned (0.2.1-rc.2). Native addons ship prebuilt for
 # linux-x64; no compiler is needed in this stage.
-FROM node:22-slim AS full-dsh-deps
+FROM node:26-slim AS full-dsh-deps
 WORKDIR /opt/dsh
 COPY docker/dsh/package.json docker/dsh/package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund && npm cache clean --force
 
-FROM node:22-slim AS full-dsh
+FROM node:26-slim AS full-dsh
 LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
 
 COPY --from=full-dsh-builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
