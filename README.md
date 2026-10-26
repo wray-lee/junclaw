@@ -9,6 +9,19 @@
 >
 > The icon is original fan art of Junko (Touhou Project, (c) Team Shanghai
 > Alice), drawn for this project; a non-commercial fan work.
+>
+> ### junclaw 1.0.0
+>
+> The 1.0.0 line adds an agent-engine layer on top of upstream. `agent.harness`
+> picks the engine that runs a turn:
+>
+> | Value | Engine |
+> |---|---|
+> | `dsh` (default) | In-process Zig port of the [dsh](https://github.com/deepseek-ai/deepseek-harness) agent loop: JSONL session log, compaction, `/goal`, `/plan`, approvals, live streaming and reasoning display, junclaw tools bridged in, junclaw security policy enforced on its file and shell tools. `dsh-native` is accepted as an alias. |
+> | `native` | The original upstream `Agent.turn` engine, unchanged. Set `"harness": "native"` to go back. |
+> | `dsh-sidecar` | The real dsh run as a Node child process behind the same interface. Needs a `-Dharness_dsh=true` build and the full image. |
+>
+> Upgrading from an earlier fork build: configs that set `"harness": "dsh"` meant the sidecar and must now say `"dsh-sidecar"`. Existing chats are seeded from the stored history the first time the new engine opens them. See [docs/en/configuration.md](docs/en/configuration.md) for the options and the [CHANGELOG](CHANGELOG.md) for the full list. Images are published as `ghcr.io/wray-lee/junclaw`.
 
 Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
@@ -22,12 +35,11 @@ Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](ht
 
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
-  <strong>678 KB binary. ~1 MB RAM. Boots in <2 ms. Runs on anything with a CPU.</strong>
+  <strong>~6 MB static binary. A few MB of RAM idle. Runs on anything with a CPU.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://github.com/nullclaw/nullclaw/actions/workflows/nightly.yml"><img src="https://github.com/nullclaw/nullclaw/actions/workflows/nightly.yml/badge.svg" alt="Nightly" /></a>
+  <a href="https://github.com/wray-lee/junclaw/actions/workflows/ci.yml"><img src="https://github.com/wray-lee/junclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
   <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
@@ -38,12 +50,12 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
 
 ```
-678 KB binary · <2 ms startup · 5,300+ tests · 50+ providers · 19 channels · Pluggable everything
+~6 MB binary · 8,800+ tests · 50+ providers · 19 channels · Pluggable everything
 ```
 
 ### Features
 
-- **Impossibly Small:** 678 KB static binary — no runtime, no VM, no framework overhead.
+- **Impossibly Small:** ~6 MB static binary (ReleaseSmall, x86_64 musl, with the dsh engine) — no runtime, no VM, no framework overhead.
 - **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.

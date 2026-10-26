@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 1.0.0 - 2026-10-26
+
+First tagged release of the junclaw fork. Highlights since the last upstream merge:
+
+### Added
+
+- In-process dsh agent engine (`agent.harness = "dsh"`, default) with a JSONL session log, compaction, `/goal`, `/plan`, `/compact`, approvals and questions, resume with crash repair, junclaw tool bridge, security-policy enforcement, native-history import, live streaming and reasoning display (`reasoning_mode`), and a fast `/stop` that aborts the in-flight provider request.
+- Reasoning display for the dsh sidecar (`dsh-sidecar`).
+- Agent-engine port layer (`src/harness/`) so the original engine stays selectable (`"harness": "native"`).
+
+
 ### Changed
 
 - `agent.harness` now defaults to `"dsh"`, the in-process dsh engine
