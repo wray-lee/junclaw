@@ -490,6 +490,27 @@ test "client reports a lost session distinctly" {
     server.stopAndJoin();
 }
 
+test "client reads driver readiness" {
+    const fake = @import("webdriver_fake_server.zig");
+    const allocator = std.testing.allocator;
+
+    const routes = [_]fake.Route{
+        .{ .method = "GET", .path = "/status", .body = "{\"value\":{\"ready\":true,\"message\":\"\"}}" },
+        .{ .method = "GET", .path = "/status", .body = "{\"value\":{\"ready\":false,\"message\":\"\"}}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+
+    var client = try WebDriverClient.init(allocator, base_url);
+    defer client.deinit();
+    try std.testing.expect(client.statusReady());
+    try std.testing.expect(!client.statusReady());
+    server.stopAndJoin();
+    try std.testing.expectEqual(routes.len, server.request_count);
+}
+
 test "session-gone detection ignores ordinary command failures" {
     try std.testing.expect(isSessionGone("{\"value\":{\"error\":\"invalid session id\"}}"));
     try std.testing.expect(isSessionGone("{\"value\":{\"error\":\"no such window\"}}"));
