@@ -500,6 +500,7 @@ const Fixture = struct {
     question_timeout_s: i32 = 120,
     host_tools: []const bridge.HostTool = &.{},
     host_executor: ?bridge.HostExecutor = null,
+    tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
     policy: ?*const SecurityPolicy = null,
     allowed_paths: []const []const u8 = &.{},
     now_ms_fn: *const fn (?*anyopaque) i64 = fixedClock,
@@ -564,6 +565,7 @@ const Fixture = struct {
             .question_timeout_s = self.question_timeout_s,
             .host_tools = self.host_tools,
             .host_executor = self.host_executor,
+            .tool_filter_groups = self.tool_filter_groups,
             .policy = self.policy,
             .allowed_paths = self.allowed_paths,
         };
@@ -651,6 +653,14 @@ fn countUserMessagesOfKind(events: []const types.Event, kind: []const u8) usize 
 
 fn turnInput(message: []const u8) port.TurnInput {
     return .{ .user_message = message };
+}
+
+/// Whether the model-visible catalog for the harness's current turn has `name`.
+fn toolSpecNamed(engine: *const DshNativeHarness, name: []const u8) bool {
+    for (engine.tool_specs) |spec| {
+        if (std.mem.eql(u8, spec.name, name)) return true;
+    }
+    return false;
 }
 
 fn readLogText(allocator: Allocator, path: []const u8) ![]u8 {
@@ -2869,6 +2879,56 @@ test "dsh-native adapter: bridged junclaw tools are model-visible and execute" {
     // P3-G: the dsh approval gate covers only bash's sandbox escalation, so a
     // bridged junclaw tool never asks it.
     try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/asked"));
+}
+
+test "dsh-native adapter: tool_filter_groups expose the native per-turn MCP subset" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "first" },
+        .{ .text = "second" },
+    });
+    defer fx.deinit();
+    // The host list is what `initMcpTools` produced after its per-server
+    // allowlist: `mcp_fake_hidden` was filtered there and must stay absent
+    // however the groups below match.
+    fx.host_tools = &.{
+        .{ .name = "mcp_fake_echo", .description = "echo", .input_schema_json = "{}" },
+        .{ .name = "mcp_fake_markdown", .description = "markdown", .input_schema_json = "{}" },
+        .{ .name = "mcp_other_list", .description = "list", .input_schema_json = "{}" },
+    };
+    fx.tool_filter_groups = &.{
+        .{ .mode = .always, .tools = &.{"mcp_fake_echo"} },
+        .{ .mode = .dynamic, .tools = &.{"mcp_fake_*"}, .keywords = &.{"网页"} },
+    };
+    // The bridge only registers host tools when an executor exists; this test
+    // only needs the catalog, never a call.
+    var fake = BridgeFake{ .output = "unused" };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    try testing.expect(toolSpecNamed(&engine, "mcp_fake_echo"));
+    try testing.expect(!toolSpecNamed(&engine, "mcp_fake_markdown"));
+    try testing.expect(!toolSpecNamed(&engine, "mcp_other_list"));
+    try testing.expect(!toolSpecNamed(&engine, "mcp_fake_hidden"));
+    // Non-MCP tools are never filtered.
+    try testing.expect(toolSpecNamed(&engine, tool_schemas.bash.name));
+
+    // CJK keyword as raw UTF-8 bytes: "网页" inside "帮我打开网页".
+    const second = try h.runTurn(turnInput("帮我打开网页"));
+    defer allocator.free(second.reply);
+    try testing.expect(toolSpecNamed(&engine, "mcp_fake_echo"));
+    try testing.expect(toolSpecNamed(&engine, "mcp_fake_markdown"));
+    try testing.expect(!toolSpecNamed(&engine, "mcp_other_list"));
+    try testing.expect(!toolSpecNamed(&engine, "mcp_fake_hidden"));
+
+    // Only the visible catalog narrows; the registry keeps every bridged tool
+    // exactly like native keeps `self.tools`.
+    try testing.expect(engine.registry.hostMeta("mcp_fake_markdown") != null);
 }
 
 test "dsh-native adapter: bridged host tools stay outside the dsh escalation gate" {

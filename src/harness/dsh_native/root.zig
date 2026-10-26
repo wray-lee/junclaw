@@ -83,4 +83,5 @@ test {
     _ = @import("harness.zig");
     _ = @import("harness_test.zig");
     _ = @import("fixture_replay_test.zig");
+    _ = @import("mcp_stdio_test.zig");
 }
