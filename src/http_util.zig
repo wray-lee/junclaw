@@ -3291,14 +3291,36 @@ const FixedHttpResponseCtx = struct {
     body: []const u8,
 };
 
+/// Poll budget for the POSIX non-blocking accept loop (~5s at 1ms).
+const fixed_response_accept_max_attempts = 5000;
+
+fn acceptFixedResponse(ctx: *FixedHttpResponseCtx) ?std_compat.net.Server.Connection {
+    var attempts: usize = 0;
+    while (attempts < fixed_response_accept_max_attempts) : (attempts += 1) {
+        const conn = ctx.server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                if (ctx.stop.load(.acquire)) return null;
+                std_compat.thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            else => return null,
+        };
+        // The test's stop path connects once to release a blocked accept on
+        // Windows; don't answer that wake-up connection.
+        if (ctx.stop.load(.acquire)) {
+            conn.stream.close();
+            return null;
+        }
+        return conn;
+    }
+    return null;
+}
+
 /// Accept one connection, drain the request, and reply with a fixed status line
 /// and body. `Connection: close` lets curl finish the response.
 fn serveFixedHttpResponse(ctx: *FixedHttpResponseCtx) void {
-    var conn = ctx.server.accept() catch return;
+    var conn = acceptFixedResponse(ctx) orelse return;
     defer conn.stream.close();
-    // The test's stop path connects once to release a blocked accept on
-    // Windows; don't answer that wake-up connection.
-    if (ctx.stop.load(.acquire)) return;
     var req_buf: [4096]u8 = undefined;
     _ = conn.stream.read(&req_buf) catch {};
     var head_buf: [256]u8 = undefined;
@@ -3309,13 +3331,24 @@ fn serveFixedHttpResponse(ctx: *FixedHttpResponseCtx) void {
 
 /// Stop a one-shot response server even if curl never connected. Windows
 /// cannot poll `accept` (see compat/net.zig), so a single connect releases a
-/// thread parked in it; joining afterwards is then bounded.
+/// thread parked in it; a failed wake is bounded instead of joined forever.
 fn stopFixedHttpServer(ctx: *FixedHttpResponseCtx, thread: std.Thread) void {
-    ctx.stop.store(true, .release);
-    if (std_compat.net.tcpConnectToAddress(ctx.server.listen_address)) |stream| {
-        stream.close();
-    } else |_| {}
-    thread.join();
+    std_compat.net.stopStubServer(ctx.server, ctx.stop, thread, true) catch
+        @panic("fixed-response stub accept thread did not stop after the wake connection");
+}
+
+// Regression: the stub thread parked in accept must stop even when no client
+// ever connects (early assertion failure or a connect-less test path).
+test "fixed response stub stops when the client never connects" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 200 OK", .body = "" };
+    const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 }
 
 // Regression: the bounded GET must keep `httpRequest`'s error identity - a
@@ -3325,7 +3358,7 @@ test "bounded http get maps a non-2xx to HttpStatusError" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     var stop = AtomicBool.init(false);
@@ -3351,7 +3384,7 @@ fn expectBoundedPostError(status_line: []const u8, expected: anyerror) !void {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     var stop = AtomicBool.init(false);
@@ -3390,7 +3423,7 @@ test "curlPost maps gateway 502 to an indeterminate send error" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     var stop = AtomicBool.init(false);
@@ -3419,7 +3452,7 @@ test "bounded http request with status preserves a non-2xx body" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     var stop = AtomicBool.init(false);
@@ -3445,7 +3478,7 @@ test "bounded http get enforces the response size cap" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     const big_body = try allocator.alloc(u8, 4096);
@@ -3477,7 +3510,7 @@ test "bounded http get accepts a body exactly at the size cap" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     const body = try allocator.alloc(u8, 4096);
@@ -3506,7 +3539,7 @@ test "web fetch get truncates an oversized body at a utf-8 boundary" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     // 1023 ASCII bytes then a 2-byte code point: a 1024-byte cut splits it.
@@ -3573,7 +3606,7 @@ test "web fetch get keeps a complete code point at the truncation cap" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     // 1021 ASCII bytes then a complete 3-byte code point ending exactly at the cap.
@@ -3609,7 +3642,7 @@ test "web fetch get keeps a non-2xx status and body" {
 
     const allocator = std.testing.allocator;
     const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
-    var server = try addr.listen(.{});
+    var server = try addr.listen(.{ .force_nonblocking = true });
     defer server.deinit();
 
     var stop = AtomicBool.init(false);

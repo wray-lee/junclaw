@@ -6,6 +6,15 @@ const IoNet = std.Io.net;
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 
+extern "kernel32" fn WaitForSingleObject(
+    handle: std.os.windows.HANDLE,
+    milliseconds: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
+
+const WAIT_OBJECT_0: std.os.windows.DWORD = 0;
+/// Only paid when a wake connection was skipped or failed.
+const stub_thread_stop_wait_ms: std.os.windows.DWORD = 5000;
+
 pub fn invalidHandle(comptime T: type) T {
     return switch (@typeInfo(T)) {
         .int => std.math.maxInt(T),
@@ -356,6 +365,30 @@ pub const Server = struct {
         return self.acceptViaIo();
     }
 };
+
+pub const StubStopError = error{StubThreadStuck};
+
+/// Test-only: stop a stub thread that may be parked in `accept`.
+///
+/// Windows cannot poll `accept`: Zig 0.16 talks to AFD handles directly, so
+/// WSAPoll/select do not apply, and shutdown on a listener returns
+/// STATUS_INVALID_PARAMETER (verified against the runner). A loopback
+/// connection is the only release, so when `wake` is skipped or its connect
+/// fails, bound the thread wait instead of joining forever. POSIX stub
+/// listeners are non-blocking with their own retry bound, so join is bounded.
+pub fn stopStubServer(server: *Server, stop: *std.atomic.Value(bool), thread: std.Thread, wake: bool) StubStopError!void {
+    stop.store(true, .release);
+    if (wake) {
+        if (tcpConnectToAddress(server.listen_address)) |stream| {
+            stream.close();
+        } else |_| {}
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (WaitForSingleObject(thread.getHandle(), stub_thread_stop_wait_ms) != WAIT_OBJECT_0)
+            return error.StubThreadStuck;
+    }
+    thread.join();
+}
 
 pub const AddressList = struct {
     arena: std.heap.ArenaAllocator,
@@ -811,4 +844,30 @@ test "compat net getAddressList returns UnknownHostName for invalid hostname on 
     if (builtin.os.tag != .windows) return;
     const result = getAddressList(std.testing.allocator, "bad host", 80);
     try std.testing.expectError(error.UnknownHostName, result);
+}
+
+var probe_server: Server = undefined;
+var probe_stop = std.atomic.Value(bool).init(false);
+
+fn probeAcceptLoop() void {
+    while (true) {
+        const conn = probe_server.accept() catch return;
+        conn.stream.close();
+        if (probe_stop.load(.acquire)) return;
+    }
+}
+
+// Regression: the stub stop path swallowed a failed wake connection and then
+// joined a thread parked in a Windows blocking accept forever.
+test "compat net stopStubServer bounds a parked accept without a wake" {
+    if (builtin.os.tag != .windows) return;
+    const addr = try Address.resolveIp("127.0.0.1", 0);
+    probe_server = try addr.listen(.{ .force_nonblocking = true });
+    probe_stop.store(false, .release);
+    const thread = try std.Thread.spawn(.{}, probeAcceptLoop, .{});
+
+    try std.testing.expectError(error.StubThreadStuck, stopStubServer(&probe_server, &probe_stop, thread, false));
+    // Deliberately abandoned: closing a Windows listener with a pending accept
+    // hits std's STATUS_CANCELLED unreachable. Thread and listener die with
+    // the test process.
 }

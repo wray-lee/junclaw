@@ -7490,11 +7490,15 @@ fn stubReadRequest(stream: std_compat.net.Stream, buf: []u8) ![]const u8 {
 // Regression: Windows ignores `force_nonblocking` (see compat/net.zig), so the
 // stub parked in a blocking `accept` and `thread.join()` hung the whole
 // Windows test run.
-/// Accept for a stub thread. POSIX polls a non-blocking listener; Windows
-/// ignores `force_nonblocking`, so `accept` blocks there until the test's stop
-/// path connects once to wake it.
+/// Poll budget for the POSIX non-blocking accept loop (~5s at 1ms).
+const stub_accept_max_attempts = 5000;
+
+/// Accept for a stub thread. POSIX polls a non-blocking listener with a finite
+/// budget; Windows ignores `force_nonblocking`, so `accept` blocks there until
+/// the test's stop path connects once to wake it.
 fn stubAcceptConnection(server: *std_compat.net.Server, stop: *const std.atomic.Value(bool)) !std_compat.net.Server.Connection {
-    while (true) {
+    var attempts: usize = 0;
+    while (attempts < stub_accept_max_attempts) : (attempts += 1) {
         const conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {
                 if (stop.load(.acquire)) return error.StubStopped;
@@ -7509,16 +7513,15 @@ fn stubAcceptConnection(server: *std_compat.net.Server, stop: *const std.atomic.
         }
         return conn;
     }
+    return error.StubAcceptTimeout;
 }
 
 /// Stop a stub thread even while it is parked in `accept`. Windows cannot poll
-/// `accept`, so connect once to release the blocked call.
+/// `accept`, so connect once to release the blocked call; a failed wake is
+/// bounded instead of becoming an unbounded join (see compat/net.zig).
 fn stopStubThread(server: *std_compat.net.Server, stop: *std.atomic.Value(bool), thread: std.Thread) void {
-    stop.store(true, .release);
-    if (std_compat.net.tcpConnectToAddress(server.listen_address)) |stream| {
-        stream.close();
-    } else |_| {}
-    thread.join();
+    std_compat.net.stopStubServer(server, stop, thread, true) catch
+        @panic("telegram stub accept thread did not stop after the wake connection");
 }
 
 const RichFallbackStubCtx = struct {
