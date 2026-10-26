@@ -89,3 +89,40 @@ jobs:
             docker tag "$image:candidate" "$image:main-$(git rev-parse --short=10 HEAD)"
             docker push "$image:main-$(git rev-parse --short=10 HEAD)"
           fi
+
+      # Lightpanda variant: same junclaw binary plus the pinned browser. Built and
+      # verified after the release push so it can never block or alter `latest`.
+      - name: Build lightpanda
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: lightpanda
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.ver.outputs.image }}:candidate-lightpanda
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}-lightpanda
+
+      # The image entrypoint is nullclaw (as in release), so select each binary.
+      - name: Verify lightpanda binary
+        run: docker run --rm --entrypoint lightpanda ${{ steps.ver.outputs.image }}:candidate-lightpanda version
+
+      - name: Verify nullclaw binary
+        run: docker run --rm --entrypoint nullclaw ${{ steps.ver.outputs.image }}:candidate-lightpanda --version
+
+      - name: Push lightpanda
+        run: |
+          image="${{ steps.ver.outputs.image }}"
+          docker tag "$image:candidate-lightpanda" "$image:main-lightpanda"
+          docker push "$image:main-lightpanda"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            docker tag "$image:candidate-lightpanda" "$image:${GITHUB_REF_NAME}-lightpanda"
+            docker push "$image:${GITHUB_REF_NAME}-lightpanda"
+          else
+            docker tag "$image:candidate-lightpanda" "$image:main-lightpanda-$(git rev-parse --short=10 HEAD)"
+            docker push "$image:main-lightpanda-$(git rev-parse --short=10 HEAD)"
+          fi
