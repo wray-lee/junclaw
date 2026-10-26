@@ -7487,20 +7487,38 @@ fn stubReadRequest(stream: std_compat.net.Stream, buf: []u8) ![]const u8 {
     return buf[0..filled];
 }
 
-/// Non-blocking accept so a stub thread can exit when the test is done with
-/// it, even if the client made fewer requests than the stub expected.
+// Regression: Windows ignores `force_nonblocking` (see compat/net.zig), so the
+// stub parked in a blocking `accept` and `thread.join()` hung the whole
+// Windows test run.
+/// Accept for a stub thread. POSIX polls a non-blocking listener; Windows
+/// ignores `force_nonblocking`, so `accept` blocks there until the test's stop
+/// path connects once to wake it.
 fn stubAcceptConnection(server: *std_compat.net.Server, stop: *const std.atomic.Value(bool)) !std_compat.net.Server.Connection {
-    while (!stop.load(.acquire)) {
+    while (true) {
         const conn = server.accept() catch |err| switch (err) {
             error.WouldBlock => {
+                if (stop.load(.acquire)) return error.StubStopped;
                 std_compat.thread.sleep(std.time.ns_per_ms);
                 continue;
             },
             else => return err,
         };
+        if (stop.load(.acquire)) {
+            conn.stream.close();
+            return error.StubStopped;
+        }
         return conn;
     }
-    return error.StubStopped;
+}
+
+/// Stop a stub thread even while it is parked in `accept`. Windows cannot poll
+/// `accept`, so connect once to release the blocked call.
+fn stopStubThread(server: *std_compat.net.Server, stop: *std.atomic.Value(bool), thread: std.Thread) void {
+    stop.store(true, .release);
+    if (std_compat.net.tcpConnectToAddress(server.listen_address)) |stream| {
+        stream.close();
+    } else |_| {}
+    thread.join();
 }
 
 const RichFallbackStubCtx = struct {
@@ -7679,6 +7697,9 @@ test "telegram gateway 502/504 on rich send sends one request" {
             .status_line = status_line,
         };
         const thread = try std.Thread.spawn(.{}, serveGatewayStatusStub, .{&ctx});
+        // Runs on assertions and early returns too: a blocked accept must not
+        // outlive the test on Windows.
+        defer stopStubThread(&server, &stop, thread);
 
         const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}", .{server.listen_address.in.getPort()});
         defer allocator.free(url);
@@ -7696,8 +7717,6 @@ test "telegram gateway 502/504 on rich send sends one request" {
         }
 
         try ch.sendMessage("12345", "hello");
-        stop.store(true, .release);
-        thread.join();
 
         try std.testing.expectEqual(@as(usize, 1), ctx.requests);
         try std.testing.expectEqual(@as(usize, 1), telegram_api.test_post_calls);
@@ -7805,10 +7824,9 @@ test "deterministic rich parse error still falls back to HTML" {
     var stop = std.atomic.Value(bool).init(false);
     var ctx = RichFallbackStubCtx{ .server = &server, .stop = &stop };
     const thread = try std.Thread.spawn(.{}, serveRichFallbackStub, .{&ctx});
+    defer stopStubThread(&server, &stop, thread);
 
     const result = ch.sendMessage("12345", "hello");
-    stop.store(true, .release);
-    thread.join();
     try result;
 
     try std.testing.expect(ctx.saw_rich);
@@ -7855,10 +7873,9 @@ test "partially sent reply is not returned for an upper-layer resend" {
     var stop = std.atomic.Value(bool).init(false);
     var ctx = PartialSendStubCtx{ .server = &server, .stop = &stop };
     const thread = try std.Thread.spawn(.{}, servePartialSendStub, .{&ctx});
+    defer stopStubThread(&server, &stop, thread);
 
     const result = ch.sendMessage("12345", "a" ** 5000);
-    stop.store(true, .release);
-    thread.join();
     // PartiallySent must not reach the dispatcher/outbox retry layers, which
     // would repost the chunk that was already delivered.
     try result;
