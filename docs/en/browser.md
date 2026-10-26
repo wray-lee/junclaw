@@ -149,17 +149,19 @@ To expose the browser only on turns that need it, add a `dynamic` filter group:
   `http://localhost:<port>/` fail with `CouldntConnect`; without it, local
   pages load. The flag does not block the stdio MCP transport, and an MCP
   `initialize` over `--port` still works with it on.
-  - Local debugging exception: if you must browse a loopback page, use a
-    separate, disposable config without `--block-private-networks` for that
-    session only, and never point it at untrusted pages. In that config, keep
-    `--block-cidrs 169.254.169.254/32` so the cloud metadata address stays
-    blocked.
+  - Local debugging exception: if you must browse a loopback page, keep
+    `--block-private-networks` on and allow only the exact address with a
+    negative CIDR, for example `--block-cidrs -127.0.0.1/32` (add `-::1/128`
+    for IPv6). Dropping the main flag opens every other private network
+    (RFC 1918, link-local, CGNAT, Docker and host management interfaces), and
+    a negative CIDR wider than `/32` reopens the whole range it covers. Use a
+    separate, disposable config and never point it at untrusted pages.
 - **Cloud metadata.** On 1.0.2, `169.254.169.254` is refused while
-  `--block-private-networks` is on. Adding
-  `--block-cidrs 169.254.169.254/32` is redundant in that case, so the default
-  config omits it. Keep that CIDR in any debug config that drops the main
-  flag. IPv6 metadata ranges were not separately probed; add the CIDRs you
-  need on clouds that expose IPv6 metadata.
+  `--block-private-networks` is on, so the default config omits the redundant
+  `--block-cidrs 169.254.169.254/32`. The loopback exception above keeps the
+  main flag, so the metadata address stays blocked there too. IPv6 metadata
+  ranges were not separately probed; add the CIDRs you need on clouds that
+  expose IPv6 metadata.
 - **Telemetry.** Lightpanda 1.0.2 collects usage telemetry by default and can
   be opted out with `LIGHTPANDA_DISABLE_TELEMETRY=true`. The image sets that
   variable. Verified on the shipped binary: the default environment sent DNS

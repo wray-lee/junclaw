@@ -137,14 +137,16 @@ Lightpanda 1.0.2 的完整 `tools/list` 约 39 KB，约合 1 万 token。注册�
   `http://localhost:<port>/` 都会以 `CouldntConnect` 失败；不开启则本地页面
   可以加载。该标记不拦 stdio MCP 传输，`--port` 模式下的 MCP `initialize`
   也仍然正常。
-  - 本地调试例外：确实要抓 loopback 页面时，为该会话单独用一份一次性配置，
-    去掉 `--block-private-networks`，并且绝不要用它访问不可信页面。该配置里
-    保留 `--block-cidrs 169.254.169.254/32`，让云元数据地址仍被拦住。
+  - 本地调试例外：确实要抓 loopback 页面时，保留 `--block-private-networks`，
+    只用负 CIDR 放行确切地址，例如 `--block-cidrs -127.0.0.1/32`（IPv6 再加
+    `-::1/128`）。去掉主开关会放行其余所有内网（RFC 1918、link-local、
+    CGNAT、Docker 与宿主机管理接口）；负 CIDR 只要比 `/32` 宽，就会重新打开
+    对应整段网络。使用一次性配置，并且绝不要用它访问不可信页面。
 - **云元数据。** 1.0.2 实测 `169.254.169.254` 在开启
-  `--block-private-networks` 时会被拒绝；此时再加
-  `--block-cidrs 169.254.169.254/32` 是冗余的，所以默认配置不加。任何去掉
-  主开关的调试配置都要保留这条 CIDR。IPv6 元数据网段未单独实测；在暴露
-  IPv6 元数据的云上按需补充 CIDR。
+  `--block-private-networks` 时会被拒绝，所以默认配置省略冗余的
+  `--block-cidrs 169.254.169.254/32`；上面的 loopback 例外保留主开关，
+  元数据地址同样被拦住。IPv6 元数据网段未单独实测；在暴露 IPv6 元数据的
+  云上按需补充 CIDR。
 - **遥测。** Lightpanda 1.0.2 默认收集使用遥测，可用
   `LIGHTPANDA_DISABLE_TELEMETRY=true` 关闭。镜像已设置该变量。对镜像内二进制
   实测：默认环境会向 Lightpanda 遥测端点发送 DNS 与 TLS 流量；使用镜像环境
