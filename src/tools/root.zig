@@ -118,6 +118,7 @@ pub const delegate = @import("delegate.zig");
 pub const browser = @import("browser.zig");
 pub const webdriver_client = @import("webdriver_client.zig");
 pub const webdriver_lifecycle = @import("webdriver_lifecycle.zig");
+pub const webdriver_security = @import("webdriver_security.zig");
 pub const image = @import("image.zig");
 pub const composio = @import("composio.zig");
 pub const screenshot = @import("screenshot.zig");

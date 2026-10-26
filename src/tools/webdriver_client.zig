@@ -21,6 +21,9 @@ const max_error_bytes: usize = 512;
 
 pub const SessionOptions = struct {
     headless: bool = true,
+    /// One-shot profile created by `webdriver_security.Profile`. Firefox reads
+    /// `<profile>/user.js`, so security prefs apply without the host profile.
+    profile_path: ?[]const u8 = null,
 };
 
 pub const WebDriverClient = struct {
@@ -60,7 +63,19 @@ pub const WebDriverClient = struct {
 
     pub fn newSession(self: *WebDriverClient, options: SessionOptions) !void {
         if (self.session_id != null) return error.SessionAlreadyOpen;
-        const args: []const []const u8 = if (options.headless) &.{"-headless"} else &.{};
+        var args_buf: [3][]const u8 = undefined;
+        var arg_count: usize = 0;
+        if (options.headless) {
+            args_buf[arg_count] = "-headless";
+            arg_count += 1;
+        }
+        if (options.profile_path) |profile| {
+            args_buf[arg_count] = "-profile";
+            arg_count += 1;
+            args_buf[arg_count] = profile;
+            arg_count += 1;
+        }
+        const args: []const []const u8 = args_buf[0..arg_count];
         const body = try std.json.Stringify.valueAlloc(self.allocator, .{
             .capabilities = .{ .alwaysMatch = .{
                 .browserName = "firefox",
@@ -380,6 +395,33 @@ test "client establishes and deletes a session" {
     try std.testing.expect(std.mem.indexOf(u8, server.requests[0].body, "\"browserName\":\"firefox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, server.requests[0].body, "\"-headless\"") != null);
     try std.testing.expectEqualStrings("DELETE", server.requests[1].method);
+}
+
+test "client passes the one-shot profile to Firefox" {
+    const fake = @import("webdriver_fake_server.zig");
+    const allocator = std.testing.allocator;
+
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\"}}" },
+        .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+
+    var client = try WebDriverClient.init(allocator, base_url);
+    defer client.deinit();
+
+    try client.newSession(.{ .headless = true, .profile_path = "/tmp/wd-profile-test" });
+    try client.deleteSession();
+
+    server.stopAndJoin();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        server.requests[0].body,
+        "\"-profile\",\"/tmp/wd-profile-test\"",
+    ) != null);
 }
 
 test "client encodes commands and decodes responses" {

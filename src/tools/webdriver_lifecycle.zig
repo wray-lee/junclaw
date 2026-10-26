@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const compat = @import("compat");
 const client_mod = @import("webdriver_client.zig");
 const WebDriverClient = client_mod.WebDriverClient;
+const webdriver_security = @import("webdriver_security.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -40,6 +41,8 @@ pub const WebDriverManager = struct {
     const Running = struct {
         client: WebDriverClient,
         child: ?compat.process.Child = null,
+        /// One-shot profile passed to Firefox; deleted on every stop path.
+        profile: webdriver_security.Profile,
         last_activity_ms: i64,
     };
 
@@ -102,6 +105,12 @@ pub const WebDriverManager = struct {
     /// Returns a connected, session-open browser. On success ownership moves to
     /// `self.running`; on failure every spawned child is killed and reaped.
     fn startLocked(self: *WebDriverManager) !Running {
+        var profile = webdriver_security.Profile.create(self.allocator) catch |err| {
+            self.setLastErrorFmt("failed to create one-shot browser profile: {s}", .{@errorName(err)});
+            return err;
+        };
+        errdefer profile.deinit();
+
         var child: ?compat.process.Child = null;
         var owned_url: ?[]u8 = null;
         errdefer {
@@ -159,7 +168,10 @@ pub const WebDriverManager = struct {
             owned_url = null;
         }
 
-        client.newSession(.{ .headless = self.options.headless }) catch |err| {
+        client.newSession(.{
+            .headless = self.options.headless,
+            .profile_path = profile.path,
+        }) catch |err| {
             self.setLastErrorFmt("webdriver session creation failed: {s} ({s})", .{
                 client.lastErrorMessage(),
                 @errorName(err),
@@ -170,6 +182,7 @@ pub const WebDriverManager = struct {
         return .{
             .client = client,
             .child = child,
+            .profile = profile,
             .last_activity_ms = nowMs(),
         };
     }
@@ -194,6 +207,7 @@ pub const WebDriverManager = struct {
             }
             running.client.deinit();
             if (running.child) |*child| terminateChild(child);
+            running.profile.deinit();
             self.running = null;
         }
     }
@@ -325,6 +339,38 @@ test "manager reuses one session and deletes it on shutdown" {
     server.stopAndJoin();
     try std.testing.expectEqual(routes.len, server.request_count);
     try std.testing.expectEqual(@as(usize, 1), countRequests(server.requests[0..server.request_count], "/session"));
+}
+
+test "manager uses a one-shot profile and removes it on shutdown" {
+    const fake = @import("webdriver_fake_server.zig");
+    const allocator = std.testing.allocator;
+
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\"}}" },
+        .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const endpoint = try server.url(allocator);
+    defer allocator.free(endpoint);
+
+    var manager = WebDriverManager.init(allocator, .{ .driver_url = endpoint, .idle_timeout_ms = 0 });
+    defer manager.deinit();
+
+    const client = try manager.acquire();
+    try std.testing.expect(client.hasSession());
+    const profile_path = try allocator.dupe(u8, manager.running.?.profile.path);
+    defer allocator.free(profile_path);
+    const user_js_path = try compat.fs.path.join(allocator, &.{ profile_path, "user.js" });
+    defer allocator.free(user_js_path);
+    try compat.fs.accessAbsolute(user_js_path, .{});
+    manager.release();
+
+    manager.shutdown();
+    server.stopAndJoin();
+    try std.testing.expectEqual(routes.len, server.request_count);
+    try std.testing.expect(std.mem.indexOf(u8, server.requests[0].body, "\"-profile\"") != null);
+    try std.testing.expectError(error.FileNotFound, compat.fs.accessAbsolute(profile_path, .{}));
 }
 
 test "manager rebuilds the session after Firefox dies" {
