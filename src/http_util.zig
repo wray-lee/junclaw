@@ -3286,6 +3286,7 @@ test "bounded http post times out instead of hanging on a stalled socket" {
 
 const FixedHttpResponseCtx = struct {
     server: *std_compat.net.Server,
+    stop: *AtomicBool,
     status_line: []const u8,
     body: []const u8,
 };
@@ -3295,12 +3296,26 @@ const FixedHttpResponseCtx = struct {
 fn serveFixedHttpResponse(ctx: *FixedHttpResponseCtx) void {
     var conn = ctx.server.accept() catch return;
     defer conn.stream.close();
+    // The test's stop path connects once to release a blocked accept on
+    // Windows; don't answer that wake-up connection.
+    if (ctx.stop.load(.acquire)) return;
     var req_buf: [4096]u8 = undefined;
     _ = conn.stream.read(&req_buf) catch {};
     var head_buf: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&head_buf, "{s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ ctx.status_line, ctx.body.len }) catch return;
     conn.stream.writeAll(head) catch {};
     conn.stream.writeAll(ctx.body) catch {};
+}
+
+/// Stop a one-shot response server even if curl never connected. Windows
+/// cannot poll `accept` (see compat/net.zig), so a single connect releases a
+/// thread parked in it; joining afterwards is then bounded.
+fn stopFixedHttpServer(ctx: *FixedHttpResponseCtx, thread: std.Thread) void {
+    ctx.stop.store(true, .release);
+    if (std_compat.net.tcpConnectToAddress(ctx.server.listen_address)) |stream| {
+        stream.close();
+    } else |_| {}
+    thread.join();
 }
 
 // Regression: the bounded GET must keep `httpRequest`'s error identity - a
@@ -3313,14 +3328,15 @@ test "bounded http get maps a non-2xx to HttpStatusError" {
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 404 Not Found", .body = "" };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 404 Not Found", .body = "" };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/missing", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", 1024);
-    thread.join();
 
     if (result) |body| {
         allocator.free(body);
@@ -3338,14 +3354,15 @@ fn expectBoundedPostError(status_line: []const u8, expected: anyerror) !void {
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = status_line, .body = "" };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = status_line, .body = "" };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/send", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const result = httpRequestWithTimeout(allocator, .POST, url, null, &.{}, null, null, "5");
-    thread.join();
 
     if (result) |body| {
         allocator.free(body);
@@ -3376,14 +3393,15 @@ test "curlPost maps gateway 502 to an indeterminate send error" {
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 502 Bad Gateway", .body = "" };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 502 Bad Gateway", .body = "" };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/chat.postMessage", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const result = curlPost(allocator, url, "{}", &.{"Authorization: Bearer test-token"});
-    thread.join();
 
     if (result) |body| {
         allocator.free(body);
@@ -3404,14 +3422,15 @@ test "bounded http request with status preserves a non-2xx body" {
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 401 Unauthorized", .body = "{\"error\":\"nope\"}" };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 401 Unauthorized", .body = "{\"error\":\"nope\"}" };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/guarded", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const resp = httpRequestWithStatusTimeout(allocator, .DELETE, url, null, &.{}, null, "", "5") catch return error.TestUnexpectedResult;
-    thread.join();
     defer allocator.free(resp.body);
 
     try std.testing.expectEqual(@as(u16, 401), resp.status_code);
@@ -3433,14 +3452,15 @@ test "bounded http get enforces the response size cap" {
     defer allocator.free(big_body);
     @memset(big_body, 'x');
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = big_body };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 200 OK", .body = big_body };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/doc", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", 64);
-    thread.join();
 
     if (result) |body| {
         allocator.free(body);
@@ -3464,14 +3484,15 @@ test "bounded http get accepts a body exactly at the size cap" {
     defer allocator.free(body);
     @memset(body, 'x');
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 200 OK", .body = body };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/doc", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const result = httpGetWithProxyTimeout(allocator, url, &.{}, "", "5", body.len);
-    thread.join();
 
     const fetched = try result;
     defer allocator.free(fetched);
@@ -3495,14 +3516,15 @@ test "web fetch get truncates an oversized body at a utf-8 boundary" {
     body[1023] = 0xC3;
     body[1024] = 0xA9;
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 200 OK", .body = body };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/large", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, 1024);
-    thread.join();
     defer allocator.free(response.body);
     defer allocator.free(response.headers);
 
@@ -3562,14 +3584,15 @@ test "web fetch get keeps a complete code point at the truncation cap" {
     body[1022] = 0xB8;
     body[1023] = 0xAD;
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 200 OK", .body = body };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 200 OK", .body = body };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/large", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, 1024);
-    thread.join();
     defer allocator.free(response.body);
     defer allocator.free(response.headers);
 
@@ -3589,14 +3612,15 @@ test "web fetch get keeps a non-2xx status and body" {
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    var ctx = FixedHttpResponseCtx{ .server = &server, .status_line = "HTTP/1.1 429 Too Many Requests", .body = "slow down" };
+    var stop = AtomicBool.init(false);
+    var ctx = FixedHttpResponseCtx{ .server = &server, .stop = &stop, .status_line = "HTTP/1.1 429 Too Many Requests", .body = "slow down" };
     const thread = try std.Thread.spawn(.{}, serveFixedHttpResponse, .{&ctx});
+    defer stopFixedHttpServer(&ctx, thread);
 
     const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/limited", .{server.listen_address.in.getPort()});
     defer allocator.free(url);
 
     const response = try curlGetForWebFetch(allocator, url, &.{}, "5", null, DEFAULT_CURL_GET_MAX_BYTES);
-    thread.join();
     defer allocator.free(response.body);
     defer allocator.free(response.headers);
 
