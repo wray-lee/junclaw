@@ -369,6 +369,7 @@ pub fn allTools(
         web_search_provider: []const u8 = "auto",
         web_search_fallback_providers: []const []const u8 = &.{},
         browser_enabled: bool = false,
+        browser: @import("../config_types.zig").BrowserConfig = .{},
         screenshot_enabled: bool = false,
         composio_api_key: ?[]const u8 = null,
         browser_open_domains: ?[]const []const u8 = null,
@@ -610,7 +611,7 @@ pub fn allTools(
 
     if (opts.browser_enabled) {
         const bt = try allocator.create(browser.BrowserTool);
-        bt.* = .{};
+        bt.* = .{ .allocator = allocator, .workspace_dir = workspace_dir, .config = opts.browser };
         try list.append(allocator, bt.tool());
     }
 

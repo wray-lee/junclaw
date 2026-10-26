@@ -2150,6 +2150,7 @@ pub const SessionManager = struct {
             .web_search_provider = self.config.http_request.search_provider,
             .web_search_fallback_providers = self.config.http_request.search_fallback_providers,
             .browser_enabled = self.config.browser.enabled,
+            .browser = self.config.browser,
             .screenshot_enabled = true,
             // MCP tools spawn configured servers as child processes and never
             // consult the agent policy; allTools skips them when

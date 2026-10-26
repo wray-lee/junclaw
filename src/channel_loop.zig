@@ -2025,6 +2025,7 @@ pub const ChannelRuntime = struct {
             .web_search_provider = config.http_request.search_provider,
             .web_search_fallback_providers = config.http_request.search_fallback_providers,
             .browser_enabled = config.browser.enabled,
+            .browser = config.browser,
             .screenshot_enabled = true,
             .mcp_server_configs = config.mcp_servers,
             .agents = config.agents,

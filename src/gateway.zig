@@ -2870,6 +2870,7 @@ fn initLocalAgentRuntime(
         .web_search_provider = cfg.http_request.search_provider,
         .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
         .browser_enabled = cfg.browser.enabled,
+        .browser = cfg.browser,
         .screenshot_enabled = true,
         .mcp_server_configs = cfg.mcp_servers,
         .agents = cfg.agents,

@@ -6,23 +6,47 @@ const ToolResult = root.ToolResult;
 const JsonObjectMap = root.JsonObjectMap;
 const net_security = @import("../root.zig").net_security;
 const http_util = @import("../http_util.zig");
+const BrowserConfig = @import("../config_types.zig").BrowserConfig;
+const WebDriverManager = @import("webdriver_lifecycle.zig").WebDriverManager;
+const webdriver_security = @import("webdriver_security.zig");
+const browser_webdriver = @import("browser_webdriver.zig");
 
 /// Maximum response body size for the "read" action (8 KB).
 const MAX_READ_BYTES: usize = 8192;
 /// Maximum raw fetch size passed to curl (64 KB, then truncated to MAX_READ_BYTES).
 const MAX_FETCH_BYTES: usize = 65536;
 
-/// Browser tool — opens URLs in the system browser and fetches page content.
-/// Supports "open" (launch URL), "read" (fetch body via curl), and returns
-/// informative errors for CDP-only actions (click, type, scroll, screenshot).
+/// Browser tool. With `backend = "webdriver"` every action is served by a
+/// lazily started geckodriver/Firefox session; the default `agent_browser`
+/// backend keeps the system-browser `open` and curl `read` behavior.
 pub const BrowserTool = struct {
     pub const tool_name = "browser";
-    pub const tool_description = "Browse web pages. Actions: open, screenshot, click, type, scroll, read.";
+    pub const tool_description = "Browse web pages. Actions: open, read, snapshot, click, type, scroll, screenshot, close. Snapshot returns page text plus numbered interactive elements for click/type. The webdriver backend (browser.backend=\"webdriver\") supports all actions; the default agent_browser backend supports open and read. screenshot returns an [IMAGE:path] marker: include it verbatim to send the picture.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["open","screenshot","click","type","scroll","read"],"description":"Browser action to perform"},"url":{"type":"string","description":"URL to open"},"selector":{"type":"string","description":"CSS selector for click/type"},"text":{"type":"string","description":"Text to type"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["open","read","snapshot","click","type","scroll","screenshot","close"],"description":"Browser action to perform"},"url":{"type":"string","description":"URL to open or read"},"index":{"type":"integer","description":"Element number from the last snapshot (click/type)"},"selector":{"type":"string","description":"CSS selector fallback for click/type"},"text":{"type":"string","description":"Text to type"},"direction":{"type":"string","enum":["up","down","left","right"],"description":"Scroll direction (default down)"},"amount":{"type":"integer","description":"Pixels to scroll (default 500)"}},"required":["action"]}
     ;
 
-    const vtable = root.ToolVTable(@This());
+    /// Long-lived tool allocator (set by allTools), not the per-turn tool
+    /// arena: the WebDriver manager and its reaper thread outlive a turn.
+    allocator: std.mem.Allocator = std.heap.page_allocator,
+    workspace_dir: []const u8 = "",
+    config: BrowserConfig = .{},
+    /// External WebDriver endpoint instead of spawning geckodriver. Used by
+    /// tests; production leaves this null and gets the lifecycled browser.
+    webdriver_url: ?[]const u8 = null,
+    manager: ?*WebDriverManager = null,
+
+    const vtable = blk: {
+        var base = root.ToolVTable(@This());
+        base.deinit = &toolDeinit;
+        break :blk base;
+    };
+
+    fn toolDeinit(ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *BrowserTool = @ptrCast(@alignCast(ptr));
+        self.shutdown();
+        allocator.destroy(self);
+    }
 
     pub fn tool(self: *BrowserTool) Tool {
         return .{
@@ -31,14 +55,83 @@ pub const BrowserTool = struct {
         };
     }
 
-    pub fn execute(_: *BrowserTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
+    /// Stop geckodriver/Firefox and drop the manager. The next WebDriver action
+    /// starts a fresh one; safe to call repeatedly.
+    pub fn shutdown(self: *BrowserTool) void {
+        if (self.manager) |manager| {
+            manager.deinit();
+            self.allocator.destroy(manager);
+            self.manager = null;
+        }
+    }
+
+    pub fn execute(self: *BrowserTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 
+        if (std.mem.eql(u8, self.config.backend, "webdriver")) {
+            return self.executeWebDriver(allocator, action, args);
+        }
+        return executeAgentBrowser(allocator, action, args);
+    }
+
+    fn executeWebDriver(self: *BrowserTool, allocator: std.mem.Allocator, action: []const u8, args: JsonObjectMap) !ToolResult {
+        if (std.mem.eql(u8, action, "close")) {
+            const was_running = self.manager != null;
+            self.shutdown();
+            return ToolResult.ok(if (was_running) "Browser closed" else "Browser is not running");
+        }
+        if (!browser_webdriver.isKnownAction(action)) {
+            const msg = try std.fmt.allocPrint(allocator, "Unknown browser action '{s}'", .{action});
+            return ToolResult{ .success = false, .output = "", .error_msg = msg };
+        }
+        // Argument errors must not spawn Firefox.
+        if (browser_webdriver.validate(action, args)) |message| return ToolResult.fail(message);
+
+        const manager = try self.ensureManager();
+        const client = manager.acquire() catch |err|
+            return webDriverFailure(allocator, action, err, manager.lastErrorMessage());
+        defer manager.release();
+
+        return browser_webdriver.run(allocator, client, .{
+            .workspace_dir = self.workspace_dir,
+            .allowed_domains = self.config.allowed_domains,
+        }, action, args) catch |err| {
+            // Only driver/transport failures carry a fresh message; other
+            // errors would otherwise report a message left by an older call.
+            const detail = switch (err) {
+                error.CommandFailed, error.Transport, error.SessionLost => client.lastErrorMessage(),
+                else => "",
+            };
+            return webDriverFailure(allocator, action, err, detail);
+        };
+    }
+
+    fn ensureManager(self: *BrowserTool) !*WebDriverManager {
+        if (self.manager) |manager| return manager;
+        const manager = try self.allocator.create(WebDriverManager);
+        errdefer self.allocator.destroy(manager);
+        manager.* = WebDriverManager.init(self.allocator, .{
+            .driver_url = self.webdriver_url,
+            .geckodriver_path = self.config.webdriver_geckodriver_path orelse "geckodriver",
+            .headless = self.config.native_headless,
+            .idle_timeout_ms = self.config.webdriver_idle_timeout_ms,
+        });
+        self.manager = manager;
+        return manager;
+    }
+
+    /// Backend `agent_browser`: system-browser open, curl read, and explicit
+    /// errors for the actions only the WebDriver backend can serve.
+    fn executeAgentBrowser(allocator: std.mem.Allocator, action: []const u8, args: JsonObjectMap) !ToolResult {
         if (std.mem.eql(u8, action, "open")) {
             return executeOpen(allocator, args);
         } else if (std.mem.eql(u8, action, "read")) {
             return executeRead(allocator, args);
+        } else if (std.mem.eql(u8, action, "close")) {
+            return ToolResult.ok("Nothing to close: the agent_browser backend does not manage a browser process");
+        } else if (std.mem.eql(u8, action, "snapshot")) {
+            return ToolResult.fail("Snapshot requires the WebDriver backend (set browser.backend = \"webdriver\")");
         } else if (std.mem.eql(u8, action, "screenshot")) {
             return ToolResult.fail("Use the screenshot tool instead");
         } else if (std.mem.eql(u8, action, "click") or
@@ -169,6 +262,14 @@ pub const BrowserTool = struct {
         return ToolResult{ .success = true, .output = output };
     }
 };
+
+fn webDriverFailure(allocator: std.mem.Allocator, action: []const u8, err: anyerror, detail: []const u8) !ToolResult {
+    const message = if (detail.len > 0)
+        try std.fmt.allocPrint(allocator, "Browser {s} failed: {s}", .{ action, detail })
+    else
+        try std.fmt.allocPrint(allocator, "Browser {s} failed: {s}", .{ action, webdriver_security.errorMessage(err) });
+    return .{ .success = false, .output = "", .error_msg = message };
+}
 
 fn isRedirectStatus(status_code: u16) bool {
     return status_code >= 300 and status_code < 400;
@@ -322,6 +423,59 @@ test "browser open accepts uppercase https scheme" {
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "example.com") != null);
+}
+
+test "webdriver backend rejects bad arguments before starting a browser" {
+    var bt = BrowserTool{
+        .config = .{ .enabled = true, .backend = "webdriver" },
+    };
+    var parsed = try root.parseTestArgs("{\"action\":\"click\"}");
+    defer parsed.deinit();
+    const result = try bt.execute(std.testing.allocator, parsed.value.object);
+    try std.testing.expect(!result.success);
+    try std.testing.expectEqualStrings(
+        "Missing 'index' (number from snapshot) or 'selector' parameter",
+        result.error_msg.?,
+    );
+    // A malformed call must not spawn geckodriver/Firefox.
+    try std.testing.expect(bt.manager == null);
+}
+
+test "webdriver backend serves snapshot and close stops the manager" {
+    const fake = @import("webdriver_fake_server.zig");
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[{\"tag\":\"button\",\"label\":\"Go\",\"detail\":\"\"}],\"more\":false}}" },
+        .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(std.testing.allocator, &routes);
+    defer server.deinit();
+    const base = try server.url(std.testing.allocator);
+    defer std.testing.allocator.free(base);
+
+    var bt = BrowserTool{
+        .allocator = std.testing.allocator,
+        .config = .{ .enabled = true, .backend = "webdriver", .allowed_domains = &.{"example.com"} },
+        .webdriver_url = base,
+    };
+    defer bt.shutdown();
+
+    var parsed = try root.parseTestArgs("{\"action\":\"snapshot\"}");
+    defer parsed.deinit();
+    const result = try bt.execute(std.testing.allocator, parsed.value.object);
+    defer std.testing.allocator.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "body text") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "[0] <button> Go") != null);
+    try std.testing.expect(bt.manager != null);
+
+    var close_args = try root.parseTestArgs("{\"action\":\"close\"}");
+    defer close_args.deinit();
+    const closed = try bt.execute(std.testing.allocator, close_args.value.object);
+    try std.testing.expect(closed.success);
+    try std.testing.expectEqualStrings("Browser closed", closed.output);
+    try std.testing.expect(bt.manager == null);
 }
 
 test "browser read rejects option-like url" {
