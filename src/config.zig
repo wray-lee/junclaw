@@ -913,6 +913,15 @@ pub const Config = struct {
                 try writePrettyField(self.allocator, w, "      ", "args", server.args, "");
                 wrote_field = true;
             }
+            if (server.tools.len > 0) {
+                if (wrote_field) {
+                    try w.writeAll(",\n");
+                } else {
+                    try w.writeAll("\n");
+                }
+                try writePrettyField(self.allocator, w, "      ", "tools", server.tools, "");
+                wrote_field = true;
+            }
             if (server.env.len > 0) {
                 if (wrote_field) {
                     try w.writeAll(",\n");
@@ -3031,6 +3040,55 @@ test "save escapes mcp_servers strings safely" {
     try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers[0].env.len);
     try std.testing.expectEqualStrings("OPEN\"KEY", loaded.mcp_servers[0].env[0].key);
     try std.testing.expectEqualStrings("ab\\cd\"ef\nz", loaded.mcp_servers[0].env[0].value);
+}
+
+test "save persists mcp tools allowlist" {
+    // Regression: Config.save omitted mcp_servers.<name>.tools, so saving
+    // silently dropped the allowlist and every MCP tool was registered again.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.mcp_servers = &.{
+        .{
+            .name = "browser",
+            .command = "lightpanda",
+            .args = &.{"mcp"},
+            .tools = &.{ "goto", "markdown" },
+        },
+    };
+
+    try cfg.save();
+
+    const file = try std_compat.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 128 * 1024);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "      \"tools\": [\n") != null);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.mcp_servers.len);
+    try std.testing.expectEqual(@as(usize, 2), loaded.mcp_servers[0].tools.len);
+    try std.testing.expectEqualStrings("goto", loaded.mcp_servers[0].tools[0]);
+    try std.testing.expectEqualStrings("markdown", loaded.mcp_servers[0].tools[1]);
 }
 
 test "save outputs pretty-printed nested sections" {
