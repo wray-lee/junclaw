@@ -106,7 +106,7 @@ Localized documentation lives under `docs/en/` and `docs/zh/`. Use the links bel
 | Install | [`docs/en/installation.md`](docs/en/installation.md) | [`docs/zh/installation.md`](docs/zh/installation.md) |
 | Install Zig | [`docs/en/zig-installation.md`](docs/en/zig-installation.md) | [`docs/zh/zig-installation.md`](docs/zh/zig-installation.md) |
 | Configure | [`docs/en/configuration.md`](docs/en/configuration.md) | [`docs/zh/configuration.md`](docs/zh/configuration.md) |
-| Browser (Lightpanda) | [`docs/en/browser.md`](docs/en/browser.md) | [`docs/zh/browser.md`](docs/zh/browser.md) |
+| Browser (Firefox/WebDriver + Lightpanda) | [`docs/en/browser.md`](docs/en/browser.md) | [`docs/zh/browser.md`](docs/zh/browser.md) |
 | Commands | [`docs/en/commands.md`](docs/en/commands.md) | [`docs/zh/commands.md`](docs/zh/commands.md) |
 | Development | [`docs/en/development.md`](docs/en/development.md) | [`docs/zh/development.md`](docs/zh/development.md) |
 | Operations | [`docs/en/usage.md`](docs/en/usage.md) | [`docs/zh/usage.md`](docs/zh/usage.md) |

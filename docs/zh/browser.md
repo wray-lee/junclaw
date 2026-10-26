@@ -9,7 +9,8 @@ junclaw 的浏览器镜像提供两条互相独立的路线：
 
 Firefox 后端内置在 junclaw 里：它通过 geckodriver 启动 Firefox ESR，由
 `browser` 工具提供八个动作。Lightpanda 路线以独立进程运行，经其 MCP server
-接入，沿用 MCP 工具集。两条路线互不影响，按需要选择镜像和配置。
+接入，沿用 MCP 工具集。两条路线互不影响，按需要选择镜像和配置。不需要浏览器
+自动化时，瘦 release 镜像（`latest`）不包含这两条路线。
 
 ## Firefox/WebDriver 后端
 
@@ -55,9 +56,17 @@ Firefox 会话完成。geckodriver 由 junclaw 自行启动和停止；自动化
 services:
   junclaw:
     image: ghcr.io/wray-lee/junclaw:main-browser
+    shm_size: 256m
+    mem_limit: 1536m
     volumes:
       - ./data:/nullclaw-data
 ```
+
+这两个上限按每个容器一个 Firefox 会话估算：`shm_size: 256m` 来自镜像冒烟测试
+中真实页面的需要；`mem_limit: 1536m` 依据阶段 2 实测——热态空闲会话的 cgroup
+占用约 350–421 MiB，冷启动首轮峰值 991–1012 MiB（含可回收页缓存），与 OOM
+相关的唯一集峰值 427–453 MiB，可用区间 1280–2048 MiB。请按 cgroup 用量而不是
+合计约 1.05 GiB 的 RSS 来定 `mem_limit`；后者会把共享页按进程重复计算。
 
 浏览器不需要额外的 sidecar 或环境变量。需要 Node 22 和 dsh sidecar 时改用
 `full-dsh-browser`；`browser` 工具在 dsh 引擎下由同一套工具注册，因此两个
@@ -150,6 +159,11 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型。它�
   和最终 URL，不覆盖每个子资源；junclaw 的解析与 Firefox 的解析之间的 DNS
   rebinding 也不在覆盖范围内。局域网必须不可达时，请把容器放到隔离网络并在
   那里限制出站流量。
+- **代理与浏览器策略手段尚未接入。** Firefox 可以用 `policies.json` 策略文件或
+  `network.proxy.*` 首选项强制走代理、收敛出网。当前后端只生成自己的
+  `user.js`（关闭遥测与更新等），不接受操作者提供的策略文件或代理首选项，
+  因此现在没有受支持的方式在浏览器内固定出网。在该能力实现前，真正可执行的
+  边界是部署侧网络隔离（容器网络与出站规则），不是 Firefox 配置。
 - **页面脚本会运行。** Firefox 会执行页面 JavaScript。模型拿不到 JavaScript
   动作；`read`、`snapshot` 和 `scroll` 使用固定的内部脚本。页面输出按不可信
   输入处理。
@@ -197,8 +211,9 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型。它�
   arm64 镜像。CI 只发布 `linux/amd64`。
 - **CI 镜像。** 镜像工作流会在推送前构建并校验两个变体。该工作流的一次运行
   不属于本阶段本地验证的一部分。
-- **空闲默认值。** `120000` ms 是当前默认值，只是起点；尚未按真实负载标定。
-  `0` 可关闭。
+- **空闲默认值。** 阶段 2 实测后默认值保持 `120000` ms：闲置会话约占
+  350–421 MiB，冷启动重建只需 1.0–1.8 s，但超时会丢页面与 snapshot 编号，
+  120 s 可覆盖正常模型延迟。内存紧张的部署可显式设为 `60000`；`0` 关闭。
 - **snapshot 编号是临时的。** 替换元素的 DOM 重渲染会让编号失效；`click` 和
   `type` 随后会报驱动的元素错误。请重新 `snapshot`。
 - **`read` 返回文本。** 它使用 `innerText`，不是 HTML 源码。需要可交互元素
@@ -213,10 +228,15 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型。它�
 - **容器告警。** 在 Docker 默认 seccomp 配置下，Firefox 会记录
   `Sandbox: CanCreateUserNamespace() clone() failure: EPERM` 并回退到隔离较弱
   的沙箱；会话仍可用，容器仍是边界。不要只为消除告警而关闭 seccomp。最小
-  页面在默认 64 MB `/dev/shm` 下可用；冒烟测试使用 256 MB。大页面导致
-  Firefox 崩溃时可调高 `--shm-size`。
-- **内存。** 上面测的是镜像大小，本阶段没有测 Firefox 的运行时 RSS。请按完整
-  浏览器而非瘦 release 镜像来规划容器内存；每个运行时一个浏览器是设计前提。
+  页面在默认 64 MB `/dev/shm` 下可用；镜像冒烟测试的真实页面需要 256 MB，
+  示例已按此设置。大页面导致 Firefox 崩溃时可调高 `--shm-size`。
+- **内存。** 用与镜像相同的 Firefox/geckodriver 组件在镜像外实测：热态空闲
+  会话的 cgroup 占用约 350–421 MiB，冷启动首轮峰值 991–1012 MiB（其中页
+  缓存可回收），与 OOM 相关的唯一集峰值 427–453 MiB。常被引用的约 1.05 GiB
+  是各进程 RSS 合计，会把共享页重复计算，不要用它来定 `mem_limit`。compose
+  示例使用 `1536m`；1280 MiB 是实用下限，2048 MiB 只适合内存足够的宿主机。
+  这些是本地文本页上的宿主机测量，不是镜像内 cgroup 数字，真实重站点会更高。
+  每个运行时一个浏览器是设计前提。
 
 ## Lightpanda MCP 变体（阶段 1）
 

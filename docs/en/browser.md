@@ -11,7 +11,8 @@ The Firefox backend is built into junclaw: it starts Firefox ESR through
 geckodriver and serves eight actions from the `browser` tool. The Lightpanda
 route runs as a separate process reached through its MCP server and keeps the
 MCP tool set. The routes are independent; pick the image and configuration for
-the one you want.
+the one you want. If you do not need browser automation, the slim release image
+(`latest`) includes neither route.
 
 ## Firefox/WebDriver Backend
 
@@ -60,9 +61,19 @@ the normal gateway entrypoint:
 services:
   junclaw:
     image: ghcr.io/wray-lee/junclaw:main-browser
+    shm_size: 256m
+    mem_limit: 1536m
     volumes:
       - ./data:/nullclaw-data
 ```
+
+These limits are sized for one Firefox session per container. `shm_size: 256m`
+is what a real page load needed in the image smoke test; `mem_limit: 1536m`
+follows the phase-2 measurements: about 350–421 MiB cgroup usage for a warm idle
+session, 991–1012 MiB at cold first start including reclaimable page cache, and
+a 427–453 MiB OOM-relevant peak, with a practical range of 1280–2048 MiB. Size
+from cgroup usage, not from the ~1.05 GiB summed RSS, which counts shared pages
+once per process.
 
 The browser needs no extra sidecar or environment variable. Use
 `full-dsh-browser` when you also want Node 22 and the dsh sidecar; the `browser`
@@ -170,6 +181,14 @@ It is not a network sandbox.
   DNS rebinding between junclaw's lookup and Firefox's is not covered. If the
   LAN must stay unreachable, put the container on an isolated network and
   restrict egress there.
+- **Proxy and browser policy controls are not wired.** Firefox can force
+  traffic through a proxy or narrow egress with a `policies.json` policy file
+  or `network.proxy.*` prefs. The backend generates only its own `user.js`
+  (telemetry and update suppression) and accepts no operator-supplied policy
+  file or proxy prefs, so there is no supported way to pin egress inside the
+  browser yet. Until that exists, the enforceable boundary is deployment-side
+  network isolation (container network and egress rules), not Firefox
+  configuration.
 - **Page scripts run.** Firefox executes the page's JavaScript. The model never
   gets a JavaScript action; `read`, `snapshot` and `scroll` use fixed internal
   snippets. Treat page output as untrusted input.
@@ -227,8 +246,10 @@ warning (see [Limitations and validation status](#limitations-and-validation-sta
 - **CI images.** The image workflow builds and verifies both variants before
   pushing. A run of that workflow is not part of this phase's local
   verification.
-- **Idle default.** `120000` ms is the current default, chosen as a starting
-  point; it has not been calibrated against real workloads. `0` disables it.
+- **Idle default.** `120000` ms is the default after the phase-2 measurements:
+  an idle session stays around 350–421 MiB, a cold restart takes 1.0–1.8 s, but
+  a timeout loses the page and snapshot numbering, so 120 s covers normal model
+  latency. Memory-constrained deployments can set `60000`; `0` disables it.
 - **Snapshot refs are ephemeral.** A DOM re-render that replaces elements
   invalidates the numbers; `click` and `type` then fail with the driver's
   element error. Call `snapshot` again.
@@ -246,11 +267,18 @@ warning (see [Limitations and validation status](#limitations-and-validation-sta
   `Sandbox: CanCreateUserNamespace() clone() failure: EPERM` and falls back to
   a less isolated sandbox; sessions still work and the container remains the
   boundary. Do not disable seccomp just to remove the warning. A minimal page
-  worked with the default 64 MB `/dev/shm`; the smoke test used 256 MB. Raise
-  `--shm-size` if large pages crash Firefox.
-- **Memory.** Image sizes are measured above, but runtime RSS for Firefox was
-  not benchmarked in this phase. Size the container for a full browser, not
-  for the slim release image; one browser per runtime is the design point.
+  worked with the default 64 MB `/dev/shm`; a real page load in the image smoke
+  test needed 256 MB, which the example sets. Raise `--shm-size` if large pages
+  crash Firefox.
+- **Memory.** Measured outside the image with the same Firefox/geckodriver
+  components: a warm idle session uses about 350–421 MiB in cgroup terms, a
+  cold first start peaks at 991–1012 MiB including reclaimable page cache, and
+  the OOM-relevant set peaks at 427–453 MiB. The ~1.05 GiB figure often quoted
+  is summed RSS, which counts shared pages once per process; do not size
+  `mem_limit` from it. The compose example uses `1536m`; 1280 MiB is a practical
+  floor and 2048 MiB only fits hosts with the RAM. These are host measurements
+  on local text pages, not in-image cgroup numbers, so treat them as a lower
+  bound for real sites. One browser per runtime is the design point.
 
 ## Lightpanda MCP Variant (Phase 1)
 
