@@ -153,6 +153,11 @@ pub const Chunk = union(enum) {
         index: u32,
         text: []const u8,
     },
+    /// One fragment of the model's reasoning trace.
+    reasoning_delta: struct {
+        index: u32,
+        text: []const u8,
+    },
     tool_call: ToolCall,
     tool_result: struct {
         call_id: []const u8,
@@ -384,11 +389,13 @@ fn parseChunk(allocator: Allocator, value: Value) !Chunk {
     const kind = stringField(object, "type") orelse
         return .{ .other = try stringifyValue(allocator, value) };
 
-    if (std.mem.eql(u8, kind, "text-delta")) {
+    if (std.mem.eql(u8, kind, "text-delta") or std.mem.eql(u8, kind, "reasoning-delta")) {
         const text = stringField(object, "text") orelse return error.InvalidFrame;
         const index = std.math.cast(u32, intField(object, "index") orelse 0) orelse
             return error.InvalidFrame;
-        return .{ .text_delta = .{ .index = index, .text = try allocator.dupe(u8, text) } };
+        const copy = try allocator.dupe(u8, text);
+        if (std.mem.eql(u8, kind, "text-delta")) return .{ .text_delta = .{ .index = index, .text = copy } };
+        return .{ .reasoning_delta = .{ .index = index, .text = copy } };
     }
 
     if (std.mem.eql(u8, kind, "tool-call") or std.mem.eql(u8, kind, "tool-call-delta")) {
@@ -740,6 +747,7 @@ fn stringifyValue(allocator: Allocator, value: Value) ![]const u8 {
 fn freeChunk(allocator: Allocator, chunk: Chunk) void {
     switch (chunk) {
         .text_delta => |text| allocator.free(text.text),
+        .reasoning_delta => |text| allocator.free(text.text),
         .tool_call => |call| {
             allocator.free(call.call_id);
             allocator.free(call.name);
@@ -1071,19 +1079,50 @@ test "parseServerFrame keeps uninterpreted chunks verbatim" {
     const allocator = std.testing.allocator;
     const frame =
         "{\"type\":\"item\",\"value\":{\"type\":\"assistant-stream\",\"frame\":{\"type\":\"chunk\"," ++
-        "\"chunk\":{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"hmm\"}}}}";
+        "\"chunk\":{\"type\":\"usage-delta\",\"index\":0,\"totalTokens\":7}}}}";
     const event = try parseServerFrame(allocator, frame);
     defer freeServerEvent(allocator, event);
     switch (event) {
         .assistant_chunk => |chunk| switch (chunk) {
             .other => |raw| try std.testing.expectEqualStrings(
-                "{\"type\":\"reasoning-delta\",\"index\":0,\"text\":\"hmm\"}",
+                "{\"type\":\"usage-delta\",\"index\":0,\"totalTokens\":7}",
                 raw,
             ),
             else => return error.TestUnexpectedChunk,
         },
         else => return error.TestUnexpectedEvent,
     }
+}
+
+test "parseServerFrame parses reasoning-delta with owned text" {
+    // Regression: reasoning-delta fell through to opaque .other, so the relay
+    // never saw the trace; the text copy is owned so freeServerEvent frees it.
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"item\",\"value\":{\"type\":\"assistant-stream\",\"frame\":{\"type\":\"chunk\"," ++
+        "\"chunk\":{\"type\":\"reasoning-delta\",\"index\":3,\"text\":\"hmm\"}}}}";
+    const event = try parseServerFrame(allocator, frame);
+    defer freeServerEvent(allocator, event);
+    switch (event) {
+        .assistant_chunk => |chunk| switch (chunk) {
+            .reasoning_delta => |delta| {
+                try std.testing.expectEqual(@as(u32, 3), delta.index);
+                try std.testing.expectEqualStrings("hmm", delta.text);
+            },
+            else => return error.TestUnexpectedChunk,
+        },
+        else => return error.TestUnexpectedEvent,
+    }
+}
+
+test "parseServerFrame rejects reasoning-delta without text" {
+    // Regression: a reasoning-delta missing text was accepted as opaque .other
+    // instead of rejecting the frame like text-delta does.
+    const allocator = std.testing.allocator;
+    const frame =
+        "{\"type\":\"item\",\"value\":{\"type\":\"assistant-stream\",\"frame\":{\"type\":\"chunk\"," ++
+        "\"chunk\":{\"type\":\"reasoning-delta\",\"index\":0}}}}";
+    try std.testing.expectError(error.InvalidFrame, parseServerFrame(allocator, frame));
 }
 
 test "parseServerFrame: turn/end kind and nested abort reason" {

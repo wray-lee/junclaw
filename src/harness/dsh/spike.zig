@@ -116,6 +116,7 @@ fn printEvent(session_id: []const u8, event: protocol.ServerEvent) void {
                     oneLine(&content_buf, result.content_json),
                 });
             },
+            .reasoning_delta => {},
             .other => {},
         },
         .turn_end => |turn| emit("EVENT session={s} turn/end kind={s} reason={s}\n", .{

@@ -257,9 +257,12 @@ fn warnDshIgnored() void {
 /// Build this session's lightweight dsh handle. The shared engine is created
 /// on first use, which only allocates and fills fields; the sidecar boots
 /// later, on the first dsh turn, outside the session-table lock.
-fn startDshHarness(manager: *SessionManager, session_key: []const u8) !DshState {
+fn startDshHarness(manager: *SessionManager, session_key: []const u8, agent: *Agent) !DshState {
     const engine = try manager.ensureDshEngine();
-    return .{ .harness = try dsh_harness_mod.DshHarness.init(engine, session_key) };
+    var harness = try dsh_harness_mod.DshHarness.init(engine, session_key);
+    // The shared engine outlives sessions; the display mode is per key.
+    harness.setCallConfig(agent.model_name, agent.reasoning_effort, agent.reasoning_mode);
+    return .{ .harness = harness };
 }
 
 const log = std.log.scoped(.session);
@@ -684,8 +687,16 @@ pub const Session = struct {
                     // The engine's reply is borrowed; host replies are owned.
                     return try self.agent.allocator.dupe(u8, reply);
                 }
-                // Commands the dsh engine does not own (e.g. /status) stay host-side.
-                return self.agent.handleSlashCommand(content);
+                // Commands the dsh engine does not own (e.g. /status, /think)
+                // stay host-side; mirror their config change to this session's
+                // sidecar handle before the next turn.
+                const reply = try self.agent.handleSlashCommand(content);
+                d.harness.setCallConfig(
+                    self.agent.model_name,
+                    self.agent.reasoning_effort,
+                    self.agent.reasoning_mode,
+                );
+                return reply;
             }
         }
         return self.agent.handleSlashCommand(content);
@@ -2445,7 +2456,7 @@ pub const SessionManager = struct {
         if (comptime dsh_enabled) {
             if (selected_config.agent.harness == .dsh_sidecar) {
                 // Attach the handle now; the sidecar boots on the first turn.
-                session.dsh = try startDshHarness(self, owned_key);
+                session.dsh = try startDshHarness(self, owned_key, &session.agent);
             }
         } else if (selected_config.agent.harness == .dsh_sidecar) {
             warnDshIgnored();
@@ -11709,4 +11720,53 @@ test "agent.harness switch between dsh and native keeps the store and restarts c
         try testing.expectEqualStrings(want.role, got.role);
         try testing.expectEqualStrings(want.content, got.content);
     }
+}
+
+test "dsh-sidecar: per-session reasoning_mode follows config and /reasoning" {
+    // Regression: Info.reasoning_mode was hardcoded `.off` for every sidecar
+    // session, so the host never knew a session had selected on/stream.
+    if (comptime !dsh_enabled) return error.SkipZigTest;
+    const allocator = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std_compat.fs.path.join(allocator, &.{ base, "config.json" });
+    defer allocator.free(config_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.agent.harness = .dsh_sidecar;
+    cfg.agent.reasoning_mode = .on;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const first = try sm.getOrCreate("cli:main:reasoning-mode-a");
+    try testing.expectEqual(
+        config_types.ReasoningMode.on,
+        first.turnHarness().info().reasoning_mode,
+    );
+
+    const reply = (try first.handleLocalCommand("/reasoning stream")).?;
+    defer allocator.free(reply);
+    try testing.expectEqual(
+        config_types.ReasoningMode.stream,
+        first.turnHarness().info().reasoning_mode,
+    );
+
+    // A second key on the same shared DshEngine keeps the configured default;
+    // the first key changing its mode must not retarget it.
+    const second = try sm.getOrCreate("cli:main:reasoning-mode-b");
+    try testing.expectEqual(
+        config_types.ReasoningMode.on,
+        second.turnHarness().info().reasoning_mode,
+    );
+    try testing.expectEqual(
+        config_types.ReasoningMode.stream,
+        first.turnHarness().info().reasoning_mode,
+    );
 }
