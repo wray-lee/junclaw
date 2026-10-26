@@ -121,6 +121,12 @@ NullClaw 支持 [Model Context Protocol](https://modelcontextprotocol.io/)，通
   工具和 `always` 分组工具。无论关键词是否命中，`dynamic` 工具都不会被写入
   prompt 文本。
 
+两个使用原生工具 schema 的引擎共用同一实现：内置 agent 与进程内 dsh 引擎
+（`agent.harness = "dsh"`，即默认值）每轮都用当轮用户消息调用一次
+`tool_filter.toolExposed`。因此同一份 `tool_filter_groups` 配置和同一条消息在
+两个引擎上暴露的 MCP 工具逐项一致，`dynamic` 在两个引擎上都生效；dsh 引擎
+没有文本 prompt 工具列表，这是它唯一的工具暴露路径。
+
 实际影响：如果你的 provider 不支持原生工具 schema，`dynamic` 分组会静默失效。
 在依赖 `dynamic` 来压缩庞大的 MCP 工具面之前，请先用支持原生 schema 的
 后端验证。

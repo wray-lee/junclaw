@@ -192,6 +192,9 @@ const DshNativeState = struct {
             .temperature = session.agent.temperature,
             .host_tools = host_tools,
             .host_executor = .{ .context = @ptrCast(&session.agent), .call = hostToolCall },
+            // Same per-turn MCP exposure as the native agent; the bridge set
+            // above is already the post-allowlist `session.agent.tools`.
+            .tool_filter_groups = config.agent.tool_filter_groups,
         });
         errdefer harness.deinit(allocator);
         return .{
@@ -4829,6 +4832,28 @@ const ProbeTool = struct {
     }
 };
 
+/// An MCP-shaped tool for bridge tests: the name is what `initMcpTools`
+/// registers after its per-server allowlist.
+fn BridgeProbeTool(comptime name: []const u8) type {
+    return struct {
+        pub const tool_name = name;
+        pub const tool_description = "Bridge allowlist probe";
+        pub const tool_params = "{}";
+        const vtable = tools_mod.ToolVTable(@This());
+
+        fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *@This(), _: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            return .{ .success = true, .output = "" };
+        }
+    };
+}
+
+const EchoBridgeProbe = BridgeProbeTool("mcp_fake_echo");
+const MarkdownBridgeProbe = BridgeProbeTool("mcp_fake_markdown");
+
 const StopDuringToolProbe = struct {
     session: ?*Session = null,
     executions: usize = 0,
@@ -6981,6 +7006,43 @@ test "agent.harness defaults to the in-process dsh engine" {
         @as(*anyopaque, @ptrCast(&session.dsh_native.?.harness)),
         session.turnHarness().ptr,
     );
+}
+
+test "dsh bridge set equals the session tools left after the MCP allowlist" {
+    // `initMcpTools` already dropped non-allowlisted tools before they reached
+    // `agent.tools`, so the bridge must copy exactly this list: no resurrection
+    // and no duplicates.
+    const allocator = testing.allocator;
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var echo_probe = EchoBridgeProbe{};
+    var markdown_probe = MarkdownBridgeProbe{};
+    const tools = [_]Tool{ echo_probe.tool(), markdown_probe.tool() };
+
+    var provider = DshNativeScriptedProvider.init(allocator, &.{.{ .text = "unused" }});
+    defer provider.deinit();
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        allocator,
+        &fixture.cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:mcp-allowlist");
+    const bridge_tools = session.dsh_native.?.host_tools;
+    try testing.expectEqual(tools.len, bridge_tools.len);
+    for (tools, bridge_tools) |tool, host| {
+        try testing.expectEqualStrings(tool.name(), host.name);
+        try testing.expectEqualStrings(tool.description(), host.description);
+        try testing.expectEqualStrings(tool.parametersJson(), host.input_schema_json);
+    }
 }
 
 test "agent.harness=dsh-sidecar is ignored in a default build" {

@@ -32,6 +32,7 @@ const std = @import("std");
 const compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const agent_mod = @import("../../agent/root.zig");
+const tool_filter = @import("../../tool_filter.zig");
 const dispatcher = @import("../../agent/dispatcher.zig");
 const native_prompt = @import("../../agent/prompt.zig");
 const bootstrap_mod = @import("../../bootstrap/root.zig");
@@ -120,6 +121,9 @@ pub const Options = struct {
     /// `autonomy.allowed_paths`: extra roots for the file and bash tools.
     allowed_paths: []const []const u8 = &.{},
     max_parallel_tools: usize = config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS,
+    /// `agent.tool_filter_groups`; empty exposes every tool. Applied per turn
+    /// with the same `tool_filter.toolExposed` the native agent uses.
+    tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
     on_corrupt: config_types.DshOnCorrupt = .fail,
     /// Routed model capacity for dsh proactive compaction. Zero disables the
     /// pre-step pressure probe; provider-confirmed overflow still compacts.
@@ -189,6 +193,13 @@ pub const DshNativeHarness = struct {
     /// modes changes only the prompt section (live recording p2b-plan-off).
     tool_schemas: []const request.ToolSchema = &.{},
     tool_specs: []const providers.ToolSpec = &.{},
+    /// The unfiltered catalog; `tool_schemas`/`tool_specs` are a per-turn
+    /// subset of these when `tool_filter_groups` is non-empty.
+    all_schemas: []const request.ToolSchema = &.{},
+    all_specs: []const providers.ToolSpec = &.{},
+    /// Backs the per-turn filtered catalog so those slices stay valid until
+    /// the next turn without growing the permanent arena.
+    turn_tools: std.heap.ArenaAllocator,
     registry: registry.Registry = .{},
     builtins: ?*builtins_mod.Builtins = null,
     bash: ?*bash_mod.Context = null,
@@ -274,6 +285,7 @@ pub const DshNativeHarness = struct {
             .arena = std.heap.ArenaAllocator.init(allocator),
             .opts = opts,
             .call_arena = std.heap.ArenaAllocator.init(allocator),
+            .turn_tools = std.heap.ArenaAllocator.init(allocator),
             .registry = registry.Registry.init(),
         };
         errdefer self.deinit(allocator);
@@ -303,6 +315,7 @@ pub const DshNativeHarness = struct {
         if (self.exit_plan) |value| self.allocator.destroy(value);
         self.allocator.destroy(self.plan_session);
         self.call_arena.deinit();
+        self.turn_tools.deinit();
         self.arena.deinit();
         self.prompt_arena.deinit();
         self.perm.deinit();
@@ -433,6 +446,8 @@ pub const DshNativeHarness = struct {
         try names.appendSlice(perm, host_names);
         const ordered = try prompt.orderTools(perm, names.items, null);
         const catalog = try self.assembleCatalog(perm, ordered);
+        self.all_schemas = catalog.schemas;
+        self.all_specs = catalog.specs;
         self.tool_schemas = catalog.schemas;
         self.tool_specs = catalog.specs;
     }
@@ -459,6 +474,39 @@ pub const DshNativeHarness = struct {
             };
         }
         return .{ .schemas = schemas, .specs = specs };
+    }
+
+    /// Narrow the model-visible catalog for one turn with
+    /// `agent.tool_filter_groups`, matching the native agent's
+    /// `filterToolSpecsForTurn`: `always` groups expose their glob matches,
+    /// `dynamic` groups only when the turn's user message carries a keyword.
+    /// Both engines share `tool_filter.toolExposed`; only the visible schema
+    /// changes, the registry keeps every tool (as native keeps `self.tools`).
+    fn selectTurnTools(self: *Self, user_message: []const u8) !void {
+        _ = self.turn_tools.reset(.retain_capacity);
+        if (self.opts.tool_filter_groups.len == 0) {
+            self.tool_schemas = self.all_schemas;
+            self.tool_specs = self.all_specs;
+        } else {
+            const arena = self.turn_tools.allocator();
+
+            var schemas: std.ArrayListUnmanaged(request.ToolSchema) = .empty;
+            for (self.all_schemas) |schema| {
+                if (tool_filter.toolExposed(self.opts.tool_filter_groups, schema.name, user_message)) {
+                    try schemas.append(arena, schema);
+                }
+            }
+            self.tool_schemas = try schemas.toOwnedSlice(arena);
+
+            var specs: std.ArrayListUnmanaged(providers.ToolSpec) = .empty;
+            for (self.all_specs) |spec| {
+                if (tool_filter.toolExposed(self.opts.tool_filter_groups, spec.name, user_message)) {
+                    try specs.append(arena, spec);
+                }
+            }
+            self.tool_specs = try specs.toOwnedSlice(arena);
+        }
+        if (self.loop) |*loop| loop.config.tools = self.tool_schemas;
     }
 
     fn findSchema(self: *Self, name: []const u8) ?registry.Schema {
@@ -555,6 +603,11 @@ pub const DshNativeHarness = struct {
         self.instructions_seq = null;
         self.freeTurnGuides();
         self.turn_memory_context = "";
+        // A fresh session starts from the full catalog; the per-turn filter is
+        // recomputed at the next turn.
+        _ = self.turn_tools.reset(.free_all);
+        self.tool_schemas = self.all_schemas;
+        self.tool_specs = self.all_specs;
     }
 
     fn freeTurnGuides(self: *Self) void {
@@ -1108,6 +1161,9 @@ pub const DshNativeHarness = struct {
         const arena = self.arena.allocator();
         self.in_turn = true;
         defer self.in_turn = false;
+        // `agent.tool_filter_groups` applies to every model call in this turn,
+        // exactly like the native agent's per-turn schema filter.
+        try self.selectTurnTools(input.user_message);
         // A goal round is one kernel turn; never leak that authority forward.
         defer {
             if (self.goal_tools) |tools| tools.authority = .{};

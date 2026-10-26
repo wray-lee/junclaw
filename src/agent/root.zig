@@ -10,6 +10,7 @@ const builtin = @import("builtin");
 const log = std.log.scoped(.agent);
 const Config = @import("../config.zig").Config;
 const config_types = @import("../config_types.zig");
+const tool_filter = @import("../tool_filter.zig");
 const providers = @import("../providers/root.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
@@ -1275,7 +1276,7 @@ pub const Agent = struct {
             "doing that now",
         };
         inline for (ascii_patterns) |pattern| {
-            if (containsAsciiIgnoreCase(text, pattern)) return true;
+            if (tool_filter.containsAsciiIgnoreCase(text, pattern)) return true;
         }
 
         const exact_patterns = [_][]const u8{
@@ -1339,23 +1340,6 @@ pub const Agent = struct {
         return false;
     }
 
-    fn containsAsciiIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-        if (needle.len == 0 or haystack.len < needle.len) return false;
-        var i: usize = 0;
-        while (i + needle.len <= haystack.len) : (i += 1) {
-            var matched = true;
-            var j: usize = 0;
-            while (j < needle.len) : (j += 1) {
-                if (std.ascii.toLower(haystack[i + j]) != std.ascii.toLower(needle[j])) {
-                    matched = false;
-                    break;
-                }
-            }
-            if (matched) return true;
-        }
-        return false;
-    }
-
     fn isToolTriggerSeparator(self: *const Agent, c: u8) bool {
         return std.ascii.isWhitespace(c) or std.mem.indexOfScalar(u8, self.tools_config.trigger_punctuation, c) != null;
     }
@@ -1396,7 +1380,7 @@ pub const Agent = struct {
     }
 
     fn toolTriggerMatchesMessage(self: *const Agent, user_message: []const u8, trigger: []const u8) bool {
-        if (containsAsciiIgnoreCase(user_message, trigger)) return true;
+        if (tool_filter.containsAsciiIgnoreCase(user_message, trigger)) return true;
         if (self.tools_config.trigger_modifiers.len == 0 and self.tools_config.trigger_punctuation.len == 0) return false;
         return self.normalizedToolTriggerEquals(user_message, trigger);
     }
@@ -1508,7 +1492,7 @@ pub const Agent = struct {
 
     fn firstMatchingKeyword(haystack: []const u8, keywords: []const []const u8) ?[]const u8 {
         for (keywords) |keyword| {
-            if (containsAsciiIgnoreCase(haystack, keyword)) return keyword;
+            if (tool_filter.containsAsciiIgnoreCase(haystack, keyword)) return keyword;
         }
         return null;
     }
@@ -1525,7 +1509,7 @@ pub const Agent = struct {
             "unclear",
         };
         inline for (ambiguous_keywords) |keyword| {
-            if (containsAsciiIgnoreCase(user_message, keyword)) return true;
+            if (tool_filter.containsAsciiIgnoreCase(user_message, keyword)) return true;
         }
         return user_message.len <= 220 and std.mem.indexOfScalar(u8, user_message, '?') != null;
     }
@@ -1586,11 +1570,11 @@ pub const Agent = struct {
         defer if (detail) |owned| self.allocator.free(owned);
         const snapshot = detail orelse return false;
         return providers.reliable.isRateLimited(snapshot) or
-            containsAsciiIgnoreCase(snapshot, "quota") or
-            containsAsciiIgnoreCase(snapshot, "credit") or
-            containsAsciiIgnoreCase(snapshot, "billing") or
-            containsAsciiIgnoreCase(snapshot, "insufficient_quota") or
-            containsAsciiIgnoreCase(snapshot, "out of credits");
+            tool_filter.containsAsciiIgnoreCase(snapshot, "quota") or
+            tool_filter.containsAsciiIgnoreCase(snapshot, "credit") or
+            tool_filter.containsAsciiIgnoreCase(snapshot, "billing") or
+            tool_filter.containsAsciiIgnoreCase(snapshot, "insufficient_quota") or
+            tool_filter.containsAsciiIgnoreCase(snapshot, "out of credits");
     }
 
     fn routeShouldBeDegraded(self: *Agent, err: anyerror) bool {
@@ -1990,23 +1974,6 @@ pub const Agent = struct {
         return commands.handleSlashCommand(self, message);
     }
 
-    /// Returns true if `name` matches `pattern` using simple `*` glob.
-    /// `*` matches any sequence of characters (including none).
-    fn globMatch(pattern: []const u8, name: []const u8) bool {
-        // Fast paths
-        if (std.mem.eql(u8, pattern, "*")) return true;
-        const star = std.mem.indexOfScalar(u8, pattern, '*') orelse {
-            return std.mem.eql(u8, pattern, name);
-        };
-        const prefix = pattern[0..star];
-        const suffix = pattern[star + 1 ..];
-        if (!std.mem.startsWith(u8, name, prefix)) return false;
-        if (suffix.len == 0) return true;
-        // suffix must appear at end (handles single-`*` patterns only)
-        if (name.len < prefix.len + suffix.len) return false;
-        return std.mem.endsWith(u8, name, suffix);
-    }
-
     fn toolPriorityScoreForMessage(self: *const Agent, tool_name: []const u8, user_message: []const u8) u16 {
         var best_score: u16 = 0;
         for (self.tools_config.tool_customizations) |custom| {
@@ -2081,20 +2048,10 @@ pub const Agent = struct {
         errdefer result.deinit(arena);
 
         for (self.tools) |t| {
-            if (!std.mem.startsWith(u8, t.name(), "mcp_")) {
+            // The empty message only lets `always` groups through: a dynamic
+            // keyword never matches, which is this path's documented rule.
+            if (tool_filter.toolExposed(self.tool_filter_groups, t.name(), "")) {
                 try result.append(arena, t);
-                continue;
-            }
-
-            for (self.tool_filter_groups) |group| {
-                if (group.mode != .always) continue;
-                for (group.tools) |pattern| {
-                    if (globMatch(pattern, t.name())) {
-                        try result.append(arena, t);
-                        break;
-                    }
-                } else continue;
-                break;
             }
         }
 
@@ -2127,44 +2084,9 @@ pub const Agent = struct {
         var result: std.ArrayListUnmanaged(ToolSpec) = .empty;
 
         for (self.tool_specs) |spec| {
-            // Non-MCP tools are always included.
-            if (!std.mem.startsWith(u8, spec.name, "mcp_")) {
+            if (tool_filter.toolExposed(self.tool_filter_groups, spec.name, user_message)) {
                 try result.append(arena, spec);
-                continue;
             }
-
-            var include = false;
-            for (self.tool_filter_groups) |group| {
-                // Check if any pattern in this group matches the tool name.
-                var pattern_matched = false;
-                for (group.tools) |pattern| {
-                    if (globMatch(pattern, spec.name)) {
-                        pattern_matched = true;
-                        break;
-                    }
-                }
-                if (!pattern_matched) continue;
-
-                switch (group.mode) {
-                    .always => {
-                        include = true;
-                        break;
-                    },
-                    .dynamic => {
-                        // Case-insensitive ASCII substring match for configured keywords.
-                        for (group.keywords) |kw| {
-                            if (containsAsciiIgnoreCase(user_message, kw)) {
-                                include = true;
-                                break;
-                            }
-                            if (include) break;
-                        }
-                        if (include) break;
-                    },
-                }
-            }
-
-            if (include) try result.append(arena, spec);
         }
 
         return self.prioritizeToolSpecsForTurn(arena, try result.toOwnedSlice(arena), user_message);
@@ -11922,6 +11844,43 @@ test "filterToolSpecsForTurn dynamic group keyword match is case-insensitive" {
     agent.tool_specs = try allocator.alloc(ToolSpec, 0);
 }
 
+test "filterToolSpecsForTurn matches the dsh per-turn MCP subset" {
+    // Keep this catalog, group set and expected names in sync with the dsh
+    // test "tool_filter_groups expose the native per-turn MCP subset": both
+    // engines must expose the same tools for the same message.
+    const allocator = std.testing.allocator;
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var agent = try makeTestAgent(allocator);
+    defer agent.deinit();
+    allocator.free(agent.tool_specs);
+    agent.tool_specs = &.{
+        .{ .name = "shell", .description = "run shell", .parameters_json = "{}" },
+        .{ .name = "mcp_fake_echo", .description = "echo", .parameters_json = "{}" },
+        .{ .name = "mcp_fake_markdown", .description = "markdown", .parameters_json = "{}" },
+        .{ .name = "mcp_other_list", .description = "list", .parameters_json = "{}" },
+    };
+    agent.tool_filter_groups = &.{
+        .{ .mode = .always, .tools = &.{"mcp_fake_echo"} },
+        .{ .mode = .dynamic, .tools = &.{"mcp_fake_*"}, .keywords = &.{"网页"} },
+    };
+
+    const without_keyword = try agent.filterToolSpecsForTurn(arena, "hello");
+    try std.testing.expectEqual(@as(usize, 2), without_keyword.len);
+    try std.testing.expectEqualStrings("shell", without_keyword[0].name);
+    try std.testing.expectEqualStrings("mcp_fake_echo", without_keyword[1].name);
+
+    const with_keyword = try agent.filterToolSpecsForTurn(arena, "帮我打开网页");
+    try std.testing.expectEqual(@as(usize, 3), with_keyword.len);
+    try std.testing.expectEqualStrings("shell", with_keyword[0].name);
+    try std.testing.expectEqualStrings("mcp_fake_echo", with_keyword[1].name);
+    try std.testing.expectEqualStrings("mcp_fake_markdown", with_keyword[2].name);
+
+    agent.tool_specs = try allocator.alloc(ToolSpec, 0);
+}
+
 test "filterToolSpecsForTurn prioritizes triggered custom tools" {
     const allocator = std.testing.allocator;
     var arena_state = std.heap.ArenaAllocator.init(allocator);
@@ -13094,12 +13053,12 @@ test "buildProviderMessagesForTurn adds priority hint without mutating history" 
 }
 
 test "globMatch handles prefix wildcard" {
-    try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_list_tasks"));
-    try std.testing.expect(Agent.globMatch("mcp_vikunja_*", "mcp_vikunja_create_task"));
-    try std.testing.expect(!Agent.globMatch("mcp_vikunja_*", "mcp_browser_open"));
-    try std.testing.expect(Agent.globMatch("*", "anything"));
-    try std.testing.expect(Agent.globMatch("shell", "shell"));
-    try std.testing.expect(!Agent.globMatch("shell", "shell_extra"));
+    try std.testing.expect(tool_filter.globMatch("mcp_vikunja_*", "mcp_vikunja_list_tasks"));
+    try std.testing.expect(tool_filter.globMatch("mcp_vikunja_*", "mcp_vikunja_create_task"));
+    try std.testing.expect(!tool_filter.globMatch("mcp_vikunja_*", "mcp_browser_open"));
+    try std.testing.expect(tool_filter.globMatch("*", "anything"));
+    try std.testing.expect(tool_filter.globMatch("shell", "shell"));
+    try std.testing.expect(!tool_filter.globMatch("shell", "shell_extra"));
 }
 
 test "loop honors max_tool_iterations limit" {

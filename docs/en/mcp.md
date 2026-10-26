@@ -130,6 +130,13 @@ behave identically, because they are applied at two different stages.
   deliberately admits only built-ins and `always`-group tools. `dynamic` tools
   are never written into the prompt text, regardless of keywords.
 
+Both native-schema engines share one implementation: the built-in agent and the
+in-process dsh engine (`agent.harness = "dsh"`, the default) call
+`tool_filter.toolExposed` once per turn with that turn's user message. The same
+`tool_filter_groups` configuration and message therefore expose exactly the same
+MCP tools on both engines, and `dynamic` works on both. The dsh engine has no
+text-prompt tool list, so this is the only exposure path it uses.
+
 Practical consequence: if your provider does not support native tool schemas,
 `dynamic` groups silently do nothing. Verify with a backend that supports them
 before relying on `dynamic` to keep a large MCP surface out of the context.

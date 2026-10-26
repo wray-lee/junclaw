@@ -20,6 +20,7 @@ pub const websocket = @import("websocket.zig");
 pub const bus = @import("bus.zig");
 pub const config = @import("config.zig");
 pub const config_paths = @import("config_paths.zig");
+pub const tool_filter = @import("tool_filter.zig");
 pub const util = @import("util.zig");
 pub const platform = @import("platform.zig");
 pub const codex_support = @import("codex_support.zig");

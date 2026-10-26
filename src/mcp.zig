@@ -220,7 +220,10 @@ pub const McpServer = struct {
             return normalized;
         }
 
-        const stdin = self.child.?.stdin orelse return error.NoStdin;
+        // A timed-out request terminates the child above; later calls must fail
+        // instead of unwrapping null.
+        const child = self.child orelse return error.ServerNotConnected;
+        const stdin = child.stdin orelse return error.NoStdin;
         try stdin.writeAll(msg);
 
         return self.readLine(allocator) catch |err| {
@@ -251,7 +254,8 @@ pub const McpServer = struct {
             return;
         }
 
-        const stdin = self.child.?.stdin orelse return error.NoStdin;
+        const child = self.child orelse return error.ServerNotConnected;
+        const stdin = child.stdin orelse return error.NoStdin;
         try stdin.writeAll(msg);
     }
 
