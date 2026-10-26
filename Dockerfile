@@ -151,6 +151,60 @@ ENTRYPOINT ["nullclaw"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
 USER 65534:65534
 
+# ── Firefox WebDriver image (optional, additive) ─────────────
+# Same junclaw binary and entrypoint as `release`, plus Debian's Firefox ESR
+# and a pinned geckodriver. Firefox is a glibc program, so the runtime is
+# Debian (like `lightpanda`); junclaw itself is still the static musl build.
+#   docker build --target browser -t junclaw:browser .
+FROM debian:13-slim AS browser
+
+LABEL org.opencontainers.image.source=https://github.com/nullclaw/nullclaw
+
+ARG TARGETARCH
+ARG GECKODRIVER_VERSION=0.37.1
+
+# Runtime packages match `lightpanda`; fonts keep headless screenshots legible.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl git tzdata \
+      firefox-esr fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/* \
+ && firefox-esr --version
+
+# Official release asset, pinned per architecture. The build stops if the
+# download does not match, so a changed asset cannot ship silently.
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) gd_arch="linux64"; gd_sha="e815130ea95983e162ae91843b48d3a3ce991735635fce83a647afde21e09f7e" ;; \
+      arm64) gd_arch="linux-aarch64"; gd_sha="8fd90b951422fbad5b56539fb344dff66eb3f986d615d8d6fde9f1f62dad610c" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/geckodriver.tar.gz \
+      "https://github.com/mozilla/geckodriver/releases/download/v${GECKODRIVER_VERSION}/geckodriver-v${GECKODRIVER_VERSION}-${gd_arch}.tar.gz"; \
+    echo "${gd_sha}  /tmp/geckodriver.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin geckodriver; \
+    rm /tmp/geckodriver.tar.gz; \
+    chmod +x /usr/local/bin/geckodriver; \
+    test "$(geckodriver --version | head -n1 | cut -d' ' -f2)" = "${GECKODRIVER_VERSION}"
+
+# geckodriver looks up `firefox` on PATH; Debian installs `firefox-esr`.
+RUN ln -s /usr/bin/firefox-esr /usr/local/bin/firefox
+
+COPY --from=builder /app/zig-out/bin/nullclaw /usr/local/bin/nullclaw
+COPY --from=config /nullclaw-data /nullclaw-data
+RUN chown -R 65534:65534 /nullclaw-data
+
+ENV NULLCLAW_WORKSPACE=/nullclaw-data/workspace
+ENV NULLCLAW_HOME=/nullclaw-data
+ENV HOME=/nullclaw-data
+ENV SHELL=/bin/sh
+ENV NULLCLAW_GATEWAY_PORT=3000
+
+WORKDIR /nullclaw-data
+EXPOSE 3000
+ENTRYPOINT ["nullclaw"]
+CMD ["gateway", "--port", "3000", "--host", "::"]
+USER 65534:65534
+
 # ── Full dsh image (optional, additive) ──────────────────────
 # The targets above are unchanged. This target adds the dsh sidecar harness:
 #   docker build --target full-dsh -t junclaw:full-dsh .
@@ -207,6 +261,43 @@ EXPOSE 3000
 USER 65534:65534
 ENTRYPOINT ["nullclaw"]
 CMD ["gateway", "--port", "3000", "--host", "::"]
+
+# ── Full dsh + Firefox WebDriver image (optional, additive) ──
+# `full-dsh` plus the same Firefox ESR + geckodriver layer as `browser`.
+#   docker build --target full-dsh-browser -t junclaw:full-dsh-browser .
+FROM full-dsh AS full-dsh-browser
+
+ARG TARGETARCH
+ARG GECKODRIVER_VERSION=0.37.1
+
+# full-dsh leaves the runtime as 65534; apt needs root.
+USER 0:0
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+      firefox-esr fonts-dejavu-core \
+ && rm -rf /var/lib/apt/lists/* \
+ && firefox-esr --version
+
+# Same pinned geckodriver asset as the `browser` target.
+RUN set -eu; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) gd_arch="linux64"; gd_sha="e815130ea95983e162ae91843b48d3a3ce991735635fce83a647afde21e09f7e" ;; \
+      arm64) gd_arch="linux-aarch64"; gd_sha="8fd90b951422fbad5b56539fb344dff66eb3f986d615d8d6fde9f1f62dad610c" ;; \
+      *) echo "Unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL -o /tmp/geckodriver.tar.gz \
+      "https://github.com/mozilla/geckodriver/releases/download/v${GECKODRIVER_VERSION}/geckodriver-v${GECKODRIVER_VERSION}-${gd_arch}.tar.gz"; \
+    echo "${gd_sha}  /tmp/geckodriver.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/geckodriver.tar.gz -C /usr/local/bin geckodriver; \
+    rm /tmp/geckodriver.tar.gz; \
+    chmod +x /usr/local/bin/geckodriver; \
+    test "$(geckodriver --version | head -n1 | cut -d' ' -f2)" = "${GECKODRIVER_VERSION}"
+
+# geckodriver looks up `firefox` on PATH; Debian installs `firefox-esr`.
+RUN ln -s /usr/bin/firefox-esr /usr/local/bin/firefox
+
+USER 65534:65534
 
 # Safe default image (used when no --target is provided)
 FROM release-base AS release

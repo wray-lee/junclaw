@@ -126,3 +126,83 @@ jobs:
             docker tag "$image:candidate-lightpanda" "$image:main-lightpanda-$(git rev-parse --short=10 HEAD)"
             docker push "$image:main-lightpanda-$(git rev-parse --short=10 HEAD)"
           fi
+
+  # Firefox WebDriver variants: the junclaw binary plus Debian's Firefox ESR
+  # and a pinned geckodriver (same versions for both). Independent of `build`,
+  # so they can never block or alter `latest`; built and pushed only, never
+  # deployed.
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: browser
+            rolling: main-browser
+            suffix: browser
+          - target: full-dsh-browser
+            rolling: full-dsh-browser
+            suffix: full-dsh-browser
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Tag convention from phase 1: <rolling> plus <rolling>-<sha> on main
+      # and <release-tag>-<suffix> on a tag push.
+      - name: Resolve tags
+        id: ver
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER}/${{ env.FORK_NAME }}"
+          sha="$(git rev-parse --short=10 HEAD)"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+            version_tag="${GITHUB_REF_NAME}-${{ matrix.suffix }}"
+          else
+            version="main-${sha}"
+            version_tag="${{ matrix.rolling }}-${sha}"
+          fi
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "version_tag=${version_tag}" >> "$GITHUB_OUTPUT"
+          echo "building ${image}:${{ matrix.rolling }} and :${version_tag}"
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          target: ${{ matrix.target }}
+          platforms: linux/amd64
+          push: false
+          load: true
+          build-args: VERSION=${{ steps.ver.outputs.version }}
+          tags: ${{ steps.ver.outputs.image }}:candidate-${{ matrix.target }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}-${{ matrix.suffix }}
+
+      - name: Verify binaries and runtime user
+        run: |
+          image="${{ steps.ver.outputs.image }}:candidate-${{ matrix.target }}"
+          docker run --rm --entrypoint nullclaw "$image" --version
+          docker run --rm --entrypoint geckodriver "$image" --version
+          docker run --rm --entrypoint firefox-esr "$image" --version
+          uid=$(docker run --rm --entrypoint id "$image" -u)
+          echo "runtime uid: ${uid}"
+          test "${uid}" = "65534"
+
+      - name: Push
+        run: |
+          image="${{ steps.ver.outputs.image }}"
+          docker tag "$image:candidate-${{ matrix.target }}" "$image:${{ matrix.rolling }}"
+          docker push "$image:${{ matrix.rolling }}"
+          docker tag "$image:candidate-${{ matrix.target }}" "$image:${{ steps.ver.outputs.version_tag }}"
+          docker push "$image:${{ steps.ver.outputs.version_tag }}"
