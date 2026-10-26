@@ -27,6 +27,8 @@ pub const Options = struct {
     headless: bool = true,
     /// 0 disables idle shutdown.
     idle_timeout_ms: u64 = 120_000,
+    /// Clock override for idle expiry (tests only); null uses the wall clock.
+    clock: ?*const fn () i64 = null,
 };
 
 pub const WebDriverManager = struct {
@@ -68,7 +70,7 @@ pub const WebDriverManager = struct {
         errdefer self.mutex.unlock();
         try self.ensureLocked();
         const running = &self.running.?;
-        running.last_activity_ms = nowMs();
+        running.last_activity_ms = self.now();
         return &running.client;
     }
 
@@ -78,7 +80,7 @@ pub const WebDriverManager = struct {
                 // The next acquire rebuilds geckodriver/Firefox from scratch.
                 self.stopLocked();
             } else {
-                running.last_activity_ms = nowMs();
+                running.last_activity_ms = self.now();
             }
         }
         self.mutex.unlock();
@@ -183,7 +185,7 @@ pub const WebDriverManager = struct {
             .client = client,
             .child = child,
             .profile = profile,
-            .last_activity_ms = nowMs(),
+            .last_activity_ms = self.now(),
         };
     }
 
@@ -224,14 +226,24 @@ pub const WebDriverManager = struct {
         while (!self.stop_reaper.load(.acquire)) {
             compat.thread.sleep(reaper_poll_ms * std.time.ns_per_ms);
             if (self.stop_reaper.load(.acquire)) break;
-            self.mutex.lock();
-            if (self.running) |*running| {
-                if (idleExpired(running.last_activity_ms, nowMs(), self.options.idle_timeout_ms)) {
-                    self.stopLocked();
-                }
-            }
-            self.mutex.unlock();
+            self.reapIdleOnce();
         }
+    }
+
+    /// One idle-expiry sweep. The reaper thread runs this every poll interval;
+    /// tests drive it directly instead of waiting for the thread.
+    pub fn reapIdleOnce(self: *WebDriverManager) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.running) |*running| {
+            if (idleExpired(running.last_activity_ms, self.now(), self.options.idle_timeout_ms)) {
+                self.stopLocked();
+            }
+        }
+    }
+
+    fn now(self: *const WebDriverManager) i64 {
+        return if (self.options.clock) |clock| clock() else nowMs();
     }
 
     fn setLastErrorFmt(self: *WebDriverManager, comptime fmt: []const u8, args: anytype) void {

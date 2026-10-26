@@ -113,4 +113,5 @@ test {
     _ = @import("harness/contract_test.zig");
     _ = @import("harness/differential_test.zig");
     _ = @import("harness/dsh_native/root.zig");
+    _ = @import("tools/browser_webdriver_integration_test.zig");
 }
