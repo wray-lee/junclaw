@@ -63,7 +63,8 @@ many or large tools from flooding the model context:
 ```
 
 Names the server does not expose are ignored with a warning. See
-[Browser automation (Lightpanda)](./browser.md) for a complete browser setup.
+[Browser automation](./browser.md) for both browser routes and a complete MCP
+setup.
 
 ## How It Works
 
@@ -143,7 +144,7 @@ before relying on `dynamic` to keep a large MCP surface out of the context.
 
 ## Related
 
-- [Browser automation (Lightpanda)](./browser.md) — main-lightpanda image and MCP setup
+- [Browser automation](./browser.md) — Firefox/WebDriver and Lightpanda variants
 - [Configuration](./configuration.md) — Full config reference
 - [Architecture](./architecture.md) — Subsystem overview
 - [Security](./security.md) — Security model

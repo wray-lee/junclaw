@@ -1,15 +1,266 @@
-# Browser Automation (Lightpanda)
+# Browser Automation
 
-junclaw publishes an additional image variant, `main-lightpanda`, that adds the
-[Lightpanda](https://github.com/lightpanda-io/browser) headless browser to the
-standard image. Lightpanda runs as a separate process and is reached through its
-own MCP server, so junclaw does not gain a new browser backend: the existing MCP
-client described in [MCP](./mcp.md) connects to it over stdio.
+junclaw's browser images provide two independent routes:
 
-This page covers the Lightpanda variant (phase 1). A Firefox/WebDriver browser
-backend is phase 2 and is not part of this image.
+| Route | Image | Tool visible to the model |
+|-------|-------|---------------------------|
+| Firefox/WebDriver backend | `main-browser`, `full-dsh-browser` | the built-in `browser` tool |
+| Lightpanda over MCP | `main-lightpanda` | `mcp_lightpanda_<tool>` |
 
-## What the Variant Contains
+The Firefox backend is built into junclaw: it starts Firefox ESR through
+geckodriver and serves eight actions from the `browser` tool. The Lightpanda
+route runs as a separate process reached through its MCP server and keeps the
+MCP tool set. The routes are independent; pick the image and configuration for
+the one you want.
+
+## Firefox/WebDriver Backend
+
+Set `browser.backend` to `"webdriver"` to serve every `browser` action from a
+local Firefox session. junclaw starts and stops geckodriver itself; the
+automation path does not use a system browser, Node or Playwright.
+
+### Image Variants
+
+- `main-browser`: the release binary on a Debian 13 runtime, plus Firefox ESR
+  and geckodriver.
+- `full-dsh-browser`: the same browser layer on top of `full-dsh` (Node 22 and
+  the dsh sidecar).
+- geckodriver 0.37.1 is downloaded per architecture and checked against a
+  pinned SHA-256 at build time. Firefox ESR comes from Debian `firefox-esr`
+  (153.5.1esr at build time) and follows Debian security updates, so it is not
+  pinned by digest.
+- `fonts-dejavu-core` keeps headless screenshots legible.
+  `/usr/local/bin/firefox` is a symlink to `firefox-esr` because geckodriver
+  looks up `firefox` on `PATH`.
+- Both images run as uid/gid 65534 and use the normal `nullclaw` entrypoint.
+
+Image tags:
+
+| Tag | Meaning |
+|-----|---------|
+| `main-browser` | rolling build from `main` |
+| `main-browser-<sha>` | fixed build for a 10-character commit SHA |
+| `<tag>-browser` | build for a git tag |
+| `full-dsh-browser` | rolling build of the full dsh variant |
+| `full-dsh-browser-<sha>` | fixed build for a 10-character commit SHA |
+| `<tag>-full-dsh-browser` | tag build of the full dsh variant |
+
+- `latest` still points at the slim release image; the browser variants are
+  opt-in.
+- Measured uncompressed image sizes: 843 MB for `main-browser` and 2.1 GB for
+  `full-dsh-browser` (linux/amd64). These are image sizes, not runtime memory.
+- CI builds and verifies `linux/amd64`. The Dockerfile carries an aarch64
+  geckodriver hash, but no arm64 image has been built or tested.
+
+Pull `ghcr.io/wray-lee/junclaw:main-browser` or
+`ghcr.io/wray-lee/junclaw:full-dsh-browser` and mount `/nullclaw-data`; both use
+the normal gateway entrypoint:
+
+```yaml
+services:
+  junclaw:
+    image: ghcr.io/wray-lee/junclaw:main-browser
+    volumes:
+      - ./data:/nullclaw-data
+```
+
+The browser needs no extra sidecar or environment variable. Use
+`full-dsh-browser` when you also want Node 22 and the dsh sidecar; the `browser`
+tool is registered through the same tool set under the dsh harness, so its
+actions are identical in both variants.
+
+### Configuration
+
+Enable the built-in tool and select the backend in the config file
+(`/nullclaw-data/config.json` in the images, `~/.nullclaw/config.json` on a
+host install):
+
+```json
+{
+  "browser": {
+    "enabled": true,
+    "backend": "webdriver",
+    "native_headless": true,
+    "allowed_domains": ["example.com"],
+    "webdriver_idle_timeout_ms": 120000
+  }
+}
+```
+
+- `enabled` registers the `browser` tool. It is off by default.
+- `backend` defaults to `"agent_browser"`, which opens pages in a host browser
+  and reads them over curl. Set `"webdriver"` for the Firefox backend; inside
+  these images there is no host browser to launch.
+- `native_headless` defaults to `true`. `false` launches a visible Firefox and
+  needs a display; do not use it in a container.
+- `allowed_domains` controls the URL policy. An empty list allows any globally
+  routable HTTPS host; a non-empty list allows only exact hosts and `*.`
+  subdomain patterns. See [Security model](#security-model) for the trade-offs.
+- `webdriver_idle_timeout_ms` is the idle time before Firefox and geckodriver
+  are stopped. The default is `120000` (2 minutes); `0` disables idle shutdown.
+- `webdriver_geckodriver_path` overrides the geckodriver binary. Leave it unset
+  to use `geckodriver` from `PATH`; the images install it in
+  `/usr/local/bin`.
+- `native_webdriver_url` and `native_chrome_path` are not used by the WebDriver
+  backend. It always starts its own geckodriver on a random loopback port and
+  does not connect to an external WebDriver endpoint.
+
+Restart junclaw after changing the configuration.
+
+### Actions
+
+| Action | Parameters | Result |
+|--------|------------|--------|
+| `open` | `url` | Navigates and returns a short confirmation. |
+| `read` | `url` | Navigates, then returns the title, final URL and page text (`innerText`). Output is capped at 8 KB with `[Content truncated to 8 KB]`. |
+| `snapshot` | none | Returns the title, final URL, page text and a numbered list of visible interactive elements. Output is capped at 8 KB; text gets at most 4 KB and the list at most 100 elements. |
+| `click` | `index` or `selector` | Clicks the numbered element from the last snapshot, or a CSS selector. |
+| `type` | `index` or `selector`, `text` | Sends text to the element. W3C send-keys appends to the current value; it does not clear the field. |
+| `scroll` | `direction`, `amount` | Scrolls the window. `direction` is `up`, `down`, `left` or `right` (default `down`); `amount` is 1–100000 pixels (default 500). |
+| `screenshot` | none | Writes a PNG to the workspace and returns an `[IMAGE:...]` marker with the absolute path, for example `[IMAGE:/nullclaw-data/workspace/browser-screenshot-1a2b3c4d.png]`. Keep the marker verbatim in the reply; the base64 payload never reaches the model. |
+| `close` | none | Stops Firefox and geckodriver and deletes the temporary profile. The next action starts a new browser. |
+
+`snapshot` writes `data-junclaw-ref="N"` to each visible interactive element
+and prints `[N] <tag> label detail`. Numbers are stable until the next
+`snapshot`; a page that replaces its DOM or navigates invalidates them, so call
+`snapshot` again after a re-render. Prefer `index`; `selector` is a CSS
+fallback. `index` may be an integer or a numeric string. When `snapshot` output is cut, it
+appends the same `[Content truncated to 8 KB]` marker as `read`.
+
+Prefer `snapshot` (or `read`) over `screenshot` for page content; the
+screenshot is for visual checks.
+
+`screenshot` requires a workspace. The file is named
+`browser-screenshot-<hex>.png` and stays in the workspace; junclaw does not
+delete old screenshots. Channels that support attachments turn the marker into
+an image; on surfaces without media support the marker remains text.
+
+The `agent_browser` backend keeps its old behavior: `open` and `read` work,
+`close` reports that there is nothing to close, `snapshot` reports that the
+WebDriver backend is required, `click`, `type` and `scroll` report that CDP is
+unavailable, and `screenshot` points at the `screenshot` tool.
+
+### Security Model
+
+The WebDriver backend uses the same URL policy and trust model as `web_fetch`.
+It is not a network sandbox.
+
+- **HTTPS only.** `http://`, `ws://`, `file://`, `data:` and `javascript:` are
+  rejected before Firefox navigates. An allowlist entry does not change the
+  scheme rule.
+- **Private networks and metadata.** With `allowed_domains` empty, every host
+  is resolved and must map to a globally routable address. Loopback, RFC 1918,
+  link-local, container-runtime aliases and cloud metadata addresses such as
+  `169.254.169.254` are rejected. This reuses the checks behind `web_fetch`.
+- **Allowlist trade-off.** A non-empty `allowed_domains` turns the list into
+  the whole policy: only matching hosts are allowed, the list is checked before
+  DNS, and matching hosts skip the private-address check so they may point at
+  an internal service. This is the same operator-trusted exception as
+  `web_fetch.allowed_domains`. Keep the list empty when private networks must
+  stay unreachable; never add private or loopback hosts to make an untrusted
+  page load.
+- **Redirects and final URL.** Firefox follows redirects itself. After every
+  navigation, and again before `snapshot`, `click`, `type`, `scroll` and
+  `screenshot`, junclaw reads the URL Firefox actually landed on and validates
+  it. If the final URL fails, the page is closed and the session is marked
+  stale; the next action rebuilds it. A final URL that cannot be read fails
+  closed.
+- **Not a network sandbox.** Firefox resolves DNS for page subresources itself.
+  The checks above cover navigations and final URLs, not every subresource;
+  DNS rebinding between junclaw's lookup and Firefox's is not covered. If the
+  LAN must stay unreachable, put the container on an isolated network and
+  restrict egress there.
+- **Page scripts run.** Firefox executes the page's JavaScript. The model never
+  gets a JavaScript action; `read`, `snapshot` and `scroll` use fixed internal
+  snippets. Treat page output as untrusted input.
+- **One-shot profile.** Each browser start creates a fresh temporary profile
+  with no cookies or storage from the host. The profile is deleted on `close`,
+  on idle shutdown and when the runtime stops.
+- **Telemetry and update traffic.** A generated `user.js` disables Firefox
+  telemetry, health reporting, crash/breakpad submission, Normandy studies,
+  search updates, add-on discovery, Pocket/FxA, captive-portal probes and
+  remote download-safety lookups. These are outbound calls a browsing tool
+  must not make on its own.
+- **Downloads.** Downloads go to a `downloads` directory inside the temporary
+  profile, never to the workspace, and are deleted with the profile.
+
+Do not weaken these checks to get a page working. In particular, do not add
+private or loopback hosts to `allowed_domains` for untrusted pages, and do not
+disable the container's seccomp profile just to silence a Firefox sandbox
+warning (see [Limitations and validation status](#limitations-and-validation-status)).
+
+### Process Lifecycle and Concurrency
+
+- **Lazy start.** The first action other than `close` validates its arguments,
+  then starts geckodriver and Firefox. Malformed calls never spawn a process.
+- geckodriver listens on `127.0.0.1` on a random port. junclaw polls `/status`
+  for up to 10 seconds; a missing binary, a failed spawn or a timeout returns a
+  tool error with the reason. geckodriver output is not forwarded.
+- **One browser per runtime.** Every browser action in a runtime goes through
+  one manager and one WebDriver session. At any moment the runtime has at most
+  one Firefox instance. A mutex serializes commands, so concurrent model or
+  channel requests queue instead of starting a second Firefox. This is
+  deliberate for the 2.4 GB target machine.
+- A gateway can create more than one session runtime, and each browser-enabled
+  runtime owns its own manager. On a small host keep browser work to one
+  runtime; otherwise memory use multiplies.
+- **Idle shutdown.** After `webdriver_idle_timeout_ms` without an action, the
+  reaper stops Firefox and geckodriver. The check runs every 250 ms. `0`
+  disables idle shutdown; `close` stops immediately.
+- **Cleanup.** The stop path deletes the WebDriver session, sends TERM to the
+  geckodriver process group, falls back to KILL, then removes the temporary
+  profile. It is safe to call repeatedly. `close` returns `Browser closed` or
+  `Browser is not running`.
+- **Self-healing.** If Firefox dies (for example after an OOM kill) or the
+  driver loses the session, the next action tears down the remains and starts
+  a new geckodriver/Firefox pair. Driver and transport failures are returned
+  as tool errors, not panics.
+
+### Limitations and Validation Status
+
+- **Validation gap.** This phase was tested with automated tests against a
+  scripted fake WebDriver server and an offline image smoke test that started
+  Firefox, opened a local page and deleted the session. A real model driving
+  the tool end to end, against real sites, has not been run.
+- **aarch64.** The build file carries the arm64 geckodriver hash, but no arm64
+  image has been built or tested. CI publishes `linux/amd64` only.
+- **CI images.** The image workflow builds and verifies both variants before
+  pushing. A run of that workflow is not part of this phase's local
+  verification.
+- **Idle default.** `120000` ms is the current default, chosen as a starting
+  point; it has not been calibrated against real workloads. `0` disables it.
+- **Snapshot refs are ephemeral.** A DOM re-render that replaces elements
+  invalidates the numbers; `click` and `type` then fail with the driver's
+  element error. Call `snapshot` again.
+- **`read` returns text.** It uses `innerText`, not HTML source. Use `snapshot`
+  for interactive elements and links.
+- **`type` appends.** It does not clear the field first; clear it through page
+  interaction or type the full replacement.
+- **Screenshots accumulate.** PNGs stay in the workspace and are not cleaned
+  up automatically.
+- **External WebDriver is not supported.** `native_webdriver_url` is ignored
+  by this backend; geckodriver is always spawned locally. Outside the images,
+  install geckodriver 0.37.1 and Firefox ESR so `firefox` is on `PATH`, or
+  point `webdriver_geckodriver_path` at the binary.
+- **Container warnings.** Under Docker's default seccomp profile Firefox logs
+  `Sandbox: CanCreateUserNamespace() clone() failure: EPERM` and falls back to
+  a less isolated sandbox; sessions still work and the container remains the
+  boundary. Do not disable seccomp just to remove the warning. A minimal page
+  worked with the default 64 MB `/dev/shm`; the smoke test used 256 MB. Raise
+  `--shm-size` if large pages crash Firefox.
+- **Memory.** Image sizes are measured above, but runtime RSS for Firefox was
+  not benchmarked in this phase. Size the container for a full browser, not
+  for the slim release image; one browser per runtime is the design point.
+
+## Lightpanda MCP Variant (Phase 1)
+
+junclaw publishes this route as the additional `main-lightpanda` image
+variant. [Lightpanda](https://github.com/lightpanda-io/browser) runs as a
+separate process and is reached through its own MCP server, so this route does
+not use the built-in `browser` tool: the existing MCP client described in
+[MCP](./mcp.md) connects to it over stdio.
+
+### What the Lightpanda Variant Contains
 
 - An additive `lightpanda` Dockerfile target; the release target is unchanged.
 - Lightpanda 1.0.2, official glibc binary, downloaded per architecture and
@@ -23,7 +274,7 @@ The agent sees the browser as `mcp_lightpanda_<tool>` (for example
 `mcp_lightpanda_goto`). Tools are discovered once at startup; restart junclaw
 after changing the configuration.
 
-## Configure the MCP Server
+### Configure the Lightpanda MCP Server
 
 Add this to `~/.nullclaw/config.json`:
 
@@ -54,7 +305,8 @@ Add this to `~/.nullclaw/config.json`:
 
 - `command`/`args`: `lightpanda` is on `PATH` inside the image; the `mcp`
   subcommand starts the server over stdio.
-- `--block-private-networks`: keep it on. See [Security model](#security-model).
+- `--block-private-networks`: keep it on. See
+  [Lightpanda security model](#lightpanda-security-model).
 - `timeout_ms`: `30000` gives room for cold starts and slow pages. Measured
   loads were about 0.3 s for `example.com` and about 1.1 s for a 343 KB page,
   but JavaScript-heavy pages can take longer. Raise it to `60000` if needed;
@@ -62,12 +314,12 @@ Add this to `~/.nullclaw/config.json`:
 - `tools`: an allowlist of raw `tools/list` names, without the
   `mcp_lightpanda_` prefix. Omit it or leave it empty to register every tool;
   names the server does not expose are ignored with a warning. See
-  [Tool allowlist and token cost](#tool-allowlist-and-token-cost).
+  [Lightpanda tool allowlist and token cost](#lightpanda-tool-allowlist-and-token-cost).
 - Do not add `--cookie-jar` by default. A jar persists cookies to disk on exit,
   which widens the leak surface; enable it only when a workflow needs login
   state to survive restarts.
 
-## Tool Allowlist and Token Cost
+### Lightpanda Tool Allowlist and Token Cost
 
 The full `tools/list` of Lightpanda 1.0.2 is about 39 KB, roughly 10k tokens.
 Registering every tool adds that payload to every model request. The allowlist
@@ -103,7 +355,7 @@ Other available tools, such as `html`, `tree`, `extract`, `detectForms`,
 session tools, are omitted to keep the context small. Add their raw names to
 `tools` when a workflow needs them.
 
-## Keyword Filtering
+### Lightpanda Keyword Filtering
 
 To expose the browser only on turns that need it, add a `dynamic` filter group:
 
@@ -140,7 +392,7 @@ To expose the browser only on turns that need it, add a `dynamic` filter group:
   support native tool schemas, use `mode: "always"` and rely on the `tools`
   allowlist to keep the context small.
 
-## Security Model
+### Lightpanda Security Model
 
 - **Private networks and SSRF.** `--block-private-networks` defaults to false
   upstream; the recommended config turns it on. Lightpanda resolves DNS and
@@ -185,7 +437,7 @@ To expose the browser only on turns that need it, add a `dynamic` filter group:
   If you modify Lightpanda, AGPL source-offer obligations apply to your
   modified binary; this image does not modify it.
 
-## Deployment
+### Lightpanda Deployment
 
 ```yaml
 services:
