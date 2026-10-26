@@ -16,9 +16,10 @@ const MAX_READ_BYTES: usize = 8192;
 /// Maximum raw fetch size passed to curl (64 KB, then truncated to MAX_READ_BYTES).
 const MAX_FETCH_BYTES: usize = 65536;
 
-/// Browser tool. With `backend = "webdriver"` every action is served by a
-/// lazily started geckodriver/Firefox session; the default `agent_browser`
-/// backend keeps the system-browser `open` and curl `read` behavior.
+/// Browser tool. With `backend = "webdriver"` every action is served by the
+/// process-wide, lazily started geckodriver/Firefox manager shared with every
+/// other BrowserTool instance; the default `agent_browser` backend keeps the
+/// system-browser `open` and curl `read` behavior.
 pub const BrowserTool = struct {
     pub const tool_name = "browser";
     pub const tool_description = "Browse web pages. Actions: open, read, snapshot, click, type, scroll, screenshot, close. Snapshot returns page text plus numbered interactive elements for click/type. The webdriver backend (browser.backend=\"webdriver\") supports all actions; the default agent_browser backend supports open and read. screenshot returns an [IMAGE:path] marker: include it verbatim to send the picture.";
@@ -26,14 +27,13 @@ pub const BrowserTool = struct {
         \\{"type":"object","properties":{"action":{"type":"string","enum":["open","read","snapshot","click","type","scroll","screenshot","close"],"description":"Browser action to perform"},"url":{"type":"string","description":"URL to open or read"},"index":{"type":"integer","description":"Element number from the last snapshot (click/type)"},"selector":{"type":"string","description":"CSS selector fallback for click/type"},"text":{"type":"string","description":"Text to type"},"direction":{"type":"string","enum":["up","down","left","right"],"description":"Scroll direction (default down)"},"amount":{"type":"integer","description":"Pixels to scroll (default 500)"}},"required":["action"]}
     ;
 
-    /// Long-lived tool allocator (set by allTools), not the per-turn tool
-    /// arena: the WebDriver manager and its reaper thread outlive a turn.
-    allocator: std.mem.Allocator = std.heap.page_allocator,
     workspace_dir: []const u8 = "",
     config: BrowserConfig = .{},
     /// External WebDriver endpoint instead of spawning geckodriver. Used by
     /// tests; production leaves this null and gets the lifecycled browser.
     webdriver_url: ?[]const u8 = null,
+    /// Shared manager used by this tool's last action. Not owned here: every
+    /// BrowserTool in the process borrows the same instance.
     manager: ?*WebDriverManager = null,
 
     const vtable = blk: {
@@ -55,14 +55,11 @@ pub const BrowserTool = struct {
         };
     }
 
-    /// Stop geckodriver/Firefox and drop the manager. The next WebDriver action
-    /// starts a fresh one; safe to call repeatedly.
+    /// Close the process-wide browser shared by every BrowserTool. The next
+    /// WebDriver action starts a fresh one; safe to call repeatedly.
     pub fn shutdown(self: *BrowserTool) void {
-        if (self.manager) |manager| {
-            manager.deinit();
-            self.allocator.destroy(manager);
-            self.manager = null;
-        }
+        _ = WebDriverManager.sharedShutdown();
+        self.manager = null;
     }
 
     pub fn execute(self: *BrowserTool, allocator: std.mem.Allocator, args: JsonObjectMap) !ToolResult {
@@ -77,8 +74,8 @@ pub const BrowserTool = struct {
 
     fn executeWebDriver(self: *BrowserTool, allocator: std.mem.Allocator, action: []const u8, args: JsonObjectMap) !ToolResult {
         if (std.mem.eql(u8, action, "close")) {
-            const was_running = self.manager != null;
-            self.shutdown();
+            const was_running = WebDriverManager.sharedShutdown();
+            self.manager = null;
             return ToolResult.ok(if (was_running) "Browser closed" else "Browser is not running");
         }
         if (!browser_webdriver.isKnownAction(action)) {
@@ -88,7 +85,14 @@ pub const BrowserTool = struct {
         // Argument errors must not spawn Firefox.
         if (browser_webdriver.validate(action, args)) |message| return ToolResult.fail(message);
 
-        const manager = try self.ensureManager();
+        const manager = try WebDriverManager.sharedAcquire(.{
+            .driver_url = self.webdriver_url,
+            .geckodriver_path = self.config.webdriver_geckodriver_path orelse "geckodriver",
+            .headless = self.config.native_headless,
+            .idle_timeout_ms = self.config.webdriver_idle_timeout_ms,
+        });
+        self.manager = manager;
+        defer WebDriverManager.sharedRelease();
         const client = manager.acquire() catch |err|
             return webDriverFailure(allocator, action, err, manager.lastErrorMessage());
         defer manager.release();
@@ -105,20 +109,6 @@ pub const BrowserTool = struct {
             };
             return webDriverFailure(allocator, action, err, detail);
         };
-    }
-
-    fn ensureManager(self: *BrowserTool) !*WebDriverManager {
-        if (self.manager) |manager| return manager;
-        const manager = try self.allocator.create(WebDriverManager);
-        errdefer self.allocator.destroy(manager);
-        manager.* = WebDriverManager.init(self.allocator, .{
-            .driver_url = self.webdriver_url,
-            .geckodriver_path = self.config.webdriver_geckodriver_path orelse "geckodriver",
-            .headless = self.config.native_headless,
-            .idle_timeout_ms = self.config.webdriver_idle_timeout_ms,
-        });
-        self.manager = manager;
-        return manager;
     }
 
     /// Backend `agent_browser`: system-browser open, curl read, and explicit
@@ -438,7 +428,7 @@ test "webdriver backend rejects bad arguments before starting a browser" {
         result.error_msg.?,
     );
     // A malformed call must not spawn geckodriver/Firefox.
-    try std.testing.expect(bt.manager == null);
+    try std.testing.expect(!WebDriverManager.sharedActiveForTest());
 }
 
 test "webdriver backend serves snapshot and close stops the manager" {
@@ -456,7 +446,6 @@ test "webdriver backend serves snapshot and close stops the manager" {
     defer std.testing.allocator.free(base);
 
     var bt = BrowserTool{
-        .allocator = std.testing.allocator,
         .config = .{ .enabled = true, .backend = "webdriver", .allowed_domains = &.{"example.com"} },
         .webdriver_url = base,
     };
@@ -469,14 +458,76 @@ test "webdriver backend serves snapshot and close stops the manager" {
     try std.testing.expect(result.success);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "body text") != null);
     try std.testing.expect(std.mem.indexOf(u8, result.output, "[0] <button> Go") != null);
-    try std.testing.expect(bt.manager != null);
+    try std.testing.expect(WebDriverManager.sharedActiveForTest());
 
     var close_args = try root.parseTestArgs("{\"action\":\"close\"}");
     defer close_args.deinit();
     const closed = try bt.execute(std.testing.allocator, close_args.value.object);
     try std.testing.expect(closed.success);
     try std.testing.expectEqualStrings("Browser closed", closed.output);
-    try std.testing.expect(bt.manager == null);
+    try std.testing.expect(!WebDriverManager.sharedActiveForTest());
+}
+
+test "webdriver backend shares one browser across tool instances" {
+    // Regression: 两个 BrowserTool 实例曾各自起一个 Firefox
+    const fake = @import("webdriver_fake_server.zig");
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[],\"more\":false}}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[],\"more\":false}}" },
+        .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(std.testing.allocator, &routes);
+    defer server.deinit();
+    const base = try server.url(std.testing.allocator);
+    defer std.testing.allocator.free(base);
+
+    var first = BrowserTool{
+        .config = .{ .enabled = true, .backend = "webdriver", .allowed_domains = &.{"example.com"} },
+        .webdriver_url = base,
+    };
+    defer first.shutdown();
+    var second = BrowserTool{
+        .config = .{ .enabled = true, .backend = "webdriver", .allowed_domains = &.{"example.com"} },
+        .webdriver_url = base,
+    };
+    defer second.shutdown();
+
+    var snapshot_args = try root.parseTestArgs("{\"action\":\"snapshot\"}");
+    defer snapshot_args.deinit();
+    const first_result = try first.execute(std.testing.allocator, snapshot_args.value.object);
+    defer std.testing.allocator.free(first_result.output);
+    try std.testing.expect(first_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, first_result.output, "body text") != null);
+
+    // The second tool must reuse the running session instead of POSTing
+    // /session again; the fake driver only has one session route.
+    const second_result = try second.execute(std.testing.allocator, snapshot_args.value.object);
+    defer std.testing.allocator.free(second_result.output);
+    try std.testing.expect(second_result.success);
+    try std.testing.expect(std.mem.indexOf(u8, second_result.output, "body text") != null);
+
+    var session_posts: usize = 0;
+    for (server.requests[0..server.request_count]) |request| {
+        if (std.mem.eql(u8, request.method, "POST") and std.mem.eql(u8, request.path, "/session")) {
+            session_posts += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), session_posts);
+
+    var close_args = try root.parseTestArgs("{\"action\":\"close\"}");
+    defer close_args.deinit();
+    const closed = try second.execute(std.testing.allocator, close_args.value.object);
+    try std.testing.expect(closed.success);
+    try std.testing.expectEqualStrings("Browser closed", closed.output);
+    try std.testing.expect(!WebDriverManager.sharedActiveForTest());
+
+    server.stopAndJoin();
+    try std.testing.expectEqual(routes.len, server.request_count);
 }
 
 test "browser read rejects option-like url" {

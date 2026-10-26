@@ -19,7 +19,6 @@ const snapshot_body =
 
 fn webdriverTool(base: []const u8, allowed_domains: []const []const u8) browser_mod.BrowserTool {
     return .{
-        .allocator = allocator,
         .config = .{
             .enabled = true,
             .backend = "webdriver",
@@ -246,7 +245,6 @@ test "webdriver integration blocks a page that navigates away after the snapshot
 
 test "webdriver integration reports a missing geckodriver without failing the host" {
     var bt = browser_mod.BrowserTool{
-        .allocator = allocator,
         .config = .{
             .enabled = true,
             .backend = "webdriver",

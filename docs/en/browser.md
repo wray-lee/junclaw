@@ -215,14 +215,15 @@ warning (see [Limitations and validation status](#limitations-and-validation-sta
 - geckodriver listens on `127.0.0.1` on a random port. junclaw polls `/status`
   for up to 10 seconds; a missing binary, a failed spawn or a timeout returns a
   tool error with the reason. geckodriver output is not forwarded.
-- **One browser per runtime.** Every browser action in a runtime goes through
-  one manager and one WebDriver session. At any moment the runtime has at most
-  one Firefox instance. A mutex serializes commands, so concurrent model or
-  channel requests queue instead of starting a second Firefox. This is
-  deliberate for the 2.4 GB target machine.
-- A gateway can create more than one session runtime, and each browser-enabled
-  runtime owns its own manager. On a small host keep browser work to one
-  runtime; otherwise memory use multiplies.
+- **One browser per process.** Every browser action in the junclaw process,
+  across all gateway sessions and channel runs, goes through one shared manager
+  and one WebDriver session. At any moment the process has at most one Firefox
+  instance. A mutex serializes commands, so concurrent model or channel
+  requests queue instead of starting a second Firefox. This is deliberate for
+  the 2.4 GB target machine.
+- **Shared teardown.** `close`, session end or idle shutdown stops the shared
+  browser for every session. The next action in any session rebuilds it. There
+  is no per-session browser to leak or double.
 - **Idle shutdown.** After `webdriver_idle_timeout_ms` without an action, the
   reaper stops Firefox and geckodriver. The check runs every 250 ms. `0`
   disables idle shutdown; `close` stops immediately.
@@ -278,7 +279,7 @@ warning (see [Limitations and validation status](#limitations-and-validation-sta
   `mem_limit` from it. The compose example uses `1536m`; 1280 MiB is a practical
   floor and 2048 MiB only fits hosts with the RAM. These are host measurements
   on local text pages, not in-image cgroup numbers, so treat them as a lower
-  bound for real sites. One browser per runtime is the design point.
+  bound for real sites. One browser per process is the design point.
 
 ## Lightpanda MCP Variant (Phase 1)
 

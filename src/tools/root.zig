@@ -611,7 +611,7 @@ pub fn allTools(
 
     if (opts.browser_enabled) {
         const bt = try allocator.create(browser.BrowserTool);
-        bt.* = .{ .allocator = allocator, .workspace_dir = workspace_dir, .config = opts.browser };
+        bt.* = .{ .workspace_dir = workspace_dir, .config = opts.browser };
         try list.append(allocator, bt.tool());
     }
 

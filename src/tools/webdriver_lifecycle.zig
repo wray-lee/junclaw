@@ -251,7 +251,81 @@ pub const WebDriverManager = struct {
         if (self.last_error) |old| self.allocator.free(old);
         self.last_error = message;
     }
+
+    // ── Process-wide shared manager ─────────────────────────────────
+    //
+    // Gateway and channel runs each build their own tool set, so a manager
+    // per BrowserTool would start one Firefox per session and exhaust a 2.4 GB
+    // host. Every tool in the process borrows this manager instead.
+    // `shared_mutex` covers lazy creation and teardown, and each action holds a
+    // lease, so a concurrent close can never free a manager another action is
+    // using.
+
+    /// Borrow the one process-wide manager, creating it on first use. The
+    /// caller must pair a successful call with `sharedRelease`. Options come
+    /// from the first caller; the process allocator keeps the manager
+    /// independent of any one tool's lifetime.
+    pub fn sharedAcquire(options: Options) !*WebDriverManager {
+        shared_mutex.lock();
+        defer shared_mutex.unlock();
+        if (shared_manager == null) {
+            const manager = try std.heap.page_allocator.create(WebDriverManager);
+            manager.* = WebDriverManager.init(std.heap.page_allocator, options);
+            shared_manager = manager;
+            shared_shutdown_pending = false;
+        }
+        shared_users += 1;
+        return shared_manager.?;
+    }
+
+    /// Drop one action lease; a close that raced with the action frees the
+    /// manager here.
+    pub fn sharedRelease() void {
+        shared_mutex.lock();
+        defer shared_mutex.unlock();
+        std.debug.assert(shared_users > 0);
+        shared_users -= 1;
+        if (shared_users == 0 and shared_shutdown_pending) destroySharedLocked();
+    }
+
+    /// Close the shared browser for every session and report whether one
+    /// existed. The next WebDriver action in any session rebuilds it. With no
+    /// action in flight the manager itself is freed, which also drops its
+    /// borrowed options.
+    pub fn sharedShutdown() bool {
+        shared_mutex.lock();
+        defer shared_mutex.unlock();
+        const had_manager = shared_manager != null;
+        if (shared_users == 0) {
+            destroySharedLocked();
+        } else if (shared_manager) |manager| {
+            manager.shutdown();
+            shared_shutdown_pending = true;
+        }
+        return had_manager;
+    }
+
+    fn destroySharedLocked() void {
+        if (shared_manager) |manager| {
+            manager.deinit();
+            std.heap.page_allocator.destroy(manager);
+            shared_manager = null;
+        }
+        shared_shutdown_pending = false;
+    }
+
+    /// Tests only: whether a shared manager exists (running or idle).
+    pub fn sharedActiveForTest() bool {
+        shared_mutex.lock();
+        defer shared_mutex.unlock();
+        return shared_manager != null;
+    }
 };
+
+var shared_mutex: compat.sync.Mutex = .{};
+var shared_manager: ?*WebDriverManager = null;
+var shared_users: usize = 0;
+var shared_shutdown_pending: bool = false;
 
 fn nowMs() i64 {
     return compat.time.milliTimestamp();

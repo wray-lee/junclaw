@@ -1940,7 +1940,7 @@ pub const BrowserConfig = struct {
     computer_use: BrowserComputerUseConfig = .{},
     allowed_domains: []const []const u8 = &.{},
     /// Idle time before the WebDriver backend shuts geckodriver/Firefox down.
-    /// 0 disables idle shutdown. Placeholder pending T5/T8 measurements.
+    /// 0 disables idle shutdown. Calibrated in phase 2; the 120000 ms default stays.
     webdriver_idle_timeout_ms: u64 = 120_000,
     /// geckodriver binary; null means "geckodriver" from PATH.
     webdriver_geckodriver_path: ?[]const u8 = null,
