@@ -429,9 +429,11 @@ pub fn connectWithTimeout(address: Address, timeout_ms: u32) !Stream {
             var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
             const timeout: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
             if (try posix.poll(&poll_fds, timeout) == 0) return error.ConnectionTimedOut;
+            // Raw call: posix.getpeername treats the EINVAL macOS returns for a
+            // refused connect as a programmer bug and panics.
             var peer: posix.sockaddr = undefined;
             var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr);
-            posix.getpeername(fd, &peer, &peer_len) catch return error.ConnectionRefused;
+            if (posix.errno(posix.system.getpeername(fd, &peer, &peer_len)) != .SUCCESS) return error.ConnectionRefused;
         },
         .CONNREFUSED => return error.ConnectionRefused,
         .NETUNREACH, .HOSTUNREACH => return error.NetworkUnreachable,
@@ -943,6 +945,15 @@ test "compat net connectWithTimeout reaches a loopback listener" {
     defer client.close();
     var conn = try server.accept();
     defer conn.stream.close();
+}
+
+// Regression: macOS getpeername returned EINVAL after a refused non-blocking connect and
+// std panicked with "reached unreachable code" instead of reporting ConnectionRefused.
+test "compat net connectWithTimeout reports a refused loopback port" {
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    const closed = server.listen_address;
+    server.deinit();
+    try std.testing.expectError(error.ConnectionRefused, connectWithTimeout(closed, 5000));
 }
 
 test "compat net readWithTimeout reads data and then times out" {
