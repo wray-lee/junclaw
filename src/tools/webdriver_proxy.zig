@@ -15,13 +15,16 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
 const net_security = @import("../net_security.zig");
+const thread_stacks = @import("../thread_stacks.zig");
 
 const Allocator = std.mem.Allocator;
 
 pub const max_head_bytes = 8 * 1024;
 pub const max_headers = 64;
-const worker_stack_size = 256 * 1024;
-const copier_stack_size = 128 * 1024;
+// glibc rejects custom stacks below the shared floor with EINVAL, which Zig's
+// Thread.spawn turns into a panic, so both roles use the coordination floor.
+const worker_stack_size = thread_stacks.COORDINATION_STACK_SIZE;
+const copier_stack_size = thread_stacks.COORDINATION_STACK_SIZE;
 
 pub const Config = struct {
     allowed_domains: []const []const u8 = &.{},
