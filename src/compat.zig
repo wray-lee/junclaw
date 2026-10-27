@@ -5,6 +5,14 @@ const shared = @import("compat/shared.zig");
 const Io = std.Io;
 const Allocator = std.mem.Allocator;
 
+/// Used by `Child.tryWait`; declared here (not linked) on every target.
+extern "kernel32" fn WaitForSingleObject(
+    handle: std.os.windows.HANDLE,
+    milliseconds: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.DWORD;
+const WAIT_OBJECT_0: std.os.windows.DWORD = 0x00000000;
+const WAIT_TIMEOUT: std.os.windows.DWORD = 0x00000102;
+
 pub fn initProcess(init: std.process.Init) void {
     shared.initProcess(init);
 }
@@ -60,6 +68,9 @@ pub const process = struct {
         request_resource_usage_statistics: bool = false,
         pgid: ?std.posix.pid_t = null,
         create_no_window: bool = true,
+        /// Windows: leave the child suspended so it can be assigned to a job
+        /// before it runs; resume with `ntdll.NtResumeThread(thread_handle)`.
+        start_suspended: bool = false,
         id: Id = undefined,
         thread_handle: if (builtin.os.tag == .windows) std.os.windows.HANDLE else void = if (builtin.os.tag == .windows) undefined else {},
         stdin: ?fs.File = null,
@@ -134,6 +145,7 @@ pub const process = struct {
                 .request_resource_usage_statistics = self.request_resource_usage_statistics,
                 .pgid = self.pgid,
                 .create_no_window = self.create_no_window,
+                .start_suspended = self.start_suspended,
             });
             self.id = inner.id.?;
             self.thread_handle = inner.thread_handle;
@@ -149,6 +161,67 @@ pub const process = struct {
             self.syncFromInner(inner);
             self.term = term;
             return term;
+        }
+
+        /// Non-blocking reap: null while the child still runs. A reaped child
+        /// caches its Term for `wait` and has its pipe ends closed here, like
+        /// `wait` does; callers must not signal a reaped pid (it may be reused).
+        pub fn tryWait(self: *Child) !?Term {
+            if (self.term) |term| return term;
+
+            if (comptime builtin.os.tag == .windows) {
+                switch (WaitForSingleObject(self.id, 0)) {
+                    WAIT_OBJECT_0 => {
+                        _ = try self.wait();
+                        return self.term;
+                    },
+                    WAIT_TIMEOUT => return null,
+                    else => return error.Unexpected,
+                }
+            } else if (comptime builtin.os.tag == .wasi) {
+                return null;
+            } else {
+                var status: if (builtin.link_libc) c_int else u32 = undefined;
+                const rc = std.posix.system.waitpid(self.id, &status, std.posix.W.NOHANG);
+                switch (std.posix.errno(rc)) {
+                    .SUCCESS => {},
+                    // Already reaped (nobody alive to answer for it).
+                    .CHILD => {
+                        self.term = .{ .unknown = 0 };
+                        self.closePipes();
+                        return self.term;
+                    },
+                    .INTR => return null,
+                    else => return error.Unexpected,
+                }
+                if (rc == 0) return null;
+                self.term = statusToTerm(@bitCast(status));
+                self.closePipes();
+                return self.term;
+            }
+        }
+
+        fn closePipes(self: *Child) void {
+            if (self.stdin) |file| {
+                file.close();
+                self.stdin = null;
+            }
+            if (self.stdout) |file| {
+                file.close();
+                self.stdout = null;
+            }
+            if (self.stderr) |file| {
+                file.close();
+                self.stderr = null;
+            }
+        }
+
+        fn statusToTerm(status: u32) Term {
+            const W = std.posix.W;
+            if (W.IFEXITED(status)) return .{ .exited = W.EXITSTATUS(status) };
+            if (W.IFSIGNALED(status)) return .{ .signal = W.TERMSIG(status) };
+            if (W.IFSTOPPED(status)) return .{ .stopped = W.STOPSIG(status) };
+            return .{ .unknown = status };
         }
 
         pub fn kill(self: *Child) !Term {

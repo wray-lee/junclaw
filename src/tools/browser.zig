@@ -90,6 +90,7 @@ pub const BrowserTool = struct {
             .geckodriver_path = self.config.webdriver_geckodriver_path orelse "geckodriver",
             .headless = self.config.native_headless,
             .idle_timeout_ms = self.config.webdriver_idle_timeout_ms,
+            .allowed_domains = self.config.allowed_domains,
         });
         self.manager = manager;
         defer WebDriverManager.sharedRelease();
@@ -97,7 +98,7 @@ pub const BrowserTool = struct {
             return webDriverFailure(allocator, action, err, manager.lastErrorMessage());
         defer manager.release();
 
-        return browser_webdriver.run(allocator, client, .{
+        var result = browser_webdriver.run(allocator, client, .{
             .workspace_dir = self.workspace_dir,
             .allowed_domains = self.config.allowed_domains,
         }, action, args) catch |err| {
@@ -109,6 +110,10 @@ pub const BrowserTool = struct {
             };
             return webDriverFailure(allocator, action, err, detail);
         };
+        // F4 depth: tabs/windows a page opened during the action must not
+        // survive it. Best effort, so this cannot fail a successful action.
+        browser_webdriver.closeExtraWindows(allocator, client, &result);
+        return result;
     }
 
     /// Backend `agent_browser`: system-browser open, curl read, and explicit
@@ -438,6 +443,7 @@ test "webdriver backend serves snapshot and close stops the manager" {
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[{\"tag\":\"button\",\"label\":\"Go\",\"detail\":\"\"}],\"more\":false}}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
     };
     const server = try fake.Server.start(std.testing.allocator, &routes);
@@ -476,9 +482,11 @@ test "webdriver backend shares one browser across tool instances" {
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[],\"more\":false}}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = "{\"value\":{\"title\":\"T\",\"url\":\"https://example.com/\",\"text\":\"body text\",\"elements\":[],\"more\":false}}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
     };
     const server = try fake.Server.start(std.testing.allocator, &routes);

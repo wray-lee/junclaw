@@ -75,6 +75,14 @@ a 427–453 MiB OOM-relevant peak, with a practical range of 1280–2048 MiB. Si
 from cgroup usage, not from the ~1.05 GiB summed RSS, which counts shared pages
 once per process.
 
+geckodriver and Firefox must not outlive the agent. In a container the primary
+guarantee is container PID 1 exiting together with the agent, which stops
+everything in it. As a per-process backstop, on Linux and macOS a small `sh`
+wrapper kills geckodriver's process group when the pipe held by the agent
+reaches EOF, so an OOM-killed or crashed agent still takes the browser down; on
+Windows geckodriver runs in a Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+
 The browser needs no extra sidecar or environment variable. Use
 `full-dsh-browser` when you also want Node 22 and the dsh sidecar; the `browser`
 tool is registered through the same tool set under the dsh harness, so its
@@ -153,48 +161,82 @@ unavailable, and `screenshot` points at the `screenshot` tool.
 
 ### Security Model
 
-The WebDriver backend uses the same URL policy and trust model as `web_fetch`.
-It is not a network sandbox.
+The WebDriver backend uses the same URL policy and trust model as `web_fetch`,
+and it enforces that policy on every browser HTTP(S) request at a filtering
+proxy. It is not a kernel-level network sandbox.
 
+- **All browser HTTP(S) traffic goes through a filtering proxy.** Each browser
+  session starts an in-process CONNECT proxy bound to a kernel-assigned
+  `127.0.0.1` port, and the one-shot profile points `network.proxy.*` at it
+  with `failover_direct=false` and `allow_hijacking_localhost=true`. Redirects,
+  page subresources, new windows and form submissions therefore leave through
+  the proxy. The proxy starts before Firefox; if it cannot start, the session
+  fails, and there is no direct-connection fallback or configuration escape
+  hatch.
 - **HTTPS only.** `http://`, `ws://`, `file://`, `data:` and `javascript:` are
-  rejected before Firefox navigates. An allowlist entry does not change the
-  scheme rule.
-- **Private networks and metadata.** With `allowed_domains` empty, every host
-  is resolved and must map to a globally routable address. Loopback, RFC 1918,
-  link-local, container-runtime aliases and cloud metadata addresses such as
-  `169.254.169.254` are rejected. This reuses the checks behind `web_fetch`.
+  rejected before Firefox navigates, and the proxy answers any request that is
+  not `CONNECT` with `403`. An allowlist entry does not change the scheme rule.
+- **Private networks and metadata.** The proxy resolves each CONNECT host once,
+  applies the same address rules as `web_fetch` to every result (loopback,
+  RFC 1918, link-local, container-runtime aliases, cloud metadata such as
+  `169.254.169.254`, IPv6 forms and ambiguous IPv4 literals judged by the
+  address they denote) and connects to that pinned address. A mixed
+  public/private answer fails closed. Pinning the checked address closes the
+  DNS rebinding / TOCTOU window between the check and the connection.
 - **Allowlist trade-off.** A non-empty `allowed_domains` turns the list into
   the whole policy: only matching hosts are allowed, the list is checked before
   DNS, and matching hosts skip the private-address check so they may point at
   an internal service. This is the same operator-trusted exception as
-  `web_fetch.allowed_domains`. Keep the list empty when private networks must
-  stay unreachable; never add private or loopback hosts to make an untrusted
-  page load.
-- **Redirects and final URL.** Firefox follows redirects itself. After every
-  navigation, and again before `snapshot`, `click`, `type`, `scroll` and
-  `screenshot`, junclaw reads the URL Firefox actually landed on and validates
-  it. If the final URL fails, the page is closed and the session is marked
-  stale; the next action rebuilds it. A final URL that cannot be read fails
-  closed.
-- **Not a network sandbox.** Firefox resolves DNS for page subresources itself.
-  The checks above cover navigations and final URLs, not every subresource;
-  DNS rebinding between junclaw's lookup and Firefox's is not covered. If the
-  LAN must stay unreachable, put the container on an isolated network and
-  restrict egress there.
-- **Proxy and browser policy controls are not wired.** Firefox can force
-  traffic through a proxy or narrow egress with a `policies.json` policy file
-  or `network.proxy.*` prefs. The backend generates only its own `user.js`
-  (telemetry and update suppression) and accepts no operator-supplied policy
-  file or proxy prefs, so there is no supported way to pin egress inside the
-  browser yet. Until that exists, the enforceable boundary is deployment-side
-  network isolation (container network and egress rules), not Firefox
-  configuration.
+  `web_fetch.allowed_domains`. A bare `*` entry allows every host, including
+  private addresses. Keep the list empty when private networks must stay
+  unreachable; never add private or loopback hosts to make an untrusted page
+  load.
+- **Redirects and final URL.** Firefox follows redirects itself, through the
+  proxy. After every navigation, and again before `snapshot`, `click`, `type`,
+  `scroll` and `screenshot`, junclaw reads the URL Firefox actually landed on
+  and validates it as defence in depth. If the final URL fails, the page is
+  closed and the session is marked stale; the next action rebuilds it. A final
+  URL that cannot be read fails closed.
+- **Extra windows are closed.** After each successful action junclaw lists the
+  session's window handles, closes every window except the current one and
+  reports the closed handles. This is best effort: driver errors are logged
+  and do not fail the action, so a popup normally does not keep running out of
+  view.
+- **Network paths around the proxy are disabled.** The generated `user.js`
+  turns off DoH/TRR, DNS prefetch, speculative, preconnect and predictor
+  connections, HTTP/3, Alt-Svc and WebRTC, and disables Safe Browsing, OCSP,
+  Remote Settings, telemetry and update endpoints.
+- **Not a kernel-level sandbox.** The proxy is ordinary user-space code, not a
+  netns or firewall rule. Firefox components that use raw sockets or bypass
+  the necko HTTP stack, or a future component with its own HTTP stack, can
+  leave without it, and the local Marionette/Remote Agent connection between
+  geckodriver and Firefox is not proxied. In HTTP proxy mode Firefox hands
+  page hostnames to the proxy instead of resolving them, and the prefs above
+  disable prefetch and TRR; if a future Firefox ignores those pref names it
+  could still make its own DNS lookups, which leaks queries but does not
+  bypass the address policy. QUIC, WebRTC and other UDP paths are closed by
+  prefs only. The proxy sees `CONNECT host:port`, not TLS content, so an
+  allowed host can still carry `wss` (WebSocket) traffic. The loopback
+  listener has no authentication, so other local processes can use it, though
+  only to validated addresses. Keep deployment-side network isolation as the
+  outer boundary when the LAN must stay unreachable. Browser cleanup is
+  layered the same way: container PID 1 exit is the primary guarantee, and the
+  POSIX watchdog or the Windows Job Object is the per-process backstop.
+- **Proxy deadlines.** On POSIX the 10-second connect and handshake deadlines
+  and the 120-second tunnel read/write deadline are enforced with `poll`. On
+  Windows the Zig 0.16 socket backend has no poll/select path, so those calls
+  block: a stalled peer can hold one of the 32 proxy workers until the browser
+  session stops, where `stopAndJoin` shuts every tunnel down. The worker pool
+  and the one-browser-per-process design bound the exposure.
 - **Page scripts run.** Firefox executes the page's JavaScript. The model never
   gets a JavaScript action; `read`, `snapshot` and `scroll` use fixed internal
   snippets. Treat page output as untrusted input.
 - **One-shot profile.** Each browser start creates a fresh temporary profile
-  with no cookies or storage from the host. The profile is deleted on `close`,
-  on idle shutdown and when the runtime stops.
+  with no cookies or storage from the host. On POSIX the profile and its
+  `downloads` directory are created with mode `0700`. The profile is deleted
+  on `close`, on idle shutdown and when the runtime stops; if the agent is
+  killed with SIGKILL, the process backstop still stops the browser but the
+  profile directory can remain until temporary-file cleanup.
 - **Telemetry and update traffic.** A generated `user.js` disables Firefox
   telemetry, health reporting, crash/breakpad submission, Normandy studies,
   search updates, add-on discovery, Pocket/FxA, captive-portal probes and
@@ -203,18 +245,26 @@ It is not a network sandbox.
 - **Downloads.** Downloads go to a `downloads` directory inside the temporary
   profile, never to the workspace, and are deleted with the profile.
 
-Do not weaken these checks to get a page working. In particular, do not add
-private or loopback hosts to `allowed_domains` for untrusted pages, and do not
-disable the container's seccomp profile just to silence a Firefox sandbox
-warning (see [Limitations and validation status](#limitations-and-validation-status)).
+Do not weaken these checks to get a page working. There is no supported switch
+that turns the proxy off; in particular, do not add private or loopback hosts
+to `allowed_domains` for untrusted pages, and do not disable the container's
+seccomp profile just to silence a Firefox sandbox warning (see
+[Limitations and validation status](#limitations-and-validation-status)).
 
 ### Process Lifecycle and Concurrency
 
 - **Lazy start.** The first action other than `close` validates its arguments,
   then starts geckodriver and Firefox. Malformed calls never spawn a process.
-- geckodriver listens on `127.0.0.1` on a random port. junclaw polls `/status`
-  for up to 10 seconds; a missing binary, a failed spawn or a timeout returns a
-  tool error with the reason. geckodriver output is not forwarded.
+- geckodriver listens on `127.0.0.1` on a kernel-assigned random port. junclaw
+  accepts that endpoint only when the `Listening on 127.0.0.1:<port>` banner
+  arrived through our own child's stderr, the child is still alive and the new
+  session reports the profile we created. A foreign listener or another
+  profile is retried on a fresh port, at most three attempts, then the start
+  fails closed. A missing binary, a failed spawn or a 10-second readiness
+  deadline per attempt returns a tool error with the reason. The deadline is
+  checked between probes, and each `/status` probe uses the 60-second WebDriver
+  command timeout, so a hung driver can stretch one attempt past 10 seconds.
+  geckodriver output is not forwarded.
 - **One browser per process.** Every browser action in the junclaw process,
   across all gateway sessions and channel runs, goes through one shared manager
   and one WebDriver session. At any moment the process has at most one Firefox
@@ -227,10 +277,14 @@ warning (see [Limitations and validation status](#limitations-and-validation-sta
 - **Idle shutdown.** After `webdriver_idle_timeout_ms` without an action, the
   reaper stops Firefox and geckodriver. The check runs every 250 ms. `0`
   disables idle shutdown; `close` stops immediately.
-- **Cleanup.** The stop path deletes the WebDriver session, sends TERM to the
-  geckodriver process group, falls back to KILL, then removes the temporary
-  profile. It is safe to call repeatedly. `close` returns `Browser closed` or
-  `Browser is not running`.
+- **Cleanup.** The stop path deletes the WebDriver session, closes the Job
+  Object on Windows or sends TERM (KILL fallback) to the geckodriver process
+  group on POSIX, removes the temporary profile, and stops the session proxy
+  last so its tunnels can drain while the browser goes away. On Windows a Job
+  Object that cannot be created degrades to `taskkill /T /F` on the direct
+  child, which is not guaranteed to reach detached grandchildren. It is safe
+  to call repeatedly. `close` returns `Browser closed` or `Browser is not
+  running`.
 - **Self-healing.** If Firefox dies (for example after an OOM kill) or the
   driver loses the session, the next action tears down the remains and starts
   a new geckodriver/Firefox pair. Driver and transport failures are returned
@@ -238,10 +292,18 @@ warning (see [Limitations and validation status](#limitations-and-validation-sta
 
 ### Limitations and Validation Status
 
-- **Validation gap.** This phase was tested with automated tests against a
-  scripted fake WebDriver server and an offline image smoke test that started
-  Firefox, opened a local page and deleted the session. A real model driving
-  the tool end to end, against real sites, has not been run.
+- **Validation gap.** Automated tests use a scripted fake WebDriver server and
+  a scripted proxy; an offline image smoke starts Firefox, opens a local page
+  and deletes the session. `scripts/browser-webdriver-smoke.sh` is a manual,
+  real-Firefox check of proxy routing (normal page load plus denied
+  subresource, popup, form submit and rebinding-style answers) and is not part
+  of CI. A real model driving the tool end to end against real sites has not
+  been run, and DNS prefetch was not captured with a DNS or packet probe: its
+  prefs are covered only by generated-`user.js` tests.
+- **Windows runtime.** Windows support is cross-compiled only; CI does not run
+  the WebDriver backend there. On Windows proxy connect, handshake and tunnel
+  I/O deadlines degrade to blocking calls (see the security model), and a Job
+  Object that cannot be created falls back to `taskkill /T /F`.
 - **aarch64.** The build file carries the arm64 geckodriver hash, but no arm64
   image has been built or tested. CI publishes `linux/amd64` only.
 - **CI images.** The image workflow builds and verifies both variants before

@@ -68,6 +68,12 @@ services:
 相关的唯一集峰值 427–453 MiB，可用区间 1280–2048 MiB。请按 cgroup 用量而不是
 合计约 1.05 GiB 的 RSS 来定 `mem_limit`；后者会把共享页按进程重复计算。
 
+geckodriver 和 Firefox 不得比 agent 活得更久。容器内的首要保证是容器 PID 1
+随 agent 一同退出，容器内的进程随之全部结束；作为进程级兜底，Linux 和 macOS
+上由一小段 `sh` 包装进程在 agent 持有的管道到达 EOF 时杀掉 geckodriver 的进程
+组，即使 agent 被 OOM 杀掉或崩溃也会带走浏览器；Windows 上 geckodriver 运行在
+设置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object 中。
+
 浏览器不需要额外的 sidecar 或环境变量。需要 Node 22 和 dsh sidecar 时改用
 `full-dsh-browser`；`browser` 工具在 dsh 引擎下由同一套工具注册，因此两个
 变体的动作完全一致。
@@ -137,55 +143,87 @@ workspace 中；junclaw 不会自动删除旧截图。支持附件的通道会�
 
 ### 安全模型
 
-WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型。它不是网络沙箱。
+WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型，并在一个过滤
+代理上对浏览器的每个 HTTP(S) 请求强制执行该策略。它不是内核级网络沙箱。
 
+- **所有浏览器 HTTP(S) 流量都经过过滤代理。** 每个浏览器会话都会启动一个
+  进程内 CONNECT 代理，只绑定内核分配的 `127.0.0.1` 端口；一次性 profile
+  的 `network.proxy.*` 指向它，并设置 `failover_direct=false` 和
+  `allow_hijacking_localhost=true`。因此重定向、页面子资源、新窗口和表单
+  提交都从代理出去。代理先于 Firefox 启动；代理启动失败即会话失败，没有
+  直连回退，也没有配置级逃生开关。
 - **只允许 HTTPS。** `http://`、`ws://`、`file://`、`data:` 和
-  `javascript:` 在 Firefox 导航前就会被拒绝。allowlist 条目不会改变协议
-  规则。
-- **私网与元数据地址。** `allowed_domains` 为空时，每个主机都会解析，且必须
-  映射到可全局路由的地址。回环、RFC 1918、链路本地、容器运行时别名，以及
-  `169.254.169.254` 之类的云元数据地址都会被拒绝。这里复用 `web_fetch`
-  背后的检查。
+  `javascript:` 在 Firefox 导航前就会被拒绝，代理对任何非 `CONNECT` 请求
+  返回 `403`。allowlist 条目不会改变协议规则。
+- **私网与元数据地址。** 代理对每个 CONNECT 主机只解析一次，对每个解析结果
+  套用与 `web_fetch` 相同的地址规则（回环、RFC 1918、链路本地、容器运行时
+  别名、`169.254.169.254` 之类的云元数据、IPv6 各形式，以及按实际地址判断
+  的歧义 IPv4 字面量），并连接到已校验的那个地址。公私混合的解析结果按
+  失败处理。固定已校验地址消除了检查与连接之间的 DNS rebinding / TOCTOU
+  窗口。
 - **allowlist 的取舍。** `allowed_domains` 非空时，这份列表就是全部策略：
   只允许匹配的主机，匹配在 DNS 之前完成，且匹配的主机会跳过私网地址检查，
   因此可以指向内部服务。这与 `web_fetch.allowed_domains` 的
-  “操作者显式信任”例外相同。私网必须不可达时请保持列表为空；不要为了打开
-  不可信页面而加入私网或回环主机。
-- **重定向与最终 URL。** Firefox 自己跟随重定向。每次导航后，以及在
-  `snapshot`、`click`、`type`、`scroll`、`screenshot` 之前，junclaw 都会读取
-  Firefox 实际落到的 URL 并重新校验。最终 URL 不通过时，页面会关闭，会话
-  标记为 stale；下一个动作会重建会话。最终 URL 读取失败按失败处理。
-- **不是网络沙箱。** Firefox 会自己为页面子资源解析 DNS。上述检查覆盖导航
-  和最终 URL，不覆盖每个子资源；junclaw 的解析与 Firefox 的解析之间的 DNS
-  rebinding 也不在覆盖范围内。局域网必须不可达时，请把容器放到隔离网络并在
-  那里限制出站流量。
-- **代理与浏览器策略手段尚未接入。** Firefox 可以用 `policies.json` 策略文件或
-  `network.proxy.*` 首选项强制走代理、收敛出网。当前后端只生成自己的
-  `user.js`（关闭遥测与更新等），不接受操作者提供的策略文件或代理首选项，
-  因此现在没有受支持的方式在浏览器内固定出网。在该能力实现前，真正可执行的
-  边界是部署侧网络隔离（容器网络与出站规则），不是 Firefox 配置。
+  “操作者显式信任”例外相同。单独的 `*` 条目等同于放行所有主机（包括私网
+  地址）。私网必须不可达时请保持列表为空；不要为了打开不可信页面而加入私网
+  或回环主机。
+- **重定向与最终 URL。** Firefox 自己跟随重定向，流量经过代理。每次导航后，
+  以及在 `snapshot`、`click`、`type`、`scroll`、`screenshot` 之前，junclaw
+  仍会读取 Firefox 实际落到的 URL 并重新校验，作为纵深防御。最终 URL 不通过
+  时，页面会关闭，会话标记为 stale；下一个动作会重建会话。最终 URL 读取失败
+  按失败处理。
+- **多余窗口会被关闭。** 每个成功动作后，junclaw 枚举会话的窗口句柄，关闭
+  除当前窗口外的所有窗口并报告被关闭的句柄。这是尽力而为：驱动错误只记日志，
+  不会让动作失败，因此点击、脚本或表单打开的新窗口通常不会在视野外继续运行。
+- **绕过代理的网络路径已关闭。** 生成的 `user.js` 关闭 DoH/TRR、DNS 预解析、
+  推测/预连接/predictor、HTTP/3、Alt-Svc 和 WebRTC，并关闭 Safe Browsing、
+  OCSP、Remote Settings、遥测与更新端点。
+- **不是内核级沙箱。** 代理是普通用户态代码，不是 netns 或防火墙规则。使用
+  裸 socket 或绕过 necko HTTP 栈的 Firefox 组件，以及未来自带 HTTP 栈的
+  组件，都可以不经代理出网；geckodriver 与 Firefox 之间的 Marionette /
+  Remote Agent 本地连接也不经代理。HTTP 代理模式下 Firefox 把页面主机名交给
+  代理而不是自己解析，上面的首选项也关闭了预解析和 TRR；若未来 Firefox 不认
+  这些 pref 名，仍可能自行做 DNS 查询——那是查询泄露，不是绕过地址策略的
+  通道。QUIC、WebRTC 等 UDP 路径只靠首选项关闭。代理只看到
+  `CONNECT host:port`，看不到 TLS 内容，因此白名单主机仍可承载 `wss`
+  (WebSocket) 流量；回环监听没有鉴权，本机其他进程也能使用它，但仍只能到
+  已校验的地址。局域网必须不可达时，部署侧网络隔离仍是外层边界。浏览器清理
+  也是同样的分层：容器 PID 1 退出是首要保证，POSIX watchdog 或 Windows
+  Job Object 是进程级兜底。
+- **代理超时。** POSIX 上 10 秒连接/握手期限和 120 秒隧道读写空闲期限用
+  `poll` 保证。Windows 上 Zig 0.16 的 socket 后端没有 poll/select 路径，这些
+  调用会阻塞：停滞的对端可以一直占用 32 个代理 worker 之一，直到浏览器会话
+  停止时由 `stopAndJoin` 断开全部隧道。worker 上限和每进程单浏览器设计限制了
+  影响范围。
 - **页面脚本会运行。** Firefox 会执行页面 JavaScript。模型拿不到 JavaScript
   动作；`read`、`snapshot` 和 `scroll` 使用固定的内部脚本。页面输出按不可信
   输入处理。
 - **一次性 profile。** 每次启动浏览器都会新建临时 profile，不包含宿主机的
-  cookie 或存储。`close`、空闲停止和运行时停止时都会删除该 profile。
+  cookie 或存储。POSIX 上 profile 及其 `downloads` 目录以 `0700` 权限创建。
+  `close`、空闲停止和运行时停止时都会删除该 profile；agent 被 SIGKILL 时，
+  进程兜底仍会停掉浏览器，但 profile 目录可能留到系统清理临时文件时。
 - **遥测与更新流量。** 生成的 `user.js` 会关闭 Firefox 遥测、健康报告、
   crash/breakpad 上报、Normandy 研究、搜索更新、附加组件发现、Pocket/FxA、
   captive portal 探测和远程下载信誉查询。浏览工具不应自行发起这些外联。
 - **下载。** 下载文件写入临时 profile 内的 `downloads` 目录，不会进入
   workspace，并随 profile 一起删除。
 
-不要为了打开页面而削弱这些检查。尤其不要为不可信页面把私网或回环主机加入
-`allowed_domains`，也不要为了消除 Firefox 沙箱告警而关闭容器的 seccomp
-配置（见[已知限制与验证状态](#已知限制与验证状态)）。
+不要为了打开页面而削弱这些检查。没有受支持的开关可以关掉代理；尤其不要为
+不可信页面把私网或回环主机加入 `allowed_domains`，也不要为了消除 Firefox
+沙箱告警而关闭容器的 seccomp 配置（见[已知限制与验证状态](#已知限制与验证状态)）。
 
 ### 进程生命周期与并发
 
 - **懒启动。** 第一次非 `close` 动作会先校验参数，然后启动 geckodriver 和
   Firefox。参数错误不会启动任何进程。
-- geckodriver 监听 `127.0.0.1` 的随机端口。junclaw 最多轮询 `/status`
-  10 秒；二进制缺失、启动失败或超时都会返回带原因的工具错误。geckodriver
-  的输出不会转发。
+- geckodriver 监听 `127.0.0.1` 上内核分配的随机端口。只有
+  `Listening on 127.0.0.1:<port>` 横幅来自我们自己子进程的 stderr、该子进程
+  仍存活、且新会话报告的是我们创建的 profile 时，junclaw 才接受该端点。
+  监听者不属于自己或 profile 不符时换新端口重试，最多三次，然后启动按失败
+  处理。二进制缺失、启动失败或每次尝试 10 秒的就绪期限都会返回带原因的工具
+  错误。期限在两次探测之间检查，单次 `/status` 探测使用 60 秒的 WebDriver
+  命令超时，因此挂起的驱动可能让一次尝试超过 10 秒。geckodriver 的输出不会
+  转发。
 - **每个进程最多一个浏览器。** 同一 junclaw 进程内（跨 gateway 会话与通道
   运行）的所有浏览器动作都走同一个共享 manager 和同一个 WebDriver 会话；
   任一时刻该进程最多只有一个 Firefox 实例。互斥锁把命令串行化，因此并发的
@@ -197,18 +235,26 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型。它�
 - **空闲停止。** 超过 `webdriver_idle_timeout_ms` 没有动作时，reaper 会停止
   Firefox 和 geckodriver。检查每 250 ms 一次。`0` 关闭空闲停止；`close`
   立即停止。
-- **清理。** 停止路径会删除 WebDriver 会话，向 geckodriver 进程组发送 TERM，
-  再以 KILL 兜底，然后删除临时 profile。重复调用是安全的。`close` 返回
-  `Browser closed` 或 `Browser is not running`。
+- **清理。** 停止路径会删除 WebDriver 会话，Windows 上关闭 Job Object、POSIX
+  上向 geckodriver 进程组发送 TERM（KILL 兜底），删除临时 profile，最后才停止
+  会话代理，让隧道在浏览器退出过程中排空。Windows 上 Job Object 创建失败时
+  降级为对直接子进程执行 `taskkill /T /F`，不保证能杀到已脱离的孙进程。重复
+  调用是安全的。`close` 返回 `Browser closed` 或 `Browser is not running`。
 - **自愈。** Firefox 死亡（例如被 OOM 杀掉）或驱动丢失会话后，下一个动作会
   清理残留并重新启动一对 geckodriver/Firefox。驱动和传输失败会作为工具错误
   返回，不会让 agent 崩溃。
 
 ### 已知限制与验证状态
 
-- **验证缺口。** 本阶段用脚本化的假 WebDriver 服务跑了自动化测试，并做了离线
-  镜像冒烟测试：启动 Firefox、打开本地页面、删除会话。还没有让真实模型在真实
-  网站上端到端驱动该工具。
+- **验证缺口。** 自动化测试使用脚本化的假 WebDriver 服务和脚本化代理；离线
+  镜像冒烟测试会启动 Firefox、打开本地页面并删除会话。
+  `scripts/browser-webdriver-smoke.sh` 是手动运行的真实 Firefox 检查，覆盖
+  代理路径（正常页面加载，以及子资源、弹窗、表单提交和类 rebinding 解析被
+  拒），不属于 CI。还没有让真实模型在真实网站上端到端驱动该工具，也没有用
+  DNS 或抓包探针实测 DNS 预解析；相关首选项只有生成 `user.js` 的测试覆盖。
+- **Windows 运行时。** Windows 支持只做交叉编译，CI 不在 Windows 上运行该
+  后端。Windows 上代理的连接、握手和隧道 I/O 期限退化为阻塞调用（见安全
+  模型），Job Object 创建失败时降级为 `taskkill /T /F`。
 - **aarch64。** 构建文件带有 arm64 的 geckodriver 哈希，但尚未构建或测试
   arm64 镜像。CI 只发布 `linux/amd64`。
 - **CI 镜像。** 镜像工作流会在推送前构建并校验两个变体。该工作流的一次运行
