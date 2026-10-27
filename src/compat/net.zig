@@ -405,11 +405,14 @@ pub fn connectWithTimeout(address: Address, timeout_ms: u32) !Stream {
         else => {},
     }
 
-    const socket_type = posix.SOCK.STREAM |
-        (if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0);
+    // Darwin defines posix.SOCK.CLOEXEC as a Zig-only shim, and
+    // `posix.system.socket` is the raw libc call there, which rejects the shim
+    // with EPROTOTYPE (macOS CI). Ask for atomic CLOEXEC only where the kernel
+    // implements it; Darwin falls back to fcntl below.
+    const atomic_cloexec = @hasDecl(posix.SOCK, "CLOEXEC") and !builtin.os.tag.isDarwin();
     const rc = posix.system.socket(
         @intCast(address.any.family),
-        @intCast(socket_type),
+        @intCast(posix.SOCK.STREAM | (if (atomic_cloexec) posix.SOCK.CLOEXEC else 0)),
         @intCast(posix.IPPROTO.TCP),
     );
     const fd: Stream.Handle = switch (posix.errno(rc)) {
@@ -417,7 +420,7 @@ pub fn connectWithTimeout(address: Address, timeout_ms: u32) !Stream {
         else => |err| return posix.unexpectedErrno(err),
     };
     errdefer closeStreamHandle(fd);
-    if (!@hasDecl(posix.SOCK, "CLOEXEC")) try setSocketCloseOnExec(fd);
+    if (!atomic_cloexec) try setSocketCloseOnExec(fd);
     try setSocketNonblocking(fd, true);
 
     switch (posix.errno(posix.system.connect(fd, &address.any, address.getOsSockLen()))) {
@@ -976,8 +979,21 @@ test "compat net writeWithTimeout gives up on a peer that stops reading" {
     posix.setsockopt(client.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small)) catch {};
     posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&small)) catch {};
 
-    const payload = try std.testing.allocator.alloc(u8, 256 * 1024);
-    defer std.testing.allocator.free(payload);
-    @memset(payload, 0);
-    try std.testing.expectError(error.Timeout, writeWithTimeout(client, payload, 100));
+    // macOS auto-tunes loopback buffers well past one small write, so keep
+    // feeding the peer until the deadline fires instead of assuming a single
+    // payload fills the queue. The cap only trips if the writer ignores its
+    // own deadline; it is not a timing assertion.
+    const chunk = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 0);
+    const write_cap = 64 * 1024 * 1024;
+    var total: usize = 0;
+    while (total < write_cap) {
+        writeWithTimeout(client, chunk, 100) catch |err| switch (err) {
+            error.Timeout => return,
+            else => return err,
+        };
+        total += chunk.len;
+    }
+    return error.TestUnexpectedResult;
 }
