@@ -469,6 +469,52 @@ pub fn readWithTimeout(stream: Stream, buffer: []u8, timeout_ms: u32) !usize {
     };
 }
 
+/// Write with a deadline. `send` uses MSG_DONTWAIT so a blocking socket cannot
+/// stall past the buffer: a peer that stops reading surfaces as `error.Timeout`
+/// instead of pinning the worker. Windows/WASI keep the blocking write; only
+/// stopAndJoin's shutdown bounds them there.
+pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !void {
+    if (bytes.len == 0) return;
+    switch (builtin.os.tag) {
+        .windows, .wasi => return stream.writeAll(bytes),
+        else => {},
+    }
+
+    const deadline = nowNanos() + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const remaining_ms = @divTrunc(deadline - nowNanos(), std.time.ns_per_ms);
+        if (remaining_ms <= 0) return error.Timeout;
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = stream.handle,
+            .events = posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const timeout: i32 = @intCast(@min(remaining_ms, @as(i96, std.math.maxInt(i32))));
+        if (try posix.poll(&poll_fds, timeout) == 0) return error.Timeout;
+        const rc = posix.system.sendto(
+            stream.handle,
+            bytes[written..].ptr,
+            bytes.len - written,
+            posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL,
+            null,
+            0,
+        );
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        const n: usize = @intCast(rc);
+        if (n == 0) return error.Unexpected;
+        written += n;
+    }
+}
+
+fn nowNanos() i96 {
+    return std.Io.Timestamp.now(shared.io(), .boot).nanoseconds;
+}
+
 fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
 
@@ -911,4 +957,27 @@ test "compat net readWithTimeout reads data and then times out" {
     var buf: [4]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 1), try readWithTimeout(client, &buf, 1000));
     try std.testing.expectError(error.Timeout, readWithTimeout(client, &buf, 10));
+}
+
+test "compat net writeWithTimeout gives up on a peer that stops reading" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    // Cap both buffers so a peer that never reads fills them after a few KiB;
+    // loopback otherwise absorbs the payload in the receiver's queue.
+    const small: c_int = 4096;
+    posix.setsockopt(client.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small)) catch {};
+    posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&small)) catch {};
+
+    const payload = try std.testing.allocator.alloc(u8, 256 * 1024);
+    defer std.testing.allocator.free(payload);
+    @memset(payload, 0);
+    try std.testing.expectError(error.Timeout, writeWithTimeout(client, payload, 100));
 }

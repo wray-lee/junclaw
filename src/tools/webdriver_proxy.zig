@@ -287,9 +287,9 @@ fn closeTunnel(tunnel: *Tunnel) void {
 }
 
 fn pump(src: compat.net.Stream, dst: compat.net.Stream, idle_timeout_ms: u32) void {
-    // Reads are idle-timed out; writes stay blocking and are unblocked by
-    // stopAndJoin's shutdown. A peer that stops reading is eventually cut by
-    // the other direction's idle timeout.
+    // Reads and writes are both idle-timed out, so a peer that stops reading
+    // cannot pin the worker forever. Windows/WASI degrade to blocking I/O;
+    // stopAndJoin's shutdown is the only bound there.
     var buf: [16 * 1024]u8 = undefined;
     while (true) {
         const n = compat.net.readWithTimeout(src, &buf, idle_timeout_ms) catch {
@@ -298,7 +298,7 @@ fn pump(src: compat.net.Stream, dst: compat.net.Stream, idle_timeout_ms: u32) vo
             return;
         };
         if (n == 0) break;
-        dst.writeAll(buf[0..n]) catch {
+        compat.net.writeWithTimeout(dst, buf[0..n], idle_timeout_ms) catch {
             dst.shutdown(.both) catch {};
             src.shutdown(.both) catch {};
             return;
@@ -730,6 +730,68 @@ test "proxy tunnels an allowlisted host to the pinned upstream" {
     const n = try readAtLeast(response.stream, buf[0..6]);
     try testing.expectEqual(@as(usize, 6), n);
     try testing.expectEqualStrings("A:ping", buf[0..n]);
+
+    // A client half-close becomes a half-close to the upstream; the upstream
+    // then closes, and its EOF reaches the client. Windows reads have no
+    // deadline here, so keep the bounded check POSIX-only.
+    if (builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        try response.stream.shutdown(.send);
+        try testing.expectEqual(@as(usize, 0), try compat.net.readWithTimeout(response.stream, &buf, 5000));
+    }
+}
+
+test "proxy rejects a lowercase CONNECT method" {
+    var proxy = try Proxy.start(testing.allocator, .{ .worker_count = 1 });
+    defer proxy.deinit();
+
+    const stream = try connectToProxy(proxy);
+    defer stream.close();
+    try stream.writeAll("connect example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n");
+    try testing.expectEqual(@as(u16, 403), try readStatus(stream));
+}
+
+test "proxy queues a third connection behind two busy workers" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var echo = try EchoServer.start(testing.allocator, "A:");
+    defer {
+        echo.stopAndJoin();
+        echo.deinit();
+    }
+    const upstream = try compat.net.Address.parseIp4("127.0.0.1", echo.port());
+    var plan = [_]compat.net.Address{upstream};
+    var plans = [_][]const compat.net.Address{plan[0..]};
+    var fake = FakeResolver{ .plans = plans[0..] };
+
+    var proxy = try Proxy.start(testing.allocator, .{
+        .worker_count = 2,
+        .handshake_timeout_ms = 30_000,
+        .allowed_domains = &.{"upstream.test"},
+        .resolver = fake.hook(),
+    });
+    defer proxy.deinit();
+
+    // Partial heads keep both workers inside the handshake read.
+    const busy_a = try connectToProxy(proxy);
+    var busy_a_open = true;
+    defer if (busy_a_open) busy_a.close();
+    const busy_b = try connectToProxy(proxy);
+    defer busy_b.close();
+    try busy_a.writeAll("CONNECT upstream.test:443 HTTP/1.1\r\n");
+    try busy_b.writeAll("CONNECT upstream.test:443 HTTP/1.1\r\n");
+
+    // The listener accepts this one, but no worker can serve it yet, so no
+    // response may arrive.
+    const queued = try connectToProxy(proxy);
+    defer queued.close();
+    try sendConnect(queued, "upstream.test:443");
+    var buf: [16]u8 = undefined;
+    try testing.expectError(error.Timeout, compat.net.readWithTimeout(queued, &buf, 500));
+
+    // Freeing one worker lets the queued request through.
+    busy_a.close();
+    busy_a_open = false;
+    try testing.expectEqual(@as(u16, 200), try readStatus(queued));
 }
 
 test "proxy pins the first resolution and never rebinds" {
