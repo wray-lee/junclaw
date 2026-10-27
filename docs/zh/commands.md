@@ -72,7 +72,7 @@
 | `nullclaw status [--json]` | 查看全局状态总览，或输出 machine-readable runtime snapshot |
 | `nullclaw doctor` | 执行系统诊断 |
 | `nullclaw update --check` | 仅检查是否有更新 |
-| `nullclaw update --yes` | 自动确认并安装更新 |
+| `nullclaw update --yes` | 自动确认并安装更新（目前会装成上游 nullclaw 而非 junclaw；junclaw 请用 release 资产或镜像升级） |
 | `nullclaw auth login openai-codex` | 为 `openai-codex` 做 OAuth 登录 |
 | `nullclaw auth login openai-codex --import-codex` | 从 `~/.codex/auth.json` 导入登录态 |
 | `nullclaw auth status openai-codex` | 查看认证状态 |

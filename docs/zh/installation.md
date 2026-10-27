@@ -22,7 +22,18 @@ zig version
 输出必须是 `0.16.0`。
 
 ## 方式一：使用二进制文件
-### Homebrew（macOS/Linux推荐）
+### junclaw 发布二进制（推荐）
+
+从 [junclaw Releases](https://github.com/wray-lee/junclaw/releases/latest) 下载对应平台的资产——`junclaw-linux-x86_64.bin`、`junclaw-macos-aarch64.bin`、`junclaw-windows-x86_64.zip` 等（完整列表见[根 README](../../README.md#install-junclaw)）。安装后的二进制名仍是 `nullclaw`。
+
+```bash
+# Linux x86_64；macOS 用 junclaw-macos-aarch64.bin 或 junclaw-macos-x86_64.bin
+curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/download/v1.1.0/junclaw-linux-x86_64.bin
+chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
+nullclaw --help
+```
+
+Homebrew 的 `nullclaw` formula 安装的是上游 nullclaw，不是本 fork；junclaw 没有 tap。只有想用上游时才执行：
 
 ```bash
 brew install nullclaw
@@ -32,7 +43,7 @@ nullclaw --help
 
 ### 命令行（CMD）(Windows)
 
-从发布页下载 Windows `.zip` 压缩包并解压后，即可直接在命令行中运行其中的 `nullclaw.exe`。
+从发布页下载 Windows `junclaw-windows-x86_64.zip`（或 `junclaw-windows-aarch64.zip`）并解压后，即可直接在命令行中运行其中的 `nullclaw.exe`。
 
 比如检查nullclaw版本号的命令如下：
 
@@ -40,9 +51,9 @@ nullclaw --help
 x:\path\nullclaw.exe --version
 ```
 
-## 方式二：官方容器镜像（Docker / Podman）
+## 方式二：容器镜像（Docker / Podman）
 
-NullClaw 当前提供官方 OCI 镜像：`ghcr.io/nullclaw/nullclaw`。
+junclaw 提供自己的 OCI 镜像：`ghcr.io/wray-lee/junclaw`（仅 `linux/amd64`）。上游也发布 `ghcr.io/nullclaw/nullclaw`，但其中没有 dsh harness 和浏览器变体。
 
 容器内的持久化目录统一放在 `/nullclaw-data`：
 
@@ -57,7 +68,7 @@ NullClaw 当前提供官方 OCI 镜像：`ghcr.io/nullclaw/nullclaw`。
 
 ```bash
 docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
-  --entrypoint sh ghcr.io/nullclaw/nullclaw:latest \
+  --entrypoint sh ghcr.io/wray-lee/junclaw:v1.1.0 \
   -c 'chown -R 65534:65534 /nullclaw-data'
 ```
 
@@ -68,7 +79,7 @@ docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest status
+  ghcr.io/wray-lee/junclaw:v1.1.0 status
 ```
 
 交互式初始化配置：
@@ -76,7 +87,7 @@ docker run --rm -it \
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest onboard --interactive
+  ghcr.io/wray-lee/junclaw:v1.1.0 onboard --interactive
 ```
 
 运行交互式 agent：
@@ -84,7 +95,7 @@ docker run --rm -it \
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest agent
+  ghcr.io/wray-lee/junclaw:v1.1.0 agent
 ```
 
 运行 HTTP gateway：
@@ -93,12 +104,18 @@ docker run --rm -it \
 docker run --rm -it \
   -p 127.0.0.1:3000:3000 \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest
+  ghcr.io/wray-lee/junclaw:v1.1.0
 ```
 
 ### Docker Compose
 
-仓库根目录自带 `docker-compose.yml`，默认直接使用官方镜像。
+仓库根目录的 `docker-compose.yml` 默认从本仓库 Dockerfile 构建 `nullclaw:local`，且 `make up` 会强制重建。要用已发布的 junclaw 镜像，先拉取再直接启动 compose：
+
+```bash
+export NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.0
+docker compose --profile gateway pull gateway
+docker compose --profile gateway up -d gateway   # 不要用 `make up`，它带 --build
+```
 
 交互式初始化：
 
@@ -106,7 +123,7 @@ docker run --rm -it \
 docker compose --profile agent run --rm agent onboard --interactive
 ```
 
-在官方容器流程里，workspace 提示直接回车即可保留挂载卷里的默认路径：
+在容器流程里，workspace 提示直接回车即可保留挂载卷里的默认路径：
 
 - 工作区：`/nullclaw-data/workspace`
 
@@ -125,14 +142,15 @@ docker compose --profile gateway up -d gateway
 Profile 含义：
 
 - `agent`：一次性的交互式 CLI 容器
-- `gateway`：长期运行的 HTTP gateway，默认发布到宿主机回环地址 `3000`
+- `gateway`：长期运行的 HTTP gateway，默认发布到宿主机回环地址 `3210`（可用 `NULLCLAW_PORT` 覆盖）
 
 如果你需要局域网或公网访问，请显式修改发布地址，并先阅读 [安全指南](./security.md)。
 
 如果你要固定版本标签，或者以后切换到其他镜像仓库，可以覆盖 `NULLCLAW_IMAGE`：
 
 ```bash
-NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gateway up -d gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.0 docker compose --profile gateway pull gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.0 docker compose --profile gateway up -d gateway
 ```
 
 ### full-dsh 镜像（可选）
@@ -140,13 +158,16 @@ NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gat
 本分叉还提供一个内置 [dsh](https://github.com/deepseek-ai/deepseek-harness) sidecar harness 的完整镜像，`nullclaw` 二进制与精简镜像相同：
 
 ```bash
-docker pull ghcr.io/<owner>/junclaw:full-dsh
+docker pull ghcr.io/wray-lee/junclaw:full-dsh
 ```
 
 标签：
 
-- `:full-dsh` —— `full-dsh` target 的最新构建
-- `:full-dsh-<version>` —— 由 `full-dsh-v*` 标签或手动 CI 运行产生
+- `:full-dsh` —— `full-dsh` target 的最新构建（当前为 `main-92f0772254`，2026-10-22，早于 v1.1.0；需要 1.1.0 代码请用 `:v1.1.0-full-dsh-browser` 或本地构建）
+- `:full-dsh-v<version>` —— 由 `full-dsh-v*` 标签产生（目前尚未推过该标签）
+- `:full-dsh-main-<sha>` —— 手动 CI 运行
+
+v1.1.0 发布没有 `v1.1.0-full-dsh`；其 full 浏览器变体是 `:v1.1.0-full-dsh-browser`。
 
 本地构建：
 
@@ -184,10 +205,16 @@ docker build --target full-dsh -t junclaw:full-dsh .
 ## 方式三：源码构建（通用）
 
 ```bash
-git clone https://github.com/nullclaw/nullclaw.git
-cd nullclaw
+git clone https://github.com/wray-lee/junclaw.git
+cd junclaw
 zig build -Doptimize=ReleaseSmall
 zig build test --summary all
+```
+
+默认构建包含进程内 `dsh` 引擎。要同时构建可选的 dsh sidecar harness（运行需要 Node 22），加 `-Dharness_dsh=true`：
+
+```bash
+zig build -Doptimize=ReleaseSmall -Dharness_dsh=true
 ```
 
 构建产物：
@@ -207,8 +234,8 @@ zig build test --summary all
 ```bash
 pkg update
 pkg install git zig
-git clone https://github.com/nullclaw/nullclaw.git
-cd nullclaw
+git clone https://github.com/wray-lee/junclaw.git
+cd junclaw
 zig version
 zig build -Doptimize=ReleaseSmall
 ./zig-out/bin/nullclaw --help
@@ -286,20 +313,17 @@ nullclaw status
 
 ## 升级与卸载
 
-### 使用二进制文件
+> **`nullclaw update` 只面向上游。** 它检查并安装上游 nullclaw 发布，会把当前二进制替换成上游。升级 junclaw 请从 [Releases](https://github.com/wray-lee/junclaw/releases/latest) 下载新的 `junclaw-*` 资产并替换二进制（命令同方式一）。
 
-#### Homebrew（macOS/Linux推荐）
+### 发布二进制
 
-```bash
-brew update
-brew upgrade nullclaw
-brew uninstall nullclaw
-```
-#### 命令行（CMD)（Windows）
+- 升级：下载新的 `junclaw-<platform>.bin`，`chmod +x` 后覆盖已安装的 `nullclaw`
+- 卸载：删除 `nullclaw` 二进制，并从 `PATH` 移除其所在目录
 
-- 升级： `nullclaw update`
-- 卸载：直接删除nullclaw二进制文件。
-检查系统变量PATH，若存在就将nullclaw二进制文件的所在目录从中删除。
+### Homebrew（仅上游 nullclaw）
+
+- 升级：`brew update && brew upgrade nullclaw`（安装的是上游，不是 junclaw）
+- 卸载：`brew uninstall nullclaw`
 
 ### 源码安装
 
