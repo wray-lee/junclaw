@@ -114,7 +114,7 @@ Focus on:
 
 ```bash
 # Linux x86_64; macOS: junclaw-macos-aarch64.bin or junclaw-macos-x86_64.bin
-curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/download/v1.1.0/junclaw-linux-x86_64.bin
+curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-linux-x86_64.bin
 chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
 nullclaw onboard --interactive
 nullclaw agent -m "hello junclaw"
