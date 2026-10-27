@@ -45,6 +45,10 @@ pub const Config = struct {
 pub const Redactor = struct {
     allocator: std.mem.Allocator,
     config: Config,
+    /// The map/counter state below is shared: the dsh host executor redacts
+    /// tool output from parallel scheduler workers while the turn thread
+    /// redacts provider requests and log events.
+    mutex: std_compat.sync.Mutex = .{},
     email_map: std.StringHashMap(u32),
     phone_map: std.StringHashMap(u32),
     card_map: std.StringHashMap(u32),
@@ -99,6 +103,8 @@ pub const Redactor = struct {
     }
 
     pub fn reset(self: *Redactor) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         clearMap(&self.email_map, self.allocator);
         clearMap(&self.phone_map, self.allocator);
         clearMap(&self.card_map, self.allocator);
@@ -118,6 +124,8 @@ pub const Redactor = struct {
     /// on `self.allocator`, so a single Redactor can serve many short-lived destination
     /// allocators (e.g. per-turn arenas) while preserving cross-call placeholder ids.
     pub fn redact(self: *Redactor, dest_allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (!self.hasMatch(input)) {
             return dest_allocator.dupe(u8, input);
         }
@@ -299,6 +307,8 @@ pub const Redactor = struct {
     /// slice owned by `dest_allocator`. Safe when `record_originals` was off
     /// during redaction — every placeholder will be unknown and preserved.
     pub fn unredact(self: *Redactor, dest_allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
         if (std.mem.indexOfScalar(u8, input, '[') == null) {
             return dest_allocator.dupe(u8, input);
         }
@@ -1318,4 +1328,70 @@ test "matchPlaceholderEnd: covers all kinds and rejects look-alikes" {
     try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("[EMAILX_1]", 0));
     try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("[EMAIL_1", 0));
     try std.testing.expectEqual(@as(?usize, null), matchPlaceholderEnd("EMAIL_1]", 0));
+}
+
+test "Redactor: concurrent redact/unredact keeps every identity distinct" {
+    // Regression: the dsh host executor redacts tool output from parallel
+    // scheduler workers sharing one Redactor; the lockless maps lost updates
+    // (two emails both became [EMAIL_1]) and rehashed concurrently (UB).
+    const testing = std.testing;
+    const allocator = testing.allocator;
+    const count = 8;
+
+    var r = Redactor.init(allocator, .{ .record_originals = true });
+    defer r.deinit();
+
+    const Worker = struct {
+        fn run(red: *Redactor, input: []const u8, slot: *[16]u8, len: *usize, failure: *?anyerror) void {
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            defer arena.deinit();
+            const out = red.redact(arena.allocator(), input) catch |err| {
+                failure.* = err;
+                return;
+            };
+            if (out.len > slot.len) {
+                failure.* = error.PlaceholderTooLong;
+                return;
+            }
+            @memcpy(slot[0..out.len], out);
+            len.* = out.len;
+        }
+    };
+
+    var inputs: [count][]u8 = undefined;
+    var slots: [count][16]u8 = undefined;
+    var lens: [count]usize = undefined;
+    var failures: [count]?anyerror = undefined;
+    var threads: [count]std.Thread = undefined;
+    @memset(&lens, 0);
+    for (&failures) |*failure| failure.* = null;
+    var spawned: usize = 0;
+    defer for (threads[0..spawned]) |thread| thread.join();
+    for (0..count) |i| {
+        inputs[i] = try std.fmt.allocPrint(allocator, "person{d}@example.com", .{i});
+        threads[i] = try std.Thread.spawn(.{}, Worker.run, .{
+            &r, inputs[i], &slots[i], &lens[i], &failures[i],
+        });
+        spawned += 1;
+    }
+    for (threads[0..spawned]) |thread| thread.join();
+    spawned = 0;
+    defer for (inputs) |input| allocator.free(input);
+
+    for (0..count) |i| {
+        try testing.expect(failures[i] == null);
+        try testing.expect(lens[i] > 0);
+    }
+    // Every thread must have interned its own value: no two placeholders equal.
+    for (0..count) |i| {
+        for (i + 1..count) |j| {
+            try testing.expect(!std.mem.eql(u8, slots[i][0..lens[i]], slots[j][0..lens[j]]));
+        }
+    }
+    // The reverse map also kept every original: unredacting rehydrates each.
+    for (0..count) |i| {
+        const restored = try r.unredact(allocator, slots[i][0..lens[i]]);
+        defer allocator.free(restored);
+        try testing.expectEqualStrings(inputs[i], restored);
+    }
 }
