@@ -3457,6 +3457,11 @@ pub const DshNativeHarness = struct {
             self.surface_seqs.shrinkRetainingCapacity(new_len);
             try self.surface_seqs.insert(arena, idx, replacement_seq);
         }
+        // Compaction shadows every surface node after the system head,
+        // including the runtime-context snapshot (Safety, guides, cwd). Drop
+        // the retained text so the next pre-step re-emits the whole snapshot
+        // instead of the "unchanged" check keeping Safety gone.
+        self.runtime_tracker.deinit(self.allocator);
         self.last_usage = null;
         self.compaction_lock = .{};
     }

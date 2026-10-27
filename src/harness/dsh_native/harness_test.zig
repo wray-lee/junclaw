@@ -1898,6 +1898,64 @@ test "dsh-native adapter: pre-step pressure compacts and rewrites the surface" {
     try testing.expect(std.mem.indexOf(u8, log_text, "compact-checkpoint") != null);
 }
 
+test "dsh-native adapter: Safety is re-emitted after compaction shadows runtime context" {
+    // Regression: compaction rewrites the surface after the system head, so
+    // the runtime-context node carrying `## Safety` is shadowed. The snapshot
+    // tracker still held the same text (the fixture clock is fixed), so
+    // `project` returned null and every request after compaction — not just
+    // until the next minute — went out without the Safety policy.
+    const allocator = testing.allocator;
+    const big_a = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big_a);
+    const big_b = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big_b);
+    @memset(big_a, 'x');
+    @memset(big_b, 'y');
+    const first_text = try std.fmt.allocPrint(allocator, "marker-one {s}", .{big_a});
+    defer allocator.free(first_text);
+    const second_text = try std.fmt.allocPrint(allocator, "marker-two {s}", .{big_b});
+    defer allocator.free(second_text);
+
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "a", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "b", .prompt_tokens = 900, .completion_tokens = 10 },
+        // Auxiliary summary calls.
+        .{ .text = "condensed history", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "c", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "condensed again", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "d" },
+    });
+    defer fx.deinit();
+    fx.context_window = 1000;
+    fx.compaction_headroom_tokens = 10;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const one = try h.runTurn(turnInput(first_text));
+    defer allocator.free(one.reply);
+    const two = try h.runTurn(turnInput(second_text));
+    defer allocator.free(two.reply);
+    const three = try h.runTurn(turnInput("third"));
+    defer allocator.free(three.reply);
+    try testing.expectEqual(port.EndReason.completed, three.end_reason);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    const log_text = try readLogText(allocator, path);
+    defer allocator.free(log_text);
+    try testing.expect(std.mem.indexOf(u8, log_text, "\"compaction/start\"") != null);
+
+    // The first request carried Safety; so must the final one, which runs
+    // after compaction shadowed every runtime-context node.
+    try testing.expect(requestContains(fx.provider.requests.items[0], "## Safety"));
+    try testing.expect(requestContains(
+        fx.provider.requests.items[fx.provider.requests.items.len - 1],
+        "## Safety",
+    ));
+}
+
 test "dsh-native adapter: a pruned result shadowed by the summary keeps the replacement seq" {
     // Regression: the pruner rewrote a tool result in place but kept its old
     // seq, so compaction/summary.shadowedSeqs and the checkpoint's
