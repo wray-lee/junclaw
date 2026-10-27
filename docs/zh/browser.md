@@ -190,6 +190,11 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型，并�
   已校验的地址。局域网必须不可达时，部署侧网络隔离仍是外层边界。浏览器清理
   也是同样的分层：容器 PID 1 退出是首要保证，POSIX watchdog 或 Windows
   Job Object 是进程级兜底。
+- **代理超时。** POSIX 上 10 秒连接/握手期限和 120 秒隧道读写空闲期限用
+  `poll` 保证。Windows 上 Zig 0.16 的 socket 后端没有 poll/select 路径，这些
+  调用会阻塞：停滞的对端可以一直占用 32 个代理 worker 之一，直到浏览器会话
+  停止时由 `stopAndJoin` 断开全部隧道。worker 上限和每进程单浏览器设计限制了
+  影响范围。
 - **页面脚本会运行。** Firefox 会执行页面 JavaScript。模型拿不到 JavaScript
   动作；`read`、`snapshot` 和 `scroll` 使用固定的内部脚本。页面输出按不可信
   输入处理。
@@ -215,8 +220,10 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型，并�
   `Listening on 127.0.0.1:<port>` 横幅来自我们自己子进程的 stderr、该子进程
   仍存活、且新会话报告的是我们创建的 profile 时，junclaw 才接受该端点。
   监听者不属于自己或 profile 不符时换新端口重试，最多三次，然后启动按失败
-  处理。二进制缺失、启动失败或每次尝试 10 秒超时都会返回带原因的工具错误。
-  geckodriver 的输出不会转发。
+  处理。二进制缺失、启动失败或每次尝试 10 秒的就绪期限都会返回带原因的工具
+  错误。期限在两次探测之间检查，单次 `/status` 探测使用 60 秒的 WebDriver
+  命令超时，因此挂起的驱动可能让一次尝试超过 10 秒。geckodriver 的输出不会
+  转发。
 - **每个进程最多一个浏览器。** 同一 junclaw 进程内（跨 gateway 会话与通道
   运行）的所有浏览器动作都走同一个共享 manager 和同一个 WebDriver 会话；
   任一时刻该进程最多只有一个 Firefox 实例。互斥锁把命令串行化，因此并发的
@@ -228,10 +235,11 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型，并�
 - **空闲停止。** 超过 `webdriver_idle_timeout_ms` 没有动作时，reaper 会停止
   Firefox 和 geckodriver。检查每 250 ms 一次。`0` 关闭空闲停止；`close`
   立即停止。
-- **清理。** 停止路径会删除 WebDriver 会话，停止会话代理（断开隧道并 join
-  全部线程），向 geckodriver 进程组发送 TERM，再以 KILL 兜底，然后删除临时
-  profile。Windows 上关闭 Job Object 会杀掉驱动进程树。重复调用是安全的。
-  `close` 返回 `Browser closed` 或 `Browser is not running`。
+- **清理。** 停止路径会删除 WebDriver 会话，Windows 上关闭 Job Object、POSIX
+  上向 geckodriver 进程组发送 TERM（KILL 兜底），删除临时 profile，最后才停止
+  会话代理，让隧道在浏览器退出过程中排空。Windows 上 Job Object 创建失败时
+  降级为对直接子进程执行 `taskkill /T /F`，不保证能杀到已脱离的孙进程。重复
+  调用是安全的。`close` 返回 `Browser closed` 或 `Browser is not running`。
 - **自愈。** Firefox 死亡（例如被 OOM 杀掉）或驱动丢失会话后，下一个动作会
   清理残留并重新启动一对 geckodriver/Firefox。驱动和传输失败会作为工具错误
   返回，不会让 agent 崩溃。
@@ -244,6 +252,9 @@ WebDriver 后端采用与 `web_fetch` 相同的 URL 策略和信任模型，并�
   代理路径（正常页面加载，以及子资源、弹窗、表单提交和类 rebinding 解析被
   拒），不属于 CI。还没有让真实模型在真实网站上端到端驱动该工具，也没有用
   DNS 或抓包探针实测 DNS 预解析；相关首选项只有生成 `user.js` 的测试覆盖。
+- **Windows 运行时。** Windows 支持只做交叉编译，CI 不在 Windows 上运行该
+  后端。Windows 上代理的连接、握手和隧道 I/O 期限退化为阻塞调用（见安全
+  模型），Job Object 创建失败时降级为 `taskkill /T /F`。
 - **aarch64。** 构建文件带有 arm64 的 geckodriver 哈希，但尚未构建或测试
   arm64 镜像。CI 只发布 `linux/amd64`。
 - **CI 镜像。** 镜像工作流会在推送前构建并校验两个变体。该工作流的一次运行

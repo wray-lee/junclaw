@@ -20,8 +20,9 @@
   rules (allowlisted hosts keep the operator-trusted private-address
   exception) and the connection is pinned to a checked address, closing DNS
   rebinding between the check and the connect. A proxy start failure fails the
-  session (no direct fallback or escape-hatch switch), and extra windows are
-  closed after each action.
+  session (no direct fallback or escape-hatch switch), extra windows are
+  closed after each action, and tunnel reads and stalled writes are cut by the
+  idle deadline on POSIX instead of pinning a proxy worker.
 - WebDriver Firefox profiles now disable DoH/TRR, DNS prefetch,
   speculative/preconnect/predictor connections, HTTP/3, Alt-Svc and WebRTC,
   and turn off Safe Browsing, OCSP, Remote Settings, telemetry and update

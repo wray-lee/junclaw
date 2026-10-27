@@ -222,6 +222,12 @@ proxy. It is not a kernel-level network sandbox.
   outer boundary when the LAN must stay unreachable. Browser cleanup is
   layered the same way: container PID 1 exit is the primary guarantee, and the
   POSIX watchdog or the Windows Job Object is the per-process backstop.
+- **Proxy deadlines.** On POSIX the 10-second connect and handshake deadlines
+  and the 120-second tunnel read/write deadline are enforced with `poll`. On
+  Windows the Zig 0.16 socket backend has no poll/select path, so those calls
+  block: a stalled peer can hold one of the 32 proxy workers until the browser
+  session stops, where `stopAndJoin` shuts every tunnel down. The worker pool
+  and the one-browser-per-process design bound the exposure.
 - **Page scripts run.** Firefox executes the page's JavaScript. The model never
   gets a JavaScript action; `read`, `snapshot` and `scroll` use fixed internal
   snippets. Treat page output as untrusted input.
@@ -254,9 +260,11 @@ seccomp profile just to silence a Firefox sandbox warning (see
   arrived through our own child's stderr, the child is still alive and the new
   session reports the profile we created. A foreign listener or another
   profile is retried on a fresh port, at most three attempts, then the start
-  fails closed. A missing binary, a failed spawn or a 10-second timeout per
-  attempt returns a tool error with the reason. geckodriver output is not
-  forwarded.
+  fails closed. A missing binary, a failed spawn or a 10-second readiness
+  deadline per attempt returns a tool error with the reason. The deadline is
+  checked between probes, and each `/status` probe uses the 60-second WebDriver
+  command timeout, so a hung driver can stretch one attempt past 10 seconds.
+  geckodriver output is not forwarded.
 - **One browser per process.** Every browser action in the junclaw process,
   across all gateway sessions and channel runs, goes through one shared manager
   and one WebDriver session. At any moment the process has at most one Firefox
@@ -269,10 +277,12 @@ seccomp profile just to silence a Firefox sandbox warning (see
 - **Idle shutdown.** After `webdriver_idle_timeout_ms` without an action, the
   reaper stops Firefox and geckodriver. The check runs every 250 ms. `0`
   disables idle shutdown; `close` stops immediately.
-- **Cleanup.** The stop path deletes the WebDriver session, stops the session
-  proxy (shutting down tunnels and joining its threads), sends TERM to the
-  geckodriver process group, falls back to KILL, then removes the temporary
-  profile. On Windows closing the Job Object kills the driver tree. It is safe
+- **Cleanup.** The stop path deletes the WebDriver session, closes the Job
+  Object on Windows or sends TERM (KILL fallback) to the geckodriver process
+  group on POSIX, removes the temporary profile, and stops the session proxy
+  last so its tunnels can drain while the browser goes away. On Windows a Job
+  Object that cannot be created degrades to `taskkill /T /F` on the direct
+  child, which is not guaranteed to reach detached grandchildren. It is safe
   to call repeatedly. `close` returns `Browser closed` or `Browser is not
   running`.
 - **Self-healing.** If Firefox dies (for example after an OOM kill) or the
@@ -290,6 +300,10 @@ seccomp profile just to silence a Firefox sandbox warning (see
   of CI. A real model driving the tool end to end against real sites has not
   been run, and DNS prefetch was not captured with a DNS or packet probe: its
   prefs are covered only by generated-`user.js` tests.
+- **Windows runtime.** Windows support is cross-compiled only; CI does not run
+  the WebDriver backend there. On Windows proxy connect, handshake and tunnel
+  I/O deadlines degrade to blocking calls (see the security model), and a Job
+  Object that cannot be created falls back to `taskkill /T /F`.
 - **aarch64.** The build file carries the arm64 geckodriver hash, but no arm64
   image has been built or tested. CI publishes `linux/amd64` only.
 - **CI images.** The image workflow builds and verifies both variants before
