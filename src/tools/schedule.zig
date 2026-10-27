@@ -16,6 +16,47 @@ threadlocal var tls_schedule_peer_kind: ?agent_routing.ChatType = null;
 threadlocal var tls_schedule_peer_id: ?[]const u8 = null;
 threadlocal var tls_schedule_thread_id: ?[]const u8 = null;
 
+/// The delivery context installed on this thread (diagnostics and tests: the
+/// values are thread-local, so a worker can only observe what it installed).
+pub const ThreadContext = struct {
+    channel: ?[]const u8 = null,
+    account_id: ?[]const u8 = null,
+    chat_id: ?[]const u8 = null,
+    peer_kind: ?agent_routing.ChatType = null,
+    peer_id: ?[]const u8 = null,
+    thread_id: ?[]const u8 = null,
+};
+
+pub fn getThreadContext() ThreadContext {
+    return .{
+        .channel = tls_schedule_channel,
+        .account_id = tls_schedule_account_id,
+        .chat_id = tls_schedule_chat_id,
+        .peer_kind = tls_schedule_peer_kind,
+        .peer_id = tls_schedule_peer_id,
+        .thread_id = tls_schedule_thread_id,
+    };
+}
+
+/// Set this thread's delivery context. The tool instance carries no state, so
+/// worker threads (dsh's tool scheduler) install the context directly before
+/// executing instead of relying on the turn thread's thread-local copy.
+pub fn setThreadContext(
+    channel: ?[]const u8,
+    account_id: ?[]const u8,
+    chat_id: ?[]const u8,
+    peer_kind: ?agent_routing.ChatType,
+    peer_id: ?[]const u8,
+    thread_id: ?[]const u8,
+) void {
+    tls_schedule_channel = channel;
+    tls_schedule_account_id = account_id;
+    tls_schedule_chat_id = chat_id;
+    tls_schedule_peer_kind = peer_kind;
+    tls_schedule_peer_id = peer_id;
+    tls_schedule_thread_id = thread_id;
+}
+
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
@@ -38,12 +79,7 @@ pub const ScheduleTool = struct {
         thread_id: ?[]const u8,
     ) void {
         _ = self;
-        tls_schedule_channel = channel;
-        tls_schedule_account_id = account_id;
-        tls_schedule_chat_id = chat_id;
-        tls_schedule_peer_kind = peer_kind;
-        tls_schedule_peer_id = peer_id;
-        tls_schedule_thread_id = thread_id;
+        setThreadContext(channel, account_id, chat_id, peer_kind, peer_id, thread_id);
     }
 
     pub fn tool(self: *ScheduleTool) Tool {

@@ -233,6 +233,51 @@ const DshNativeState = struct {
     }
 };
 
+const TurnDeliveryRoute = struct {
+    channel: ?[]const u8,
+    account_id: ?[]const u8,
+    chat_id: ?[]const u8,
+    peer_kind: ?agent_routing.ChatType,
+    peer_id: ?[]const u8,
+};
+
+/// Where this turn's replies and scheduled tasks must go. Shared by the turn
+/// thread (schedule/spawn defaults) and dsh's tool workers.
+fn turnDeliveryRoute(session_key: []const u8, conversation_context: ?ConversationContext) TurnDeliveryRoute {
+    const channel = if (conversation_context) |ctx| (ctx.channel orelse SessionManager.parseChannelFromSessionKey(session_key)) else SessionManager.parseChannelFromSessionKey(session_key);
+    const chat_id = if (conversation_context) |ctx|
+        ctx.delivery_chat_id orelse SessionManager.parsePeerIdFromSessionKey(session_key)
+    else
+        SessionManager.parsePeerIdFromSessionKey(session_key);
+    const account_id = if (conversation_context) |ctx| ctx.account_id else null;
+    const peer_kind = if (conversation_context) |ctx|
+        if (ctx.is_group) |is_group|
+            if (is_group) agent_routing.ChatType.group else agent_routing.ChatType.direct
+        else
+            null
+    else
+        null;
+    const peer_id = if (conversation_context) |ctx| blk: {
+        if (ctx.is_group) |is_group| {
+            if (is_group) {
+                if (ctx.group_id) |group_id| break :blk group_id;
+            }
+        }
+        if (ctx.peer_id) |value| break :blk value;
+        break :blk chat_id;
+    } else chat_id;
+    return .{ .channel = channel, .account_id = account_id, .chat_id = chat_id, .peer_kind = peer_kind, .peer_id = peer_id };
+}
+
+/// Install the turn's delivery route into this thread. dsh executes host tools
+/// on worker threads, so the turn thread's thread-local context (set by
+/// `setTurnToolContext`) does not follow; without this the schedule tool
+/// records a job with no chat target and the reminder never reaches the chat.
+fn installScheduleThreadContext(conversation_context: ?ConversationContext, session_key: ?[]const u8) void {
+    const route = turnDeliveryRoute(session_key orelse "agent", conversation_context);
+    tools_mod.schedule.setThreadContext(route.channel, route.account_id, route.chat_id, route.peer_kind, route.peer_id, null);
+}
+
 /// Bridge executor: arguments are re-serialized because the junclaw executor
 /// takes raw JSON (the same shape the native loop passes).
 fn hostToolCall(
@@ -242,6 +287,8 @@ fn hostToolCall(
     args: std.json.Value,
 ) anyerror!dsh_bridge.HostResult {
     const agent: *Agent = @ptrCast(@alignCast(context));
+    installScheduleThreadContext(agent.conversation_context, agent.memory_session_id);
+    defer installScheduleThreadContext(null, null);
     const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
     const outcome = agent.executeHostTool(allocator, name, args_json);
     const output = try sanitizeHostToolOutput(allocator, agent.redactor, outcome.output);
@@ -2010,33 +2057,11 @@ pub const SessionManager = struct {
         session_key: []const u8,
         conversation_context: ?ConversationContext,
     ) void {
-        const channel = if (conversation_context) |ctx| (ctx.channel orelse parseChannelFromSessionKey(session_key)) else parseChannelFromSessionKey(session_key);
-        const chat_id = if (conversation_context) |ctx|
-            ctx.delivery_chat_id orelse parsePeerIdFromSessionKey(session_key)
-        else
-            parsePeerIdFromSessionKey(session_key);
-        const account_id = if (conversation_context) |ctx| ctx.account_id else null;
-        const peer_kind = if (conversation_context) |ctx|
-            if (ctx.is_group) |is_group|
-                if (is_group) agent_routing.ChatType.group else agent_routing.ChatType.direct
-            else
-                null
-        else
-            null;
-        const peer_id = if (conversation_context) |ctx| blk: {
-            if (ctx.is_group) |is_group| {
-                if (is_group) {
-                    if (ctx.group_id) |group_id| break :blk group_id;
-                }
-            }
-            if (ctx.peer_id) |value| break :blk value;
-            break :blk chat_id;
-        } else chat_id;
-
+        const route = turnDeliveryRoute(session_key, conversation_context);
         for (tools) |tool| {
             if (std.mem.eql(u8, tool.name(), "schedule")) {
                 const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-                schedule_tool.setContext(channel, account_id, chat_id, peer_kind, peer_id, null);
+                schedule_tool.setContext(route.channel, route.account_id, route.chat_id, route.peer_kind, route.peer_id, null);
             }
         }
     }
@@ -3056,6 +3081,10 @@ pub const SessionManager = struct {
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
         setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        // Native calls this at every turn start; dsh bypasses Agent.turn, so
+        // the spawn tool's origin route must be refreshed here or subagent
+        // results go to the synthetic "system" channel.
+        agent_mod.commands.refreshSubagentToolContext(&session.agent);
 
         const maybe_response = try session.handleLocalCommand(content);
         if (maybe_response == null) return null;
@@ -3612,6 +3641,10 @@ pub const SessionManager = struct {
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
         setTurnToolContext(session.agent.tools, session_key, conversation_context);
+        // Native calls this at every turn start; dsh bypasses Agent.turn, so
+        // the spawn tool's origin route must be refreshed here or subagent
+        // results go to the synthetic "system" channel.
+        agent_mod.commands.refreshSubagentToolContext(&session.agent);
 
         // The stream/progress install block and the agent_start observer event
         // moved verbatim into the native adapter (src/harness/native.zig
@@ -9449,6 +9482,84 @@ test "setTurnToolContext prefers delivery chat target over direct peer session i
     try testing.expectEqualStrings("dm-channel-42", job.delivery.to.?);
     try testing.expect(job.delivery.peer_id != null);
     try testing.expectEqualStrings("user-42", job.delivery.peer_id.?);
+}
+
+test "dsh host tool workers inherit the turn's schedule delivery context" {
+    // Probe tool reports the schedule thread-local context it can see, so the
+    // test needs no cron.json and cannot race the scheduler tests.
+    const WorkerProbe = struct {
+        pub const tool_name = "worker_ctx_probe";
+        pub const tool_description = "Test probe: reports the schedule thread context";
+        pub const tool_params = "{\"type\":\"object\",\"properties\":{}}";
+        const vtable = tools_mod.ToolVTable(@This());
+
+        fn tool(self: *@This()) Tool {
+            return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+        }
+
+        pub fn execute(_: *@This(), allocator: Allocator, _: tools_mod.JsonObjectMap) !tools_mod.ToolResult {
+            const ctx = tools_mod.schedule.getThreadContext();
+            const output = try std.fmt.allocPrint(allocator, "{s}|{s}|{s}|{s}", .{
+                ctx.channel orelse "null",
+                ctx.chat_id orelse "null",
+                ctx.peer_id orelse "null",
+                if (ctx.peer_kind) |kind| @tagName(kind) else "null",
+            });
+            return .{ .success = true, .output = output };
+        }
+    };
+
+    var worker_probe = WorkerProbe{};
+    var tools = [_]Tool{worker_probe.tool()};
+
+    var noop = observability.NoopObserver{};
+    var agent = Agent{
+        .allocator = testing.allocator,
+        .provider = undefined,
+        .tools = &tools,
+        .tool_specs = &.{},
+        .mem = null,
+        .observer = noop.observer(),
+        .model_name = "test/mock-model",
+        .temperature = 0.7,
+        .workspace_dir = "worker-test-workspace",
+        .max_tool_iterations = 10,
+        .max_history_messages = 10,
+        .auto_save = false,
+    };
+    agent.memory_session_id = "agent:main:telegram:group:-10042";
+    agent.conversation_context = .{
+        .channel = "telegram",
+        .delivery_chat_id = "-10042",
+        .group_id = "-10042",
+        .is_group = true,
+    };
+
+    const Probe = struct {
+        outcome: ?anyerror = null,
+        output: []const u8 = "",
+    };
+    const Worker = struct {
+        fn run(worker_agent: *Agent, probe: *Probe, arena: *std.heap.ArenaAllocator) void {
+            const result = hostToolCall(@ptrCast(worker_agent), arena.allocator(), "worker_ctx_probe", .{ .object = .{} }) catch |err| {
+                probe.outcome = err;
+                return;
+            };
+            probe.output = result.output;
+            if (!result.success) probe.outcome = error.HostToolFailed;
+        }
+    };
+
+    // Regression: dsh executes host tools on a worker thread, so the turn
+    // thread's TLS never reached the schedule tool and reminders lost their
+    // chat target.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var probe = Probe{};
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &agent, &probe, &arena });
+    thread.join();
+    try testing.expect(probe.outcome == null);
+    try testing.expectEqualStrings("telegram|-10042|-10042|group", probe.output);
 }
 
 test "processMessage updates last_active" {
