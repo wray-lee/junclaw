@@ -396,6 +396,79 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
     return tcpConnectToAddress(addresses.addrs[0]);
 }
 
+/// Connect to an already-resolved address with a total timeout. Never resolves
+/// hostnames. Windows/WASI use a blocking connect: Zig 0.16's std.Io has no
+/// timeout connect there, and callers keep a deterministic stop path.
+pub fn connectWithTimeout(address: Address, timeout_ms: u32) !Stream {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return tcpConnectToAddress(address),
+        else => {},
+    }
+
+    const socket_type = posix.SOCK.STREAM |
+        (if (@hasDecl(posix.SOCK, "CLOEXEC")) posix.SOCK.CLOEXEC else 0);
+    const rc = posix.system.socket(
+        @intCast(address.any.family),
+        @intCast(socket_type),
+        @intCast(posix.IPPROTO.TCP),
+    );
+    const fd: Stream.Handle = switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    };
+    errdefer closeStreamHandle(fd);
+    if (!@hasDecl(posix.SOCK, "CLOEXEC")) try setSocketCloseOnExec(fd);
+    try setSocketNonblocking(fd, true);
+
+    switch (posix.errno(posix.system.connect(fd, &address.any, address.getOsSockLen()))) {
+        .SUCCESS => {},
+        .INPROGRESS, .AGAIN => {
+            var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const timeout: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+            if (try posix.poll(&poll_fds, timeout) == 0) return error.ConnectionTimedOut;
+            var peer: posix.sockaddr = undefined;
+            var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+            posix.getpeername(fd, &peer, &peer_len) catch return error.ConnectionRefused;
+        },
+        .CONNREFUSED => return error.ConnectionRefused,
+        .NETUNREACH, .HOSTUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+    // Tunnel reads use poll() and writeAll expects a blocking socket.
+    try setSocketNonblocking(fd, false);
+    return .{ .handle = fd };
+}
+
+fn closeStreamHandle(fd: Stream.Handle) void {
+    const stream = Stream{ .handle = fd };
+    stream.close();
+}
+
+/// Read with a deadline. SO_RCVTIMEO is not usable: Zig 0.16's threaded Io
+/// treats EAGAIN on a blocking socket as a programmer bug and panics, so poll
+/// before reading. Windows/WASI fall back to a blocking read; the proxy's
+/// stopAndJoin shuts active tunnels down there.
+pub fn readWithTimeout(stream: Stream, buffer: []u8, timeout_ms: u32) !usize {
+    if (buffer.len == 0) return 0;
+    switch (builtin.os.tag) {
+        .windows, .wasi => return stream.read(buffer),
+        else => {},
+    }
+
+    var poll_fds = [_]posix.pollfd{.{
+        .fd = stream.handle,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const timeout: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+    if (try posix.poll(&poll_fds, timeout) == 0) return error.Timeout;
+    return posix.read(stream.handle, buffer) catch |err| switch (err) {
+        error.WouldBlock => error.Timeout,
+        else => err,
+    };
+}
+
 fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
 
@@ -811,4 +884,31 @@ test "compat net getAddressList returns UnknownHostName for invalid hostname on 
     if (builtin.os.tag != .windows) return;
     const result = getAddressList(std.testing.allocator, "bad host", 80);
     try std.testing.expectError(error.UnknownHostName, result);
+}
+
+test "compat net connectWithTimeout reaches a loopback listener" {
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try connectWithTimeout(server.listen_address, 5000);
+    defer client.close();
+    var conn = try server.accept();
+    defer conn.stream.close();
+}
+
+test "compat net readWithTimeout reads data and then times out" {
+    if (builtin.os.tag == .windows) return;
+
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    try conn.stream.writeAll("x");
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try readWithTimeout(client, &buf, 1000));
+    try std.testing.expectError(error.Timeout, readWithTimeout(client, &buf, 10));
 }

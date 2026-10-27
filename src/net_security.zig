@@ -210,6 +210,167 @@ pub fn resolveConnectHost(
     return error.HostResolutionFailed;
 }
 
+pub const ResolveConnectAddressesError = std.mem.Allocator.Error || error{
+    HostResolutionFailed,
+    LocalAddressBlocked,
+    HostNotAllowed,
+};
+
+/// Test seam for resolution: production passes null and uses the system
+/// resolver. Tests inject a deterministic address list to exercise DNS
+/// rebinding without touching real DNS or /etc/hosts.
+pub const AddressResolver = struct {
+    context: ?*anyopaque = null,
+    resolve: *const fn (
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+    ) std_compat.net.GetAddressListError!*std_compat.net.AddressList,
+};
+
+pub const ResolvedConnectAddresses = struct {
+    arena: std.heap.ArenaAllocator,
+    addrs: []std_compat.net.Address,
+
+    pub fn deinit(self: *ResolvedConnectAddresses) void {
+        var arena = self.arena;
+        arena.deinit();
+    }
+};
+
+/// Resolve `host` once and return the binary addresses that passed the SSRF
+/// policy. Callers must connect to one of these addresses and never resolve
+/// the name again, which pins the connection against DNS rebinding.
+pub fn resolveConnectAddresses(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    allowed_domains: []const []const u8,
+) ResolveConnectAddressesError!ResolvedConnectAddresses {
+    return resolveConnectAddressesWith(allocator, host, port, allowed_domains, null);
+}
+
+pub fn resolveConnectAddressesWith(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    allowed_domains: []const []const u8,
+    resolver: ?AddressResolver,
+) ResolveConnectAddressesError!ResolvedConnectAddresses {
+    const bare = stripHostBrackets(host);
+    const unscoped = stripIpv6ZoneId(bare);
+    const normalized = stripTrailingDot(unscoped);
+    if (normalized.len == 0) return error.HostResolutionFailed;
+
+    // A non-empty allowlist is a complete whitelist: deny before any DNS
+    // query. A match is explicit operator trust and skips private-range
+    // checks, but the address is still pinned to this one resolution.
+    const trusted = allowed_domains.len > 0 and hostMatchesAllowlistNormalized(normalized, allowed_domains);
+    if (allowed_domains.len > 0 and !trusted) return error.HostNotAllowed;
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    // Numeric literals are never sent to DNS: a client that writes
+    // 0177.0.0.1 really connects to 127.0.0.1, so judge that address.
+    if (parseIpv4InetAton(normalized)) |octets| {
+        if (!trusted and isNonGlobalV4(octets)) return error.LocalAddressBlocked;
+        const text = try std.fmt.allocPrint(arena_allocator, "{d}.{d}.{d}.{d}", .{
+            octets[0], octets[1], octets[2], octets[3],
+        });
+        const addr = std_compat.net.Address.parseIp4(text, port) catch return error.HostResolutionFailed;
+        return .{ .arena = arena, .addrs = try arena_allocator.dupe(std_compat.net.Address, &.{addr}) };
+    }
+    if (parseIpv6(unscoped)) |segs| {
+        if (!trusted and isNonGlobalV6(segs)) return error.LocalAddressBlocked;
+        const text = try std.fmt.allocPrint(arena_allocator, "{x}:{x}:{x}:{x}:{x}:{x}:{x}:{x}", .{
+            segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
+        });
+        const addr = std_compat.net.Address.parseIp6(text, port) catch return error.HostResolutionFailed;
+        return .{ .arena = arena, .addrs = try arena_allocator.dupe(std_compat.net.Address, &.{addr}) };
+    }
+
+    const addr_list = (if (resolver) |hook|
+        hook.resolve(hook.context, allocator, bare, port)
+    else
+        std_compat.net.getAddressList(allocator, bare, port)) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return error.HostResolutionFailed,
+    };
+    defer addr_list.deinit();
+
+    // Validate every record before connecting to any of them: a mixed
+    // public/private answer must fail closed.
+    var v4_count: usize = 0;
+    var v6_count: usize = 0;
+    for (addr_list.addrs) |addr| {
+        switch (addr.any.family) {
+            std.posix.AF.INET => {
+                const octets: *const [4]u8 = @ptrCast(&addr.in.sa.addr);
+                if (!trusted and isNonGlobalV4(octets.*)) return error.LocalAddressBlocked;
+                v4_count += 1;
+            },
+            std.posix.AF.INET6 => {
+                if (!trusted and isNonGlobalV6(ipv6Segments(addr.in6.sa.addr))) return error.LocalAddressBlocked;
+                v6_count += 1;
+            },
+            else => {},
+        }
+    }
+    if (v4_count + v6_count == 0) return error.HostResolutionFailed;
+
+    // Prefer IPv4 (first), then IPv6.
+    const out = try arena_allocator.alloc(std_compat.net.Address, v4_count + v6_count);
+    var index: usize = 0;
+    for (addr_list.addrs) |addr| {
+        if (addr.any.family == std.posix.AF.INET) {
+            out[index] = addr;
+            index += 1;
+        }
+    }
+    for (addr_list.addrs) |addr| {
+        if (addr.any.family == std.posix.AF.INET6) {
+            out[index] = addr;
+            index += 1;
+        }
+    }
+    return .{ .arena = arena, .addrs = out };
+}
+
+fn ipv6Segments(bytes: [16]u8) [8]u16 {
+    return .{
+        (@as(u16, bytes[0]) << 8) | bytes[1],
+        (@as(u16, bytes[2]) << 8) | bytes[3],
+        (@as(u16, bytes[4]) << 8) | bytes[5],
+        (@as(u16, bytes[6]) << 8) | bytes[7],
+        (@as(u16, bytes[8]) << 8) | bytes[9],
+        (@as(u16, bytes[10]) << 8) | bytes[11],
+        (@as(u16, bytes[12]) << 8) | bytes[13],
+        (@as(u16, bytes[14]) << 8) | bytes[15],
+    };
+}
+
+/// Case-insensitive allowlist match with one trailing dot ignored, as used by
+/// the proxy. `hostMatchesAllowlist` keeps its original exact-match contract
+/// for callers that pass user-supplied patterns.
+fn hostMatchesAllowlistNormalized(host: []const u8, allowed: []const []const u8) bool {
+    const h = stripTrailingDot(host);
+    for (allowed) |raw| {
+        const pattern = stripTrailingDot(raw);
+        if (pattern.len == 1 and pattern[0] == '*') return true;
+        if (std.ascii.eqlIgnoreCase(h, pattern)) return true;
+        if (std.mem.startsWith(u8, pattern, "*.")) {
+            const domain = pattern[2..];
+            if (h.len <= domain.len) continue;
+            const prefix_len = h.len - domain.len;
+            if (h[prefix_len - 1] == '.' and std.ascii.eqlIgnoreCase(h[prefix_len..], domain)) return true;
+        }
+    }
+    return false;
+}
+
 /// Resolve hostname and reject if any resolved IP is local/private/reserved.
 /// This closes SSRF bypasses via numeric host aliases (e.g. 2130706433) and
 /// DNS rebinding-style domains that resolve to loopback/private addresses.
@@ -299,6 +460,8 @@ fn isNonGlobalV4(addr: [4]u8) bool {
     if (a == 198 and (b == 18 or b == 19)) return true;
     // 192.0.0.0/24 (IETF protocol assignments)
     if (a == 192 and b == 0 and c == 0) return true;
+    // 192.88.99.0/24 (6to4 relay anycast, RFC 7526)
+    if (a == 192 and b == 88 and c == 99) return true;
     return false;
 }
 
@@ -332,6 +495,22 @@ fn isNonGlobalV6(segs: [8]u16) bool {
         };
         return isNonGlobalV4(ipv4);
     }
+    // ::/96 (deprecated IPv4-compatible, e.g. ::7f00:1 is 127.0.0.1)
+    if (segs[0] == 0 and segs[1] == 0 and segs[2] == 0 and segs[3] == 0 and
+        segs[4] == 0 and segs[5] == 0)
+        return true;
+    // 64:ff9b::/96 (NAT64) and 64:ff9b:1::/48 (local-use NAT64)
+    if (segs[0] == 0x0064 and segs[1] == 0xff9b) return true;
+    // 2002::/16 (6to4, embeds an IPv4 address)
+    if (segs[0] == 0x2002) return true;
+    // 2001::/32 (Teredo)
+    if (segs[0] == 0x2001 and segs[1] == 0) return true;
+    // 100::/64 (discard-only)
+    if (segs[0] == 0x0100 and segs[1] == 0 and segs[2] == 0 and segs[3] == 0) return true;
+    // fec0::/10 (deprecated site-local)
+    if (segs[0] & 0xffc0 == 0xfec0) return true;
+    // 2001:2::/48 (benchmarking)
+    if (segs[0] == 0x2001 and segs[1] == 0x0002 and segs[2] == 0) return true;
     return false;
 }
 
@@ -1001,4 +1180,161 @@ test "hostResolvesToLocal blocks ambiguous IPv4 literals" {
     try std.testing.expect(hostResolvesToLocal(std.testing.allocator, "0300.0250.0.1", 443));
     try std.testing.expect(!hostResolvesToLocal(std.testing.allocator, "134744072", 443));
     try std.testing.expect(!hostResolvesToLocal(std.testing.allocator, "8.8.8.8", 443));
+}
+
+test "isNonGlobalV4 blocks 6to4 relay anycast" {
+    try std.testing.expect(isNonGlobalV4(.{ 192, 88, 99, 1 }));
+    try std.testing.expect(!isNonGlobalV4(.{ 192, 88, 98, 1 }));
+}
+
+test "isNonGlobalV6 blocks translation and deprecation ranges" {
+    try std.testing.expect(isNonGlobalV6(.{ 0, 0, 0, 0, 0, 0, 0x7f00, 1 })); // ::7f00:1
+    try std.testing.expect(isNonGlobalV6(.{ 0x0064, 0xff9b, 0, 0, 0, 0, 0x7f00, 1 })); // NAT64
+    try std.testing.expect(isNonGlobalV6(.{ 0x0064, 0xff9b, 1, 0, 0, 0, 0, 1 })); // local NAT64
+    try std.testing.expect(isNonGlobalV6(.{ 0x2002, 0x7f00, 0, 1, 0, 0, 0, 0 })); // 6to4
+    try std.testing.expect(isNonGlobalV6(.{ 0x2001, 0, 0, 0, 0, 0, 0, 1 })); // Teredo
+    try std.testing.expect(isNonGlobalV6(.{ 0x0100, 0, 0, 0, 0, 0, 0, 1 })); // discard-only
+    try std.testing.expect(isNonGlobalV6(.{ 0xfec0, 0, 0, 0, 0, 0, 0, 1 })); // site-local
+    try std.testing.expect(isNonGlobalV6(.{ 0x2001, 0x0002, 0, 0, 0, 0, 0, 1 })); // benchmark
+    try std.testing.expect(!isNonGlobalV6(.{ 0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111 }));
+}
+
+const TestResolver = struct {
+    calls: usize = 0,
+    plans: []const []const std_compat.net.Address,
+
+    fn resolve(
+        context: ?*anyopaque,
+        allocator: std.mem.Allocator,
+        host: []const u8,
+        port: u16,
+    ) std_compat.net.GetAddressListError!*std_compat.net.AddressList {
+        _ = host;
+        _ = port;
+        const self: *TestResolver = @ptrCast(@alignCast(context.?));
+        const index = @min(self.calls, self.plans.len - 1);
+        self.calls += 1;
+        const addrs = self.plans[index];
+        var arena = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena.deinit();
+        const list = try arena.allocator().create(std_compat.net.AddressList);
+        list.* = .{ .arena = arena, .addrs = &.{} };
+        // Grow through list.arena: a separate buffer must be recorded in the
+        // arena that AddressList.deinit later frees.
+        list.addrs = try list.arena.allocator().dupe(std_compat.net.Address, addrs);
+        return list;
+    }
+
+    fn hook(self: *TestResolver) AddressResolver {
+        return .{ .context = self, .resolve = resolve };
+    }
+};
+
+test "resolveConnectAddresses denies unlisted hosts before resolving" {
+    var resolver = TestResolver{ .plans = &.{} };
+    try std.testing.expectError(error.HostNotAllowed, resolveConnectAddressesWith(
+        std.testing.allocator,
+        "blocked.test",
+        443,
+        &.{"allowed.test"},
+        resolver.hook(),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), resolver.calls);
+}
+
+test "resolveConnectAddresses trusts allowlisted private addresses and pins their port" {
+    const local = try std_compat.net.Address.parseIp4("127.0.0.1", 8443);
+    var plan = [_]std_compat.net.Address{local};
+    var plans = [_][]const std_compat.net.Address{plan[0..]};
+    var resolver = TestResolver{ .plans = plans[0..] };
+
+    var resolved = try resolveConnectAddressesWith(
+        std.testing.allocator,
+        "ALLOWED.test.",
+        443,
+        &.{"allowed.test"},
+        resolver.hook(),
+    );
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 1), resolved.addrs.len);
+    try std.testing.expectEqual(@as(u16, 8443), resolved.addrs[0].in.getPort());
+}
+
+test "resolveConnectAddresses fails closed on mixed public/private answers" {
+    const public = try std_compat.net.Address.parseIp4("93.184.216.34", 443);
+    const private = try std_compat.net.Address.parseIp4("127.0.0.1", 443);
+    var plan = [_]std_compat.net.Address{ public, private };
+    var plans = [_][]const std_compat.net.Address{plan[0..]};
+    var resolver = TestResolver{ .plans = plans[0..] };
+
+    try std.testing.expectError(error.LocalAddressBlocked, resolveConnectAddressesWith(
+        std.testing.allocator,
+        "mixed.test",
+        443,
+        &.{},
+        resolver.hook(),
+    ));
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+}
+
+test "resolveConnectAddresses returns IPv4 before IPv6" {
+    const v6 = try std_compat.net.Address.parseIp6("2606:4700:4700::1111", 443);
+    const v4 = try std_compat.net.Address.parseIp4("8.8.8.8", 443);
+    var plan = [_]std_compat.net.Address{ v6, v4 };
+    var plans = [_][]const std_compat.net.Address{plan[0..]};
+    var resolver = TestResolver{ .plans = plans[0..] };
+
+    var resolved = try resolveConnectAddressesWith(
+        std.testing.allocator,
+        "dual.test",
+        443,
+        &.{},
+        resolver.hook(),
+    );
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, 2), resolved.addrs.len);
+    try std.testing.expect(resolved.addrs[0].any.family == std.posix.AF.INET);
+    try std.testing.expect(resolved.addrs[1].any.family == std.posix.AF.INET6);
+}
+
+test "resolveConnectAddresses handles a large address list" {
+    const count = 4096; // ~114 KiB of Address entries exercises the arena path
+    const addresses = try std.testing.allocator.alloc(std_compat.net.Address, count);
+    defer std.testing.allocator.free(addresses);
+    var text_buf: [16]u8 = undefined;
+    for (addresses, 0..) |*address, i| {
+        const text = try std.fmt.bufPrint(&text_buf, "11.{d}.{d}.1", .{ i / 256, i % 256 });
+        address.* = try std_compat.net.Address.parseIp4(text, 443);
+    }
+    var plans = [_][]const std_compat.net.Address{addresses};
+    var resolver = TestResolver{ .plans = plans[0..] };
+
+    var resolved = try resolveConnectAddressesWith(
+        std.testing.allocator,
+        "large.test",
+        443,
+        &.{},
+        resolver.hook(),
+    );
+    defer resolved.deinit();
+    try std.testing.expectEqual(@as(usize, count), resolved.addrs.len);
+}
+
+test "resolveConnectAddresses blocks ambiguous literals without DNS" {
+    var resolver = TestResolver{ .plans = &.{} };
+    try std.testing.expectError(error.LocalAddressBlocked, resolveConnectAddressesWith(
+        std.testing.allocator,
+        "0177.0.0.1",
+        443,
+        &.{},
+        resolver.hook(),
+    ));
+    try std.testing.expectError(error.LocalAddressBlocked, resolveConnectAddressesWith(
+        std.testing.allocator,
+        "[::ffff:127.0.0.1]",
+        443,
+        &.{},
+        resolver.hook(),
+    ));
+    try std.testing.expectEqual(@as(usize, 0), resolver.calls);
 }
