@@ -1288,6 +1288,12 @@ test "stopLocked shuts down the proxy tunnel and joins its workers" {
     });
     defer manager.deinit();
     const proxy = try manager.startProxyLocked();
+    // The manager only owns the proxy once `running` is set below; free it on
+    // any early assertion failure instead of leaking it (macOS CI did).
+    var proxy_owned = true;
+    defer {
+        if (proxy_owned) proxy.deinit();
+    }
     const proxy_port = proxy.port();
     const tunnel = try webdriver_proxy.requestStatus(proxy, authority);
     defer tunnel.stream.close();
@@ -1299,6 +1305,7 @@ test "stopLocked shuts down the proxy tunnel and joins its workers" {
         .proxy = proxy,
         .last_activity_ms = manager.now(),
     };
+    proxy_owned = false;
     manager.stopLocked();
     try std.testing.expect(manager.running == null);
 
