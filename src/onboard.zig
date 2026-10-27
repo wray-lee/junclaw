@@ -597,14 +597,17 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     }
 
     // Providers with no models-list API (or purely local catalogs) keep the
-    // static fallback path for offline/test use.
-    if (std.mem.eql(u8, canonical, "anthropic") or
-        std.mem.eql(u8, canonical, "gemini") or
-        std.mem.eql(u8, canonical, "gemini-cli") or
-        std.mem.eql(u8, canonical, "vertex") or
-        std.mem.eql(u8, canonical, "deepseek") or
-        std.mem.eql(u8, canonical, "ollama") or
-        std.mem.eql(u8, canonical, "claude-cli"))
+    // static fallback path for offline/test use. A configured base_url is a
+    // gateway: its failure must reach the expired-cache fallback instead of
+    // letting the static list win and overwrite the cached gateway models.
+    if (base_url == null and
+        (std.mem.eql(u8, canonical, "anthropic") or
+            std.mem.eql(u8, canonical, "gemini") or
+            std.mem.eql(u8, canonical, "gemini-cli") or
+            std.mem.eql(u8, canonical, "vertex") or
+            std.mem.eql(u8, canonical, "deepseek") or
+            std.mem.eql(u8, canonical, "ollama") or
+            std.mem.eql(u8, canonical, "claude-cli")))
     {
         return dupeFallbackModels(allocator, canonical, null);
     }
@@ -5392,6 +5395,64 @@ test "loadModelsWithCache returns an expired cache entry when live fetch fails" 
 
     // Serving a stale entry must not make it fresh: the next call still refetches.
     try std.testing.expectError(error.CacheExpired, readCachedModels(allocator, cache_path, cache_provider, false));
+}
+
+// Regression: a built-in provider on a custom gateway fell back to its static
+// table after a 503, so the expired gateway cache never won and was then
+// overwritten with ids the gateway does not serve.
+test "loadModelsWithCache keeps expired cache for a built-in provider on a gateway" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1", .{server.listen_address.in.getPort()});
+    defer allocator.free(base_url);
+
+    const cache_provider = try modelsCacheProviderKey(allocator, "anthropic", "test-key", base_url);
+    defer allocator.free(cache_provider);
+    const cache_path = try std_compat.fs.path.join(allocator, &.{ base, "models_cache.json" });
+    defer allocator.free(cache_path);
+    const cache_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"fetched_at\": {d}, \"{s}\": [\"stub-model-b\", \"stub-model-a\"]}}",
+        .{ std_compat.time.timestamp() - (CACHE_TTL_SECS + 60), cache_provider },
+    );
+    defer allocator.free(cache_json);
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
+    defer file.close();
+    try file.writeAll(cache_json);
+
+    const unavailable = ModelsStubResponse{ .status_line = "HTTP/1.1 503 Service Unavailable", .body = "{}" };
+    const responses = [_]ModelsStubResponse{ unavailable, unavailable };
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = ModelsStubContext{ .server = &server, .stop = &stop, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, serveModelsStub, .{&ctx});
+    defer stopModelsStub(&ctx, thread);
+
+    const models = try loadModelsWithCache(allocator, base, "anthropic", "test-key", base_url, null);
+    defer {
+        for (models) |m| allocator.free(m);
+        allocator.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("stub-model-a", models[0]);
+    try std.testing.expectEqualStrings("stub-model-b", models[1]);
+
+    // The static Claude list never wrote back over the gateway cache.
+    const cached = try readCachedModels(allocator, cache_path, cache_provider, true);
+    defer {
+        for (cached) |m| allocator.free(m);
+        allocator.free(cached);
+    }
+    try std.testing.expectEqual(@as(usize, 2), cached.len);
+    try std.testing.expectEqualStrings("stub-model-a", cached[0]);
 }
 
 // Regression: custom/OpenAI-compatible providers used to fall back to the Claude
