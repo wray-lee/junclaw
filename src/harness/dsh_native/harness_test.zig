@@ -2724,9 +2724,13 @@ test "dsh-native adapter: exit_plan_mode approval defers plan/mode to the pre-st
     try testing.expect(tool_result.? < plan_off.?);
     try testing.expect(plan_off.? < header_indexes[2]);
     // Same catalog after approval, but the mode change opens a new series
-    // (live plan-exit-approved logs reason "series" for that request).
+    // (live plan-exit-approved logs reason "series" for that request). The
+    // question tool follows the turn's interaction: absent on the first
+    // interactive-less turn, present once the approval channel exists.
     for (headers) |header| try testing.expect(headerHasTool(header.?, tool_schemas.exit_plan_mode.name));
-    try testing.expect(headerToolNamesEqual(headers[0].?, headers[1].?));
+    try testing.expect(!headerHasTool(headers[0].?, "ask_user_question"));
+    try testing.expect(headerHasTool(headers[1].?, "ask_user_question"));
+    try testing.expect(headerHasTool(headers[2].?, "ask_user_question"));
     try testing.expect(headerToolNamesEqual(headers[1].?, headers[2].?));
     try testing.expect(!off_narration);
 }
@@ -5656,4 +5660,100 @@ test "dsh-native adapter: PII redaction and secret scrub cover provider, log and
     try testing.expect(std.mem.indexOf(u8, log_text, secret) == null);
     try testing.expect(std.mem.indexOf(u8, log_text, "[EMAIL_1]") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "[REDACTED]") != null);
+}
+
+test "dsh-native adapter: conversation, group and schedule guidance ride the runtime context" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "ok" }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    var input = turnInput("hello");
+    input.conversation_context = .{
+        .channel = "telegram",
+        .account_id = "bot-main",
+        .delivery_chat_id = "-10042",
+        .group_id = "-10042",
+        .is_group = true,
+        .sender_name = "Ada",
+        .sender_username = "ada",
+        .rich_formatting = true,
+    };
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+
+    // The generated dsh system prompt stays byte-identical (cache prefix).
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "## Conversation Context") == null);
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "## Scheduled Tasks") == null);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const runtime = lastUserMessageText(read.events, "runtime-context") orelse
+        return error.MissingRuntimeContext;
+
+    try testing.expect(std.mem.indexOf(u8, runtime, "## Conversation Context") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "- Channel: telegram") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "- Chat type: group") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "- Group ID: -10042") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "- Sender: Ada") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "renders rich Markdown (GFM)") != null);
+    // Group silence guidance and the in-group schedule contract.
+    try testing.expect(std.mem.indexOf(u8, runtime, "## Group Chat Behavior") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "[NO_REPLY]") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "## Scheduled Tasks in Groups") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "Current group ID: `-10042`") != null);
+    // The generic schedule guidance applies in every context.
+    try testing.expect(std.mem.indexOf(u8, runtime, "## Scheduled Tasks\n") != null);
+    try testing.expect(std.mem.indexOf(u8, runtime, "ALWAYS use double quotes") != null);
+}
+
+test "dsh-native adapter: a silent-token final round is not merged with interim text" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "Checking the file.", .tool_calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"note.txt\"}" }} },
+        .{ .text = "[NO_REPLY]" },
+    });
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    // Regression: the reply was "Checking the file.\n\n[NO_REPLY]", so the
+    // channel posted the interim prose instead of suppressing the turn.
+    const result = try h.runTurn(turnInput("check the file"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("[NO_REPLY]", result.reply);
+    try testing.expectEqualStrings("[NO_REPLY]", result.persisted_reply.?);
+}
+
+test "dsh-native adapter: ask_user_question is hidden without an interaction" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "ok" }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("hello"));
+    defer allocator.free(result.reply);
+
+    // Regression: the catalog advertised a tool every call was bound to fail
+    // (the host never supplies an Interaction under dsh).
+    try testing.expect(!toolSpecNamed(&engine, "ask_user_question"));
+    try testing.expect(toolSpecNamed(&engine, "read"));
 }

@@ -317,58 +317,8 @@ pub fn buildSystemPrompt(
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
 
-    // Conversation context section (Signal-specific for now)
     if (ctx.conversation_context) |cc| {
-        try w.writeAll("## Conversation Context\n\n");
-        if (cc.channel) |ch| {
-            try w.print("- Channel: {s}\n", .{ch});
-        }
-        if (cc.is_group) |ig| {
-            if (ig) {
-                if (cc.group_id) |gid| {
-                    try w.print("- Chat type: group\n", .{});
-                    try w.print("- Group ID: {s}\n", .{gid});
-                } else {
-                    try w.print("- Chat type: group\n", .{});
-                }
-            } else {
-                try w.print("- Chat type: direct message\n", .{});
-            }
-        }
-        if (cc.sender_number) |num| {
-            try w.print("- Sender phone: {s}\n", .{num});
-        }
-        // Show sender identity: "Sender: Name (UUID)" or just "Sender: (UUID)"
-        if (cc.sender_name) |name| {
-            if (cc.sender_uuid) |uuid| {
-                try w.print("- Sender: {s} ({s})\n", .{ name, uuid });
-            } else {
-                try w.print("- Sender: {s}\n", .{name});
-            }
-        } else if (cc.sender_uuid) |uuid| {
-            try w.print("- Sender: ({s})\n", .{uuid});
-        }
-        // Sender identity fields
-        if (cc.sender_id) |sid| {
-            const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
-            if (is_discord) {
-                try w.print("- Sender Discord ID: {s}\n", .{sid});
-            } else {
-                try w.print("- Sender ID: {s}\n", .{sid});
-            }
-        }
-        if (cc.sender_username) |uname| {
-            try w.print("- Sender username: {s}\n", .{uname});
-        }
-        if (cc.sender_display_name) |dname| {
-            try w.print("- Sender display name: {s}\n", .{dname});
-        }
-        if (cc.rich_formatting) |rich| {
-            if (rich) {
-                try w.writeAll("- This Telegram chat renders rich Markdown (GFM): headings, tables, task lists, code fences, and ==mark==/||spoiler||/$math$ are supported. Prefer Markdown; do not emit raw HTML.\n");
-            }
-        }
-        try w.writeAll("\n");
+        try appendConversationContextSection(w, cc);
     }
 
     if (ctx.capabilities_section) |section| {
@@ -378,48 +328,9 @@ pub fn buildSystemPrompt(
     // Safety section
     try w.writeAll(safety_section);
 
-    // Group chat behavior section (Telegram-only guidance). The [NO_REPLY]
-    // marker itself is suppressed on every channel, DMs included; only the
-    // guidance to use it stays group-only, because a DM must be answered.
-    if (ctx.conversation_context) |cc| {
-        const is_telegram = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "telegram") else false;
-        if (is_telegram and cc.is_group != null and cc.is_group.?) {
-            try w.writeAll("## Group Chat Behavior\n\n");
-            try w.writeAll("You are in a group chat. Not every message requires a response.\n\n");
-            try w.writeAll("Use the `[NO_REPLY]` marker when:\n");
-            try w.writeAll("- The message is casual chat between other members\n");
-            try w.writeAll("- The message is not directed at you (no question, no @mention)\n");
-            try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
-            try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
-            try w.writeAll("When you choose NOT to reply, respond with exactly `[NO_REPLY]` and no other text; the system suppresses only token-only replies.\n\n");
-            try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
-            try w.writeAll("- \"Anyone online?\" -> `[NO_REPLY]` (unless you're specifically needed)\n");
-            try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
-            try w.writeAll("- General chit-chat between other members -> `[NO_REPLY]`\n\n");
+    try appendGroupChatBehaviorSection(w, ctx.conversation_context);
 
-            // Add schedule tool guidance for Telegram group chats.
-            try w.writeAll("## Scheduled Tasks in Groups\n\n");
-            try w.writeAll("When using the `schedule` tool to create reminders in this group:\n");
-            try w.writeAll("1. Use SIMPLE command like: `echo \"Time is up!\"` or `date`\n");
-            try w.writeAll("2. ALWAYS use double quotes (\") for the command string, not single quotes\n");
-            try w.writeAll("3. The system will AUTOMATICALLY send the result to this group\n");
-            try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
-            try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
-            if (cc.group_id) |gid| {
-                try w.print("Current group ID: `{s}`\n\n", .{gid});
-            }
-            try w.writeAll("Good example (simple, double quotes):\n");
-            try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
-            try w.writeAll("The command output will be automatically delivered to this chat.\n\n");
-        }
-    }
-
-    // Schedule tool guidance for all contexts (including private chats)
-    try w.writeAll("## Scheduled Tasks\n\n");
-    try w.writeAll("When using the `schedule` tool to create reminders:\n");
-    try w.writeAll("- ALWAYS use double quotes (\") for the command string\n");
-    try w.writeAll("- Example: `echo \"Time is up!\"`\n");
-    try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
+    try appendScheduledTasksSection(w);
 
     // Web Search guidance
     try w.writeAll("## External Information and Web Search\n\n");
@@ -839,6 +750,107 @@ pub fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("- Each option must include `id` and `label`; `submit_text` is optional (if omitted, label is used as submit text).\n");
     try w.writeAll("- `id` must be lowercase and contain only `a-z`, `0-9`, `_`, `-` (example: `yes`, `no`, `later_10m`).\n");
     try w.writeAll("- Example: `<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\"}]}</nc_choices>`\n\n");
+}
+
+/// Conversation context the model needs to know who is talking and where.
+/// Native writes it into the system prompt; dsh injects the same bytes into
+/// its per-turn runtime context so the two engines cannot drift.
+pub fn appendConversationContextSection(w: anytype, cc: ConversationContext) !void {
+    try w.writeAll("## Conversation Context\n\n");
+    if (cc.channel) |ch| {
+        try w.print("- Channel: {s}\n", .{ch});
+    }
+    if (cc.is_group) |ig| {
+        if (ig) {
+            if (cc.group_id) |gid| {
+                try w.print("- Chat type: group\n", .{});
+                try w.print("- Group ID: {s}\n", .{gid});
+            } else {
+                try w.print("- Chat type: group\n", .{});
+            }
+        } else {
+            try w.print("- Chat type: direct message\n", .{});
+        }
+    }
+    if (cc.sender_number) |num| {
+        try w.print("- Sender phone: {s}\n", .{num});
+    }
+    // Show sender identity: "Sender: Name (UUID)" or just "Sender: (UUID)"
+    if (cc.sender_name) |name| {
+        if (cc.sender_uuid) |uuid| {
+            try w.print("- Sender: {s} ({s})\n", .{ name, uuid });
+        } else {
+            try w.print("- Sender: {s}\n", .{name});
+        }
+    } else if (cc.sender_uuid) |uuid| {
+        try w.print("- Sender: ({s})\n", .{uuid});
+    }
+    // Sender identity fields
+    if (cc.sender_id) |sid| {
+        const is_discord = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "discord") else false;
+        if (is_discord) {
+            try w.print("- Sender Discord ID: {s}\n", .{sid});
+        } else {
+            try w.print("- Sender ID: {s}\n", .{sid});
+        }
+    }
+    if (cc.sender_username) |uname| {
+        try w.print("- Sender username: {s}\n", .{uname});
+    }
+    if (cc.sender_display_name) |dname| {
+        try w.print("- Sender display name: {s}\n", .{dname});
+    }
+    if (cc.rich_formatting) |rich| {
+        if (rich) {
+            try w.writeAll("- This Telegram chat renders rich Markdown (GFM): headings, tables, task lists, code fences, and ==mark==/||spoiler||/$math$ are supported. Prefer Markdown; do not emit raw HTML.\n");
+        }
+    }
+    try w.writeAll("\n");
+}
+
+/// Group chat behavior section (Telegram-only guidance). The [NO_REPLY]
+/// marker itself is suppressed on every channel, DMs included; only the
+/// guidance to use it stays group-only, because a DM must be answered.
+pub fn appendGroupChatBehaviorSection(w: anytype, conversation_context: ?ConversationContext) !void {
+    const cc = conversation_context orelse return;
+    const is_telegram = if (cc.channel) |ch| std.ascii.eqlIgnoreCase(ch, "telegram") else false;
+    if (!is_telegram or cc.is_group == null or !cc.is_group.?) return;
+    try w.writeAll("## Group Chat Behavior\n\n");
+    try w.writeAll("You are in a group chat. Not every message requires a response.\n\n");
+    try w.writeAll("Use the `[NO_REPLY]` marker when:\n");
+    try w.writeAll("- The message is casual chat between other members\n");
+    try w.writeAll("- The message is not directed at you (no question, no @mention)\n");
+    try w.writeAll("- The message is a simple acknowledgment (ok, thanks, haha, etc.)\n");
+    try w.writeAll("- You have nothing meaningful to add to the conversation\n\n");
+    try w.writeAll("When you choose NOT to reply, respond with exactly `[NO_REPLY]` and no other text; the system suppresses only token-only replies.\n\n");
+    try w.writeAll("Examples of when to use `[NO_REPLY]`:\n");
+    try w.writeAll("- \"Anyone online?\" -> `[NO_REPLY]` (unless you're specifically needed)\n");
+    try w.writeAll("- \"lol\" / \"haha\" / emoji reactions -> `[NO_REPLY]`\n");
+    try w.writeAll("- General chit-chat between other members -> `[NO_REPLY]`\n\n");
+
+    // Add schedule tool guidance for Telegram group chats.
+    try w.writeAll("## Scheduled Tasks in Groups\n\n");
+    try w.writeAll("When using the `schedule` tool to create reminders in this group:\n");
+    try w.writeAll("1. Use SIMPLE command like: `echo \"Time is up!\"` or `date`\n");
+    try w.writeAll("2. ALWAYS use double quotes (\") for the command string, not single quotes\n");
+    try w.writeAll("3. The system will AUTOMATICALLY send the result to this group\n");
+    try w.writeAll("4. DO NOT use curl, say, or other methods to send messages manually\n");
+    try w.writeAll("5. DO NOT add any extra commands - just the basic echo\n\n");
+    if (cc.group_id) |gid| {
+        try w.print("Current group ID: `{s}`\n\n", .{gid});
+    }
+    try w.writeAll("Good example (simple, double quotes):\n");
+    try w.writeAll("```\nschedule action=once delay=30m command=\"echo \\\"Time is up!\\\"\"\n```\n\n");
+    try w.writeAll("The command output will be automatically delivered to this chat.\n\n");
+}
+
+/// Schedule tool guidance for every context (including private chats).
+pub fn appendScheduledTasksSection(w: anytype) !void {
+    try w.writeAll("## Scheduled Tasks\n\n");
+    try w.writeAll("When using the `schedule` tool to create reminders:\n");
+    try w.writeAll("- ALWAYS use double quotes (\") for the command string\n");
+    try w.writeAll("- Example: `echo \"Time is up!\"`\n");
+    try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 }
 
 fn writeToolInstructionsSection(w: anytype, tools: anytype, ctx: PromptContext) !void {

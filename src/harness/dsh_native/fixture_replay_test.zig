@@ -1778,7 +1778,9 @@ fn manifestFlag(manifest: Value, group: []const u8, key: []const u8) bool {
 }
 
 /// The ask_user_question schema the model sees must be the generated dsh text.
-fn checkGeneratedToolSchema(provider: *HarnessProvider) !void {
+/// It is only advertised on turns that carry a host interaction; a captured
+/// session whose every prompt step was `noInteraction` must not show it.
+fn checkGeneratedToolSchema(provider: *HarnessProvider, expect_ask_user: bool) !void {
     var seen = false;
     for (provider.requests.items) |captured| {
         for (captured.tools) |tool| {
@@ -1788,7 +1790,7 @@ fn checkGeneratedToolSchema(provider: *HarnessProvider) !void {
             try std.testing.expectEqualStrings(generated_interaction.ask_user_question.input_schema_json, tool.parameters_json);
         }
     }
-    try std.testing.expect(seen);
+    try std.testing.expectEqual(expect_ask_user, seen);
 }
 
 fn expectCompactionInstruction(manifest: Value, provider: *HarnessProvider) !void {
@@ -1977,6 +1979,8 @@ fn runEventFixture(scenario: []const u8) !void {
     }
     try h.restore(.{ .messages = &.{}, .dsh_session_id = "fixture-session" });
 
+    // The question tool is only advertised on turns with a host interaction.
+    var expect_ask_user = false;
     for (input.steps) |step| {
         if (std.mem.eql(u8, step.op, "initialize")) continue;
         if (std.mem.eql(u8, step.op, "newSession")) {
@@ -2008,6 +2012,7 @@ fn runEventFixture(scenario: []const u8) !void {
                 .advance_ms = if (step.questions) |questions| questions.advanceMs else 0,
                 .plan_review = step.planReview,
             };
+            if (!step.noInteraction) expect_ask_user = true;
             var during = DuringTurn{ .harness = h, .command = step.commandDuringTurn };
             provider.during = if (step.commandDuringTurn != null) &during else null;
             defer provider.during = null;
@@ -2035,7 +2040,7 @@ fn runEventFixture(scenario: []const u8) !void {
     const log_bytes = try fs_compat.readFileAlloc(compat.fs.cwd(), allocator, log_path, 16 * 1024 * 1024);
     defer allocator.free(log_bytes);
 
-    try checkGeneratedToolSchema(&provider);
+    try checkGeneratedToolSchema(&provider, expect_ask_user);
     try expectCompactionInstruction(manifest, &provider);
 
     const actual_records = try fixture_compare.parseJsonl(fixture_allocator, log_bytes);

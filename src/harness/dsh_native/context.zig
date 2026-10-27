@@ -39,6 +39,8 @@ pub const ContextOrder = struct {
     pub const junclaw_channel_attachments: i32 = 85;
     /// Native `## Safety` policy, shared verbatim with the native prompt.
     pub const junclaw_safety: i32 = 86;
+    /// Native conversation-context, group-chat and schedule guidance.
+    pub const junclaw_turn_guidance: i32 = 87;
     pub const current_datetime: i32 = 90;
     pub const working_directory: i32 = 100;
     pub const sandbox_policy: i32 = 110;

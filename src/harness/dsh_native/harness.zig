@@ -40,6 +40,7 @@ const providers = @import("../../providers/root.zig");
 const provider_helpers = @import("../../providers/helpers.zig");
 const redaction = @import("../../redaction.zig");
 const http_util = @import("../../http_util.zig");
+const util = @import("../../util.zig");
 const config_types = @import("../../config_types.zig");
 const memory_mod = @import("../../memory/root.zig");
 const port = @import("../port.zig");
@@ -203,6 +204,11 @@ pub const DshNativeHarness = struct {
     /// subset of these when `tool_filter_groups` is non-empty.
     all_schemas: []const request.ToolSchema = &.{},
     all_specs: []const providers.ToolSpec = &.{},
+    /// `all_*` minus `ask_user_question`, used on turns without a host
+    /// interaction. Permanent (perm arena) so request-header snapshots that
+    /// borrow the turn's catalog never dangle.
+    no_ask_schemas: []const request.ToolSchema = &.{},
+    no_ask_specs: []const providers.ToolSpec = &.{},
     /// Backs the per-turn filtered catalog so those slices stay valid until
     /// the next turn without growing the permanent arena.
     turn_tools: std.heap.ArenaAllocator,
@@ -251,6 +257,10 @@ pub const DshNativeHarness = struct {
     /// out of the kernel settlement, which dies with the step.
     turn_reasoning: std.ArrayListUnmanaged(u8) = .empty,
     last_assistant_text: ?[]const u8 = null,
+    /// Current turn's conversation context. Native renders `## Conversation
+    /// Context`, group chat and schedule guidance into the system prompt; dsh
+    /// carries the same bytes in its per-turn runtime context.
+    turn_conversation_context: ?native_prompt.ConversationContext = null,
 
     // Per turn.
     sink: ?port.Sink = null,
@@ -311,6 +321,21 @@ pub const DshNativeHarness = struct {
         errdefer buf.deinit(allocator);
         var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
         try native_prompt.appendChannelAttachmentsSection(&writer.writer);
+        buf = writer.toArrayList();
+        return buf.toOwnedSlice(allocator);
+    }
+
+    /// Native's conversation-context, group-chat and schedule guidance for
+    /// this turn, rendered with the same helpers the native prompt uses.
+    fn renderTurnGuidance(self: *const Self, allocator: Allocator) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        if (self.turn_conversation_context) |cc| {
+            try native_prompt.appendConversationContextSection(&writer.writer, cc);
+        }
+        try native_prompt.appendGroupChatBehaviorSection(&writer.writer, self.turn_conversation_context);
+        try native_prompt.appendScheduledTasksSection(&writer.writer);
         buf = writer.toArrayList();
         return buf.toOwnedSlice(allocator);
     }
@@ -474,6 +499,19 @@ pub const DshNativeHarness = struct {
         self.all_specs = catalog.specs;
         self.tool_schemas = catalog.schemas;
         self.tool_specs = catalog.specs;
+
+        var no_ask_schemas: std.ArrayListUnmanaged(request.ToolSchema) = .empty;
+        for (catalog.schemas) |schema| {
+            if (std.mem.eql(u8, schema.name, generated_interaction.ask_user_question.name)) continue;
+            try no_ask_schemas.append(perm, schema);
+        }
+        var no_ask_specs: std.ArrayListUnmanaged(providers.ToolSpec) = .empty;
+        for (catalog.specs) |spec| {
+            if (std.mem.eql(u8, spec.name, generated_interaction.ask_user_question.name)) continue;
+            try no_ask_specs.append(perm, spec);
+        }
+        self.no_ask_schemas = try no_ask_schemas.toOwnedSlice(perm);
+        self.no_ask_specs = try no_ask_specs.toOwnedSlice(perm);
     }
 
     const Catalog = struct {
@@ -508,14 +546,24 @@ pub const DshNativeHarness = struct {
     /// changes, the registry keeps every tool (as native keeps `self.tools`).
     fn selectTurnTools(self: *Self, user_message: []const u8) !void {
         _ = self.turn_tools.reset(.retain_capacity);
+        // The question tool is registered but only usable with a host
+        // interaction; without one the call would always fail, so do not
+        // advertise it (native exposes it only when its ask path is wired).
+        const hide_ask_user = self.interaction == null;
         if (self.opts.tool_filter_groups.len == 0) {
-            self.tool_schemas = self.all_schemas;
-            self.tool_specs = self.all_specs;
+            if (hide_ask_user) {
+                self.tool_schemas = self.no_ask_schemas;
+                self.tool_specs = self.no_ask_specs;
+            } else {
+                self.tool_schemas = self.all_schemas;
+                self.tool_specs = self.all_specs;
+            }
         } else {
             const arena = self.turn_tools.allocator();
 
             var schemas: std.ArrayListUnmanaged(request.ToolSchema) = .empty;
             for (self.all_schemas) |schema| {
+                if (hide_ask_user and std.mem.eql(u8, schema.name, generated_interaction.ask_user_question.name)) continue;
                 if (tool_filter.toolExposed(self.opts.tool_filter_groups, schema.name, user_message)) {
                     try schemas.append(arena, schema);
                 }
@@ -524,6 +572,7 @@ pub const DshNativeHarness = struct {
 
             var specs: std.ArrayListUnmanaged(providers.ToolSpec) = .empty;
             for (self.all_specs) |spec| {
+                if (hide_ask_user and std.mem.eql(u8, spec.name, generated_interaction.ask_user_question.name)) continue;
                 if (tool_filter.toolExposed(self.opts.tool_filter_groups, spec.name, user_message)) {
                     try specs.append(arena, spec);
                 }
@@ -1188,7 +1237,11 @@ pub const DshNativeHarness = struct {
         self.in_turn = true;
         defer self.in_turn = false;
         // `agent.tool_filter_groups` applies to every model call in this turn,
-        // exactly like the native agent's per-turn schema filter.
+        // exactly like the native agent's per-turn schema filter. The
+        // interaction is installed first: `ask_user_question` is only exposed
+        // when this turn has a way to ask.
+        self.interaction = input.interaction;
+        defer self.interaction = null;
         try self.selectTurnTools(input.user_message);
         // A goal round is one kernel turn; never leak that authority forward.
         defer {
@@ -1207,12 +1260,10 @@ pub const DshNativeHarness = struct {
         defer providers.reliable.setRetryObserver(prev_retry_observer);
         self.drain = input.drain;
         self.drain_ctx = input.drain_ctx;
-        self.interaction = input.interaction;
         defer {
             self.sink = null;
             self.drain = null;
             self.drain_ctx = null;
-            self.interaction = null;
         }
 
         // Native re-reads the workspace guides once per turn; the runtime
@@ -1226,9 +1277,11 @@ pub const DshNativeHarness = struct {
                 .identity_config = self.opts.identity_config,
             });
         }
+        self.turn_conversation_context = input.conversation_context;
         defer {
             self.freeTurnGuides();
             self.turn_memory_context = "";
+            self.turn_conversation_context = null;
         }
 
         self.turn_text.clearRetainingCapacity();
@@ -2047,6 +2100,14 @@ pub const DshNativeHarness = struct {
             context.ContextOrder.junclaw_safety,
             safety_text,
         ));
+        const turn_guidance = try self.renderTurnGuidance(allocator);
+        if (std.mem.trimEnd(u8, turn_guidance, "\n").len > 0) {
+            try sections.append(allocator, context.customSection(
+                "junclaw:turn-guidance",
+                context.ContextOrder.junclaw_turn_guidance,
+                turn_guidance,
+            ));
+        }
         try sections.append(allocator, try context.dateTimeSection(allocator, self.opts.timezone, self.nowSeconds()));
         try sections.append(allocator, try context.workingDirectorySection(allocator, self.workspace()));
         try sections.append(allocator, try context.sandboxPolicySection(allocator, self.sandboxMode(), self.workspace()));
@@ -2758,8 +2819,15 @@ pub const DshNativeHarness = struct {
     /// already showed the thinking live; `persisted_reply` stays clean either
     /// way because the host derives it from `last_assistant_text`.
     fn composeReply(self: *Self) ![]const u8 {
+        // Native parity: a silent-token final round reaches the channel as the
+        // bare token. Merging the interim text would make it a normal message
+        // and defeat the channel's silent-reply suppression.
+        const base_text: []const u8 = if (self.last_assistant_text) |text| blk: {
+            if (util.isSilentTokenReply(text)) break :blk text;
+            break :blk self.turn_text.items;
+        } else self.turn_text.items;
         if (self.opts.reasoning_mode != .on or self.turn_reasoning.items.len == 0) {
-            return self.allocator.dupe(u8, self.turn_text.items);
+            return self.allocator.dupe(u8, base_text);
         }
         const clean = try providers.stripToolCallMarkup(self.allocator, self.turn_reasoning.items);
         defer self.allocator.free(clean);
@@ -2773,7 +2841,7 @@ pub const DshNativeHarness = struct {
             try out.appendSlice(self.allocator, "\n");
         }
         try out.appendSlice(self.allocator, "\n\n");
-        try out.appendSlice(self.allocator, self.turn_text.items);
+        try out.appendSlice(self.allocator, base_text);
         return out.toOwnedSlice(self.allocator);
     }
 
