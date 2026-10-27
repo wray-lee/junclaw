@@ -511,9 +511,7 @@ pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !voi
             .revents = 0,
         }};
         const timeout: i32 = @intCast(@min(remaining_ms, @as(i96, std.math.maxInt(i32))));
-        if (comptime builtin.is_test) trace("poll start remaining={d}ms written={d}/{d}\n", .{ remaining_ms, written, bytes.len });
         if (try posix.poll(&poll_fds, timeout) == 0) return error.Timeout;
-        if (comptime builtin.is_test) trace("poll done revents={d}\n", .{poll_fds[0].revents});
         const rc = posix.system.sendto(
             stream.handle,
             bytes[written..].ptr,
@@ -522,7 +520,6 @@ pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !voi
             null,
             0,
         );
-        if (comptime builtin.is_test) trace("sendto rc={d}\n", .{rc});
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             .INTR, .AGAIN => continue,
@@ -532,12 +529,6 @@ pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !voi
         if (n == 0) return error.Unexpected;
         written += n;
     }
-}
-
-/// TEMPORARY hang diagnosis: test-only stderr trace of the write loop, so a
-/// macOS CI timeout prints the syscall the test blocked in. Remove with the fix.
-fn trace(comptime fmt: []const u8, args: anytype) void {
-    std.debug.print("wwt: " ++ fmt, args);
 }
 
 fn nowNanos() i96 {
@@ -1010,14 +1001,11 @@ test "compat net readWithTimeout reads data and then times out" {
 test "compat net writeWithTimeout gives up on a peer that stops reading" {
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
-    std.debug.print("wwt: listen\n", .{});
     var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
     defer server.deinit();
 
-    std.debug.print("wwt: connect\n", .{});
     const client = try tcpConnectToAddress(server.listen_address);
     defer client.close();
-    std.debug.print("wwt: accept\n", .{});
     var conn = try server.accept();
     defer conn.stream.close();
 
@@ -1037,16 +1025,11 @@ test "compat net writeWithTimeout gives up on a peer that stops reading" {
     const write_cap = 64 * 1024 * 1024;
     var total: usize = 0;
     while (total < write_cap) {
-        if (total % (1 * 1024 * 1024) == 0) std.debug.print("wwt: writing total={d}\n", .{total});
         writeWithTimeout(client, chunk, 100) catch |err| switch (err) {
-            error.Timeout => {
-                std.debug.print("wwt: timed out after {d} bytes, done\n", .{total});
-                return;
-            },
+            error.Timeout => return,
             else => return err,
         };
         total += chunk.len;
     }
-    std.debug.print("wwt: cap reached without a timeout\n", .{});
     return error.TestUnexpectedResult;
 }
