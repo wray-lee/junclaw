@@ -1,6 +1,6 @@
 .{
     .name = .nullclaw,
-    .version = "1.1.0",
+    .version = "1.1.1",
     .fingerprint = 0xe73e13d1c95956c2,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{

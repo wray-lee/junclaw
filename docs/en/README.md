@@ -1,8 +1,8 @@
-# NullClaw English Docs
+# Junclaw English Docs
 
-This directory provides structured English documentation for NullClaw, covering installation, configuration, operations, integration, and development.
+This directory provides structured English documentation for junclaw, covering installation, configuration, operations, integration, and development.
 
-Community: [Join Discord](https://discord.gg/Bfmdua22Ud)
+Community (upstream NullClaw): [Join Discord](https://discord.gg/Bfmdua22Ud)
 
 If you are new here, use the guided paths below instead of guessing which page to open first.
 
@@ -34,6 +34,8 @@ If you are new here, use the guided paths below instead of guessing which page t
 Start here if you have never configured an AI model, edited a JSON file, or used a command-line tool.
 
 [Beginner's Guide](./beginners-guide.md)
+
+Note: that guide comes from upstream, so its install step installs upstream nullclaw. To get junclaw, use the release-binary steps in [Installation](./installation.md).
 
 ### 1. I just want to get it running
 
@@ -79,7 +81,7 @@ Focus on:
 
 ## Navigation
 
-- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to NullClaw
+- [Beginner's Guide](./beginners-guide.md)  ← start here if you are new to NullClaw (upstream guide; install junclaw from [Installation](./installation.md))
 - [Installation](./installation.md)
 - [Zig Installation](./zig-installation.md)
 - [Termux Guide](./termux.md)
@@ -94,6 +96,7 @@ Focus on:
 - [Voice](./voice.md)
 - [Hardware & Peripherals](./hardware.md)
 - [Commands](./commands.md)
+- [Browser Automation](./browser.md)
 - [Development](./development.md)
 
 ## Ops Runbooks
@@ -110,12 +113,14 @@ Focus on:
 ## Fastest First Run (3 minutes)
 
 ```bash
-brew install nullclaw
+# Linux x86_64; macOS: junclaw-macos-aarch64.bin or junclaw-macos-x86_64.bin
+curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-linux-x86_64.bin
+chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
 nullclaw onboard --interactive
-nullclaw agent -m "hello nullclaw"
+nullclaw agent -m "hello junclaw"
 ```
 
-If you are not installing via Homebrew, start with [Installation](./installation.md) for container and source paths.
+Homebrew's `nullclaw` formula installs upstream nullclaw, not junclaw. For other platforms, container and source paths, start with [Installation](./installation.md).
 
 ## Specialized Guides
 
@@ -125,7 +130,7 @@ If you are not installing via Homebrew, start with [Installation](./installation
 
 ## Next Steps
 
-- Follow [Installation](./installation.md) for setup from Homebrew, container, or source
+- Follow [Installation](./installation.md) for setup from a release binary, container, or source
 - Continue to [Configuration](./configuration.md) to wire providers, memory, channels, and gateway settings
 - Use [Usage and Operations](./usage.md) once you want to run NullClaw day to day
 

@@ -35,7 +35,18 @@ zig version
 
 The output must be `0.16.0`.
 
-## Option 1: Homebrew (recommended for macOS/Linux)
+## Option 1: Release binary (junclaw, recommended)
+
+Download the asset for your platform from [junclaw Releases](https://github.com/wray-lee/junclaw/releases/latest) — `junclaw-linux-x86_64.bin`, `junclaw-macos-aarch64.bin`, `junclaw-windows-x86_64.zip`, and so on (full list: [root README](../../README.md#install-junclaw)). The installed binary is still named `nullclaw`.
+
+```bash
+# Linux x86_64; macOS: junclaw-macos-aarch64.bin or junclaw-macos-x86_64.bin
+curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-linux-x86_64.bin
+chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
+nullclaw --help
+```
+
+Homebrew's `nullclaw` formula installs upstream nullclaw, not this fork; there is no junclaw tap. Use it only if you want upstream:
 
 ```bash
 brew install nullclaw
@@ -44,9 +55,9 @@ nullclaw --help
 
 If the command works, installation is complete.
 
-## Option 2: Official Container Image (Docker / Podman)
+## Option 2: Container Image (Docker / Podman)
 
-NullClaw publishes an official OCI image at `ghcr.io/nullclaw/nullclaw`.
+junclaw publishes its own OCI image at `ghcr.io/wray-lee/junclaw` (`linux/amd64` only). Upstream also publishes `ghcr.io/nullclaw/nullclaw`, which does not include the dsh harness or browser variants.
 
 The container stores its persistent state under `/nullclaw-data`:
 
@@ -61,7 +72,7 @@ A named volume keeps the ownership it was first populated with. If yours was cre
 
 ```bash
 docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
-  --entrypoint sh ghcr.io/nullclaw/nullclaw:latest \
+  --entrypoint sh ghcr.io/wray-lee/junclaw:v1.1.1 \
   -c 'chown -R 65534:65534 /nullclaw-data'
 ```
 
@@ -72,7 +83,7 @@ Bind mounts are not covered by that command: they carry the host directory's own
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest status
+  ghcr.io/wray-lee/junclaw:v1.1.1 status
 ```
 
 Initialize config interactively:
@@ -80,7 +91,7 @@ Initialize config interactively:
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest onboard --interactive
+  ghcr.io/wray-lee/junclaw:v1.1.1 onboard --interactive
 ```
 
 Run the interactive agent:
@@ -88,7 +99,7 @@ Run the interactive agent:
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest agent
+  ghcr.io/wray-lee/junclaw:v1.1.1 agent
 ```
 
 Run the HTTP gateway:
@@ -97,12 +108,18 @@ Run the HTTP gateway:
 docker run --rm -it \
   -p 127.0.0.1:3000:3000 \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/nullclaw/nullclaw:latest
+  ghcr.io/wray-lee/junclaw:v1.1.1
 ```
 
 ### Docker Compose
 
-The repository ships a `docker-compose.yml` that uses the official image by default.
+The repository's `docker-compose.yml` builds `nullclaw:local` from the Dockerfile by default, and `make up` forces a rebuild. To use the published junclaw image instead, pull it and start compose directly:
+
+```bash
+export NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1
+docker compose --profile gateway pull gateway
+docker compose --profile gateway up -d gateway   # do not use `make up`; it adds --build
+```
 
 Interactive onboarding:
 
@@ -110,7 +127,7 @@ Interactive onboarding:
 docker compose --profile agent run --rm agent onboard --interactive
 ```
 
-Inside the official container flow, pressing Enter at the workspace prompt keeps the volume-backed default:
+Inside the container flow, pressing Enter at the workspace prompt keeps the volume-backed default:
 
 - workspace: `/nullclaw-data/workspace`
 
@@ -129,14 +146,15 @@ docker compose --profile gateway up -d gateway
 Profile behavior:
 
 - `agent`: one-off interactive CLI container
-- `gateway`: long-running HTTP gateway published on host loopback port `3000`
+- `gateway`: long-running HTTP gateway published on host loopback port `3210` (override with `NULLCLAW_PORT`)
 
 If you need LAN or public exposure, change the published host IP deliberately and review [Security](./security.md) first.
 
 To pin a release tag or switch registries later, override `NULLCLAW_IMAGE`:
 
 ```bash
-NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gateway up -d gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1 docker compose --profile gateway pull gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1 docker compose --profile gateway up -d gateway
 ```
 
 ### Full dsh image (optional)
@@ -144,13 +162,16 @@ NULLCLAW_IMAGE=ghcr.io/nullclaw/nullclaw:v2026.3.11 docker compose --profile gat
 The fork also publishes a full image that bundles the [dsh](https://github.com/deepseek-ai/deepseek-harness) sidecar harness with the same `nullclaw` binary:
 
 ```bash
-docker pull ghcr.io/<owner>/junclaw:full-dsh
+docker pull ghcr.io/wray-lee/junclaw:full-dsh
 ```
 
 Tags:
 
 - `:full-dsh` — latest build of the `full-dsh` target
-- `:full-dsh-<version>` — build from a `full-dsh-v*` tag or a manual CI run
+- `:full-dsh-v<version>` — build from a `full-dsh-v*` tag, pushed with each release (e.g. `:full-dsh-v1.1.1`)
+- `:full-dsh-main-<sha>` — manual CI run
+
+Releases publish no `v<version>-full-dsh`; the full browser variant is `:v<version>-full-dsh-browser`.
 
 Build it locally from the repository Dockerfile target:
 
@@ -188,10 +209,16 @@ Keep your normal `models.providers` configuration in `config.json`; the harness 
 ## Option 3: Build from Source (cross-platform)
 
 ```bash
-git clone https://github.com/nullclaw/nullclaw.git
-cd nullclaw
+git clone https://github.com/wray-lee/junclaw.git
+cd junclaw
 zig build -Doptimize=ReleaseSmall
 zig build test --summary all
+```
+
+The default build includes the in-process `dsh` engine. To also build the optional dsh sidecar harness (needs Node 22 at run time), add `-Dharness_dsh=true`:
+
+```bash
+zig build -Doptimize=ReleaseSmall -Dharness_dsh=true
 ```
 
 Build output:
@@ -211,8 +238,8 @@ There are three different Android / Termux paths:
 ```bash
 pkg update
 pkg install git zig
-git clone https://github.com/nullclaw/nullclaw.git
-cd nullclaw
+git clone https://github.com/wray-lee/junclaw.git
+cd junclaw
 zig version
 zig build -Doptimize=ReleaseSmall
 ./zig-out/bin/nullclaw --help
@@ -272,7 +299,7 @@ $env:Path = "$env:Path;$bin"
 ```
 
 ### Downloaded nullclaw binary file (Windows, Powershell)
-Download the Windows `.zip` archive from the releases page, extract it, and then run the following commands with administrator privileges in Powershell to add the directory containing `nullclaw.exe` to the Windows `PATH` environment variable:
+Download `junclaw-windows-x86_64.zip` (or `junclaw-windows-aarch64.zip`) from [junclaw Releases](https://github.com/wray-lee/junclaw/releases/latest), extract it, and then run the following commands with administrator privileges in Powershell to add the directory containing `nullclaw.exe` to the Windows `PATH` environment variable:
 
 ```Powershell 
 $old = [Environment]::GetEnvironmentVariable("Path", "Machine")
@@ -292,22 +319,17 @@ If `status` returns component state successfully, runtime basics are ready.
 
 ## Upgrade and Uninstall
 
-### Homebrew（Recommended for macOS/Linux）
+> **Upgrading from 1.1.0 or earlier:** those builds' `nullclaw update` still fetches upstream nullclaw and would replace junclaw with it. Download the new `junclaw-*` asset from [Releases](https://github.com/wray-lee/junclaw/releases/latest) once and replace the binary (same commands as Option 1); later builds update from junclaw releases with `nullclaw update`.
 
-- update:
-```bash
-brew update
-brew upgrade nullclaw
-```
-- uninstall:
-```bash
-brew uninstall nullclaw
-```
-#### Command line(CMD) (Windows)
+### Release binary
 
-- update: `nullclaw update`
+- upgrade: download the new `junclaw-<platform>.bin`, then `chmod +x` and move it over the installed `nullclaw`
+- uninstall: delete the `nullclaw` binary and remove its directory from `PATH`
 
-- uninstall: delete the `nullclaw` binary file and remove the entry of the directory containing the binary file in environment variables PATH if it exists.
+### Homebrew (upstream nullclaw only)
+
+- upgrade: `brew update && brew upgrade nullclaw` (installs upstream, not junclaw)
+- uninstall: `brew uninstall nullclaw`
 
 ### Source install
 

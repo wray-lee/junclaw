@@ -36,6 +36,32 @@
   live child and the matching `moz:profile` must all agree; otherwise junclaw
   retries on a fresh port and then fails closed.
 
+## 1.1.1 - 2026-10-28
+
+Fix release: model menu, text tool calls and self-update.
+
+### Fixed
+
+- `/model` no longer falls back to the built-in Claude list when a gateway's
+  `/v1/models` call fails. An expired `models_cache.json` entry is served
+  instead (still refreshed on the next call); custom/OpenAI-compatible
+  providers fall back to the configured model or an empty list with a
+  "try again later" message; a built-in provider pointed at a custom
+  `base_url` no longer overwrites the gateway cache with its static table.
+  The catalog request is retried once and its timeout raised from 10 s to 20 s.
+- dsh engine: models that write tool calls as `<tool_call>…</tool_call>` text
+  (seen with Gemini behind OpenAI-compatible gateways) now run the tools
+  instead of ending the turn with the raw markup. Both blocking and streaming
+  paths reuse the native dispatcher parser; structured calls win when both
+  appear, the live draft never shows the markup, a malformed or truncated
+  block is not executed, and a block inside `<think>` stays reasoning.
+- `nullclaw update` now checks and downloads junclaw releases (`junclaw-*`
+  assets from `wray-lee/junclaw`) and, in a container, suggests
+  `docker pull ghcr.io/wray-lee/junclaw:latest`. It previously fetched
+  upstream nullclaw and replaced junclaw with it. Containers are now also
+  detected via `/.dockerenv`, since the junclaw image installs to
+  `/usr/local/bin`.
+
 ## 1.1.0 - 2026-10-27
 
 Browser release: two ways to give the agent a real browser, shipped as separate

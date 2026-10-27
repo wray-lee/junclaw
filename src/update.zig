@@ -9,6 +9,9 @@ const builtin = @import("builtin");
 
 const log = std.log.scoped(.update);
 
+/// junclaw publishes its own releases and images; upstream ones lack the fork.
+const release_repo = "wray-lee/junclaw";
+
 // ── Public API ───────────────────────────────────────────────────────
 
 pub const Options = struct {
@@ -144,10 +147,14 @@ pub fn detectInstallMethod() !InstallMethod {
         return .homebrew;
     }
 
-    // Check for docker
+    // Check for docker: the junclaw image installs to /usr/local/bin, so the
+    // binary path alone does not identify a container.
     if (std.mem.eql(u8, exe_path, "/nullclaw")) {
         return .docker;
     }
+    if (std_compat.fs.accessAbsolute("/.dockerenv", .{})) |_| {
+        return .docker;
+    } else |_| {}
 
     // Check for dev/build
     if (std.mem.indexOf(u8, exe_path, "zig-out") != null) {
@@ -168,7 +175,7 @@ fn printPackageManagerUpdate(method: InstallMethod) !void {
     const cmd = switch (method) {
         .nix => "nix-channel --update && nix-env -iA nixpkgs.nullclaw",
         .homebrew => "brew upgrade nullclaw",
-        .docker => "docker pull ghcr.io/nullclaw/nullclaw:latest",
+        .docker => "docker pull ghcr.io/" ++ release_repo ++ ":latest",
         else => unreachable,
     };
 
@@ -193,7 +200,7 @@ pub const ReleaseInfo = struct {
 };
 
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
-    const url = "https://api.github.com/repos/nullclaw/nullclaw/releases/latest";
+    const url = "https://api.github.com/repos/" ++ release_repo ++ "/releases/latest";
 
     // Use curl subprocess approach (from http_util pattern)
     const result = std_compat.process.Child.run(.{
@@ -258,11 +265,11 @@ pub const PlatformTarget = enum {
 
     pub fn assetName(self: PlatformTarget) []const u8 {
         return switch (self) {
-            .linux_x86_64 => "nullclaw-linux-x86_64.bin",
-            .linux_aarch64 => "nullclaw-linux-aarch64.bin",
-            .macos_aarch64 => "nullclaw-macos-aarch64.bin",
-            .macos_x86_64 => "nullclaw-macos-x86_64.bin",
-            .windows_x86_64 => "nullclaw-windows-x86_64.exe",
+            .linux_x86_64 => "junclaw-linux-x86_64.bin",
+            .linux_aarch64 => "junclaw-linux-aarch64.bin",
+            .macos_aarch64 => "junclaw-macos-aarch64.bin",
+            .macos_x86_64 => "junclaw-macos-x86_64.bin",
+            .windows_x86_64 => "junclaw-windows-x86_64.exe",
         };
     }
 };
@@ -288,7 +295,7 @@ pub fn getCurrentPlatform() ?PlatformTarget {
 
 fn findAssetUrl(allocator: std.mem.Allocator, asset_name: []const u8) ?[]const u8 {
     // Construct the download URL directly
-    const base_url = "https://github.com/nullclaw/nullclaw/releases/latest/download/";
+    const base_url = "https://github.com/" ++ release_repo ++ "/releases/latest/download/";
 
     var buf: [256]u8 = undefined;
     const url = std.fmt.bufPrint(&buf, "{s}{s}", .{ base_url, asset_name }) catch return null;
@@ -481,12 +488,13 @@ test "stripV" {
     try std.testing.expectEqualStrings("2026.2.21", stripV("2026.2.21"));
 }
 
+// Regression: update fetched upstream nullclaw-* assets, replacing junclaw with upstream.
 test "PlatformTarget.assetName covers all release assets" {
-    try std.testing.expectEqualStrings("nullclaw-linux-x86_64.bin", PlatformTarget.linux_x86_64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-linux-aarch64.bin", PlatformTarget.linux_aarch64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-macos-aarch64.bin", PlatformTarget.macos_aarch64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-macos-x86_64.bin", PlatformTarget.macos_x86_64.assetName());
-    try std.testing.expectEqualStrings("nullclaw-windows-x86_64.exe", PlatformTarget.windows_x86_64.assetName());
+    try std.testing.expectEqualStrings("junclaw-linux-x86_64.bin", PlatformTarget.linux_x86_64.assetName());
+    try std.testing.expectEqualStrings("junclaw-linux-aarch64.bin", PlatformTarget.linux_aarch64.assetName());
+    try std.testing.expectEqualStrings("junclaw-macos-aarch64.bin", PlatformTarget.macos_aarch64.assetName());
+    try std.testing.expectEqualStrings("junclaw-macos-x86_64.bin", PlatformTarget.macos_x86_64.assetName());
+    try std.testing.expectEqualStrings("junclaw-windows-x86_64.exe", PlatformTarget.windows_x86_64.assetName());
 }
 
 test "platformFromParts maps supported and unsupported targets" {

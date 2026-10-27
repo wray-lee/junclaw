@@ -1,36 +1,3 @@
-> **Personal fork.** `junclaw` is a personal hard fork of
-> [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw), maintained by
-> [@wray-lee](https://github.com/wray-lee). It tracks upstream by **merge**
-> (never rebase); fixes here are also submitted upstream and tracked in
-> [nullclaw/nullclaw#1066](https://github.com/nullclaw/nullclaw/issues/1066).
-> MIT licensed with the original copyright retained. The binary name, config
-> directory (`~/.nullclaw`), `NULLCLAW_*` environment variables and the Zig
-> package name are intentionally unchanged for compatibility.
->
-> The icon is original fan art of Junko (Touhou Project, (c) Team Shanghai
-> Alice), drawn for this project; a non-commercial fan work.
->
-> ### junclaw 1.0.0
->
-> The 1.0.0 line adds an agent-engine layer on top of upstream. `agent.harness`
-> picks the engine that runs a turn:
->
-> | Value | Engine |
-> |---|---|
-> | `dsh` (default) | In-process Zig port of the [dsh](https://github.com/deepseek-ai/deepseek-harness) agent loop: JSONL session log, compaction, `/goal`, `/plan`, approvals, live streaming and reasoning display, junclaw tools bridged in, junclaw security policy enforced on its file and shell tools. `dsh-native` is accepted as an alias. |
-> | `native` | The original upstream `Agent.turn` engine, unchanged. Set `"harness": "native"` to go back. |
-> | `dsh-sidecar` | The real dsh run as a Node child process behind the same interface. Needs a `-Dharness_dsh=true` build and the full image. |
->
-> Upgrading from an earlier fork build: configs that set `"harness": "dsh"` meant the sidecar and must now say `"dsh-sidecar"`. Existing chats are seeded from the stored history the first time the new engine opens them. See [docs/en/configuration.md](docs/en/configuration.md) for the options and the [CHANGELOG](CHANGELOG.md) for the full list. Images are published as `ghcr.io/wray-lee/junclaw`.
->
-> ### junclaw 1.1.0
->
-> Browser variants of the image, so the default image stays small: `main-lightpanda` (Lightpanda over MCP, lightest), `main-browser` (Firefox ESR + geckodriver, W3C WebDriver backend) and `full-dsh-browser` (full-dsh plus Firefox). `latest` is unchanged. Choosing between them, configuration and the security model are in [docs/en/browser.md](docs/en/browser.md).
-
-Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
-
-[nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
-
 <p align="center">
   <img src="junclaw.png" alt="junclaw" width="200" />
 </p>
@@ -39,33 +6,141 @@ Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](ht
 
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
-  <strong>~6 MB static binary. A few MB of RAM idle. Runs on anything with a CPU.</strong>
+  <strong>~6 MB static binary. A few MB of RAM idle. Runs on anything with a CPU.</strong><br>
+  <strong>v1.1.1 · <a href="https://github.com/wray-lee/junclaw/releases/latest">latest release</a></strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/wray-lee/junclaw/actions/workflows/ci.yml"><img src="https://github.com/wray-lee/junclaw/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
-  <a href="https://nullclaw.github.io"><img src="https://img.shields.io/badge/docs-nullclaw.github.io-informational" alt="Documentation" /></a>
-  <a href="https://discord.gg/Bfmdua22Ud"><img src="https://img.shields.io/badge/discord-join%20community-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
+  <a href="https://github.com/wray-lee/junclaw/releases/latest"><img src="https://img.shields.io/github/v/release/wray-lee/junclaw?label=release" alt="Latest release" /></a>
+  <a href="docs/en/README.md"><img src="https://img.shields.io/badge/docs-junclaw-informational" alt="Documentation" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT (code)" /></a>
 </p>
 
-The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc.
+The smallest fully autonomous AI assistant infrastructure — a static Zig binary that fits on any $5 board, boots in milliseconds, and requires nothing but libc. The default binary is 100% Zig with no runtime; the full-dsh and browser images add Node 22, Firefox/geckodriver or Lightpanda.
 
-Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Discord](https://discord.gg/Bfmdua22Ud)
+Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributing](CONTRIBUTING.md) · [Issues](https://github.com/wray-lee/junclaw/issues) · [Discord (upstream community)](https://discord.gg/Bfmdua22Ud)
 
 ```
-~6 MB binary · 8,800+ tests · 50+ providers · 19 channels · Pluggable everything
+~6 MB binary · 9,000+ tests · 50+ providers · 20+ channels · Pluggable everything
 ```
 
-### Features
+> **Personal fork.** `junclaw` is a personal hard fork of
+> [nullclaw/nullclaw](https://github.com/nullclaw/nullclaw), maintained by
+> [@wray-lee](https://github.com/wray-lee). It tracks upstream by **merge**
+> (never rebase). Upstream-compatible fixes are queued for upstream; existing
+> upstream PRs are tracked in
+> [nullclaw/nullclaw#1066](https://github.com/nullclaw/nullclaw/issues/1066).
+> Fork-only work (the dsh harness, browser images) lives here — report junclaw
+> bugs at [wray-lee/junclaw/issues](https://github.com/wray-lee/junclaw/issues).
+> Code is MIT licensed with the original copyright retained; the binary name,
+> config directory (`~/.nullclaw`), `NULLCLAW_*` environment variables and the
+> Zig package name are intentionally unchanged for compatibility.
+>
+> The icon is original fan art of Junko (Touhou Project, (c) Team Shanghai
+> Alice), drawn for this project; a non-commercial fan work (commercial reuse of
+> the icon is not granted).
+
+## What junclaw adds
+
+junclaw adds an agent-engine layer (1.0.0) and browser-ready images (1.1.0) on top of upstream nullclaw. The binary name and config format are unchanged, so existing upstream configs keep working. Per-version history: [CHANGELOG.md](CHANGELOG.md).
+
+### Agent engines
+
+`agent.harness` selects the engine that runs a turn ([configuration docs](docs/en/configuration.md#agentharness)):
+
+| Value | Engine |
+|---|---|
+| `dsh` (default) | In-process Zig port of the [dsh](https://github.com/deepseek-ai/deepseek-harness) agent loop: JSONL session log, compaction, `/goal`, `/plan`, approvals, live streaming and reasoning display, junclaw tools bridged in, junclaw security policy enforced on its file and shell tools. `dsh-native` is accepted as an alias. |
+| `native` | The original upstream `Agent.turn` engine, unchanged. Set `"harness": "native"` to go back. |
+| `dsh-sidecar` | The real dsh run as a Node child process behind the same interface. Needs a `-Dharness_dsh=true` build and the full image. |
+
+Upgrading from an earlier fork build: configs that set `"harness": "dsh"` meant the sidecar and must now say `"dsh-sidecar"`. Existing chats are seeded from the stored history the first time the new engine opens them.
+
+### Browser images
+
+The default image stays slim. Three variants add browser automation:
+
+- `main-lightpanda` — Lightpanda over MCP, lightest.
+- `main-browser` — Firefox ESR + geckodriver, W3C WebDriver backend, `browser` tool.
+- `full-dsh-browser` — `full-dsh` plus Firefox.
+
+Choosing between them, configuration and the security model: [docs/en/browser.md](docs/en/browser.md).
+
+## Install junclaw
+
+Release binaries: [github.com/wray-lee/junclaw/releases](https://github.com/wray-lee/junclaw/releases/latest) (latest: `v1.1.1`, 2026-10-28). The installed binary is still named `nullclaw`.
+
+| Platform | Release asset |
+|---|---|
+| Linux x86_64 / aarch64 / riscv64 | `junclaw-linux-x86_64.bin`, `junclaw-linux-aarch64.bin`, `junclaw-linux-riscv64.bin` |
+| Linux arm32 (glibc / musl) | `junclaw-linux-arm32-gnu.bin`, `junclaw-linux-arm32-musl.bin` |
+| macOS aarch64 / x86_64 | `junclaw-macos-aarch64.bin`, `junclaw-macos-x86_64.bin` |
+| Windows x86_64 / aarch64 | `junclaw-windows-x86_64.zip` / `.exe`, `junclaw-windows-aarch64.zip` / `.exe` (contains `nullclaw.exe`) |
+| Android aarch64 / armv7 / x86_64 | `junclaw-android-aarch64.bin`, `junclaw-android-armv7.bin`, `junclaw-android-x86_64.bin` |
+| Source | `junclaw-source-v1.1.1.tar.gz` |
+
+Linux (x86_64):
+
+```bash
+curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-linux-x86_64.bin
+chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
+nullclaw --version   # 1.1.1
+```
+
+macOS (Apple Silicon; Intel: `junclaw-macos-x86_64.bin`):
+
+```bash
+curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-macos-aarch64.bin
+chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
+nullclaw --version   # 1.1.1
+```
+
+Windows: download `junclaw-windows-x86_64.zip`, extract, and run `nullclaw.exe`.
+
+Docker images ([GHCR](https://github.com/wray-lee/junclaw/pkgs/container/junclaw), `linux/amd64` only):
+
+| Tag | Contents |
+|---|---|
+| `latest`, `v1.1.1`, `main-<sha>` | Slim image: release binary, in-process dsh engine |
+| `full-dsh`, `full-dsh-v1.1.1`, `full-dsh-main-<sha>` | Adds Node 22 and the dsh sidecar (set `"harness": "dsh-sidecar"`) |
+| `main-lightpanda`, `main-lightpanda-<sha>`, `v1.1.1-lightpanda` | Adds Lightpanda over MCP |
+| `main-browser`, `main-browser-<sha>`, `v1.1.1-browser` | Adds Firefox ESR + geckodriver (`browser` tool) |
+| `full-dsh-browser`, `full-dsh-browser-<sha>`, `v1.1.1-full-dsh-browser` | `full-dsh` plus Firefox |
+
+`full-dsh` and `full-dsh-v<version>` are rebuilt by a `full-dsh-v*` git tag (pushed with each release) or a manual `image-full-dsh` run.
+
+```bash
+docker pull ghcr.io/wray-lee/junclaw:v1.1.1
+docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1 status
+docker run --rm -it -p 127.0.0.1:3000:3000 -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1
+```
+
+All images are `linux/amd64` only. On ARM, use the matching release binary or build the image locally.
+
+### Build from source
+
+> **Prerequisite:** use **Zig 0.16.0** (exact version); other versions may fail to build. Verify with `zig version`.
+
+```bash
+git clone https://github.com/wray-lee/junclaw.git
+cd junclaw
+zig build -Doptimize=ReleaseSmall                      # in-process dsh engine (default)
+zig build -Doptimize=ReleaseSmall -Dharness_dsh=true   # optional: dsh sidecar (needs Node 22)
+zig build test --summary all
+```
+
+> **Upstream ecosystem:** [nullhub](https://github.com/nullclaw/nullhub) is a UI for installing and managing upstream NullClaw (beta). It installs upstream nullclaw, not this fork.
+
+## Features
 
 - **Impossibly Small:** ~6 MB static binary (ReleaseSmall, x86_64 musl, with the dsh engine) — no runtime, no VM, no framework overhead.
-- **Near-Zero Memory:** ~1 MB peak RSS. Runs comfortably on the cheapest ARM SBCs and microcontrollers.
+- **Near-Zero Memory:** ~2–3 MB RSS idle; a few hundred MB during a dsh turn (measured in the container). Runs comfortably on the cheapest ARM SBCs.
 - **Instant Startup:** <2 ms on Apple Silicon, <8 ms on a 0.8 GHz edge core.
 - **True Portability:** Single self-contained binary across ARM, x86, and RISC-V. Drop it anywhere, it just runs.
-- **Feature-Complete:** 50+ providers, 19 channels, 35+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
+- **Feature-Complete:** 50+ providers, 20+ channels, 35+ tools, 10 memory engines, multi-layer sandbox, tunnels, hardware peripherals, MCP, subagents, streaming, voice — the full stack.
 
-### Why nullclaw
+## Why junclaw
 
 - **Lean by default:** Zig compiles to a tiny static binary. No allocator overhead, no garbage collector, no runtime.
 - **Secure by design:** pairing, strict sandboxing (landlock, firejail, bubblewrap, docker), explicit allowlists, workspace scoping, encrypted secrets.
@@ -74,19 +149,19 @@ Docs: [English](docs/en/README.md) · [中文](docs/zh/README.md) · [Contributi
 
 ## Benchmark Snapshot
 
-Local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge hardware.
+Comparison figures from a local machine benchmark (macOS arm64, Feb 2026), normalized for 0.8 GHz edge hardware. The Junclaw column uses the v1.1.0 release: binary size from the release asset, tests and source files from the tree, memory from the linux/amd64 container measurements (idle gateway / peak during a dsh turn) in [docs/en/installation.md](docs/en/installation.md).
 
-| | [OpenClaw](https://github.com/openclaw/openclaw) | [NanoBot](https://github.com/HKUDS/nanobot) | [PicoClaw](https://github.com/sipeed/picoclaw) | [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) | **[🦞 NullClaw](https://github.com/nullclaw/nullclaw)** |
+| | [OpenClaw](https://github.com/openclaw/openclaw) | [NanoBot](https://github.com/HKUDS/nanobot) | [PicoClaw](https://github.com/sipeed/picoclaw) | [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) | **[🦞 Junclaw](https://github.com/wray-lee/junclaw)** |
 |---|---|---|---|---|---|
 | **Language** | TypeScript | Python | Go | Rust | **Zig** |
-| **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~1 MB** |
-| **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **< 8 ms** |
-| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **678 KB** |
-| **Tests** | — | — | — | 1,017 | **5,300+** |
-| **Source Files** | ~400+ | — | — | ~120 | **~230** |
+| **RAM** | > 1 GB | > 100 MB | < 10 MB | < 5 MB | **~2–3 MB idle / ~288 MB peak** |
+| **Startup (0.8 GHz)** | > 500 s | > 30 s | < 1 s | < 10 ms | **few ms** |
+| **Binary Size** | ~28 MB (dist) | N/A (Scripts) | ~8 MB | ~8.8 MB | **~6 MB** |
+| **Tests** | — | — | — | 1,017 | **9,000+** |
+| **Source Files** | ~400+ | — | — | ~120 | **~370** |
 | **Cost** | Mac Mini $599 | Linux SBC ~$50 | Linux Board $10 | Any $10 hardware | **Any $5 hardware** |
 
-> Measured with `/usr/bin/time -l` on ReleaseSmall builds. nullclaw is a static binary with zero runtime dependencies.
+> Measured with `/usr/bin/time -l` on ReleaseSmall builds for the compared projects. The default Junclaw build is a static binary with zero runtime dependencies.
 
 Reproduce locally:
 
@@ -138,9 +213,9 @@ Localized documentation lives under `docs/en/` and `docs/zh/`. Use the links bel
 
 ## Quick Start
 
-### 1) Recommended install (Homebrew)
+### 1) Homebrew (upstream nullclaw only)
 
-The simplest path: install a ready-to-run binary with no extra runtime dependencies.
+Homebrew's `nullclaw` formula installs upstream nullclaw, not junclaw. For junclaw, use the [release assets](#install-junclaw) above.
 
 ```bash
 brew install nullclaw
@@ -155,9 +230,9 @@ nullclaw --help
 > Debian users who need Zig first can follow [`docs/en/zig-installation.md`](docs/en/zig-installation.md).
 
 ```bash
-git clone https://github.com/nullclaw/nullclaw.git
-cd nullclaw
-zig build -Doptimize=ReleaseSmall
+git clone https://github.com/wray-lee/junclaw.git
+cd junclaw
+zig build -Doptimize=ReleaseSmall   # in-process dsh engine (default)
 zig build test --summary all
 ```
 
@@ -192,8 +267,14 @@ nullclaw --help
 
 ### 3) Run with Docker Compose
 
-The repository includes a Makefile wrapper around Docker Compose for local
-containerized runs.
+The published image is the shortest path:
+
+```bash
+docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1 status
+docker run --rm -it -p 127.0.0.1:3000:3000 -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1
+```
+
+Or build the image locally with the Makefile wrapper around Docker Compose:
 
 ```bash
 make build
@@ -299,9 +380,9 @@ Every subsystem is a **vtable interface** — swap implementations with a config
 | Subsystem | Interface | Ships with | Extend |
 |-----------|-----------|------------|--------|
 | **AI Models** | `Provider` | 50+ providers (OpenRouter, Anthropic, OpenAI, Azure OpenAI, Gemini, Vertex AI, Ollama, Venice, NEAR AI Cloud, Atlas Cloud, Evolink, Eden AI, Cheaper Inference, Groq, Mistral, xAI, DeepSeek, Together, Fireworks, Perplexity, Cohere, Bedrock, and many OpenAI-compatible endpoints) | `custom:https://your-api.com` — any OpenAI-compatible API |
-| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost | Any messaging API |
+| **Channels** | `Channel` | CLI, Telegram, Signal, Discord, Slack, iMessage, Matrix, WhatsApp, Webhook, IRC, Lark/Feishu, OneBot, Line, DingTalk, Email, Nostr, QQ, MaixCam, Mattermost, Teams, WeCom, WeChat, Max | Any messaging API |
 | **Memory** | `Memory` | SQLite with hybrid search (FTS5 + vector cosine similarity), Markdown, ClickHouse, PostgreSQL, Redis, LanceDB, Lucid, LRU, API | Any persistence backend |
-| **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
+| **Tools** | `Tool` | shell, file_read, file_write, file_edit, file_edit_hashed, file_read_hashed, file_append, memory_store, memory_recall, memory_forget, memory_list, browser, browser_open, screenshot, composio, http_request, web_fetch, web_search, delegate, schedule, hardware_info, hardware_memory, pushover, message, spawn, git, image, i2c, spi, and more | Any capability |
 | **Observability** | `Observer` | Noop, Log, File, Multi | Prometheus, OTel |
 | **Runtime** | `RuntimeAdapter` | Native, Docker (sandboxed), WASM (wasmtime) | Any runtime |
 | **Security** | `Sandbox` | Landlock, Firejail, Bubblewrap, Docker, auto-detect | Any sandbox backend |
@@ -398,6 +479,8 @@ Config: `~/.nullclaw/config.json` (created by `onboard`)
 >
 > `models.providers.vertex.base_url` can be set explicitly (`.../projects/<id>/locations/<loc>/publishers/google/models`), or omitted when service-account JSON is used (nullclaw will derive it from `project_id`, with `VERTEX_LOCATION` defaulting to `global`).
 > Service-account mode requires `openssl` available in `$PATH` for RS256 JWT signing.
+
+The turn engine is selected by `agent.harness`: `dsh` (default, in-process), `native` (the upstream engine) or `dsh-sidecar` (a `-Dharness_dsh=true` build plus Node). A config written for the old sidecar spelling (`"dsh"`) must change to `"dsh-sidecar"`. See [docs/en/configuration.md](docs/en/configuration.md#agentharness).
 
 ```json
 {
@@ -726,9 +809,9 @@ Use this when you want full web-search provider control plus unrestricted shell 
 - High-risk and medium-risk runtime gates still apply after the allowlist check; set `block_medium_risk_commands: false` when you intentionally allow network/transfer commands such as `curl`/`wget` or other medium-risk mutations.
 - `allowed_paths: ["*"]` allows access outside workspace, except system-protected paths.
 
-### Web UI / Browser Relay
+### Web UI (WebChannel Relay)
 
-Use `channels.web` for browser UI events (WebChannel v1):
+Use `channels.web` for browser UI events (WebChannel v1). For browser automation (Firefox/Lightpanda image variants), see [docs/en/browser.md](docs/en/browser.md).
 
 ```json
 {
@@ -878,7 +961,9 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `capabilities [--json]` | Show runtime capabilities manifest |
 | `auth login\|status\|logout` | Manage OAuth authentication |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
-| `update [--check] [--yes]` | Check for and install updates |
+| `update [--check] [--yes]` | Check for and install updates from junclaw releases |
+
+> **Upgrading from 1.1.0 or earlier:** those builds' `nullclaw update` still fetches upstream nullclaw and would replace junclaw with it. Install the new `junclaw-*` asset from [Releases](https://github.com/wray-lee/junclaw/releases/latest) once; later builds update from junclaw releases.
 
 ## Development
 
@@ -886,8 +971,8 @@ Build and tests are pinned to **Zig 0.16.0**.
 
 ```bash
 zig build                          # Dev build
-zig build -Doptimize=ReleaseSmall  # Release build (678 KB)
-zig build test --summary all       # 5,300+ tests
+zig build -Doptimize=ReleaseSmall  # Release build (~6 MB)
+zig build test --summary all       # 9,000+ tests
 ```
 
 ### Channel Flow Coverage
@@ -904,12 +989,12 @@ Channel CJM coverage (ingress parsing/filtering, session key routing, account pr
 
 ```
 Language:     Zig 0.16.0
-Source files: ~250
-Lines of code: ~249,000
-Tests:        5,300+
-Binary:       678 KB (ReleaseSmall)
-Peak RSS:     ~1 MB
-Startup:      <2 ms (Apple Silicon)
+Source files: ~370
+Lines of code: ~380,000
+Tests:        9,000+
+Binary:       ~6 MB (ReleaseSmall, including the dsh engine)
+RSS:          ~2–3 MB idle; ~288 MB peak during a dsh turn
+Startup:      milliseconds (no runtime)
 Dependencies: 0 (besides libc + optional SQLite)
 ```
 
@@ -920,10 +1005,11 @@ src/
   main.zig              CLI entry point + argument parsing
   root.zig              Module hierarchy (public API)
   config.zig            JSON config loader + 30 sub-config structs
-  agent.zig             Agent loop, auto-compaction, tool dispatch
+  agent.zig             Native agent loop, auto-compaction, tool dispatch
+  harness/              Agent-engine port: dsh (default) and native engines
   daemon.zig            Daemon supervisor with exponential backoff
   gateway.zig           HTTP gateway (rate limiting, idempotency, pairing)
-  channels/             19 channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
+  channels/             20+ channel implementations (telegram, signal, discord, slack, nostr, matrix, whatsapp, line, lark, onebot, mattermost, qq, ...)
   providers/            50+ AI provider integrations
   memory/               SQLite backend, embeddings, vector search, hygiene, snapshots
   tools/                35+ tool implementations
@@ -939,17 +1025,21 @@ src/
 
 ## Versioning
 
-nullclaw uses **CalVer** (`YYYY.M.D`) for releases — e.g. `v2026.2.20`.
+junclaw releases use **semver** (`vMAJOR.MINOR.PATCH`) — latest `v1.1.1` (2026-10-28, see [Releases](https://github.com/wray-lee/junclaw/releases)). The version is recorded in `build.zig.zon`.
 
-- **Tag format:** `vYYYY.M.D` (one release per day max; patch suffix `vYYYY.M.D.N` if needed)
+- **Tag format:** `vX.Y.Z` (e.g. `v1.1.1`)
 - **Release binaries derive their embedded version from the git tag** (`v...` -> `nullclaw --version`)
 - **Non-release builds default to `dev`** unless you override with `zig build -Dversion=...`
-- **No stability guarantees yet** — the project is pre-1.0, config and CLI may change between releases
+- **1.x:** config and CLI may still change between minor releases; fork-only features are documented in [CHANGELOG.md](CHANGELOG.md)
 - **`nullclaw --version`** prints the current version
+
+Upstream nullclaw uses CalVer (`YYYY.M.D`, e.g. `v2026.2.20`); its tags are not junclaw releases.
 
 ## Contributing
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for development environment setup, workflow, validation commands, and the PR checklist.
+
+junclaw is developed at [wray-lee/junclaw](https://github.com/wray-lee/junclaw); open junclaw PRs there. `CONTRIBUTING.md` is inherited from upstream, so its clone URL and workflow point at upstream nullclaw; upstream PRs are tracked in [nullclaw/nullclaw#1066](https://github.com/nullclaw/nullclaw/issues/1066).
 
 Implement a vtable interface, submit a PR:
 
@@ -973,6 +1063,7 @@ Implement a vtable interface, submit a PR:
 - [Security model (安全机制)](docs/zh/security.md)
 - [Gateway API (中文)](docs/zh/gateway-api.md)
 - [Commands reference (命令参考)](docs/zh/commands.md)
+- [Browser automation (浏览器自动化)](docs/zh/browser.md)
 - [Development guide (开发指南)](docs/zh/development.md)
 
 ## English Docs
@@ -986,6 +1077,7 @@ Implement a vtable interface, submit a PR:
 - [Security](docs/en/security.md)
 - [Gateway API](docs/en/gateway-api.md)
 - [Commands](docs/en/commands.md)
+- [Browser automation](docs/en/browser.md)
 - [Development](docs/en/development.md)
 
 ## Disclaimer
@@ -994,12 +1086,12 @@ nullclaw is a pure open-source software project. It has **no token, no cryptocur
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT for the code — see [LICENSE](LICENSE). The icon is a non-commercial fan work (see the notice above).
 
 ---
 
-**nullclaw** — Null overhead. Null compromise. Deploy anywhere. Swap anything.
+**junclaw** — Null overhead. Null compromise. Deploy anywhere. Swap anything.
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=nullclaw/nullclaw&type=date&legend=top-left)](https://www.star-history.com/#nullclaw/nullclaw&type=date&legend=top-left)
+[![Star History Chart](https://api.star-history.com/svg?repos=wray-lee/junclaw&type=date&legend=top-left)](https://www.star-history.com/#wray-lee/junclaw&type=date&legend=top-left)
