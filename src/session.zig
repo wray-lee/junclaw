@@ -244,11 +244,25 @@ fn hostToolCall(
     const agent: *Agent = @ptrCast(@alignCast(context));
     const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
     const outcome = agent.executeHostTool(allocator, name, args_json);
-    // The dsh bridge spills this text verbatim to disk; native never persists
-    // raw tool output, so scrub secrets (and PII when enabled) before retain.
-    const scrubbed = try providers.scrubSecretPatterns(allocator, outcome.output);
-    const output = if (agent.redactor) |r| try r.redact(allocator, scrubbed) else scrubbed;
+    const output = try sanitizeHostToolOutput(allocator, agent.redactor, outcome.output);
     return .{ .success = outcome.success, .output = output };
+}
+
+/// The dsh bridge retains/spills this text verbatim to disk; native never
+/// persists raw tool output, so scrub secrets (and redact PII when enabled)
+/// before retain. `record_originals=true` is the production mode, so the same
+/// Redactor rehydrates placeholders for host display afterwards.
+fn sanitizeHostToolOutput(
+    allocator: Allocator,
+    redactor: ?*redaction.Redactor,
+    output: []const u8,
+) ![]u8 {
+    const scrubbed = try providers.scrubSecretPatterns(allocator, output);
+    if (redactor) |r| {
+        defer allocator.free(scrubbed);
+        return r.redact(allocator, scrubbed);
+    }
+    return scrubbed;
 }
 
 /// Test seam: point session-created dsh harnesses at an in-process mock
@@ -366,6 +380,30 @@ test "safeMessageLogPreview redacts PII" {
     defer preview.deinit(testing.allocator);
     try testing.expect(std.mem.indexOf(u8, preview.slice, "user@example.com") == null);
     try testing.expect(std.mem.indexOf(u8, preview.slice, "[EMAIL_1]") != null);
+}
+
+// Regression: the dsh host executor handed raw tool output (PII, secrets)
+// straight to the bridge, which retains a >64KB copy verbatim in its spill.
+test "host tool output is sanitized before the dsh bridge retains it" {
+    const raw = "API_KEY=sk-live1234567890\ncontact alice@example.com";
+    var redactor = redaction.Redactor.init(testing.allocator, .{ .record_originals = true });
+    defer redactor.deinit();
+
+    const clean = try sanitizeHostToolOutput(testing.allocator, &redactor, raw);
+    defer testing.allocator.free(clean);
+    try testing.expect(std.mem.indexOf(u8, clean, "alice@example.com") == null);
+    try testing.expect(std.mem.indexOf(u8, clean, "sk-live1234567890") == null);
+
+    // record_originals=true is the production mode: host display rehydrates PII.
+    const restored = try redactor.unredact(testing.allocator, clean);
+    defer testing.allocator.free(restored);
+    try testing.expect(std.mem.indexOf(u8, restored, "alice@example.com") != null);
+}
+
+test "host tool output still scrubs secrets when PII redaction is disabled" {
+    const clean = try sanitizeHostToolOutput(testing.allocator, null, "token=sk-abcdefgh12345678");
+    defer testing.allocator.free(clean);
+    try testing.expect(std.mem.indexOf(u8, clean, "sk-abcdefgh12345678") == null);
 }
 
 fn estimateRestoredSessionTokens(entries: []const memory_mod.MessageEntry) u64 {
