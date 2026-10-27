@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+## 1.1.0 - 2026-10-27
+
+Browser release: two ways to give the agent a real browser, shipped as separate
+image variants so the default image stays small.
+
+### Added
+
+- `main-lightpanda` image: the standard image plus the pinned Lightpanda 1.0.2
+  browser, reached through its own MCP server (AGPL-3.0 notice shipped in
+  `/usr/share/doc/lightpanda`, telemetry off). Per-server MCP `tools`
+  allowlist (`mcp_servers.<name>.tools`) keeps the token cost of the browser
+  tool list small.
+- `agent.tool_filter_groups` now also applies in the dsh engine, with the
+  same matching as the native engine.
+- Firefox WebDriver browser backend (`browser.backend = "webdriver"`):
+  open, read, snapshot (numbered interactive elements), click, type, scroll,
+  screenshot and close. geckodriver is started lazily, one browser per
+  process, reaped when idle, with a one-shot profile. HTTPS only, private and
+  metadata addresses blocked, final URL rechecked after navigation and after
+  each action. See `docs/en/browser.md` for the security model and known
+  limits.
+- `main-browser` and `full-dsh-browser` image variants (Firefox ESR and
+  geckodriver 0.37.1). Tags: `main-browser`, `full-dsh-browser`,
+  `<release-tag>-browser`, `<release-tag>-full-dsh-browser` and a `-<sha>`
+  suffixed rolling tag; `latest` is unchanged.
+
+### Fixed
+
+- `config save` no longer drops the `mcp_servers.<name>.tools` allowlist.
+
 ## 1.0.0 - 2026-10-26
 
 First tagged release of the junclaw fork. Highlights since the last upstream merge:

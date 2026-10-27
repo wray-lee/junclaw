@@ -22,6 +22,10 @@
 > | `dsh-sidecar` | The real dsh run as a Node child process behind the same interface. Needs a `-Dharness_dsh=true` build and the full image. |
 >
 > Upgrading from an earlier fork build: configs that set `"harness": "dsh"` meant the sidecar and must now say `"dsh-sidecar"`. Existing chats are seeded from the stored history the first time the new engine opens them. See [docs/en/configuration.md](docs/en/configuration.md) for the options and the [CHANGELOG](CHANGELOG.md) for the full list. Images are published as `ghcr.io/wray-lee/junclaw`.
+>
+> ### junclaw 1.1.0
+>
+> Browser variants of the image, so the default image stays small: `main-lightpanda` (Lightpanda over MCP, lightest), `main-browser` (Firefox ESR + geckodriver, W3C WebDriver backend) and `full-dsh-browser` (full-dsh plus Firefox). `latest` is unchanged. Choosing between them, configuration and the security model are in [docs/en/browser.md](docs/en/browser.md).
 
 Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
