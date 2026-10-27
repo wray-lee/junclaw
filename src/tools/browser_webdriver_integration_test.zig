@@ -39,15 +39,19 @@ test "webdriver integration runs the full session, snapshot, click, type and clo
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fake-session\",\"capabilities\":{}}}" },
         .{ .method = "POST", .path = "/session/fake-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fake-session/execute/sync", .body = snapshot_body },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fake-session/element", .body = "{\"value\":{\"element-6066-11e4-a52e-4f735466cecf\":\"el-1\"}}" },
         .{ .method = "POST", .path = "/session/fake-session/element/el-1/click", .body = "{\"value\":null}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/fake-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fake-session/element", .body = "{\"value\":{\"element-6066-11e4-a52e-4f735466cecf\":\"el-2\"}}" },
         .{ .method = "POST", .path = "/session/fake-session/element/el-2/value", .body = "{\"value\":null}" },
+        .{ .method = "GET", .path = "/session/fake-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "DELETE", .path = "/session/fake-session", .body = "{\"value\":null}" },
     };
     const server = try fake.Server.start(allocator, &routes);
@@ -93,29 +97,35 @@ test "webdriver integration runs the full session, snapshot, click, type and clo
     try testing.expectEqualStrings("GET", server.requests[2].method);
     try testing.expectEqualStrings("/session/fake-session/url", server.requests[2].path);
     try testing.expectEqualStrings("GET", server.requests[3].method);
-    try testing.expectEqualStrings("/session/fake-session/url", server.requests[3].path);
+    try testing.expectEqualStrings("/session/fake-session/window/handles", server.requests[3].path);
 
-    try testing.expectEqualStrings("/session/fake-session/execute/sync", server.requests[4].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[4].body, "data-junclaw-ref") != null);
+    try testing.expectEqualStrings("GET", server.requests[4].method);
+    try testing.expectEqualStrings("/session/fake-session/url", server.requests[4].path);
+    try testing.expectEqualStrings("/session/fake-session/execute/sync", server.requests[5].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[5].body, "data-junclaw-ref") != null);
 
-    // Snapshot post-script recheck, then the click pre-check.
-    try testing.expectEqualStrings("GET", server.requests[5].method);
-    try testing.expectEqualStrings("/session/fake-session/url", server.requests[5].path);
+    // Snapshot post-script recheck, then its window sweep, then the click
+    // pre-check.
     try testing.expectEqualStrings("GET", server.requests[6].method);
     try testing.expectEqualStrings("/session/fake-session/url", server.requests[6].path);
-    try testing.expectEqualStrings("/session/fake-session/element", server.requests[7].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[7].body, "data-junclaw-ref=\\\"0\\\"") != null);
-    try testing.expectEqualStrings("/session/fake-session/element/el-1/click", server.requests[8].path);
+    try testing.expectEqualStrings("/session/fake-session/window/handles", server.requests[7].path);
+    try testing.expectEqualStrings("GET", server.requests[8].method);
+    try testing.expectEqualStrings("/session/fake-session/url", server.requests[8].path);
+    try testing.expectEqualStrings("/session/fake-session/element", server.requests[9].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[9].body, "data-junclaw-ref=\\\"0\\\"") != null);
+    try testing.expectEqualStrings("/session/fake-session/element/el-1/click", server.requests[10].path);
 
-    try testing.expectEqualStrings("GET", server.requests[9].method);
-    try testing.expectEqualStrings("/session/fake-session/url", server.requests[9].path);
-    try testing.expectEqualStrings("/session/fake-session/element", server.requests[10].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[10].body, "data-junclaw-ref=\\\"1\\\"") != null);
-    try testing.expectEqualStrings("/session/fake-session/element/el-2/value", server.requests[11].path);
-    try testing.expect(std.mem.indexOf(u8, server.requests[11].body, "\"text\":\"hello\"") != null);
+    try testing.expectEqualStrings("/session/fake-session/window/handles", server.requests[11].path);
+    try testing.expectEqualStrings("GET", server.requests[12].method);
+    try testing.expectEqualStrings("/session/fake-session/url", server.requests[12].path);
+    try testing.expectEqualStrings("/session/fake-session/element", server.requests[13].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[13].body, "data-junclaw-ref=\\\"1\\\"") != null);
+    try testing.expectEqualStrings("/session/fake-session/element/el-2/value", server.requests[14].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[14].body, "\"text\":\"hello\"") != null);
+    try testing.expectEqualStrings("/session/fake-session/window/handles", server.requests[15].path);
 
-    try testing.expectEqualStrings("DELETE", server.requests[12].method);
-    try testing.expectEqualStrings("/session/fake-session", server.requests[12].path);
+    try testing.expectEqualStrings("DELETE", server.requests[16].method);
+    try testing.expectEqualStrings("/session/fake-session", server.requests[16].path);
 
     var session_posts: usize = 0;
     for (server.requests) |request| {
@@ -124,15 +134,86 @@ test "webdriver integration runs the full session, snapshot, click, type and clo
     try testing.expectEqual(@as(usize, 1), session_posts);
 }
 
+// F4 depth: an action can open tabs/windows the URL checks never see; after
+// every successful action the extra windows are closed and recorded.
+test "webdriver integration closes extra windows after an action and keeps the current one" {
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"popup-session\",\"capabilities\":{}}}" },
+        .{ .method = "POST", .path = "/session/popup-session/url", .body = "{\"value\":null}" },
+        .{ .method = "GET", .path = "/session/popup-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/popup-session/window/handles", .body = "{\"value\":[\"main-handle\",\"popup-handle\"]}" },
+        .{ .method = "GET", .path = "/session/popup-session/window", .body = "{\"value\":\"main-handle\"}" },
+        .{ .method = "POST", .path = "/session/popup-session/window", .body = "{\"value\":null}" },
+        .{ .method = "POST", .path = "/session/popup-session/window/close", .body = "{\"value\":null}" },
+        .{ .method = "POST", .path = "/session/popup-session/window", .body = "{\"value\":null}" },
+        .{ .method = "DELETE", .path = "/session/popup-session", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base = try server.url(allocator);
+    defer allocator.free(base);
+
+    var bt = webdriverTool(base, &.{"example.com"});
+    defer bt.shutdown();
+
+    const opened = try execute(&bt, "{\"action\":\"open\",\"url\":\"https://example.com/page\"}");
+    defer allocator.free(opened.output);
+    try testing.expect(opened.success);
+    try testing.expect(std.mem.indexOf(u8, opened.output, "Closed 1 extra browser window(s): popup-handle") != null);
+
+    bt.shutdown();
+    server.stopAndJoin();
+    try testing.expectEqual(routes.len, server.request_count);
+    try testing.expectEqualStrings("GET", server.requests[3].method);
+    try testing.expectEqualStrings("/session/popup-session/window/handles", server.requests[3].path);
+    try testing.expectEqualStrings("GET", server.requests[4].method);
+    try testing.expectEqualStrings("/session/popup-session/window", server.requests[4].path);
+    // Close the extra window, then put the original window back in front.
+    try testing.expectEqualStrings("/session/popup-session/window", server.requests[5].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[5].body, "\"handle\":\"popup-handle\"") != null);
+    try testing.expectEqualStrings("/session/popup-session/window/close", server.requests[6].path);
+    try testing.expectEqualStrings("/session/popup-session/window", server.requests[7].path);
+    try testing.expect(std.mem.indexOf(u8, server.requests[7].body, "\"handle\":\"main-handle\"") != null);
+}
+
+test "webdriver integration keeps a successful action when window cleanup fails" {
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"nowindow-session\",\"capabilities\":{}}}" },
+        .{ .method = "POST", .path = "/session/nowindow-session/url", .body = "{\"value\":null}" },
+        .{ .method = "GET", .path = "/session/nowindow-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/nowindow-session/window/handles", .status = 500, .body = "{\"value\":{\"error\":\"unknown error\",\"message\":\"unsupported command\"}}" },
+        .{ .method = "DELETE", .path = "/session/nowindow-session", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base = try server.url(allocator);
+    defer allocator.free(base);
+
+    var bt = webdriverTool(base, &.{"example.com"});
+    defer bt.shutdown();
+
+    const opened = try execute(&bt, "{\"action\":\"open\",\"url\":\"https://example.com/page\"}");
+    defer allocator.free(opened.output);
+    try testing.expect(opened.success);
+    try testing.expect(std.mem.indexOf(u8, opened.output, "Closed") == null);
+    try testing.expect(std.mem.indexOf(u8, opened.output, "https://example.com/page") != null);
+
+    bt.shutdown();
+    server.stopAndJoin();
+    try testing.expectEqual(routes.len, server.request_count);
+}
+
 test "webdriver integration rebuilds the session after Firefox dies" {
     const routes = [_]fake.Route{
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"dead-session\",\"capabilities\":{}}}" },
         .{ .method = "POST", .path = "/session/dead-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/dead-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/dead-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/dead-session/url", .status = 404, .body = "{\"value\":{\"error\":\"invalid session id\",\"message\":\"session deleted\"}}" },
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"live-session\",\"capabilities\":{}}}" },
         .{ .method = "POST", .path = "/session/live-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/live-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/live-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "DELETE", .path = "/session/live-session", .body = "{\"value\":null}" },
     };
     const server = try fake.Server.start(allocator, &routes);
@@ -162,9 +243,9 @@ test "webdriver integration rebuilds the session after Firefox dies" {
     bt.shutdown();
     server.stopAndJoin();
     try testing.expectEqual(routes.len, server.request_count);
-    try testing.expectEqualStrings("/session", server.requests[4].path);
-    try testing.expectEqualStrings("DELETE", server.requests[7].method);
-    try testing.expectEqualStrings("/session/live-session", server.requests[7].path);
+    try testing.expectEqualStrings("/session", server.requests[5].path);
+    try testing.expectEqualStrings("DELETE", server.requests[9].method);
+    try testing.expectEqualStrings("/session/live-session", server.requests[9].path);
 }
 
 test "webdriver integration blocks a redirect to a metadata address and closes the page" {
@@ -208,6 +289,7 @@ test "webdriver integration blocks a page that navigates away after the snapshot
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"race-session\",\"capabilities\":{}}}" },
         .{ .method = "POST", .path = "/session/race-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/race-session/url", .body = "{\"value\":\"https://8.8.8.8/page\"}" },
+        .{ .method = "GET", .path = "/session/race-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/race-session/url", .body = "{\"value\":\"https://8.8.8.8/page\"}" },
         .{ .method = "POST", .path = "/session/race-session/execute/sync", .body = snapshot_body },
         .{ .method = "GET", .path = "/session/race-session/url", .body = "{\"value\":\"https://169.254.169.254/latest/meta-data/\"}" },
@@ -238,9 +320,9 @@ test "webdriver integration blocks a page that navigates away after the snapshot
 
     server.stopAndJoin();
     try testing.expectEqual(routes.len, server.request_count);
-    try testing.expectEqualStrings("GET", server.requests[5].method);
-    try testing.expectEqualStrings("/session/race-session/url", server.requests[5].path);
-    try testing.expectEqualStrings("/session/race-session/window/close", server.requests[6].path);
+    try testing.expectEqualStrings("GET", server.requests[6].method);
+    try testing.expectEqualStrings("/session/race-session/url", server.requests[6].path);
+    try testing.expectEqualStrings("/session/race-session/window/close", server.requests[7].path);
 }
 
 test "webdriver integration reports a missing geckodriver without failing the host" {
@@ -354,6 +436,7 @@ test "webdriver integration close reaps the browser child process" {
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"child-session\",\"capabilities\":{}}}" },
         .{ .method = "POST", .path = "/session/child-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/child-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/child-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "DELETE", .path = "/session/child-session", .body = "{\"value\":null}" },
     };
     const server = try fake.Server.start(allocator, &routes);
@@ -381,7 +464,7 @@ test "webdriver integration close reaps the browser child process" {
 
     server.stopAndJoin();
     try testing.expectEqual(routes.len, server.request_count);
-    try testing.expectEqualStrings("DELETE", server.requests[3].method);
+    try testing.expectEqualStrings("DELETE", server.requests[4].method);
 }
 
 test "webdriver integration reaps the browser child after a failed action" {
@@ -390,6 +473,7 @@ test "webdriver integration reaps the browser child after a failed action" {
         .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"fail-session\",\"capabilities\":{}}}" },
         .{ .method = "POST", .path = "/session/fail-session/url", .body = "{\"value\":null}" },
         .{ .method = "GET", .path = "/session/fail-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
+        .{ .method = "GET", .path = "/session/fail-session/window/handles", .body = "{\"value\":[\"main\"]}" },
         .{ .method = "GET", .path = "/session/fail-session/url", .body = "{\"value\":\"https://example.com/page\"}" },
         .{ .method = "POST", .path = "/session/fail-session/element", .status = 500, .body = "{\"value\":{\"error\":\"unknown error\",\"message\":\"driver crashed\"}}" },
         .{ .method = "DELETE", .path = "/session/fail-session", .body = "{\"value\":null}" },
@@ -424,5 +508,5 @@ test "webdriver integration reaps the browser child after a failed action" {
 
     server.stopAndJoin();
     try testing.expectEqual(routes.len, server.request_count);
-    try testing.expectEqualStrings("DELETE", server.requests[5].method);
+    try testing.expectEqualStrings("DELETE", server.requests[6].method);
 }

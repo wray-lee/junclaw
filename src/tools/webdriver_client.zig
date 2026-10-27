@@ -228,6 +228,45 @@ pub const WebDriverClient = struct {
         parsed.deinit();
     }
 
+    /// W3C GET /window: the current top-level window handle.
+    pub fn getWindowHandle(self: *WebDriverClient, allocator: Allocator) ![]u8 {
+        return self.getSessionString(allocator, "/window");
+    }
+
+    /// W3C GET /window/handles: every top-level window handle in the session.
+    /// Caller frees each string and the slice.
+    pub fn getWindowHandles(self: *WebDriverClient, allocator: Allocator) ![][]u8 {
+        const path = try self.sessionPath("/window/handles");
+        defer self.allocator.free(path);
+        var parsed = try self.request(.GET, path, null);
+        defer parsed.deinit();
+        const value = try responseValue(parsed.value);
+        if (value != .array) return error.Protocol;
+        const items = value.array.items;
+        const handles = try allocator.alloc([]u8, items.len);
+        var count: usize = 0;
+        errdefer {
+            for (handles[0..count]) |handle| allocator.free(handle);
+            allocator.free(handles);
+        }
+        for (items) |item| {
+            if (item != .string) return error.Protocol;
+            handles[count] = try allocator.dupe(u8, item.string);
+            count += 1;
+        }
+        return handles;
+    }
+
+    /// W3C POST /window: make another top-level window the current one.
+    pub fn switchToWindow(self: *WebDriverClient, handle: []const u8) !void {
+        const path = try self.sessionPath("/window");
+        defer self.allocator.free(path);
+        const body = try std.json.Stringify.valueAlloc(self.allocator, .{ .handle = handle }, .{});
+        defer self.allocator.free(body);
+        var parsed = try self.request(.POST, path, body);
+        parsed.deinit();
+    }
+
     /// GET /status; true when the driver reports it can accept new sessions.
     pub fn statusReady(self: *WebDriverClient) bool {
         var parsed = self.request(.GET, "/status", null) catch return false;
