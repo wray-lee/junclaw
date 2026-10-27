@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- `nullclaw update` now checks and downloads junclaw releases (`junclaw-*`
+  assets from `wray-lee/junclaw`) and, in a container, suggests
+  `docker pull ghcr.io/wray-lee/junclaw:latest`. It previously fetched
+  upstream nullclaw and replaced junclaw with it. Containers are now also
+  detected via `/.dockerenv`, since the junclaw image installs to
+  `/usr/local/bin`.
+
 ## 1.1.0 - 2026-10-27
 
 Browser release: two ways to give the agent a real browser, shipped as separate

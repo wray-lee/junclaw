@@ -319,7 +319,7 @@ If `status` returns component state successfully, runtime basics are ready.
 
 ## Upgrade and Uninstall
 
-> **`nullclaw update` is upstream-only.** It checks and installs upstream nullclaw releases and would replace this binary with upstream. To upgrade junclaw, download the new `junclaw-*` asset from [Releases](https://github.com/wray-lee/junclaw/releases/latest) and replace the binary (same commands as Option 1).
+> **Upgrading from 1.1.0 or earlier:** those builds' `nullclaw update` still fetches upstream nullclaw and would replace junclaw with it. Download the new `junclaw-*` asset from [Releases](https://github.com/wray-lee/junclaw/releases/latest) once and replace the binary (same commands as Option 1); later builds update from junclaw releases with `nullclaw update`.
 
 ### Release binary
 

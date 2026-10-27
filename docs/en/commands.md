@@ -86,7 +86,7 @@ This page groups the NullClaw CLI by task so you can find the right command quic
 | `nullclaw status [--json]` | Show overall system status or emit the machine-readable runtime snapshot |
 | `nullclaw doctor` | Run diagnostics |
 | `nullclaw update --check` | Check for updates without installing |
-| `nullclaw update --yes` | Install updates without prompting (currently fetches upstream nullclaw, not junclaw; upgrade junclaw from its release assets or image) |
+| `nullclaw update --yes` | Install updates without prompting (from junclaw releases; in Docker it prints the `docker pull` command) |
 | `nullclaw auth login openai-codex` | Authenticate `openai-codex` via OAuth device flow |
 | `nullclaw auth login openai-codex --import-codex` | Import auth from `~/.codex/auth.json` |
 | `nullclaw auth status openai-codex` | Show authentication state |

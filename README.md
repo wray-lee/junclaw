@@ -963,9 +963,9 @@ See [Gateway API docs](docs/en/gateway-api.md) for full A2A reference including 
 | `capabilities [--json]` | Show runtime capabilities manifest |
 | `auth login\|status\|logout` | Manage OAuth authentication |
 | `migrate openclaw [--dry-run] [--source PATH]` | Import memory + migrate config from OpenClaw |
-| `update [--check] [--yes]` | Check for and install updates (currently fetches upstream nullclaw, not junclaw; upgrade junclaw from its release assets or image) |
+| `update [--check] [--yes]` | Check for and install updates from junclaw releases |
 
-> **`update` is upstream-only:** `nullclaw update` checks and installs upstream nullclaw releases, replacing this binary with upstream and losing the dsh harness and browser images. To upgrade junclaw, install the new `junclaw-*` asset from [Releases](https://github.com/wray-lee/junclaw/releases/latest).
+> **Upgrading from 1.1.0 or earlier:** those builds' `nullclaw update` still fetches upstream nullclaw and would replace junclaw with it. Install the new `junclaw-*` asset from [Releases](https://github.com/wray-lee/junclaw/releases/latest) once; later builds update from junclaw releases.
 
 ## Development
 

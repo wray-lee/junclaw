@@ -313,7 +313,7 @@ nullclaw status
 
 ## 升级与卸载
 
-> **`nullclaw update` 只面向上游。** 它检查并安装上游 nullclaw 发布，会把当前二进制替换成上游。升级 junclaw 请从 [Releases](https://github.com/wray-lee/junclaw/releases/latest) 下载新的 `junclaw-*` 资产并替换二进制（命令同方式一）。
+> **从 1.1.0 及更早版本升级：** 这些版本的 `nullclaw update` 仍会拉取上游 nullclaw，把 junclaw 替换成上游。请先从 [Releases](https://github.com/wray-lee/junclaw/releases/latest) 下载新的 `junclaw-*` 资产手动替换一次（命令同方式一）；之后的版本 `nullclaw update` 会从 junclaw releases 更新。
 
 ### 发布二进制
 
