@@ -38,13 +38,48 @@ kill_tree() {
 ) </dev/null >/dev/null 2>&1 &
 watchdog_pid=$!
 
+# TEMPORARY hang diagnosis: macOS samples the running test binaries so a stalled
+# test leaves the blocking syscall in the log. Delete once the hang is fixed.
+sample_tests() {
+    local pid comm
+    for pid in $(pgrep -P "$zig_pid" 2>/dev/null); do
+        comm=$(ps -o comm= -p "$pid" 2>/dev/null) || continue
+        case "$comm" in
+            */test|test) sample "$pid" 1 -file "/tmp/ci-test-sample-${pid}.txt" >/dev/null 2>&1 || true ;;
+        esac
+    done
+}
+
+sampler_pid=""
+if [ "$(uname -s)" = "Darwin" ] && command -v sample >/dev/null 2>&1; then
+    rm -f /tmp/ci-test-sample-*.txt
+    (
+        while kill -0 "$zig_pid" 2>/dev/null; do
+            sample_tests
+            sleep 15
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    sampler_pid=$!
+fi
+
 wait "$zig_pid"
 status=$?
 kill "$watchdog_pid" 2>/dev/null
 wait "$watchdog_pid" 2>/dev/null
+if [ -n "$sampler_pid" ]; then
+    kill "$sampler_pid" 2>/dev/null
+    wait "$sampler_pid" 2>/dev/null
+fi
 if [ "$status" -eq 143 ] || [ "$status" -eq 137 ]; then
     echo "ci-test: the ${wall_clock}s wall-clock watchdog killed the test run" >&2
 elif [ "$status" -ne 0 ]; then
     echo "ci-test: zig build test exited with status ${status}" >&2
 fi
+# TEMPORARY hang diagnosis (paired with the sampler above).
+for sample_file in /tmp/ci-test-sample-*.txt; do
+    [ -f "$sample_file" ] || continue
+    echo "ci-test: last stack sample ${sample_file}" >&2
+    sed -n '1,120p' "$sample_file" >&2
+    rm -f "$sample_file"
+done
 exit "$status"
