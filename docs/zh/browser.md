@@ -68,6 +68,12 @@ services:
 相关的唯一集峰值 427–453 MiB，可用区间 1280–2048 MiB。请按 cgroup 用量而不是
 合计约 1.05 GiB 的 RSS 来定 `mem_limit`；后者会把共享页按进程重复计算。
 
+geckodriver 和 Firefox 不得比 agent 活得更久。容器内的首要保证是容器 PID 1
+随 agent 一同退出，容器内的进程随之全部结束；作为进程级兜底，Linux 和 macOS
+上由一小段 `sh` 包装进程在 agent 持有的管道到达 EOF 时杀掉 geckodriver 的进程
+组，即使 agent 被 OOM 杀掉或崩溃也会带走浏览器；Windows 上 geckodriver 运行在
+设置了 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 的 Job Object 中。
+
 浏览器不需要额外的 sidecar 或环境变量。需要 Node 22 和 dsh sidecar 时改用
 `full-dsh-browser`；`browser` 工具在 dsh 引擎下由同一套工具注册，因此两个
 变体的动作完全一致。

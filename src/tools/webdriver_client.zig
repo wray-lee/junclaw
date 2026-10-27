@@ -31,6 +31,10 @@ pub const WebDriverClient = struct {
     base_url: []u8,
     session_id: ?[]u8 = null,
     last_error: ?[]u8 = null,
+    /// `moz:profile` from the session capabilities, when the driver reports
+    /// it. The lifecycle compares it with our one-shot profile to prove the
+    /// session belongs to the process we spawned (F11).
+    last_profile: ?[]u8 = null,
     /// Set after a transport failure or a "session is gone" driver error.
     /// The lifecycle manager uses it to rebuild the session on the next call.
     stale: bool = false,
@@ -49,6 +53,7 @@ pub const WebDriverClient = struct {
     pub fn deinit(self: *WebDriverClient) void {
         if (self.session_id) |id| self.allocator.free(id);
         if (self.last_error) |msg| self.allocator.free(msg);
+        if (self.last_profile) |profile| self.allocator.free(profile);
         self.allocator.free(self.base_url);
         self.* = undefined;
     }
@@ -57,12 +62,21 @@ pub const WebDriverClient = struct {
         return self.session_id != null;
     }
 
+    /// `moz:profile` reported by the last successful newSession, if any.
+    pub fn lastProfile(self: *const WebDriverClient) ?[]const u8 {
+        return self.last_profile;
+    }
+
     pub fn lastErrorMessage(self: *const WebDriverClient) []const u8 {
         return self.last_error orelse "";
     }
 
     pub fn newSession(self: *WebDriverClient, options: SessionOptions) !void {
         if (self.session_id != null) return error.SessionAlreadyOpen;
+        if (self.last_profile) |profile| {
+            self.allocator.free(profile);
+            self.last_profile = null;
+        }
         var args_buf: [3][]const u8 = undefined;
         var arg_count: usize = 0;
         if (options.headless) {
@@ -91,6 +105,15 @@ pub const WebDriverClient = struct {
         const session_id = value.object.get("sessionId") orelse return error.Protocol;
         if (session_id != .string) return error.Protocol;
         self.session_id = try self.allocator.dupe(u8, session_id.string);
+        if (value.object.get("capabilities")) |capabilities| {
+            if (capabilities == .object) {
+                if (capabilities.object.get("moz:profile")) |profile| {
+                    if (profile == .string) {
+                        self.last_profile = try self.allocator.dupe(u8, profile.string);
+                    }
+                }
+            }
+        }
     }
 
     pub fn deleteSession(self: *WebDriverClient) !void {
@@ -434,6 +457,48 @@ test "client establishes and deletes a session" {
     try std.testing.expect(std.mem.indexOf(u8, server.requests[0].body, "\"browserName\":\"firefox\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, server.requests[0].body, "\"-headless\"") != null);
     try std.testing.expectEqualStrings("DELETE", server.requests[1].method);
+}
+
+test "client keeps the moz:profile capability for ownership checks" {
+    const fake = @import("webdriver_fake_server.zig");
+    const allocator = std.testing.allocator;
+
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"s\",\"capabilities\":{\"moz:profile\":\"/tmp/our-profile\"}}}" },
+        .{ .method = "DELETE", .path = "/session/s", .body = "{\"value\":null}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+
+    var client = try WebDriverClient.init(allocator, base_url);
+    defer client.deinit();
+    try client.newSession(.{ .profile_path = "/tmp/our-profile" });
+    try std.testing.expectEqualStrings("/tmp/our-profile", client.lastProfile().?);
+    try client.deleteSession();
+    server.stopAndJoin();
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+}
+
+test "client reports no moz:profile when the driver omits it" {
+    const fake = @import("webdriver_fake_server.zig");
+    const allocator = std.testing.allocator;
+
+    const routes = [_]fake.Route{
+        .{ .method = "POST", .path = "/session", .body = "{\"value\":{\"sessionId\":\"s\"}}" },
+    };
+    const server = try fake.Server.start(allocator, &routes);
+    defer server.deinit();
+    const base_url = try server.url(allocator);
+    defer allocator.free(base_url);
+
+    var client = try WebDriverClient.init(allocator, base_url);
+    defer client.deinit();
+    try client.newSession(.{});
+    try std.testing.expect(client.lastProfile() == null);
+    server.stopAndJoin();
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
 }
 
 test "client passes the one-shot profile to Firefox" {

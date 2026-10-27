@@ -404,6 +404,13 @@ pub fn makeDirAbsolute(absolute_path: []const u8) std.Io.Dir.CreateDirError!void
     try std.Io.Dir.createDirAbsolute(shared.io(), absolute_path, .default_dir);
 }
 
+/// POSIX mode bits for a directory; Windows has no equivalent (ACLs inherit).
+pub fn chmodAbsolute(absolute_path: []const u8, mode: File.Mode) !void {
+    var dir = try openDirAbsolute(absolute_path, .{});
+    defer dir.close();
+    try dir.toInner().setPermissions(shared.io(), permissionsFromMode(mode));
+}
+
 pub fn deleteFileAbsolute(absolute_path: []const u8) std.Io.Dir.DeleteFileError!void {
     try std.Io.Dir.deleteFileAbsolute(shared.io(), absolute_path);
 }

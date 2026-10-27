@@ -36,6 +36,20 @@ extern "kernel32" fn OpenProcess(
     inherit_handle: std.os.windows.BOOL,
     process_id: std.os.windows.DWORD,
 ) callconv(.winapi) ?std.os.windows.HANDLE;
+extern "kernel32" fn CreateJobObjectW(
+    attributes: ?*std.os.windows.SECURITY_ATTRIBUTES,
+    name: ?[*:0]const u16,
+) callconv(.winapi) ?std.os.windows.HANDLE;
+extern "kernel32" fn SetInformationJobObject(
+    job: std.os.windows.HANDLE,
+    info_class: std.os.windows.DWORD,
+    info: *const anyopaque,
+    info_length: std.os.windows.DWORD,
+) callconv(.winapi) std.os.windows.BOOL;
+extern "kernel32" fn AssignProcessToJobObject(
+    job: std.os.windows.HANDLE,
+    process: std.os.windows.HANDLE,
+) callconv(.winapi) std.os.windows.BOOL;
 
 const CP_UTF8: std.os.windows.UINT = 65001;
 const CP_GBK: std.os.windows.UINT = 936;
@@ -97,6 +111,97 @@ fn terminateWindowsProcessTreeByPid(pid: std.os.windows.DWORD) void {
         taskkill.create_no_window = true;
         _ = taskkill.spawnAndWait() catch null;
     } else |_| {}
+}
+
+/// Kill a child and every descendant. Windows has no process groups here, so
+/// `taskkill /T /F` is the fallback when the driver runs without a job object.
+pub fn terminateWindowsProcessTree(process: std.os.windows.HANDLE) void {
+    terminateWindowsProcessTreeByPid(GetProcessId(process));
+}
+
+pub fn processIdOf(process: std.os.windows.HANDLE) std.os.windows.DWORD {
+    return GetProcessId(process);
+}
+
+/// Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: when the last handle
+/// closes (including when the agent is killed), Windows terminates every
+/// process in the job, so geckodriver and Firefox cannot outlive the agent.
+pub const WindowsJob = if (builtin.os.tag == .windows) struct {
+    handle: std.os.windows.HANDLE,
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: std.os.windows.DWORD = 0x00002000;
+    const JobObjectExtendedLimitInformation: std.os.windows.DWORD = 9;
+
+    const BasicLimitInformation = extern struct {
+        per_process_user_time_limit: i64,
+        per_job_user_time_limit: i64,
+        limit_flags: std.os.windows.DWORD,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit: std.os.windows.DWORD,
+        affinity: usize,
+        priority_class: std.os.windows.DWORD,
+        scheduling_class: std.os.windows.DWORD,
+    };
+    const IoCounters = extern struct {
+        read_operation_count: u64,
+        write_operation_count: u64,
+        other_operation_count: u64,
+        read_transfer_count: u64,
+        write_transfer_count: u64,
+        other_transfer_count: u64,
+    };
+    const ExtendedLimitInformation = extern struct {
+        basic_limit_information: BasicLimitInformation,
+        io_info: IoCounters,
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_used: usize,
+        peak_job_memory_used: usize,
+    };
+
+    pub fn create() !WindowsJob {
+        const handle = CreateJobObjectW(null, null) orelse return error.JobCreateFailed;
+        errdefer std.os.windows.CloseHandle(handle);
+        var info: ExtendedLimitInformation = undefined;
+        @memset(std.mem.asBytes(&info), 0);
+        info.basic_limit_information.limit_flags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if (!SetInformationJobObject(
+            handle,
+            JobObjectExtendedLimitInformation,
+            @ptrCast(&info),
+            @sizeOf(ExtendedLimitInformation),
+        ).toBool()) return error.JobConfigureFailed;
+        return .{ .handle = handle };
+    }
+
+    /// The child must still be suspended: nothing of it runs before it is in
+    /// the job, so a crash right here cannot strand a browser.
+    pub fn assignProcess(self: *const WindowsJob, process: std.os.windows.HANDLE) !void {
+        if (!AssignProcessToJobObject(self.handle, process).toBool()) return error.JobAssignFailed;
+    }
+
+    /// Closing the last handle kills every process in the job.
+    pub fn close(self: *WindowsJob) void {
+        std.os.windows.CloseHandle(self.handle);
+    }
+} else struct {
+    pub fn create() !WindowsJob {
+        unreachable;
+    }
+    pub fn assignProcess(_: *const WindowsJob, _: std.os.windows.HANDLE) !void {
+        unreachable;
+    }
+    pub fn close(_: *WindowsJob) void {}
+};
+
+pub fn resumeSuspendedThread(thread_handle: std.os.windows.HANDLE) !void {
+    if (comptime builtin.os.tag != .windows) unreachable;
+    var previous_count: std.os.windows.ULONG = 0;
+    switch (std.os.windows.ntdll.NtResumeThread(thread_handle, &previous_count)) {
+        .SUCCESS => {},
+        else => return error.ResumeThreadFailed,
+    }
 }
 
 fn linuxProcessParentPid(allocator: std.mem.Allocator, pid: std.posix.pid_t) ?std.posix.pid_t {
@@ -236,7 +341,7 @@ fn processIsZombie(allocator: std.mem.Allocator, pid: std.posix.pid_t) bool {
     return content[close_idx + 2] == 'Z';
 }
 
-fn processExistsWindows(pid: std.os.windows.DWORD) bool {
+pub fn processExistsWindows(pid: std.os.windows.DWORD) bool {
     if (pid == 0) return false;
 
     const handle = OpenProcess(PROCESS_SYNCHRONIZE, .FALSE, pid) orelse return false;

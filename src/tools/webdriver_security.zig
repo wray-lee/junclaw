@@ -234,6 +234,14 @@ fn escapeUserJsPath(allocator: Allocator, path: []const u8) ![]u8 {
     return out;
 }
 
+/// F8: the profile holds cookies/logins and downloads receive page content, so
+/// both directories are owner-only. Windows has no POSIX mode bits; the
+/// profile lives under the per-user temp directory and inherits its ACL.
+fn restrictProfileDir(path: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    try compat.fs.chmodAbsolute(path, 0o700);
+}
+
 /// A throwaway Firefox profile. Never points at the host profile, so no host
 /// cookies or logins are loaded; `deinit` removes the whole tree.
 pub const Profile = struct {
@@ -255,10 +263,12 @@ pub const Profile = struct {
 
         try compat.fs.makeDirAbsolute(path);
         errdefer compat.fs.deleteTreeAbsolute(path) catch {};
+        try restrictProfileDir(path);
 
         const downloads = try compat.fs.path.join(allocator, &.{ path, "downloads" });
         defer allocator.free(downloads);
         try compat.fs.makeDirAbsolute(downloads);
+        try restrictProfileDir(downloads);
 
         const user_js = try userJsAlloc(allocator, proxy_port, downloads);
         defer allocator.free(user_js);
@@ -528,6 +538,23 @@ test "one-shot profile writes user.js prefs and is removed on deinit" {
     profile.deinit();
     alive = false;
     try std.testing.expectError(error.FileNotFound, compat.fs.accessAbsolute(profile_path, .{}));
+}
+
+test "one-shot profile and downloads directories are owner-only" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var profile = try Profile.create(allocator, null);
+    defer profile.deinit();
+
+    const downloads = try compat.fs.path.join(allocator, &.{ profile.path, "downloads" });
+    defer allocator.free(downloads);
+
+    // Regression: both directories used to be created with the default 0777
+    // minus umask, so other local users could read cookies and downloads.
+    const profile_stat = try compat.fs.Dir.cwd().statFile(profile.path);
+    try std.testing.expectEqual(@as(compat.fs.File.Mode, 0o700), profile_stat.mode & 0o777);
+    const downloads_stat = try compat.fs.Dir.cwd().statFile(downloads);
+    try std.testing.expectEqual(@as(compat.fs.File.Mode, 0o700), downloads_stat.mode & 0o777);
 }
 
 test "profile for an external WebDriver endpoint has no proxy prefs" {

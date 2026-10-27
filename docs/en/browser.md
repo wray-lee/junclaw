@@ -75,6 +75,14 @@ a 427–453 MiB OOM-relevant peak, with a practical range of 1280–2048 MiB. Si
 from cgroup usage, not from the ~1.05 GiB summed RSS, which counts shared pages
 once per process.
 
+geckodriver and Firefox must not outlive the agent. In a container the primary
+guarantee is container PID 1 exiting together with the agent, which stops
+everything in it. As a per-process backstop, on Linux and macOS a small `sh`
+wrapper kills geckodriver's process group when the pipe held by the agent
+reaches EOF, so an OOM-killed or crashed agent still takes the browser down; on
+Windows geckodriver runs in a Job Object with
+`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`.
+
 The browser needs no extra sidecar or environment variable. Use
 `full-dsh-browser` when you also want Node 22 and the dsh sidecar; the `browser`
 tool is registered through the same tool set under the dsh harness, so its
