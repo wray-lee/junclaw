@@ -38,6 +38,7 @@ const native_prompt = @import("../../agent/prompt.zig");
 const bootstrap_mod = @import("../../bootstrap/root.zig");
 const providers = @import("../../providers/root.zig");
 const provider_helpers = @import("../../providers/helpers.zig");
+const redaction = @import("../../redaction.zig");
 const http_util = @import("../../http_util.zig");
 const config_types = @import("../../config_types.zig");
 const memory_mod = @import("../../memory/root.zig");
@@ -109,6 +110,11 @@ pub const Options = struct {
     bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
     /// Native identity config (AIEOS); disabled by default like native.
     identity_config: ?config_types.IdentityConfig = null,
+    /// junclaw PII redactor (`agent.enable_pii_redaction`, default on). Null
+    /// disables redaction. Provider-bound messages, every message the JSONL
+    /// log stores, and tool output are redacted, the same boundaries native
+    /// redacts; the host rehydrates placeholders for allowed displays.
+    redactor: ?*redaction.Redactor = null,
     /// Test seam: the captured dsh fixtures ran without the runtime-context
     /// and agent-instructions plugins, so replaying them must not inject the
     /// pre-step context messages that a production session carries.
@@ -374,11 +380,49 @@ pub const DshNativeHarness = struct {
 
     fn appendEvent(self: *Self, event_type: []const u8, data: Value, surface_op: ?types.SurfaceOp, seqs: ?[]const u64) !u64 {
         const log = if (self.log) |*value| value else return error.NoSession;
+        // The JSONL is disk state native keeps redacted (turn persistence and
+        // every append site); walk the payload so auxiliary copies (stream
+        // chunks, tool-call arguments, summaries) carry no raw PII either.
+        if (self.opts.redactor != null) {
+            var redactable = data;
+            try self.redactEventData(self.arena.allocator(), &redactable);
+        }
         return log.append(event_type, data, .{
             .time_ms = self.now(),
             .surface_op = surface_op,
             .source_event_seqs = seqs,
         });
+    }
+
+    fn redactEventData(self: *Self, allocator: Allocator, value: *Value) !void {
+        switch (value.*) {
+            .object => |*object| {
+                var entries = object.iterator();
+                while (entries.next()) |entry| {
+                    if (redactedField(entry.key_ptr.*)) {
+                        switch (entry.value_ptr.*) {
+                            .string => |text| entry.value_ptr.* = .{ .string = try self.redactText(allocator, text) },
+                            .array => |*items| for (items.items) |*item| {
+                                if (item.* == .string) item.* = .{ .string = try self.redactText(allocator, item.string) };
+                            },
+                            else => {},
+                        }
+                        continue;
+                    }
+                    try self.redactEventData(allocator, entry.value_ptr);
+                }
+            },
+            .array => |*items| for (items.items) |*item| try self.redactEventData(allocator, item),
+            else => {},
+        }
+    }
+
+    /// dsh event fields that carry human/model text (content blocks, tool
+    /// arguments, stream runs); structural fields (ids, names, paths) stay.
+    fn redactedField(key: []const u8) bool {
+        const fields = [_][]const u8{ "text", "arguments", "argumentsDelta", "texts", "args" };
+        for (fields) |field| if (std.mem.eql(u8, key, field)) return true;
+        return false;
     }
 
     fn buildTools(self: *Self) !void {
@@ -1361,7 +1405,7 @@ pub const DshNativeHarness = struct {
             .has_own_autonomy = false,
             .queue_mode = .steer,
             .reasoning_mode = self.opts.reasoning_mode,
-            .redactor = null,
+            .redactor = self.opts.redactor,
             .harness_kind = .dsh,
             .owns_inbox = true,
             .supports_commands = false,
@@ -1584,7 +1628,7 @@ pub const DshNativeHarness = struct {
         const arena = self.arena.allocator();
         // dsh stores `user/message` with the message at the top level of
         // `data` (no inner `message` key); `surface.fold` reads it that way.
-        const data = try parseValue(arena, message.json);
+        var data = try parseValue(arena, message.json);
         // Fold before logging: a goal round the projection rejects (stale
         // revision, wrong phase) must not leave a user/message the log can
         // never replay.
@@ -1611,6 +1655,8 @@ pub const DshNativeHarness = struct {
                 tools.authority = .{};
             }
         }
+        // PII never reaches the JSONL or the model surface.
+        data = try self.redactUserMessageData(arena, data);
         const surface_op = message.surface_op orelse .append;
         const seq = try self.appendEvent("user/message", data, surface_op, message.source_event_seqs);
         const projected = try surface_mod.messageFromEvent(arena, .{
@@ -1681,8 +1727,11 @@ pub const DshNativeHarness = struct {
         is_attempt: bool,
     ) !u64 {
         const arena = self.arena.allocator();
+        // PII never reaches the JSONL, the surface or the host sink.
+        var message = settlement.message;
+        message.content = try self.redactContent(arena, message.content);
         var data = try objectWithPosition(arena, position, 0, 0);
-        try data.put(arena, "message", try messageValue(arena, settlement.message));
+        try data.put(arena, "message", try messageValue(arena, message));
         if (settlement.usage) |usage| try data.put(arena, "usage", try usageValue(arena, usage));
         try data.put(arena, "stream", try streamValue(arena, settlement.stream));
         if (settlement.interrupted) try data.put(arena, "interrupted", .{ .bool = true });
@@ -1694,23 +1743,23 @@ pub const DshNativeHarness = struct {
         const seq = try self.appendEvent("assistant/message", .{ .object = data }, .append, null);
 
         // The host renders the turn's whole text; the log keeps every segment.
-        const text = try textOf(arena, settlement.message.content);
+        const text = try textOf(arena, message.content);
         try self.turn_text.appendSlice(self.allocator, text);
         // `.on` renders the last response's reasoning as a post-turn block,
         // like native's `composeFinalReply`; copy it out of the step arena.
         if (self.opts.reasoning_mode == .on) {
             self.turn_reasoning.clearRetainingCapacity();
-            for (settlement.message.content) |block| switch (block) {
+            for (message.content) |block| switch (block) {
                 .reasoning => |trace| try self.turn_reasoning.appendSlice(self.allocator, trace),
                 else => {},
             };
         }
-        if (countToolCalls(settlement.message.content) == 0) self.last_assistant_text = text;
+        if (countToolCalls(message.content) == 0) self.last_assistant_text = text;
         if (self.sink) |sink| {
             if (text.len > 0) sink.send(.{ .assistant_message = .{ .text = text } });
         }
         // The kernel's accumulator arena dies at step end: copy first.
-        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, settlement.message));
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, message));
         if (settlement.usage) |usage| {
             self.total_tokens += usage.input_tokens + usage.output_tokens;
             // The host's ledger wants one record per model call, like the
@@ -1783,10 +1832,11 @@ pub const DshNativeHarness = struct {
         _ = self.pending_calls.orderedRemove(0);
         defer self.freePendingCall(call);
 
+        const safe_result = try self.sanitizeToolResult(arena, result);
         const message = types.Message{
             .id = try self.nextMessageId(),
             .role = .tool,
-            .content = result.content(),
+            .content = safe_result.content(),
             .source = .{ .tool = .{ .call_id = try arena.dupe(u8, call.call.id) } },
             .tool_call_id = try arena.dupe(u8, call.call.id),
             .is_error = result.isError(),
@@ -1813,7 +1863,7 @@ pub const DshNativeHarness = struct {
             sink.send(.{ .tool_result = .{
                 .call_id = call.call.id,
                 .name = call.call.name,
-                .output = try toolOutputText(arena, result),
+                .output = try toolOutputText(arena, safe_result),
                 .is_error = result.isError(),
             } });
             sink.send(.{ .progress = .{
@@ -1837,11 +1887,13 @@ pub const DshNativeHarness = struct {
     /// the user-visible error and must not receive the marker as a reply.
     fn appendAssistantCloser(self: *Self, position: loop_mod.Position, message: types.Message) !u64 {
         const arena = self.arena.allocator();
+        var safe_message = message;
+        safe_message.content = try self.redactContent(arena, safe_message.content);
         var data = try objectWithPosition(arena, position, 0, 0);
-        try data.put(arena, "message", try messageValue(arena, message));
+        try data.put(arena, "message", try messageValue(arena, safe_message));
         try data.put(arena, "stream", try streamValue(arena, &.{}));
         const seq = try self.appendEvent("assistant/message", .{ .object = data }, .append, null);
-        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, message));
+        try self.addSurfaceSnapshot(arena, seq, try cloneMessage(arena, safe_message));
         return seq;
     }
 
@@ -2062,7 +2114,7 @@ pub const DshNativeHarness = struct {
         self.streamed_live = false;
 
         const arena = self.call_arena.allocator();
-        const messages = try requestsFromMessages(arena, self.messages.items);
+        const messages = try self.requestsFromMessages(arena, self.messages.items);
         const chat = providers.ChatRequest{
             .messages = messages,
             .model = self.opts.model,
@@ -2555,18 +2607,92 @@ pub const DshNativeHarness = struct {
         response.reasoning_content = null;
     }
 
+    /// Redact one text at a model/disk boundary; a null redactor passes through.
+    fn redactText(self: *Self, allocator: Allocator, text: []const u8) ![]const u8 {
+        const r = self.opts.redactor orelse return text;
+        return r.redact(allocator, text);
+    }
+
+    /// Redacted copy of the text blocks; image and reasoning payloads pass
+    /// through untouched.
+    fn redactContent(self: *Self, allocator: Allocator, content: []const types.ContentBlock) ![]const types.ContentBlock {
+        if (self.opts.redactor == null) return content;
+        const out = try allocator.alloc(types.ContentBlock, content.len);
+        for (content, 0..) |block, index| {
+            out[index] = block;
+            switch (block) {
+                .text => |text| out[index] = .{ .text = try self.redactText(allocator, text) },
+                else => {},
+            }
+        }
+        return out;
+    }
+
+    /// Native scrubs secret patterns out of every tool result before it enters
+    /// history and then applies the PII redactor; mirror both so the
+    /// model-facing text, the JSONL and the sink all see the same bytes.
+    fn sanitizeToolResult(self: *Self, allocator: Allocator, result: registry.ToolResult) !registry.ToolResult {
+        return switch (result) {
+            .success => |success| .{ .success = .{
+                .content = try self.sanitizeToolContent(allocator, success.content),
+                .meta = success.meta,
+                .additional_contexts = success.additional_contexts,
+                .concludes_turn = success.concludes_turn,
+                .replaces_selected_content = success.replaces_selected_content,
+            } },
+            .failure => |failure| .{ .failure = .{
+                .error_info = failure.error_info,
+                .content = try self.sanitizeToolContent(allocator, failure.content),
+                .meta = failure.meta,
+                .additional_contexts = failure.additional_contexts,
+                .replaces_selected_content = failure.replaces_selected_content,
+            } },
+        };
+    }
+
+    fn sanitizeToolContent(self: *Self, allocator: Allocator, content: []const types.ContentBlock) ![]const types.ContentBlock {
+        const out = try allocator.alloc(types.ContentBlock, content.len);
+        for (content, 0..) |block, index| {
+            out[index] = block;
+            switch (block) {
+                .text => |text| {
+                    const scrubbed = try providers.scrubSecretPatterns(allocator, text);
+                    out[index] = .{ .text = try self.redactText(allocator, scrubbed) };
+                },
+                else => {},
+            }
+        }
+        return out;
+    }
+
+    /// Redact the text blocks of a dsh user/message payload before it is
+    /// logged and folded into the surface. Structural fields stay untouched.
+    fn redactUserMessageData(self: *Self, allocator: Allocator, data: Value) !Value {
+        if (self.opts.redactor == null or data != .object) return data;
+        const content = data.object.getPtr("content") orelse return data;
+        if (content.* != .array) return data;
+        for (content.array.items) |*item| {
+            if (item.* != .object) continue;
+            const text = item.object.getPtr("text") orelse continue;
+            if (text.* != .string) continue;
+            text.* = .{ .string = try self.redactText(allocator, text.string) };
+        }
+        return data;
+    }
+
     /// Surface items -> provider messages. Assistant tool calls are rendered as
     /// the native harness's `<tool_call>` text and tool results as the
     /// `[Tool results]` user message, because `ChatMessage` cannot carry an
-    /// assistant `tool_calls` array.
-    fn requestsFromMessages(allocator: Allocator, messages: []const types.Message) ![]providers.ChatMessage {
+    /// assistant `tool_calls` array. Every text is redacted: this is the
+    /// provider boundary native redacts in `redactMessagesForProvider`.
+    fn requestsFromMessages(self: *Self, allocator: Allocator, messages: []const types.Message) ![]providers.ChatMessage {
         var out: std.ArrayListUnmanaged(providers.ChatMessage) = .empty;
         for (messages, 0..) |message, index| {
             switch (message.role) {
                 .system => {
                     // Every turn logs its own system message; the provider
                     // gets one, and only when it differs from the last one.
-                    const text = try textOf(allocator, message.content);
+                    const text = try self.redactText(allocator, try textOf(allocator, message.content));
                     if (index > 0 and messages[index - 1].role == .system) {
                         const previous = out.items[out.items.len - 1];
                         if (previous.role == .system and std.mem.eql(u8, previous.content, text)) continue;
@@ -2575,16 +2701,16 @@ pub const DshNativeHarness = struct {
                 },
                 .developer, .user => try out.append(allocator, .{
                     .role = .user,
-                    .content = try textOf(allocator, message.content),
+                    .content = try self.redactText(allocator, try textOf(allocator, message.content)),
                 }),
                 .assistant => {
-                    const text = try assistantHistoryText(allocator, message.content);
+                    const text = try self.redactText(allocator, try assistantHistoryText(allocator, message.content));
                     if (text.len == 0) continue;
                     try out.append(allocator, .{ .role = .assistant, .content = text });
                 },
                 .tool => {
                     const name = toolNameFor(messages, message.tool_call_id);
-                    const body = try textOf(allocator, message.content);
+                    const body = try self.redactText(allocator, try textOf(allocator, message.content));
                     const rendered = try std.fmt.allocPrint(
                         allocator,
                         "[Tool results]\n<tool_result name=\"{s}\" status=\"{s}\">\n{s}\n</tool_result>\n",
@@ -3199,7 +3325,7 @@ pub const DshNativeHarness = struct {
         input: compaction_mod.SummaryInput,
     ) anyerror!compaction_mod.SummaryOutput {
         const self = selfOf(context_ptr.?);
-        const messages = try requestsFromMessages(allocator, input.messages);
+        const messages = try self.requestsFromMessages(allocator, input.messages);
         const chat = providers.ChatRequest{
             .messages = messages,
             .model = self.opts.model,

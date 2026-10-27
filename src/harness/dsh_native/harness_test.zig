@@ -10,6 +10,7 @@ const compat = @import("compat");
 const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
+const redaction = @import("../../redaction.zig");
 const http_util = @import("../../http_util.zig");
 const port = @import("../port.zig");
 const native_prompt = @import("../../agent/prompt.zig");
@@ -505,6 +506,7 @@ const Fixture = struct {
     question_timeout_s: i32 = 120,
     host_tools: []const bridge.HostTool = &.{},
     host_executor: ?bridge.HostExecutor = null,
+    redactor: ?*redaction.Redactor = null,
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
     policy: ?*const SecurityPolicy = null,
     allowed_paths: []const []const u8 = &.{},
@@ -570,6 +572,7 @@ const Fixture = struct {
             .question_timeout_s = self.question_timeout_s,
             .host_tools = self.host_tools,
             .host_executor = self.host_executor,
+            .redactor = self.redactor,
             .tool_filter_groups = self.tool_filter_groups,
             .policy = self.policy,
             .allowed_paths = self.allowed_paths,
@@ -3278,6 +3281,8 @@ test "dsh-native adapter: runtime context is a pre-step user message" {
 
     try testing.expect(requestContains(fx.provider.requests.items[0], "Persona baseline"));
     try testing.expect(requestContains(fx.provider.requests.items[0], "Current Date & Time"));
+    try testing.expect(requestContains(fx.provider.requests.items[0], "## Safety"));
+    try testing.expect(requestContains(fx.provider.requests.items[0], "Do not exfiltrate private data."));
 }
 
 test "dsh-native adapter: attachment markers in the final reply reach the host" {
@@ -5428,4 +5433,64 @@ test "dsh-native adapter: a truncated streamed response discards its text call" 
     try testing.expect(!contains(result.reply, "<tool_call>"));
     try testing.expect(contains(result.reply, "before"));
     try testing.expect(contains(result.reply, "after"));
+}
+
+// Regression: dsh used to bypass junclaw's default-on PII redaction and
+// secret scrub, so emails and API keys reached the provider and the JSONL raw.
+test "dsh-native adapter: PII redaction and secret scrub cover provider, log and tool output" {
+    const allocator = testing.allocator;
+    const email = "user@example.com";
+    const secret = "sk-1234567890abcdef";
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+
+    var fake = BridgeFake{ .output = "api_key=" ++ secret ++ " owner " ++ email };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "web_search", .arguments = "{\"query\":\"x\"}" }} },
+        // The model echoes the address back, so the stream copy matters too.
+        .{ .text = "done " ++ email },
+    });
+    defer fx.deinit();
+    fx.redactor = &redactor;
+    fx.host_tools = &.{.{
+        .name = "web_search",
+        .description = "Search the web for pages",
+        .input_schema_json = "{\"type\":\"object\"}",
+        .concurrency_safe = true,
+    }};
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    // Native parity: the host reads the same redactor through port.Info.
+    try testing.expectEqual(@as(?*redaction.Redactor, &redactor), h.info().redactor);
+
+    const result = try h.runTurn(turnInput("mail me at " ++ email));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done [EMAIL_1]", result.reply);
+
+    // The user email is redacted before the first provider call.
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(!requestContains(fx.provider.requests.items[0], email));
+    try testing.expect(requestContains(fx.provider.requests.items[0], "[EMAIL_1]"));
+
+    // The tool result reaches the second call with neither the key nor the
+    // email in the clear.
+    for (fx.provider.requests.items[1].contents) |content| {
+        try testing.expect(std.mem.indexOf(u8, content, email) == null);
+        try testing.expect(std.mem.indexOf(u8, content, secret) == null);
+    }
+    try testing.expect(requestContains(fx.provider.requests.items[1], "[REDACTED]"));
+    try testing.expect(requestContains(fx.provider.requests.items[1], "[EMAIL_1]"));
+
+    // The dsh JSONL only ever stores the redacted/scrubbed text.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    const log_text = try readLogText(allocator, path);
+    defer allocator.free(log_text);
+    try testing.expect(std.mem.indexOf(u8, log_text, email) == null);
+    try testing.expect(std.mem.indexOf(u8, log_text, secret) == null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "[EMAIL_1]") != null);
+    try testing.expect(std.mem.indexOf(u8, log_text, "[REDACTED]") != null);
 }

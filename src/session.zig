@@ -175,6 +175,9 @@ const DshNativeState = struct {
             .timezone = config.agent.timezone,
             .bootstrap_provider = session.agent.bootstrap,
             .identity_config = config.identity,
+            // Default-on PII redaction applies to the dsh engine exactly as it
+            // does to native (provider text, JSONL, tool output).
+            .redactor = session.agent.redactor,
             .approval_policy = config.agent.dsh_approval_policy,
             .sandbox = config.agent.dsh_sandbox,
             // The dsh tools must never be wider than the native ones: same
@@ -241,7 +244,11 @@ fn hostToolCall(
     const agent: *Agent = @ptrCast(@alignCast(context));
     const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
     const outcome = agent.executeHostTool(allocator, name, args_json);
-    return .{ .success = outcome.success, .output = outcome.output };
+    // The dsh bridge spills this text verbatim to disk; native never persists
+    // raw tool output, so scrub secrets (and PII when enabled) before retain.
+    const scrubbed = try providers.scrubSecretPatterns(allocator, outcome.output);
+    const output = if (agent.redactor) |r| try r.redact(allocator, scrubbed) else scrubbed;
+    return .{ .success = outcome.success, .output = output };
 }
 
 /// Test seam: point session-created dsh harnesses at an in-process mock
