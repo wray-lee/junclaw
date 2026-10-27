@@ -334,7 +334,10 @@ pub const WebDriverManager = struct {
                     self.options.geckodriver_path,
                     @errorName(err),
                 });
-                return err;
+                // POSIX spawns geckodriver under a `/bin/sh` wrapper, so a
+                // missing binary only surfaces after the readiness retries;
+                // Windows spawns it directly and must report the same error.
+                return error.DriverStartFailed;
             };
             var accepted = false;
             defer if (!accepted) driver.deinit();
@@ -1229,6 +1232,8 @@ test "manager reports a missing geckodriver clearly" {
     });
     defer manager.deinit();
 
+    // Regression: Windows returned error.FileNotFound straight from
+    // Child.spawn instead of the manager's DriverStartFailed.
     try std.testing.expectError(error.DriverStartFailed, manager.acquire());
     try std.testing.expect(std.mem.indexOf(u8, manager.lastErrorMessage(), "geckodriver") != null);
     // Regression: the proxy starts before geckodriver, so this failure path
