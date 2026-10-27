@@ -3185,6 +3185,67 @@ test "dsh-native adapter: bash creates dsh_home/spill before spawning" {
     try testing.expect(saw_result);
 }
 
+test "dsh-native adapter: a >64KB bash spill is scrubbed and redacted" {
+    // Regression: the bash tool writes the full stream to dsh_home/spill
+    // before appendToolResult sanitizes the 64KB model-facing tail, so PII at
+    // the start of a long output stayed in plaintext in the spill file.
+    const builtin = @import("builtin");
+    const allocator = testing.allocator;
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "bash",
+            .arguments = "{\"description\":\"spill pii\",\"command\":\"cat big-output.txt\"}",
+        }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.redactor = &redactor;
+
+    // `cat` is on the default command allowlist; the secret and address sit in
+    // the part of the output the model-facing 64KB tail drops.
+    {
+        const output_path = try std.fs.path.join(allocator, &.{ fx.workspace, "big-output.txt" });
+        defer allocator.free(output_path);
+        const file = try fs_compat.createPath(output_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("API_KEY=sk-live0123456789abcdef\nmail alice@example.com\n");
+        const filler = try allocator.alloc(u8, 70_000);
+        defer allocator.free(filler);
+        @memset(filler, 'x');
+        try file.writeAll(filler);
+    }
+
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // POSIX sh -c execution
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("spill it"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    const spill = try std.fs.path.join(allocator, &.{ fx.dsh_home, "spill" });
+    defer allocator.free(spill);
+    var dir = try fs_compat.openDirPath(spill, .{ .iterate = true });
+    defer dir.close();
+    var iterator = dir.iterate();
+    var saw_spill = false;
+    while (try iterator.next()) |entry| {
+        if (!std.mem.startsWith(u8, entry.name, "dsh-bash-")) continue;
+        const spill_path = try std.fs.path.join(allocator, &.{ spill, entry.name });
+        defer allocator.free(spill_path);
+        const content = try fs_compat.readFileAlloc(compat.fs.cwd(), allocator, spill_path, 1 << 20);
+        defer allocator.free(content);
+        try testing.expect(content.len >= 70_000);
+        try testing.expect(std.mem.indexOf(u8, content, "alice@example.com") == null);
+        try testing.expect(std.mem.indexOf(u8, content, "sk-live0123456789abcdef") == null);
+        try testing.expect(std.mem.indexOf(u8, content, "[EMAIL_1]") != null);
+        saw_spill = true;
+    }
+    try testing.expect(saw_spill);
+}
+
 test "dsh-native adapter: read-only autonomy denies dsh tool calls" {
     const allocator = testing.allocator;
     const policy = SecurityPolicy{ .autonomy = .read_only };

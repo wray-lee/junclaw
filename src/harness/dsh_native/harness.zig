@@ -1806,12 +1806,14 @@ pub const DshNativeHarness = struct {
             .content = safe_result.content(),
             .source = .{ .tool = .{ .call_id = try arena.dupe(u8, call.call.id) } },
             .tool_call_id = try arena.dupe(u8, call.call.id),
-            .is_error = result.isError(),
+            .is_error = safe_result.isError(),
         };
         var data = try objectWithPosition(arena, position, 0, 0);
         try data.put(arena, "message", try messageValue(arena, message));
-        switch (result) {
-            .success => |success| if (success.meta) |meta| try data.put(arena, "meta", try cloneValue(arena, meta)),
+        // The log copy must be the sanitized one: `meta` carries the bash
+        // stdout/stderr tails and `error.reason` the raw failure detail.
+        switch (safe_result) {
+            .success => |success| if (success.meta) |meta| try data.put(arena, "meta", meta),
             .failure => |failure| {
                 var error_object: std.json.ObjectMap = .empty;
                 try error_object.put(arena, "name", .{ .string = failure.error_info.name });
@@ -1820,7 +1822,7 @@ pub const DshNativeHarness = struct {
                     try error_object.put(arena, "reason", .{ .string = reason });
                 }
                 try data.put(arena, "error", .{ .object = error_object });
-                if (failure.meta) |meta| try data.put(arena, "meta", try cloneValue(arena, meta));
+                if (failure.meta) |meta| try data.put(arena, "meta", meta);
             },
         }
         const seqs = [1]u64{call.seq};
@@ -2597,24 +2599,37 @@ pub const DshNativeHarness = struct {
 
     /// Native scrubs secret patterns out of every tool result before it enters
     /// history and then applies the PII redactor; mirror both so the
-    /// model-facing text, the JSONL and the sink all see the same bytes.
+    /// model-facing text, the JSONL, the sink and any bash spill file all see
+    /// the same bytes.
     fn sanitizeToolResult(self: *Self, allocator: Allocator, result: registry.ToolResult) !registry.ToolResult {
         return switch (result) {
             .success => |success| .{ .success = .{
                 .content = try self.sanitizeToolContent(allocator, success.content),
-                .meta = success.meta,
+                .meta = try self.sanitizeToolMeta(allocator, success.meta),
                 .additional_contexts = success.additional_contexts,
                 .concludes_turn = success.concludes_turn,
                 .replaces_selected_content = success.replaces_selected_content,
             } },
             .failure => |failure| .{ .failure = .{
-                .error_info = failure.error_info,
+                .error_info = .{
+                    .name = failure.error_info.name,
+                    .code = failure.error_info.code,
+                    .reason = if (failure.error_info.reason) |reason|
+                        try self.sanitizeToolText(allocator, reason)
+                    else
+                        null,
+                },
                 .content = try self.sanitizeToolContent(allocator, failure.content),
-                .meta = failure.meta,
+                .meta = try self.sanitizeToolMeta(allocator, failure.meta),
                 .additional_contexts = failure.additional_contexts,
                 .replaces_selected_content = failure.replaces_selected_content,
             } },
         };
+    }
+
+    fn sanitizeToolText(self: *Self, allocator: Allocator, text: []const u8) ![]const u8 {
+        const scrubbed = try providers.scrubSecretPatterns(allocator, text);
+        return self.redactText(allocator, scrubbed);
     }
 
     fn sanitizeToolContent(self: *Self, allocator: Allocator, content: []const types.ContentBlock) ![]const types.ContentBlock {
@@ -2622,14 +2637,42 @@ pub const DshNativeHarness = struct {
         for (content, 0..) |block, index| {
             out[index] = block;
             switch (block) {
-                .text => |text| {
-                    const scrubbed = try providers.scrubSecretPatterns(allocator, text);
-                    out[index] = .{ .text = try self.redactText(allocator, scrubbed) };
-                },
+                .text => |text| out[index] = .{ .text = try self.sanitizeToolText(allocator, text) },
                 else => {},
             }
         }
         return out;
+    }
+
+    /// `meta` is logged as-is and carries the bash stdout/stderr tails, so it
+    /// needs the same treatment as content. A `spillPath` value points at the
+    /// full stream the bash tool already wrote to disk; rewrite that file
+    /// instead of redacting the path itself.
+    fn sanitizeToolMeta(self: *Self, allocator: Allocator, meta: ?Value) !?Value {
+        const value = meta orelse return null;
+        var copy = try cloneValue(allocator, value);
+        try self.sanitizeMetaValue(allocator, &copy);
+        return copy;
+    }
+
+    fn sanitizeMetaValue(self: *Self, allocator: Allocator, value: *Value) !void {
+        switch (value.*) {
+            .object => |*object| {
+                var entries = object.iterator();
+                while (entries.next()) |entry| {
+                    if (std.mem.eql(u8, entry.key_ptr.*, "spillPath")) {
+                        if (entry.value_ptr.* == .string) {
+                            try scrubSpillFile(allocator, self.opts.redactor, entry.value_ptr.string);
+                        }
+                        continue;
+                    }
+                    try self.sanitizeMetaValue(allocator, entry.value_ptr);
+                }
+            },
+            .array => |*items| for (items.items) |*item| try self.sanitizeMetaValue(allocator, item),
+            .string => |text| value.* = .{ .string = try self.sanitizeToolText(allocator, text) },
+            else => {},
+        }
     }
 
     /// Redact the text blocks of a dsh user/message payload before it is
@@ -3962,6 +4005,32 @@ fn providerCallsFromText(
     return calls;
 }
 
+/// The bash tool streams the full output into a spill file (up to 64 MiB)
+/// before the harness sees the result, so the on-disk copy needs the same
+/// scrub/redaction as the model-facing tail. Paths come from tool meta
+/// (`stdout.spillPath` / `stderr.spillPath`).
+fn scrubSpillFile(
+    allocator: Allocator,
+    redactor: ?*redaction.Redactor,
+    path: []const u8,
+) !void {
+    // bash caps spills at max_spill_bytes (64 MiB); +1 so an over-cap file
+    // errors instead of being truncated into an inconsistent rewrite.
+    const raw = fs_compat.readFileAlloc(compat.fs.cwd(), allocator, path, 64 * 1024 * 1024 + 1) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer allocator.free(raw);
+    const scrubbed = try providers.scrubSecretPatterns(allocator, raw);
+    defer allocator.free(scrubbed);
+    const clean = if (redactor) |r| try r.redact(allocator, scrubbed) else scrubbed;
+    defer if (redactor != null) allocator.free(clean);
+    if (std.mem.eql(u8, clean, raw)) return;
+    const file = try fs_compat.createPath(path, .{ .truncate = true });
+    defer file.close();
+    try file.writeAll(clean);
+}
+
 /// Lowercase hex of an instruction-baseline identity, as dsh stores it in
 /// `source.baselineIdentity`.
 fn identityHex(identity: [32]u8) [64]u8 {
@@ -4479,4 +4548,40 @@ test "dsh-native harness: a seeded log without end-seed resumes the import" {
         .text => |text| text,
         else => return error.InvalidSeedMessage,
     });
+}
+
+test "dsh-native harness: a spill file is scrubbed and redacted in place" {
+    // Regression: the bash spill is written before sanitizeToolResult runs, so
+    // the on-disk copy kept raw secrets and PII that never reached the model.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(dir);
+    const path = try std.fs.path.join(allocator, &.{ dir, "dsh-bash-test.log" });
+    defer allocator.free(path);
+
+    var content: std.ArrayListUnmanaged(u8) = .empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "API_KEY=sk-live0123456789abcdef\nmail alice@example.com\n");
+    const filler = try allocator.alloc(u8, 70_000);
+    defer allocator.free(filler);
+    @memset(filler, 'x');
+    try content.appendSlice(allocator, filler);
+    {
+        const file = try fs_compat.createPath(path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(content.items);
+    }
+
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+    try scrubSpillFile(allocator, &redactor, path);
+
+    const after = try fs_compat.readFileAlloc(compat.fs.cwd(), allocator, path, 1 << 20);
+    defer allocator.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "sk-live0123456789abcdef") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, after, "[EMAIL_1]") != null);
+    try std.testing.expect(std.mem.endsWith(u8, after, "xxx"));
 }
