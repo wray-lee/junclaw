@@ -13,6 +13,27 @@
   This changes global behavior for `web_fetch`, `http_request`, the WebDriver
   browser backend and remote provider request pinning; domains such as
   `1e100.net` and `08.com` are still treated as domains.
+- WebDriver browser sessions now force every HTTP(S) request through an
+  in-process filtering CONNECT proxy on a kernel-assigned loopback port.
+  Redirects, subresources, new windows and form submissions are checked at the
+  proxy; each host is resolved once, every address is screened with the SSRF
+  rules (allowlisted hosts keep the operator-trusted private-address
+  exception) and the connection is pinned to a checked address, closing DNS
+  rebinding between the check and the connect. A proxy start failure fails the
+  session (no direct fallback or escape-hatch switch), and extra windows are
+  closed after each action.
+- WebDriver Firefox profiles now disable DoH/TRR, DNS prefetch,
+  speculative/preconnect/predictor connections, HTTP/3, Alt-Svc and WebRTC,
+  and turn off Safe Browsing, OCSP, Remote Settings, telemetry and update
+  endpoints, so browser-initiated traffic cannot bypass the proxy.
+- geckodriver and Firefox no longer outlive the agent: on POSIX a watchdog
+  kills the driver's process group when the agent's pipe closes, and Windows
+  uses a Job Object with `KILL_ON_JOB_CLOSE`. The one-shot profile and its
+  `downloads` directory are `0700` on POSIX.
+- A WebDriver endpoint is accepted only when it is the child junclaw started:
+  the kernel-assigned port, the `Listening on` banner from our own stderr, a
+  live child and the matching `moz:profile` must all agree; otherwise junclaw
+  retries on a fresh port and then fails closed.
 
 ## 1.1.0 - 2026-10-27
 
