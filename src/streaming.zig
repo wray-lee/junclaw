@@ -1789,8 +1789,23 @@ fn assertEverySplit(
     expected_passthrough: []const u8,
     expected_render: []const u8,
 ) !void {
+    return assertSplitGrid(input, 1, expected_strip, expected_passthrough, expected_render);
+}
+
+/// Same sweep as `assertEverySplit`, but only at split positions `step` apart.
+/// The pairwise sweep is O(n^2) with a large debug-build constant (~1.5 min for
+/// 448 B), which overran the macOS CI per-test timeout; a step > 1 is for long
+/// inputs. When the step divides `input.len` the split at the end is still
+/// covered, and for a run of equal blocks every block boundary is hit exactly.
+fn assertSplitGrid(
+    input: []const u8,
+    step: usize,
+    expected_strip: []const u8,
+    expected_passthrough: []const u8,
+    expected_render: []const u8,
+) !void {
     var a: usize = 0;
-    while (a <= input.len) : (a += 1) {
+    while (a <= input.len) : (a += step) {
         const two = [_][]const u8{ input[0..a], input[a..] };
         try assertFilteredEquals(.strip, &two, expected_strip);
         try assertFilteredEquals(.passthrough, &two, expected_passthrough);
@@ -1798,7 +1813,7 @@ fn assertEverySplit(
         try assertBatchParity(&two, input);
 
         var b: usize = a;
-        while (b <= input.len) : (b += 1) {
+        while (b <= input.len) : (b += step) {
             const three = [_][]const u8{ input[0..a], input[a..b], input[b..] };
             try assertFilteredEquals(.strip, &three, expected_strip);
             try assertFilteredEquals(.passthrough, &three, expected_passthrough);
@@ -2359,7 +2374,11 @@ test "TagFilter keeps a dense run of closed calls in step with the batch strip" 
         try input.appendSlice(a, "A<tool_call>{\"name\":\"shell\",\"arguments\":{}}</tool_call>B");
         try expected.appendSlice(a, "AB");
     }
-    try assertEverySplit(input.items, expected.items, expected.items, expected.items);
+    // 8 x 56 B; the full pairwise sweep here took minutes in a debug build
+    // (macOS CI hit the 300 s per-test timeout). A 8-byte grid still splits on
+    // every block boundary and inside every token region, and the single-block
+    // tests above already cover every offset within a block.
+    try assertSplitGrid(input.items, 8, expected.items, expected.items, expected.items);
 }
 
 test "TagFilter hides a quoted-colon salvaged call" {
