@@ -2017,6 +2017,15 @@ pub const DshNativeHarness = struct {
                 ));
             }
         }
+        // Native's `## Safety` policy, verbatim. It rides the runtime context
+        // like the other junclaw-only guidance so dsh's generated system
+        // prompt keeps its exact bytes and cache prefix.
+        const safety_text = std.mem.trimEnd(u8, native_prompt.safety_section, "\n");
+        try sections.append(allocator, context.customSection(
+            "junclaw:safety",
+            context.ContextOrder.junclaw_safety,
+            safety_text,
+        ));
         try sections.append(allocator, try context.dateTimeSection(allocator, self.opts.timezone, self.nowSeconds()));
         try sections.append(allocator, try context.workingDirectorySection(allocator, self.workspace()));
         try sections.append(allocator, try context.sandboxPolicySection(allocator, self.sandboxMode(), self.workspace()));

@@ -37,6 +37,8 @@ pub const ContextOrder = struct {
     pub const junclaw_guides: i32 = 80;
     /// Channel attachment/choice marker guidance shared with the native prompt.
     pub const junclaw_channel_attachments: i32 = 85;
+    /// Native `## Safety` policy, shared verbatim with the native prompt.
+    pub const junclaw_safety: i32 = 86;
     pub const current_datetime: i32 = 90;
     pub const working_directory: i32 = 100;
     pub const sandbox_policy: i32 = 110;
