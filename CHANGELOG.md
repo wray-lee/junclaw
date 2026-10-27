@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Security
+
+- SSRF host screening now reads ambiguous IPv4 literals the way browsers and
+  the C resolver do: leading-zero octal (`0177.0.0.1` is `127.0.0.1`), `0x`
+  hex, bare 32-bit integers (`2130706433`), short forms (`127.1`) and a
+  trailing dot. Previously the pinned-resolve check read `0177.0.0.1` as
+  `177.0.0.1` and approved it as public, while Firefox and the C resolver
+  read it as loopback, so the WebDriver backend navigated to `127.0.0.1`.
+  This changes global behavior for `web_fetch`, `http_request`, the WebDriver
+  browser backend and remote provider request pinning; domains such as
+  `1e100.net` and `08.com` are still treated as domains.
+
 ## 1.1.0 - 2026-10-27
 
 Browser release: two ways to give the agent a real browser, shipped as separate
