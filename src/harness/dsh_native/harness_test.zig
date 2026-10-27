@@ -679,6 +679,20 @@ fn contains(haystack: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, haystack, needle) != null;
 }
 
+/// Lets a test count a marker across every message the model saw (a recovered
+/// call must be encoded in history exactly once).
+fn requestContainsCount(request: FakeProvider.Request, needle: []const u8) usize {
+    var count: usize = 0;
+    for (request.contents) |content| {
+        var rest = content;
+        while (std.mem.indexOf(u8, rest, needle)) |at| {
+            count += 1;
+            rest = rest[at + needle.len ..];
+        }
+    }
+    return count;
+}
+
 /// The prompt in force for a request: the last system message sent.
 fn lastSystemContent(request: FakeProvider.Request) []const u8 {
     var found: []const u8 = "";
@@ -4954,4 +4968,275 @@ test "dsh-native adapter: provider failure text is classified for the user" {
     const draft = try recorder.text(allocator);
     defer allocator.free(draft);
     try testing.expectEqualStrings("partial", draft);
+}
+
+test "dsh-native adapter: a <tool_call> text reply runs the call instead of ending the turn" {
+    // Regression: gemini wrote its tool call as `<tool_call>` text, and the
+    // adapter treated the response as the final reply: the turn ended with the
+    // markup shown to the user and no tool ever ran.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "Let me look.\n<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"note.txt\"}}</tool_call>\nDone reading." },
+        .{ .text = "the file says alpha" },
+        .{ .text = "resumed" },
+    });
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    const session_id = blk: {
+        var engine = try fx.harness();
+        defer engine.deinit(allocator);
+        const h = engine.harness();
+
+        const result = try h.runTurn(turnInput("read note.txt"));
+        defer allocator.free(result.reply);
+        try testing.expectEqual(port.EndReason.completed, result.end_reason);
+        // The call ran and its result went back to the model.
+        try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+        try testing.expect(!contains(result.reply, "<tool_call>"));
+        try testing.expect(contains(result.reply, "Let me look."));
+        try testing.expect(contains(result.reply, "the file says alpha"));
+        try testing.expect(requestContains(fx.provider.requests.items[1], "alpha"));
+
+        break :blk try allocator.dupe(u8, engine.session_id);
+    };
+    defer allocator.free(session_id);
+
+    // The persisted assistant text has no markup, and the call exists once.
+    const path = try fx.logPath(allocator, session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_tag = false;
+    var call_events: usize = 0;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "tool/call")) call_events += 1;
+        if (!std.mem.eql(u8, event.event_type, "assistant/message")) continue;
+        const content = event.data.object.get("message").?.object.get("content").?.array.items;
+        for (content) |block| {
+            if (!std.mem.eql(u8, block.object.get("type").?.string, "text")) continue;
+            if (contains(block.object.get("text").?.string, "<tool_call>")) saw_tag = true;
+        }
+    }
+    try testing.expect(!saw_tag);
+    try testing.expectEqual(@as(usize, 1), call_events);
+
+    // Resume replays the call once: one `<tool_call>` encoding in history,
+    // none left in the assistant text.
+    var restored = try fx.harness();
+    defer restored.deinit(allocator);
+    const h = restored.harness();
+    try h.restore(.{ .messages = &.{} });
+    const next = try h.runTurn(turnInput("again"));
+    defer allocator.free(next.reply);
+    try testing.expectEqualStrings("resumed", next.reply);
+    try testing.expectEqual(@as(usize, 1), requestContainsCount(fx.provider.requests.items[2], "<tool_call>"));
+}
+
+test "dsh-native adapter: streamed <tool_call> blocks split across chunks run in order" {
+    // Regression: the streamed markup reached the Telegram draft and the
+    // assistant text, and the turn ended as if the call were the reply.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{
+            .text = "",
+            .pieces = &.{
+                .{ .text = "Reading " },
+                .{ .text = "<tool_c" },
+                .{ .text = "all>{\"name\":\"read\"," },
+                .{ .text = "\"arguments\":{\"file_path\":\"a.txt\"}}" },
+                .{ .text = "</tool_call>" },
+                .{ .text = " and " },
+                .{ .text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"b.txt\"}}</tool_call>" },
+                .{ .text = "now." },
+            },
+        },
+        .{ .text = "both files are fine", .pieces = &.{.{ .text = "both files are fine" }} },
+    });
+    defer fx.deinit();
+
+    for ([_][]const u8{ "a.txt", "b.txt" }) |name| {
+        const file_path = try std.fs.path.join(allocator, &.{ fx.workspace, name });
+        defer allocator.free(file_path);
+        const file = try fs_compat.createPath(file_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("content\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var recorder = RecordingSink{ .allocator = allocator, .provider = &fx.provider };
+    defer recorder.deinit();
+    var input = turnInput("read both");
+    input.live_stream = true;
+    input.sink = recorder.sink();
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "Reading "));
+    try testing.expect(contains(result.reply, "now."));
+
+    // The draft never showed the markup or the arguments.
+    const draft = try recorder.text(allocator);
+    defer allocator.free(draft);
+    try testing.expect(!contains(draft, "<tool_call"));
+    try testing.expect(!contains(draft, "\"arguments\""));
+
+    // Both calls ran: the model saw the result of each file.
+    const second = fx.provider.requests.items[1];
+    try testing.expect(requestContains(second, "a.txt"));
+    try testing.expect(requestContains(second, "b.txt"));
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var calls: usize = 0;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "tool/call")) calls += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), calls);
+}
+
+test "dsh-native adapter: a malformed <tool_call> block executes nothing" {
+    // Regression: a loose parser turned arbitrary text after `<tool_call>`
+    // into a call; the dispatcher's grammar must reject it instead.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "before <tool_call>{not json}</tool_call> after" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("hi"));
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 1), fx.provider.requests.items.len);
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "before"));
+    try testing.expect(contains(result.reply, "after"));
+}
+
+test "dsh-native adapter: a text call to an unknown tool returns the unknown-tool error" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "<tool_call>{\"name\":\"no_such_tool\",\"arguments\":{}}</tool_call>" },
+        .{ .text = "recovered" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const result = try h.runTurn(turnInput("call it"));
+    defer allocator.free(result.reply);
+    // The failure is a tool result, not a crash or an ended turn.
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expectEqualStrings("recovered", result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_error = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        saw_error = toolResultFailed(event) and contains(toolResultText(event), "unknown tool");
+    }
+    try testing.expect(saw_error);
+}
+
+test "dsh-native adapter: a structured call wins over a text call in the same stream" {
+    // Regression: both encodings of the same call ran, so the tool executed
+    // twice and the markup stayed in the reply.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{
+            .text = "",
+            .tool_calls = &.{.{ .id = "call-1", .name = "read", .arguments = "{\"file_path\":\"note.txt\"}" }},
+            .pieces = &.{
+                .{ .text = "Checking.\n" },
+                .{ .text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"other.txt\"}}</tool_call>" },
+            },
+        },
+        .{ .text = "done", .pieces = &.{.{ .text = "done" }} },
+    });
+    defer fx.deinit();
+
+    for ([_][]const u8{ "note.txt", "other.txt" }) |name| {
+        const file_path = try std.fs.path.join(allocator, &.{ fx.workspace, name });
+        defer allocator.free(file_path);
+        const file = try fs_compat.createPath(file_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(if (std.mem.eql(u8, name, "note.txt")) "alpha\n" else "beta\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+    var input = turnInput("read note");
+    input.live_stream = true;
+
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    // Only the provider's structured call ran.
+    try testing.expect(requestContains(fx.provider.requests.items[1], "alpha"));
+    try testing.expect(!requestContains(fx.provider.requests.items[1], "beta"));
+    // Its text tag was still removed from the answer.
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "Checking."));
+}
+
+test "dsh-native adapter: a 64KB text reply with a tool call does not leak" {
+    var poison = PoisonAllocator{ .child = testing.allocator };
+    const allocator = poison.allocator();
+
+    const filler = "The quick brown fox jumps over the lazy dog. ";
+    var big: std.ArrayListUnmanaged(u8) = .empty;
+    defer big.deinit(allocator);
+    while (big.items.len < 64 * 1024) try big.appendSlice(allocator, filler);
+    try big.appendSlice(allocator, "<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"note.txt\"}}</tool_call>");
+    try big.appendSlice(allocator, "tail after the call");
+
+    var replies = [_]Reply{
+        .{ .text = try allocator.dupe(u8, big.items) },
+        .{ .text = "done" },
+    };
+    defer allocator.free(replies[0].text);
+    var fx = try Fixture.init(allocator, &replies);
+    defer fx.deinit();
+
+    const note = try std.fs.path.join(allocator, &.{ fx.workspace, "note.txt" });
+    defer allocator.free(note);
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("alpha\n");
+    }
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("go"));
+    defer allocator.free(result.reply);
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "tail after the call"));
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(poison.free_calls > 0);
 }

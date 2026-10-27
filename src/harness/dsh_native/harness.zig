@@ -2039,7 +2039,6 @@ pub const DshNativeHarness = struct {
             .include_reasoning = self.opts.reasoning_mode != .off,
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
         };
-        _ = view;
 
         // Both paths run on this thread until the request ends, so either one
         // must expose the stop flag to the transport: a /stop from the host
@@ -2049,7 +2048,7 @@ pub const DshNativeHarness = struct {
         http_util.setThreadInterruptFlag(&self.stream_cancel);
         defer http_util.setThreadInterruptFlag(outer_interrupt);
 
-        if (self.streamingEnabled()) return self.beginStreaming(arena, chat);
+        if (self.streamingEnabled()) return self.beginStreaming(arena, chat, view.position);
 
         var response = self.opts.provider.chatWithTools(arena, chat) catch |err| {
             self.last_provider_error = err;
@@ -2080,13 +2079,34 @@ pub const DshNativeHarness = struct {
             }
         }
         const content: []const u8 = response.content orelse "";
-        if (content.len > 0) {
+        // A provider without native tool calls can write the call into its
+        // answer instead. Recover it with the dispatcher's parser; structured
+        // calls always win when the provider sent both.
+        var text = content;
+        var text_calls: []const providers.ToolCall = &.{};
+        if (containsTextToolCall(content)) {
+            const parsed = try dispatcher.parseToolCalls(arena, content);
+            text = parsed.text;
+            if (response.tool_calls.len == 0 and parsed.calls.len > 0) {
+                if (response.truncated) {
+                    std.log.warn("dsh-native: discarding {d} text tool call(s) from a truncated response", .{parsed.calls.len});
+                } else {
+                    text_calls = try providerCallsFromText(arena, view.position, parsed.calls, 0);
+                }
+            }
+        }
+        if (text.len > 0) {
             try self.pending.append(arena, .{ .chunk = .{ .text_delta = .{
                 .index = next_block_index,
-                .text = try arena.dupe(u8, content),
+                .text = try arena.dupe(u8, text),
             } } });
         }
-        try self.pushDone(arena, response.tool_calls, response.usage, response.truncated);
+        try self.pushDone(
+            arena,
+            if (response.tool_calls.len > 0) response.tool_calls else text_calls,
+            response.usage,
+            response.truncated,
+        );
     }
 
     /// Live streaming needs a host draft and a provider that returns native
@@ -2109,6 +2129,12 @@ pub const DshNativeHarness = struct {
         /// completes.
         held: std.ArrayListUnmanaged(u8) = .empty,
         in_reasoning: bool = false,
+        /// Calls recovered from an explicit `<tool_call>` block in the text.
+        text_calls: std.ArrayListUnmanaged(providers.ToolCall) = .empty,
+        /// Held begins with a `<tool_call>` opener whose close tag is pending.
+        in_tool_block: bool = false,
+        /// Names the response for the recovered calls' generated ids.
+        position: loop_mod.Position,
         /// At least one delta reached the kernel/host, so a later provider
         /// error settles a partial assistant message (P3).
         saw_delta: bool = false,
@@ -2137,10 +2163,8 @@ pub const DshNativeHarness = struct {
                 return;
             }
             if (chunk.delta.len == 0) return;
-            // Native hands the host the provider's raw chunk; the host's
-            // per-turn TagFilter applies `reasoning_mode`. Off mode drops
-            // reasoning here so nothing reaches the draft.
-            if (self.mode != .off) self.toHost(chunk);
+            // The splitter owns host delivery too: a `<tool_call>` block must
+            // never reach the draft, not even before its close tag arrives.
             try self.split(chunk.delta);
         }
 
@@ -2157,42 +2181,136 @@ pub const DshNativeHarness = struct {
             });
         }
 
-        /// Split raw provider text into reasoning and visible runs. The SSE
-        /// parsers emit `<think>`/`</think>` as their own chunks, but a tag
-        /// inside content can straddle chunks, so a trailing partial tag waits
-        /// for the next call.
-        fn split(self: *StreamRelay, text: []const u8) !void {
-            try self.held.appendSlice(self.arena, text);
-            var i: usize = 0;
-            var start: usize = 0;
-            while (i < self.held.items.len) {
-                if (self.held.items[i] != '<') {
-                    i += 1;
-                    continue;
-                }
-                switch (provider_helpers.scanThinkTag(self.held.items[i..])) {
-                    .none => i += 1,
-                    .partial => {
-                        try self.emit(self.held.items[start..i]);
-                        const tail = self.held.items[i..];
-                        std.mem.copyForwards(u8, self.held.items[0..tail.len], tail);
-                        self.held.shrinkRetainingCapacity(tail.len);
-                        return;
-                    },
-                    .complete => |tag| {
-                        try self.emit(self.held.items[start..i]);
-                        self.in_reasoning = !tag.close;
-                        i += tag.len;
-                        start = i;
-                    },
-                }
-            }
-            try self.emit(self.held.items[start..]);
-            self.held.clearRetainingCapacity();
+        const tool_open = "<tool_call>";
+        const tool_close = "</tool_call>";
+
+        /// True when `rest` is the start of a `<tool_call>` opener, complete or
+        /// still split across chunks.
+        fn isToolCallPrefix(rest: []const u8) bool {
+            if (std.mem.startsWith(u8, rest, tool_open)) return true;
+            return rest.len < tool_open.len and std.mem.startsWith(u8, tool_open, rest);
         }
 
-        /// Flush a trailing partial tag: a response cut mid-tag is text.
+        fn holdFrom(self: *StreamRelay, at: usize) void {
+            const tail = self.held.items[at..];
+            std.mem.copyForwards(u8, self.held.items[0..tail.len], tail);
+            self.held.shrinkRetainingCapacity(tail.len);
+        }
+
+        /// Split raw provider text into reasoning, visible and tool-call runs.
+        /// The SSE parsers emit `<think>`/`</think>` as their own chunks, but a
+        /// tag inside content can straddle chunks, so a trailing partial tag
+        /// waits for the next call. A `<tool_call>` block waits for its close
+        /// tag and then goes to the dispatcher: neither the draft nor the
+        /// assistant text may see the markup.
+        fn split(self: *StreamRelay, text: []const u8) !void {
+            try self.held.appendSlice(self.arena, text);
+            while (true) {
+                if (self.in_tool_block) {
+                    if (!try self.scanToolBlock()) return;
+                    continue;
+                }
+                var i: usize = 0;
+                var start: usize = 0;
+                var holding = false;
+                while (i < self.held.items.len) {
+                    if (self.held.items[i] != '<') {
+                        i += 1;
+                        continue;
+                    }
+                    const rest = self.held.items[i..];
+                    switch (provider_helpers.scanThinkTag(rest)) {
+                        .none => {
+                            if (isToolCallPrefix(rest)) {
+                                try self.emit(self.held.items[start..i]);
+                                self.holdFrom(i);
+                                self.in_tool_block = true;
+                                holding = true;
+                                break;
+                            }
+                            i += 1;
+                        },
+                        .partial => {
+                            try self.emit(self.held.items[start..i]);
+                            self.holdFrom(i);
+                            return;
+                        },
+                        .complete => |tag| {
+                            try self.emit(self.held.items[start..i]);
+                            if (self.mode != .off) self.hostText(rest[0..tag.len]);
+                            self.in_reasoning = !tag.close;
+                            i += tag.len;
+                            start = i;
+                        },
+                    }
+                }
+                if (holding) continue;
+                try self.emit(self.held.items[start..]);
+                self.held.clearRetainingCapacity();
+                return;
+            }
+        }
+
+        /// Consume the held `<tool_call>` block. False means the close tag (or
+        /// the rest of the opener) has not arrived yet.
+        fn scanToolBlock(self: *StreamRelay) !bool {
+            const bytes = self.held.items;
+            if (bytes.len < tool_open.len) {
+                if (std.mem.startsWith(u8, tool_open, bytes)) return false;
+                // It only looked like an opener: ordinary text.
+                self.in_tool_block = false;
+                try self.emit(bytes);
+                self.held.clearRetainingCapacity();
+                return false;
+            }
+            if (!std.mem.startsWith(u8, bytes, tool_open)) {
+                self.in_tool_block = false;
+                try self.emit(bytes);
+                self.held.clearRetainingCapacity();
+                return false;
+            }
+            const close_rel = std.mem.indexOf(u8, bytes[tool_open.len..], tool_close) orelse return false;
+            const end = tool_open.len + close_rel + tool_close.len;
+
+            const parsed = try dispatcher.parseToolCalls(self.arena, bytes[0..end]);
+            if (parsed.calls.len > 0) {
+                try self.appendTextCalls(parsed.calls);
+            } else {
+                // Not an executable call: the dispatcher returns the prose with
+                // the marker tokens removed, or nothing for a malformed payload.
+                try self.emit(parsed.text);
+            }
+
+            const rest_len = bytes.len - end;
+            std.mem.copyForwards(u8, bytes[0..rest_len], bytes[end..]);
+            self.held.shrinkRetainingCapacity(rest_len);
+            self.in_tool_block = false;
+            return true;
+        }
+
+        fn appendTextCalls(self: *StreamRelay, parsed: []const dispatcher.ParsedToolCall) !void {
+            try self.text_calls.appendSlice(
+                self.arena,
+                try providerCallsFromText(self.arena, self.position, parsed, self.text_calls.items.len),
+            );
+        }
+
+        /// Flush what is left at end of stream. A trailing partial tag is text;
+        /// an unclosed `<tool_call>` gets the same dispatch decision as the
+        /// whole response would.
         fn flush(self: *StreamRelay) !void {
+            if (self.in_tool_block) {
+                const parsed = try dispatcher.parseToolCalls(self.arena, self.held.items);
+                if (parsed.calls.len > 0) {
+                    try self.appendTextCalls(parsed.calls);
+                } else {
+                    std.log.warn("dsh-native: released an unclosed <tool_call> block as text", .{});
+                    try self.emit(parsed.text);
+                }
+                self.held.clearRetainingCapacity();
+                self.in_tool_block = false;
+                return;
+            }
             try self.emit(self.held.items);
             self.held.clearRetainingCapacity();
         }
@@ -2227,8 +2345,10 @@ pub const DshNativeHarness = struct {
                     .index = text_index,
                     .text = copied,
                 } } });
-                if (self.mode == .off) self.hostText(copied);
             }
+            // The draft sees the provider bytes minus tool-call markup (held by
+            // `split`) and, in `off` mode, reasoning.
+            if (!self.in_reasoning or self.mode != .off) self.hostText(copied);
         }
     };
 
@@ -2236,10 +2356,20 @@ pub const DshNativeHarness = struct {
     /// The provider invokes the callback synchronously on this thread, so the
     /// call arena and `pending` need no locking; every chunk is copied or
     /// forwarded before the callback returns, because its slice is borrowed.
-    fn beginStreaming(self: *Self, arena: Allocator, chat: providers.ChatRequest) anyerror!void {
+    fn beginStreaming(
+        self: *Self,
+        arena: Allocator,
+        chat: providers.ChatRequest,
+        position: loop_mod.Position,
+    ) anyerror!void {
         self.turn_model_calls += 1;
         self.streamed_live = true;
-        var relay = StreamRelay{ .harness = self, .arena = arena, .mode = self.opts.reasoning_mode };
+        var relay = StreamRelay{
+            .harness = self,
+            .arena = arena,
+            .mode = self.opts.reasoning_mode,
+            .position = position,
+        };
         // `providerBegin` installed the stop flag for this whole call.
 
         var failed: ?anyerror = null;
@@ -2289,7 +2419,18 @@ pub const DshNativeHarness = struct {
             const estimate = (relay.output_bytes + 3) / 4;
             result.usage.completion_tokens = @intCast(@min(estimate, std.math.maxInt(u32)));
         }
-        try self.pushDone(arena, result.tool_calls, result.usage, result.truncated);
+        // Text-embedded calls are the fallback only: the provider's structured
+        // calls decide when it sent any. A truncated response must not run a
+        // call salvaged from its partial text.
+        var calls: []const providers.ToolCall = result.tool_calls;
+        if (calls.len == 0 and relay.text_calls.items.len > 0) {
+            if (result.truncated) {
+                std.log.warn("dsh-native: discarding {d} text tool call(s) from a truncated response", .{relay.text_calls.items.len});
+            } else {
+                calls = relay.text_calls.items;
+            }
+        }
+        try self.pushDone(arena, calls, result.usage, result.truncated);
     }
 
     fn pushDone(
@@ -3654,6 +3795,37 @@ pub const DshNativeHarness = struct {
         return .{ .array = array };
     }
 };
+
+/// True when the response carries an explicit `<tool_call>` marker. Only these
+/// markers trigger the text fallback; ordinary prose about tool calls does not.
+fn containsTextToolCall(text: []const u8) bool {
+    return std.mem.indexOf(u8, text, "<tool_call>") != null;
+}
+
+/// Convert the dispatcher's parsed text calls into provider calls. The id is
+/// stable for a given response (turn/step) and its position in the batch, so a
+/// replay or resume maps the same call to the same id. `first_index` keeps ids
+/// unique when a streamed response is parsed one block at a time.
+fn providerCallsFromText(
+    allocator: Allocator,
+    position: loop_mod.Position,
+    parsed: []const dispatcher.ParsedToolCall,
+    first_index: usize,
+) ![]const providers.ToolCall {
+    const calls = try allocator.alloc(providers.ToolCall, parsed.len);
+    for (parsed, 0..) |call, index| {
+        calls[index] = .{
+            .id = try std.fmt.allocPrint(
+                allocator,
+                "text-call-{d}-{d}-{d}",
+                .{ position.turn, position.step, first_index + index + 1 },
+            ),
+            .name = call.name,
+            .arguments = call.arguments_json,
+        };
+    }
+    return calls;
+}
 
 /// Lowercase hex of an instruction-baseline identity, as dsh stores it in
 /// `source.baselineIdentity`.
