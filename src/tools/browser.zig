@@ -90,6 +90,7 @@ pub const BrowserTool = struct {
             .geckodriver_path = self.config.webdriver_geckodriver_path orelse "geckodriver",
             .headless = self.config.native_headless,
             .idle_timeout_ms = self.config.webdriver_idle_timeout_ms,
+            .allowed_domains = self.config.allowed_domains,
         });
         self.manager = manager;
         defer WebDriverManager.sharedRelease();

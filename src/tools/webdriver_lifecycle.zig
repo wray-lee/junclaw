@@ -11,6 +11,7 @@ const compat = @import("compat");
 const client_mod = @import("webdriver_client.zig");
 const WebDriverClient = client_mod.WebDriverClient;
 const webdriver_security = @import("webdriver_security.zig");
+const webdriver_proxy = @import("webdriver_proxy.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -27,6 +28,10 @@ pub const Options = struct {
     headless: bool = true,
     /// 0 disables idle shutdown.
     idle_timeout_ms: u64 = 120_000,
+    /// `browser.allowed_domains`, deep-copied into the filtering proxy when the
+    /// session starts. The manager is process-wide, so the first caller's
+    /// options are the ones in force.
+    allowed_domains: []const []const u8 = &.{},
     /// Clock override for idle expiry (tests only); null uses the wall clock.
     clock: ?*const fn () i64 = null,
 };
@@ -45,6 +50,9 @@ pub const WebDriverManager = struct {
         child: ?compat.process.Child = null,
         /// One-shot profile passed to Firefox; deleted on every stop path.
         profile: webdriver_security.Profile,
+        /// Filtering proxy Firefox is forced through; joined on every stop
+        /// path. Null only for an external `driver_url` endpoint.
+        proxy: ?*webdriver_proxy.Proxy = null,
         last_activity_ms: i64,
     };
 
@@ -107,7 +115,18 @@ pub const WebDriverManager = struct {
     /// Returns a connected, session-open browser. On success ownership moves to
     /// `self.running`; on failure every spawned child is killed and reaped.
     fn startLocked(self: *WebDriverManager) !Running {
-        var profile = webdriver_security.Profile.create(self.allocator) catch |err| {
+        // The proxy starts first: its port goes into user.js, and no Firefox
+        // may start without it (fail closed; there is no direct-connection
+        // fallback). An external driver_url endpoint is test-only and owns its
+        // own profile, so it keeps running without our proxy.
+        var proxy: ?*webdriver_proxy.Proxy = null;
+        errdefer if (proxy) |active| active.deinit();
+        if (self.options.driver_url == null) proxy = try self.startProxyLocked();
+
+        var profile = webdriver_security.Profile.create(
+            self.allocator,
+            if (proxy) |active| active.port() else null,
+        ) catch |err| {
             self.setLastErrorFmt("failed to create one-shot browser profile: {s}", .{@errorName(err)});
             return err;
         };
@@ -185,7 +204,19 @@ pub const WebDriverManager = struct {
             .client = client,
             .child = child,
             .profile = profile,
+            .proxy = proxy,
             .last_activity_ms = self.now(),
+        };
+    }
+
+    /// Start the session's filtering proxy. A failure fails the session start;
+    /// falling back to the per-navigation URL check alone is not an option.
+    fn startProxyLocked(self: *WebDriverManager) !*webdriver_proxy.Proxy {
+        return webdriver_proxy.Proxy.start(self.allocator, .{
+            .allowed_domains = self.options.allowed_domains,
+        }) catch |err| {
+            self.setLastErrorFmt("failed to start browser filtering proxy: {s}", .{@errorName(err)});
+            return err;
         };
     }
 
@@ -210,6 +241,9 @@ pub const WebDriverManager = struct {
             running.client.deinit();
             if (running.child) |*child| terminateChild(child);
             running.profile.deinit();
+            // Last, so browser shutdown traffic above can still drain: the
+            // proxy stops every tunnel and joins every worker here.
+            if (running.proxy) |proxy| proxy.deinit();
             self.running = null;
         }
     }
@@ -512,6 +546,83 @@ test "manager reports a missing geckodriver clearly" {
 
     try std.testing.expectError(error.DriverStartFailed, manager.acquire());
     try std.testing.expect(std.mem.indexOf(u8, manager.lastErrorMessage(), "geckodriver") != null);
+    // Regression: the proxy starts before geckodriver, so this failure path
+    // must tear it down again. The testing allocator reports a proxy object
+    // that was never deinit'ed (deinit is what joins the worker threads).
+    try std.testing.expect(manager.running == null);
+}
+
+test "manager filtering proxy follows allowed_domains from options" {
+    const allocator = std.testing.allocator;
+
+    // Empty allowlist: a loopback target is refused before any connection.
+    var open = WebDriverManager.init(allocator, .{ .idle_timeout_ms = 0 });
+    defer open.deinit();
+    const open_proxy = try open.startProxyLocked();
+    defer open_proxy.deinit();
+    const denied = try webdriver_proxy.requestStatus(open_proxy, "localhost:1");
+    defer denied.stream.close();
+    try std.testing.expectEqual(@as(u16, 403), denied.status);
+
+    // Non-empty allowlist: a listed host keeps the explicit-trust meaning
+    // (private-address checks are skipped, the address is still pinned), so it
+    // reaches the connect stage, while an unlisted host is denied.
+    var trusted = WebDriverManager.init(allocator, .{
+        .idle_timeout_ms = 0,
+        .allowed_domains = &.{"localhost"},
+    });
+    defer trusted.deinit();
+    const trusted_proxy = try trusted.startProxyLocked();
+    defer trusted_proxy.deinit();
+    const dialed = try webdriver_proxy.requestStatus(trusted_proxy, "localhost:1");
+    defer dialed.stream.close();
+    try std.testing.expectEqual(@as(u16, 502), dialed.status);
+    const unlisted = try webdriver_proxy.requestStatus(trusted_proxy, "127.0.0.1:1");
+    defer unlisted.stream.close();
+    try std.testing.expectEqual(@as(u16, 403), unlisted.status);
+}
+
+test "stopLocked shuts down the proxy tunnel and joins its workers" {
+    const allocator = std.testing.allocator;
+
+    // Upstream that completes the TCP handshake but never replies, so the
+    // tunnel is still active when the manager stops.
+    const upstream_address = try compat.net.Address.parseIp4("127.0.0.1", 0);
+    var upstream = try upstream_address.listen(.{ .reuse_address = true });
+    defer upstream.deinit();
+    var authority_buf: [32]u8 = undefined;
+    const authority = try std.fmt.bufPrint(
+        &authority_buf,
+        "localhost:{d}",
+        .{upstream.listen_address.in.getPort()},
+    );
+
+    var manager = WebDriverManager.init(allocator, .{
+        .idle_timeout_ms = 0,
+        .allowed_domains = &.{"localhost"},
+    });
+    defer manager.deinit();
+    const proxy = try manager.startProxyLocked();
+    const proxy_port = proxy.port();
+    const tunnel = try webdriver_proxy.requestStatus(proxy, authority);
+    defer tunnel.stream.close();
+    try std.testing.expectEqual(@as(u16, 200), tunnel.status);
+
+    manager.running = .{
+        .client = try WebDriverClient.init(allocator, "http://127.0.0.1:1"),
+        .profile = try webdriver_security.Profile.create(allocator, proxy_port),
+        .proxy = proxy,
+        .last_activity_ms = manager.now(),
+    };
+    manager.stopLocked();
+    try std.testing.expect(manager.running == null);
+
+    // The listener was closed only after every worker was joined.
+    const proxy_address = try compat.net.Address.parseIp4("127.0.0.1", proxy_port);
+    if (compat.net.tcpConnectToAddress(proxy_address)) |stream| {
+        stream.close();
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }
 
 fn countRequests(requests: anytype, path: []const u8) usize {

@@ -557,12 +557,14 @@ fn readStatus(stream: compat.net.Stream) !u16 {
     return error.BadResponse;
 }
 
-const Response = struct {
+/// Test helper shared with the lifecycle tests: send one CONNECT request and
+/// return the proxy's status line plus the open stream (caller closes it).
+pub const Response = struct {
     stream: compat.net.Stream,
     status: u16,
 };
 
-fn requestStatus(proxy: *Proxy, authority: []const u8) !Response {
+pub fn requestStatus(proxy: *Proxy, authority: []const u8) !Response {
     const stream = try connectToProxy(proxy);
     errdefer stream.close();
     try sendConnect(stream, authority);
