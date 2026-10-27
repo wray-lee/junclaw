@@ -41,18 +41,18 @@ watchdog_pid=$!
 # TEMPORARY hang diagnosis: macOS samples the running test binaries so a stalled
 # test leaves the blocking syscall in the log. Delete once the hang is fixed.
 sample_tests() {
-    local pid comm
-    for pid in $(pgrep -P "$zig_pid" 2>/dev/null); do
-        comm=$(ps -o comm= -p "$pid" 2>/dev/null) || continue
-        case "$comm" in
-            */test|test) sample "$pid" 1 -file "/tmp/ci-test-sample-${pid}.txt" >/dev/null 2>&1 || true ;;
-        esac
+    local pid
+    # The test binaries are grandchildren of zig (the build runner spawns them),
+    # so match their command line: Run passes `--listen=-`.
+    for pid in $(pgrep -f -- '--listen=-' 2>/dev/null); do
+        sample "$pid" 1 -file "/tmp/ci-test-sample-${pid}.txt" >/dev/null 2>&1 || true
     done
 }
 
 sampler_pid=""
 if [ "$(uname -s)" = "Darwin" ] && command -v sample >/dev/null 2>&1; then
     rm -f /tmp/ci-test-sample-*.txt
+    echo "ci-test: sampling test-binary stacks every 15s for the hang diagnosis"
     (
         while kill -0 "$zig_pid" 2>/dev/null; do
             sample_tests

@@ -478,21 +478,26 @@ pub fn readWithTimeout(stream: Stream, buffer: []u8, timeout_ms: u32) !usize {
 /// stall past the buffer: a peer that stops reading surfaces as `error.Timeout`
 /// instead of pinning the worker. Windows/WASI keep the blocking write; only
 /// stopAndJoin's shutdown bounds them there.
-/// TEMPORARY hang diagnosis: test-only stderr trace of the write loop, so the
-/// macOS CI timeout prints the syscall the test blocked in.
-var trace_left: usize = 40;
-
-fn trace(comptime fmt: []const u8, args: anytype) void {
-    if (trace_left == 0) return;
-    trace_left -= 1;
-    std.debug.print("wwt: " ++ fmt, args);
-}
-
 pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !void {
     if (bytes.len == 0) return;
     switch (builtin.os.tag) {
         .windows, .wasi => return stream.writeAll(bytes),
         else => {},
+    }
+
+    // MSG_DONTWAIT alone did not bound the send on the macOS CI runner: with a
+    // peer that stopped reading, the write loop slept for 300 s instead of
+    // timing out, so the kernel was sleeping inside sendto. A send timeout
+    // wakes that sleep without touching the socket's blocking mode, so a reader
+    // on the same fd is unaffected. Cleared (no timeout) on the way out.
+    const sndtimeo: posix.timeval = .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&sndtimeo)) catch {};
+    defer {
+        const clear: posix.timeval = .{ .sec = 0, .usec = 0 };
+        posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&clear)) catch {};
     }
 
     const deadline = nowNanos() + @as(i96, timeout_ms) * std.time.ns_per_ms;
@@ -527,6 +532,12 @@ pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !voi
         if (n == 0) return error.Unexpected;
         written += n;
     }
+}
+
+/// TEMPORARY hang diagnosis: test-only stderr trace of the write loop, so a
+/// macOS CI timeout prints the syscall the test blocked in. Remove with the fix.
+fn trace(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("wwt: " ++ fmt, args);
 }
 
 fn nowNanos() i96 {
