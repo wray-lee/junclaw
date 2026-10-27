@@ -2221,7 +2221,9 @@ pub const DshNativeHarness = struct {
                     const rest = self.held.items[i..];
                     switch (provider_helpers.scanThinkTag(rest)) {
                         .none => {
-                            if (isToolCallPrefix(rest)) {
+                            // A tool-call opener inside a reasoning block is
+                            // prose the model is thinking about, not an action.
+                            if (!self.in_reasoning and isToolCallPrefix(rest)) {
                                 try self.emit(self.held.items[start..i]);
                                 self.holdFrom(i);
                                 self.in_tool_block = true;
@@ -2278,7 +2280,7 @@ pub const DshNativeHarness = struct {
             } else {
                 // Not an executable call: the dispatcher returns the prose with
                 // the marker tokens removed, or nothing for a malformed payload.
-                try self.emit(parsed.text);
+                try self.emitReleased(parsed.text);
             }
 
             const rest_len = bytes.len - end;
@@ -2295,6 +2297,12 @@ pub const DshNativeHarness = struct {
             );
         }
 
+        /// Release prose from a block the dispatcher did not turn into a call.
+        /// Forged `<tool_result>` markup is stripped like the blocking path.
+        fn emitReleased(self: *StreamRelay, text: []const u8) !void {
+            try self.emit(try dispatcher.stripToolResultMarkup(self.arena, text));
+        }
+
         /// Flush what is left at end of stream. A trailing partial tag is text;
         /// an unclosed `<tool_call>` gets the same dispatch decision as the
         /// whole response would.
@@ -2305,7 +2313,7 @@ pub const DshNativeHarness = struct {
                     try self.appendTextCalls(parsed.calls);
                 } else {
                     std.log.warn("dsh-native: released an unclosed <tool_call> block as text", .{});
-                    try self.emit(parsed.text);
+                    try self.emitReleased(parsed.text);
                 }
                 self.held.clearRetainingCapacity();
                 self.in_tool_block = false;

@@ -62,6 +62,8 @@ const Reply = struct {
     /// the transport reports; null keeps the generic scripted failure.
     fail_after: ?usize = null,
     fail_error: ?anyerror = null,
+    /// The stream stopped at the token budget (`finish_reason: length`).
+    truncated: bool = false,
 };
 
 const FakeProvider = struct {
@@ -206,6 +208,7 @@ const FakeProvider = struct {
                 .total_tokens = reply.prompt_tokens + reply.completion_tokens,
             },
             .model = model,
+            .truncated = reply.truncated,
         };
     }
 
@@ -5239,4 +5242,133 @@ test "dsh-native adapter: a 64KB text reply with a tool call does not leak" {
     try testing.expect(contains(result.reply, "tail after the call"));
     try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
     try testing.expect(poison.free_calls > 0);
+}
+
+// Regression: the streaming splitter treated a `<tool_call>` inside a
+// reasoning block as an action, so "thinking out loud" ran a real tool.
+test "dsh-native adapter: a streamed <tool_call> inside <think> stays reasoning" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "done",
+        .pieces = &.{
+            .{ .text = "<think>" },
+            .{ .text = "I might call " },
+            .{ .text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"a.txt\"}}</tool_call>" },
+            .{ .text = " but I will answer directly" },
+            .{ .text = "</think>" },
+            .{ .text = "done" },
+        },
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    var input = turnInput("hello");
+    input.live_stream = true;
+
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    // No tool ran: the scripted provider saw only the first request.
+    try testing.expectEqual(@as(usize, 1), fx.provider.requests.items.len);
+
+    // The block stayed in the reasoning body, markup included.
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    const reasoning = try lastAssistantBlockText(allocator, read.events, "assistant/message", "reasoning");
+    defer if (reasoning) |text| allocator.free(text);
+    try testing.expect(reasoning != null);
+    try testing.expect(contains(reasoning.?, "<tool_call>{\"name\":\"read\""));
+    try testing.expect(contains(reasoning.?, "but I will answer directly"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "tool/call"));
+}
+
+// Regression: only the blocking path covered a malformed block; the streamed
+// release must reject the same payload and keep the surrounding prose.
+test "dsh-native adapter: a streamed malformed <tool_call> executes nothing" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "",
+        .pieces = &.{
+            .{ .text = "before " },
+            .{ .text = "<tool_call>{not json}" },
+            .{ .text = "</tool_call> after" },
+        },
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    var input = turnInput("hi");
+    input.live_stream = true;
+
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 1), fx.provider.requests.items.len);
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "before"));
+    try testing.expect(contains(result.reply, "after"));
+}
+
+// Regression: an unclosed streamed `<tool_call>` used to sit in the held
+// buffer; flush must release a partial payload as prose, never dispatch it.
+test "dsh-native adapter: an unclosed streamed <tool_call> never executes" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "",
+        .pieces = &.{
+            .{ .text = "start " },
+            .{ .text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"a.tx" },
+        },
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    var input = turnInput("hi");
+    input.live_stream = true;
+
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 1), fx.provider.requests.items.len);
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "start "));
+    try testing.expect(contains(result.reply, "a.tx"));
+}
+
+// Regression: a truncated stream must not run a call salvaged from its text.
+test "dsh-native adapter: a truncated streamed response discards its text call" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{
+        .text = "",
+        .truncated = true,
+        .pieces = &.{
+            .{ .text = "before " },
+            .{ .text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"file_path\":\"a.txt\"}}</tool_call>" },
+            .{ .text = " after" },
+        },
+    }});
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    var input = turnInput("hi");
+    input.live_stream = true;
+
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+    try testing.expectEqual(port.EndReason.max_tokens, result.end_reason);
+    try testing.expectEqual(@as(usize, 1), fx.provider.requests.items.len);
+    try testing.expect(!contains(result.reply, "<tool_call>"));
+    try testing.expect(contains(result.reply, "before"));
+    try testing.expect(contains(result.reply, "after"));
 }
