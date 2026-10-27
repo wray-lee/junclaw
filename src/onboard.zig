@@ -5869,3 +5869,11 @@ test "parseModelIds sorts alphabetically when no free suffix is present" {
     try std.testing.expectEqualStrings("m-model", models[1]);
     try std.testing.expectEqualStrings("z-model", models[2]);
 }
+
+test "default AGENTS.md template silences with the token the channel suppresses" {
+    // Regression: the template told the model to answer HEARTBEAT_OK, which
+    // no suppression path recognizes, so quiet group/heartbeat turns posted
+    // the literal word.
+    try std.testing.expect(std.mem.indexOf(u8, WORKSPACE_AGENTS_TEMPLATE, "HEARTBEAT_OK") == null);
+    try std.testing.expect(std.mem.indexOf(u8, WORKSPACE_AGENTS_TEMPLATE, "[NO_REPLY]") != null);
+}

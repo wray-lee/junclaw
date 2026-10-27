@@ -50,9 +50,11 @@ const log = std.log.scoped(.daemon);
 const STATUS_FLUSH_SECONDS: u64 = 5;
 
 /// Default heartbeat prompt sent to the agent when HEARTBEAT.md has tasks.
+/// The silent token must be `[NO_REPLY]`: no suppression path recognizes
+/// `HEARTBEAT_OK`, so a quiet heartbeat would post the literal word.
 const DEFAULT_HEARTBEAT_PROMPT =
     "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. " ++
-    "Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.";
+    "Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply [NO_REPLY].";
 
 /// Daemon heartbeat initializes memory/bootstrap runtime state before it
 /// settles into its periodic loop, so it needs the session-turn budget.
@@ -4868,4 +4870,9 @@ test "a steered daemon message is finalized when the consuming turn ends" {
         if (call.reaction == .done) steered_done = true;
     }
     try std.testing.expect(steered_done);
+}
+
+test "default heartbeat prompt asks for the suppressed silent token" {
+    try std.testing.expect(std.mem.indexOf(u8, DEFAULT_HEARTBEAT_PROMPT, "[NO_REPLY]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, DEFAULT_HEARTBEAT_PROMPT, "HEARTBEAT_OK") == null);
 }
