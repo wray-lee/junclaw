@@ -806,7 +806,10 @@ test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "outside-secret-rules") == null);
 }
 
-fn appendChannelAttachmentsSection(w: anytype) !void {
+/// Attachment/choice marker conventions for channel delivery. Both the native
+/// system prompt and the dsh engine's per-turn runtime context call this, so
+/// the guidance the model reads stays byte-identical across engines.
+pub fn appendChannelAttachmentsSection(w: anytype) !void {
     try w.writeAll("## Channel Attachments\n\n");
     try w.writeAll("- On marker-aware channels (for example Telegram and Slack), you can send real attachments by emitting markers in your final reply.\n");
     try w.writeAll("- File/document: `[FILE:/absolute/path/to/file.ext]` or `[DOCUMENT:/absolute/path/to/file.ext]`\n");
@@ -1460,6 +1463,20 @@ test "buildSystemPrompt includes channel attachment marker guidance" {
     try std.testing.expect(std.mem.indexOf(u8, prompt, "## Channel Choices") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "<nc_choices>") != null);
     try std.testing.expect(std.mem.indexOf(u8, prompt, "One choices block must correspond to one concrete unanswered question.") != null);
+}
+
+test "appendChannelAttachmentsSection is the shared channel marker guidance" {
+    const allocator = std.testing.allocator;
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(allocator);
+    var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+
+    try appendChannelAttachmentsSection(&writer.writer);
+    buf = writer.toArrayList();
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "## Channel Attachments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "[FILE:/absolute/path/to/file.ext]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "## Channel Choices") != null);
 }
 
 test "buildSystemPrompt omits telegram-only group marker guidance for non-telegram groups" {

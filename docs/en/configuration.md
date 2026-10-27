@@ -286,6 +286,8 @@ P3 status: the in-process engine is the default. Omitting `agent.harness` keeps 
 - Automatic compaction runs on the agent pre-step once the measured token count reaches the threshold, and a provider context-overflow error at request start triggers one compaction and one retry. `/compact` is the manual entry point.
 - Other slash commands are left to the host.
 
+The engine injects the native channel attachment-marker guidance into its runtime context, so a reply written with `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]`, or the other markers is uploaded by the channel exactly as on the native engine, under the same workspace/`autonomy.allowed_paths` scope filter.
+
 Example:
 
 ```json

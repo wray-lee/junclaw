@@ -223,6 +223,10 @@ pub const DshNativeHarness = struct {
     /// Log seq of each surface node, parallel to `messages`.
     surface_seqs: std.ArrayListUnmanaged(u64) = .empty,
     system_prompt: []const u8 = "",
+    /// Native `## Channel Attachments` block, rendered once. It rides the
+    /// runtime-context snapshot so dsh's generated system prompt stays
+    /// verbatim and its cache prefix never changes with this guidance.
+    channel_attachments: ?[]u8 = null,
     spill_dir: []const u8 = "",
 
     in_turn: bool = false,
@@ -292,7 +296,17 @@ pub const DshNativeHarness = struct {
         self.approval = approval_mod.Service.init(.{ .policy = opts.approval_policy });
         try self.buildTools();
         try self.buildPrompt();
+        self.channel_attachments = try renderChannelAttachments(allocator);
         return self;
+    }
+
+    fn renderChannelAttachments(allocator: Allocator) ![]u8 {
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &buf);
+        try native_prompt.appendChannelAttachmentsSection(&writer.writer);
+        buf = writer.toArrayList();
+        return buf.toOwnedSlice(allocator);
     }
 
     pub fn deinit(self: *Self, allocator: Allocator) void {
@@ -313,6 +327,7 @@ pub const DshNativeHarness = struct {
         if (self.ask_user) |value| self.allocator.destroy(value);
         if (self.todo) |value| self.allocator.destroy(value);
         if (self.exit_plan) |value| self.allocator.destroy(value);
+        if (self.channel_attachments) |text| self.allocator.free(text);
         self.allocator.destroy(self.plan_session);
         self.call_arena.deinit();
         self.turn_tools.deinit();
@@ -1989,6 +2004,16 @@ pub const DshNativeHarness = struct {
                     "junclaw:workspace-guides",
                     context.ContextOrder.junclaw_guides,
                     guide_text,
+                ));
+            }
+        }
+        if (self.channel_attachments) |text| {
+            const attachments_text = std.mem.trimEnd(u8, text, "\n");
+            if (attachments_text.len > 0) {
+                try sections.append(allocator, context.customSection(
+                    "junclaw:channel-attachments",
+                    context.ContextOrder.junclaw_channel_attachments,
+                    attachments_text,
                 ));
             }
         }

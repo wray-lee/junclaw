@@ -266,6 +266,8 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 - 自动压缩在 agent pre-step 阶段、测得 token 数达到阈值时运行；请求开始时的 provider context 溢出错误会触发一次压缩并重试一次。`/compact` 是手动入口。
 - 其余斜杠命令留给宿主处理。
 
+该引擎会把与原生引擎相同的渠道附件标记说明注入运行时上下文，因此回复里写 `[FILE:...]`、`[DOCUMENT:...]`、`[IMAGE:...]` 等标记时，渠道会像原生引擎一样上传文件，并同样受工作区/`autonomy.allowed_paths` 范围过滤约束。
+
 示例：
 
 ```json

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Fixed
+
+- dsh engine: the in-process engine's runtime context now carries the same
+  channel attachment-marker guidance as the native system prompt, so the model
+  emits `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]`, and the other markers
+  instead of pasting file bodies or calling a channel API with its own
+  credentials. The dsh system prompt stays verbatim, and the existing
+  workspace/`autonomy.allowed_paths` marker-scope filter applies unchanged.
+
 ## 1.1.1 - 2026-10-28
 
 Fix release: model menu, text tool calls and self-update.

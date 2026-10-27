@@ -7009,6 +7009,48 @@ test "agent.harness defaults to the in-process dsh engine" {
     );
 }
 
+test "dsh-native reply attachment markers reach the channel layer" {
+    // Regression: dsh 引擎不知道附件标记，模型用 curl+bot token 自行发文件.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    const marker = try std.fmt.allocPrint(
+        testing.allocator,
+        "report ready [FILE:{s}/report.pdf]",
+        .{fixture.base},
+    );
+    defer testing.allocator.free(marker);
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = marker }});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const reply = try sm.processMessage("cli:main:dsh-native-attachment", "send the report", null);
+    defer testing.allocator.free(reply);
+    // The session layer hands the channel one string; the marker survives the
+    // engine's reply composition so the outbound layer can upload the file.
+    try testing.expectEqualStrings(marker, reply);
+    try testing.expect(outbound_mod.has_legacy_attachment_markers(reply));
+}
+
+test "dsh-native escaping attachment marker is dropped for an agent with its own autonomy" {
+    // Regression: dsh 引擎不知道附件标记，模型用 curl+bot token 自行发文件.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "here [DOCUMENT:/etc/passwd] bye" }});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("cli:main:dsh-native-attachment-scope");
+    session.agent.has_own_autonomy = true;
+
+    const reply = try sm.processMessage("cli:main:dsh-native-attachment-scope", "hi", null);
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, reply, "/etc/passwd") == null);
+}
+
 test "dsh bridge set equals the session tools left after the MCP allowlist" {
     // `initMcpTools` already dropped non-allowlisted tools before they reached
     // `agent.tools`, so the bridge must copy exactly this list: no resurrection
