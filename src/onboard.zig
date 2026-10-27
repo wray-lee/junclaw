@@ -334,6 +334,11 @@ pub fn providerEnvVar(provider: []const u8) []const u8 {
 
 // ── Live model fetching ─────────────────────────────────────────
 
+/// Catalog endpoints (gateways included) can be cold and slow: the first call
+/// may stall for several seconds before the gateway warms up.
+const MODELS_LIST_TIMEOUT_SECS = "20";
+const MODELS_LIST_RETRY_DELAY_NS: u64 = 250 * std.time.ns_per_ms;
+
 pub const ModelsCacheEntry = struct {
     provider: []const u8,
     models: []const []const u8,
@@ -363,12 +368,17 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "openai-codex")) return &codex_support.codex_model_fallbacks;
     if (std.mem.eql(u8, canonical, "gemini-cli")) return &gemini_cli_fallback;
 
-    // For providers without a curated fallback list, return a single-item fallback
-    // based on the onboarding default model for that provider.
+    // For providers without a curated fallback list, return the onboarding
+    // default model when the provider is known.
     if (providerDefaultFallback(canonical)) |models| return models;
 
-    return &anthropic_fallback;
+    // Custom/OpenAI-compatible providers have no trustworthy static list.
+    // Inventing Claude ids here is how /model ended up listing them for a
+    // gateway that only serves non-Claude models.
+    return &empty_fallback;
 }
+
+const empty_fallback = [_][]const u8{};
 
 const ProviderFallback = struct {
     key: []const u8,
@@ -495,17 +505,23 @@ const NativeModelCatalog = struct {
     parse_options: ModelIdParseOptions = .{},
 };
 
-/// Return a heap-allocated copy of the static fallback list for a provider.
+/// Return a heap-allocated copy of the fallback list for a provider.
+/// Providers without a curated list fall back to `current_model`; with none,
+/// the list is empty and the caller reports the fetch failure to the user.
 /// Caller owns the returned slice and all its strings.
-fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]const u8 {
-    const static = fallbackModelsForProvider(provider);
+fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8, current_model: ?[]const u8) ![][]const u8 {
     var result: std.ArrayListUnmanaged([]const u8) = .empty;
     errdefer {
         for (result.items) |item| allocator.free(item);
         result.deinit(allocator);
     }
-    for (static) |m| {
-        try appendOwnedCopy(allocator, &result, m);
+    const static = fallbackModelsForProvider(provider);
+    if (static.len > 0) {
+        for (static) |m| {
+            try appendOwnedCopy(allocator, &result, m);
+        }
+    } else if (current_model) |model| {
+        if (model.len > 0) try appendOwnedCopy(allocator, &result, model);
     }
     return result.toOwnedSlice(allocator);
 }
@@ -514,8 +530,10 @@ fn dupeFallbackModels(allocator: std.mem.Allocator, provider: []const u8) ![][]c
 ///
 /// Uses file-based cache at `state/models_cache.json` inside the config directory with 12h TTL.
 /// Returns at most 20 model IDs. Caller ALWAYS owns the returned slice and strings.
+/// When the live fetch fails and the provider has no curated fallback list,
+/// `current_model` (the caller's configured model) is returned instead.
 /// Free with: for (models) |m| allocator.free(m); allocator.free(models);
-pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
+pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8, current_model: ?[]const u8) ![][]const u8 {
     const canonical = canonicalProviderName(provider);
     if (std.mem.eql(u8, canonical, "codex-cli") or std.mem.eql(u8, canonical, "openai-codex")) {
         return codex_support.loadCodexModels(allocator);
@@ -525,11 +543,11 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
     // real ~/.nullclaw cache state.
     if (builtin.is_test) {
         return fetchModelsFromApi(allocator, canonical, api_key, base_url) catch
-            dupeFallbackModels(allocator, canonical);
+            dupeFallbackModels(allocator, canonical, current_model);
     }
 
     const config_dir = config_paths.defaultConfigDir(allocator) catch
-        return dupeFallbackModels(allocator, provider);
+        return dupeFallbackModels(allocator, provider, current_model);
     defer allocator.free(config_dir);
 
     const state_dir = try std_compat.fs.path.join(allocator, &.{ config_dir, "state" });
@@ -538,10 +556,10 @@ pub fn fetchModels(allocator: std.mem.Allocator, provider: []const u8, api_key: 
     // Ensure state directory exists
     std_compat.fs.makeDirAbsolute(state_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => return dupeFallbackModels(allocator, provider),
+        else => return dupeFallbackModels(allocator, provider, current_model),
     };
 
-    return loadModelsWithCache(allocator, state_dir, provider, api_key, base_url);
+    return loadModelsWithCache(allocator, state_dir, provider, api_key, base_url, current_model);
 }
 
 /// Fetch model IDs from a provider's API. Returns owned slice of owned strings.
@@ -588,7 +606,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
         std.mem.eql(u8, canonical, "ollama") or
         std.mem.eql(u8, canonical, "claude-cli"))
     {
-        return dupeFallbackModels(allocator, canonical);
+        return dupeFallbackModels(allocator, canonical, null);
     }
 
     return error.FetchFailed;
@@ -733,7 +751,7 @@ fn modelsCacheProviderKey(allocator: std.mem.Allocator, provider: []const u8, ap
 fn fetchModelsFromModelsDev(allocator: std.mem.Allocator, provider: []const u8) !?[][]const u8 {
     const provider_key = modelsDevProviderKey(provider) orelse return null;
 
-    const response = http_util.curlGet(allocator, MODELS_DEV_URL, &.{}, "10") catch |err| {
+    const response = http_util.curlGet(allocator, MODELS_DEV_URL, &.{}, MODELS_LIST_TIMEOUT_SECS) catch |err| {
         logModelCatalogFailureErr(MODELS_DEV_URL, provider, err);
         return error.FetchFailed;
     };
@@ -932,7 +950,17 @@ fn parseOpenAiModelIds(allocator: std.mem.Allocator, json_response: []const u8, 
 }
 
 fn fetchAndParseModels(allocator: std.mem.Allocator, provider: []const u8, url: []const u8, headers: []const []const u8, options: ModelIdParseOptions) ![][]const u8 {
-    const response = http_util.curlGet(allocator, url, headers, "10") catch |err| {
+    return fetchAndParseModelsOnce(allocator, provider, url, headers, options) catch |first_err| {
+        if (first_err == error.OutOfMemory) return first_err;
+        // Cold gateway catalogs 503 or time out once before warming up; one
+        // retry with a short fixed pause covers that without a retry storm.
+        if (!builtin.is_test) std_compat.thread.sleep(MODELS_LIST_RETRY_DELAY_NS);
+        return fetchAndParseModelsOnce(allocator, provider, url, headers, options);
+    };
+}
+
+fn fetchAndParseModelsOnce(allocator: std.mem.Allocator, provider: []const u8, url: []const u8, headers: []const []const u8, options: ModelIdParseOptions) ![][]const u8 {
+    const response = http_util.curlGet(allocator, url, headers, MODELS_LIST_TIMEOUT_SECS) catch |err| {
         logModelCatalogFailureErr(url, provider, err);
         return error.FetchFailed;
     };
@@ -977,10 +1005,11 @@ fn buildModelsUrl(allocator: std.mem.Allocator, base_url: []const u8) ![]const u
 }
 
 /// Load models with file-based cache. Cache expires after 12 hours.
-/// Falls back to hardcoded list on any error. Caller ALWAYS owns the result.
-pub fn loadModelsWithCache(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8) ![][]const u8 {
+/// Falls back to an expired cache entry, then to the static/current-model
+/// fallback on any error. Caller ALWAYS owns the result.
+pub fn loadModelsWithCache(allocator: std.mem.Allocator, cache_dir: []const u8, provider: []const u8, api_key: ?[]const u8, base_url: ?[]const u8, current_model: ?[]const u8) ![][]const u8 {
     return loadModelsWithCacheInner(allocator, cache_dir, provider, api_key, base_url) catch {
-        return dupeFallbackModels(allocator, provider);
+        return dupeFallbackModels(allocator, provider, current_model);
     };
 }
 
@@ -991,13 +1020,19 @@ fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8,
     const cache_provider = try modelsCacheProviderKey(allocator, canonical, api_key, base_url);
     defer allocator.free(cache_provider);
 
-    // Try reading cache file
-    if (readCachedModels(allocator, cache_path, cache_provider)) |cached| {
+    // Try reading a fresh cache entry
+    if (readCachedModels(allocator, cache_path, cache_provider, false)) |cached| {
         return cached;
     } else |_| {}
 
-    // Cache miss or expired — fetch from API
-    const models = try fetchModelsFromApi(allocator, canonical, api_key, base_url);
+    // Cache miss or expired — fetch from API. An expired entry still beats a
+    // wrong static list; it is not written back, so the next call refreshes it.
+    const models = fetchModelsFromApi(allocator, canonical, api_key, base_url) catch |err| {
+        if (readCachedModels(allocator, cache_path, cache_provider, true)) |stale| {
+            return stale;
+        } else |_| {}
+        return err;
+    };
 
     // Best-effort: save to cache (coerce [][]const u8 -> []const []const u8)
     const models_const: []const []const u8 = models;
@@ -1008,7 +1043,7 @@ fn loadModelsWithCacheInner(allocator: std.mem.Allocator, cache_dir: []const u8,
 
 const CACHE_TTL_SECS: i64 = 12 * 3600; // 12 hours
 
-fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8) ![][]const u8 {
+fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provider: []const u8, allow_expired: bool) ![][]const u8 {
     const file = std_compat.fs.openFileAbsolute(cache_path, .{}) catch return error.CacheNotFound;
     defer file.close();
 
@@ -1028,8 +1063,10 @@ fn readCachedModels(allocator: std.mem.Allocator, cache_path: []const u8, provid
         else => return error.CacheParseError,
     };
 
-    const now = std_compat.time.timestamp();
-    if (now - fetched_at > CACHE_TTL_SECS) return error.CacheExpired;
+    if (!allow_expired) {
+        const now = std_compat.time.timestamp();
+        if (now - fetched_at > CACHE_TTL_SECS) return error.CacheExpired;
+    }
 
     // Get provider's model list
     const provider_val = root.object.get(provider) orelse return error.CacheProviderMissing;
@@ -2414,14 +2451,14 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
     else
         cfg.default_provider;
 
-    if (fetchModels(allocator, provider_for_fetch, cfg.defaultProviderKey(), cfg.getProviderBaseUrl(cfg.default_provider))) |models| {
+    if (fetchModels(allocator, provider_for_fetch, cfg.defaultProviderKey(), cfg.getProviderBaseUrl(cfg.default_provider), default_model_for_provider)) |models| {
         models_fetched = true;
         live_models = models;
         models_to_use = live_models;
     } else |_| {
         try out.writeAll("  Could not fetch models (will use fallback)\n");
         try out.flush();
-        models_to_use = try dupeFallbackModels(allocator, provider_for_fetch);
+        models_to_use = try dupeFallbackModels(allocator, provider_for_fetch, default_model_for_provider);
     }
 
     defer {
@@ -4783,10 +4820,10 @@ test "fallbackModelsForProvider handles aliases" {
     try std.testing.expectEqualStrings("gemini-2.5-pro", vertex_models[0]);
 }
 
-test "fallbackModelsForProvider unknown returns anthropic fallback" {
+test "fallbackModelsForProvider unknown returns no invented models" {
+    // Regression: it used to return the Claude trio for any unknown provider.
     const models = fallbackModelsForProvider("some-unknown-provider");
-    try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqual(@as(usize, 0), models.len);
 }
 
 test "fallbackModelsForProvider uses provider defaults for uncataloged providers" {
@@ -5009,7 +5046,7 @@ test "cache read returns error for missing file" {
     const missing_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "nonexistent-cache-12345.json" });
     defer std.testing.allocator.free(missing_path);
 
-    const result = readCachedModels(std.testing.allocator, missing_path, "openai");
+    const result = readCachedModels(std.testing.allocator, missing_path, "openai", false);
     try std.testing.expectError(error.CacheNotFound, result);
 }
 
@@ -5031,7 +5068,7 @@ test "cache round-trip: write then read fresh cache" {
     try saveCachedModels(std.testing.allocator, cache_path, "testprov", &models);
 
     // Read back
-    const loaded = try readCachedModels(std.testing.allocator, cache_path, "testprov");
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "testprov", false);
     defer {
         for (loaded) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(loaded);
@@ -5063,7 +5100,7 @@ test "cache read sorts stale model ordering on load" {
     defer file.close();
     try file.writeAll(cache_json);
 
-    const loaded = try readCachedModels(std.testing.allocator, cache_path, "openrouter");
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "openrouter", false);
     defer {
         for (loaded) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(loaded);
@@ -5088,7 +5125,7 @@ test "cache read returns error for wrong provider" {
     try saveCachedModels(std.testing.allocator, cache_path, "provA", &models);
 
     // Reading for a different provider should fail
-    const result = readCachedModels(std.testing.allocator, cache_path, "provB");
+    const result = readCachedModels(std.testing.allocator, cache_path, "provB", false);
     try std.testing.expectError(error.CacheProviderMissing, result);
 }
 
@@ -5107,8 +5144,31 @@ test "cache read returns error for expired cache" {
     defer file.close();
     try file.writeAll(old_json);
 
-    const result = readCachedModels(std.testing.allocator, cache_path, "myprov");
+    const result = readCachedModels(std.testing.allocator, cache_path, "myprov", false);
     try std.testing.expectError(error.CacheExpired, result);
+}
+
+test "cache read can return an expired entry when requested" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+    const cache_path = try std_compat.fs.path.join(std.testing.allocator, &.{ base, "models_cache.json" });
+    defer std.testing.allocator.free(cache_path);
+
+    const old_json = "{\"fetched_at\": 1000000, \"myprov\": [\"old-model\"]}";
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
+    defer file.close();
+    try file.writeAll(old_json);
+
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "myprov", true);
+    defer {
+        for (loaded) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(loaded);
+    }
+    try std.testing.expectEqual(@as(usize, 1), loaded.len);
+    try std.testing.expectEqualStrings("old-model", loaded[0]);
 }
 
 test "modelsCacheProviderKey keeps public catalog separate from native listings" {
@@ -5152,7 +5212,7 @@ test "cache round-trip escapes provider keys and model ids" {
     const models = [_][]const u8{ "model\"quote", "path\\model" };
     try saveCachedModels(std.testing.allocator, cache_path, "provider\"quote", &models);
 
-    const loaded = try readCachedModels(std.testing.allocator, cache_path, "provider\"quote");
+    const loaded = try readCachedModels(std.testing.allocator, cache_path, "provider\"quote", false);
     defer {
         for (loaded) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(loaded);
@@ -5183,7 +5243,7 @@ test "loadModelsWithCache keeps public and native cache entries separate" {
     defer file.close();
     try file.writeAll(cache_json);
 
-    const public_models = try loadModelsWithCache(std.testing.allocator, base, "openai", null, null);
+    const public_models = try loadModelsWithCache(std.testing.allocator, base, "openai", null, null, null);
     defer {
         for (public_models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(public_models);
@@ -5191,7 +5251,7 @@ test "loadModelsWithCache keeps public and native cache entries separate" {
     try std.testing.expectEqual(@as(usize, 1), public_models.len);
     try std.testing.expectEqualStrings("gpt-public", public_models[0]);
 
-    const native_models = try loadModelsWithCache(std.testing.allocator, base, "openai", "test-key", null);
+    const native_models = try loadModelsWithCache(std.testing.allocator, base, "openai", "test-key", null, null);
     defer {
         for (native_models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(native_models);
@@ -5210,7 +5270,7 @@ test "loadModelsWithCache falls back on fetch failure" {
     defer std.testing.allocator.free(nonexistent);
 
     // openai without api key will fail fetch, falling back to hardcoded list
-    const models = try loadModelsWithCache(std.testing.allocator, nonexistent, "openai", null, null);
+    const models = try loadModelsWithCache(std.testing.allocator, nonexistent, "openai", null, null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5226,7 +5286,7 @@ test "loadModelsWithCache returns models for anthropic" {
     const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(base);
 
-    const models = try loadModelsWithCache(std.testing.allocator, base, "anthropic", null, null);
+    const models = try loadModelsWithCache(std.testing.allocator, base, "anthropic", null, null, null);
     // Anthropic returns hardcoded models (allocated copies)
     defer {
         for (models) |m| std.testing.allocator.free(m);
@@ -5234,6 +5294,222 @@ test "loadModelsWithCache returns models for anthropic" {
     }
     try std.testing.expect(models.len == 3);
     try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+}
+
+// ── Stub gateway for live /v1/models tests ─────────────────────
+
+const ModelsStubResponse = struct {
+    status_line: []const u8,
+    body: []const u8,
+};
+
+const ModelsStubContext = struct {
+    server: *std_compat.net.Server,
+    stop: *std.atomic.Value(bool),
+    responses: []const ModelsStubResponse,
+};
+
+/// Serve one canned HTTP response per connection, then exit.
+fn serveModelsStub(ctx: *ModelsStubContext) void {
+    var served: usize = 0;
+    while (served < ctx.responses.len) {
+        var conn = ctx.server.accept() catch return;
+        defer conn.stream.close();
+        // The stop path connects once to release a blocked accept on Windows
+        // (setSocketNonblocking is a no-op there); don't answer that connection.
+        if (ctx.stop.load(.acquire)) return;
+        var req_buf: [4096]u8 = undefined;
+        _ = conn.stream.read(&req_buf) catch {};
+        const response = ctx.responses[served];
+        served += 1;
+        var head_buf: [256]u8 = undefined;
+        const head = std.fmt.bufPrint(&head_buf, "{s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{ response.status_line, response.body.len }) catch return;
+        conn.stream.writeAll(head) catch {};
+        conn.stream.writeAll(response.body) catch {};
+    }
+}
+
+/// Join the stub even when the request path never consumed every response:
+/// a single connect releases a thread parked in accept, so the join is bounded.
+fn stopModelsStub(ctx: *ModelsStubContext, thread: std.Thread) void {
+    ctx.stop.store(true, .release);
+    if (std_compat.net.tcpConnectToAddress(ctx.server.listen_address)) |stream| {
+        stream.close();
+    } else |_| {}
+    thread.join();
+}
+
+const stub_ok_body = "{\"data\": [{\"id\": \"stub-model-b\"}, {\"id\": \"stub-model-a\"}]}";
+
+// Regression: a failed /v1/models call (503) dropped straight to the static
+// fallback even though models_cache.json still had usable ids for the provider.
+test "loadModelsWithCache returns an expired cache entry when live fetch fails" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1", .{server.listen_address.in.getPort()});
+    defer allocator.free(base_url);
+
+    const cache_provider = try modelsCacheProviderKey(allocator, "stub-gateway", null, base_url);
+    defer allocator.free(cache_provider);
+    const cache_path = try std_compat.fs.path.join(allocator, &.{ base, "models_cache.json" });
+    defer allocator.free(cache_path);
+    const cache_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"fetched_at\": {d}, \"{s}\": [\"stub-model-b\", \"stub-model-a\"]}}",
+        .{ std_compat.time.timestamp() - (CACHE_TTL_SECS + 60), cache_provider },
+    );
+    defer allocator.free(cache_json);
+    const file = try @import("compat").fs.Dir.wrap(tmp.dir).createFile("models_cache.json", .{});
+    defer file.close();
+    try file.writeAll(cache_json);
+
+    const responses = [_]ModelsStubResponse{
+        .{ .status_line = "HTTP/1.1 503 Service Unavailable", .body = "{}" },
+        .{ .status_line = "HTTP/1.1 503 Service Unavailable", .body = "{}" },
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = ModelsStubContext{ .server = &server, .stop = &stop, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, serveModelsStub, .{&ctx});
+    defer stopModelsStub(&ctx, thread);
+
+    const models = try loadModelsWithCache(allocator, base, "stub-gateway", null, base_url, null);
+    defer {
+        for (models) |m| allocator.free(m);
+        allocator.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("stub-model-a", models[0]);
+    try std.testing.expectEqualStrings("stub-model-b", models[1]);
+
+    // Serving a stale entry must not make it fresh: the next call still refetches.
+    try std.testing.expectError(error.CacheExpired, readCachedModels(allocator, cache_path, cache_provider, false));
+}
+
+// Regression: custom/OpenAI-compatible providers used to fall back to the Claude
+// trio, so /model listed claude-* ids the gateway never served.
+test "loadModelsWithCache custom provider failure falls back to the configured model" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1", .{server.listen_address.in.getPort()});
+    defer allocator.free(base_url);
+
+    const unavailable = ModelsStubResponse{ .status_line = "HTTP/1.1 503 Service Unavailable", .body = "{}" };
+    const responses = [_]ModelsStubResponse{ unavailable, unavailable, unavailable, unavailable };
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = ModelsStubContext{ .server = &server, .stop = &stop, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, serveModelsStub, .{&ctx});
+    defer stopModelsStub(&ctx, thread);
+
+    const configured = try loadModelsWithCache(allocator, base, "stub-gateway", null, base_url, "stub-configured-model");
+    defer {
+        for (configured) |m| allocator.free(m);
+        allocator.free(configured);
+    }
+    try std.testing.expectEqual(@as(usize, 1), configured.len);
+    try std.testing.expectEqualStrings("stub-configured-model", configured[0]);
+
+    const empty = try loadModelsWithCache(allocator, base, "stub-gateway", null, base_url, null);
+    defer {
+        for (empty) |m| allocator.free(m);
+        allocator.free(empty);
+    }
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "loadModelsWithCache caches a successful catalog fetch" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1", .{server.listen_address.in.getPort()});
+    defer allocator.free(base_url);
+
+    const responses = [_]ModelsStubResponse{
+        .{ .status_line = "HTTP/1.1 200 OK", .body = stub_ok_body },
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = ModelsStubContext{ .server = &server, .stop = &stop, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, serveModelsStub, .{&ctx});
+    defer stopModelsStub(&ctx, thread);
+
+    const models = try loadModelsWithCache(allocator, base, "stub-gateway", "test-key", base_url, null);
+    defer {
+        for (models) |m| allocator.free(m);
+        allocator.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("stub-model-a", models[0]);
+    try std.testing.expectEqualStrings("stub-model-b", models[1]);
+
+    // The fetched list must be readable back as a fresh cache entry.
+    const cache_provider = try modelsCacheProviderKey(allocator, "stub-gateway", "test-key", base_url);
+    defer allocator.free(cache_provider);
+    const cache_path = try std_compat.fs.path.join(allocator, &.{ base, "models_cache.json" });
+    defer allocator.free(cache_path);
+    const cached = try readCachedModels(allocator, cache_path, cache_provider, false);
+    defer {
+        for (cached) |m| allocator.free(m);
+        allocator.free(cached);
+    }
+    try std.testing.expectEqual(@as(usize, 2), cached.len);
+    try std.testing.expectEqualStrings("stub-model-a", cached[0]);
+    try std.testing.expectEqualStrings("stub-model-b", cached[1]);
+}
+
+// Regression: a cold gateway answered the first /v1/models call with 503 and the
+// catalog fetch never retried, so /model lost the list until the 12h TTL cycle.
+test "fetchModelsFromApi retries a failed catalog request once" {
+    if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.resolveIp("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    defer server.deinit();
+    const base_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/v1", .{server.listen_address.in.getPort()});
+    defer allocator.free(base_url);
+
+    const responses = [_]ModelsStubResponse{
+        .{ .status_line = "HTTP/1.1 503 Service Unavailable", .body = "{}" },
+        .{ .status_line = "HTTP/1.1 200 OK", .body = stub_ok_body },
+    };
+    var stop = std.atomic.Value(bool).init(false);
+    var ctx = ModelsStubContext{ .server = &server, .stop = &stop, .responses = &responses };
+    const thread = try std.Thread.spawn(.{}, serveModelsStub, .{&ctx});
+    defer stopModelsStub(&ctx, thread);
+
+    const models = try fetchModelsFromApi(allocator, "stub-gateway", null, base_url);
+    defer {
+        for (models) |m| allocator.free(m);
+        allocator.free(models);
+    }
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("stub-model-a", models[0]);
+    try std.testing.expectEqualStrings("stub-model-b", models[1]);
 }
 
 test "fetchModelsFromApi returns hardcoded for anthropic" {
@@ -5380,7 +5656,7 @@ test "fetchModels returns models for anthropic (no network)" {
     defer std.testing.allocator.free(test_home_z);
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(env_name.ptr, test_home_z.ptr, 1));
 
-    const models = try fetchModels(std.testing.allocator, "anthropic", null, null);
+    const models = try fetchModels(std.testing.allocator, "anthropic", null, null, null);
     // Anthropic uses hardcoded fallback (allocated copies via fetchModelsFromApi)
     defer {
         for (models) |m| std.testing.allocator.free(m);
@@ -5391,7 +5667,7 @@ test "fetchModels returns models for anthropic (no network)" {
 }
 
 test "fetchModels returns models for gemini (no network)" {
-    const models = try fetchModels(std.testing.allocator, "gemini", null, null);
+    const models = try fetchModels(std.testing.allocator, "gemini", null, null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5401,7 +5677,7 @@ test "fetchModels returns models for gemini (no network)" {
 }
 
 test "fetchModels returns models for deepseek (no network)" {
-    const models = try fetchModels(std.testing.allocator, "deepseek", null, null);
+    const models = try fetchModels(std.testing.allocator, "deepseek", null, null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5412,7 +5688,7 @@ test "fetchModels returns models for deepseek (no network)" {
 
 test "fetchModels returns fallback for openai without key" {
     // OpenAI needs auth — without key, should gracefully fall back
-    const models = try fetchModels(std.testing.allocator, "openai", null, null);
+    const models = try fetchModels(std.testing.allocator, "openai", null, null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);
@@ -5421,18 +5697,31 @@ test "fetchModels returns fallback for openai without key" {
     try std.testing.expectEqualStrings("gpt-5.2", models[0]);
 }
 
-test "fetchModels returns fallback for unknown provider" {
-    const models = try fetchModels(std.testing.allocator, "some-random-provider", null, null);
+// Regression: unknown providers used to fall back to the Claude trio, so /model
+// listed claude-* for a gateway that only serves its own model ids.
+test "fetchModels unknown provider falls back to current model or empty list" {
+    const empty = try fetchModels(std.testing.allocator, "some-random-provider", null, null, null);
     defer {
-        for (models) |m| std.testing.allocator.free(m);
-        std.testing.allocator.free(models);
+        for (empty) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(empty);
     }
-    try std.testing.expect(models.len >= 3);
-    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqual(@as(usize, 0), empty.len);
+
+    const configured = try fetchModels(std.testing.allocator, "some-random-provider", null, null, "gateway-model-1");
+    defer {
+        for (configured) |m| std.testing.allocator.free(m);
+        std.testing.allocator.free(configured);
+    }
+    try std.testing.expectEqual(@as(usize, 1), configured.len);
+    try std.testing.expectEqualStrings("gateway-model-1", configured[0]);
+}
+
+test "fallbackModelsForProvider invents no Claude list for unknown providers" {
+    try std.testing.expectEqual(@as(usize, 0), fallbackModelsForProvider("some-random-provider").len);
 }
 
 test "fetchModels handles google alias" {
-    const models = try fetchModels(std.testing.allocator, "google", null, null);
+    const models = try fetchModels(std.testing.allocator, "google", null, null, null);
     defer {
         for (models) |m| std.testing.allocator.free(m);
         std.testing.allocator.free(models);

@@ -62,7 +62,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
 
     // Use onboard's fetchModels (handles caching, fallbacks, API calls)
-    const models = onboard.fetchModels(allocator, provider_key, api_key, base_url) catch |err| {
+    const models = onboard.fetchModels(allocator, provider_key, api_key, base_url, null) catch |err| {
         std.debug.print("error fetching models: {}\n", .{err});
         std_compat.process.exit(1);
     };

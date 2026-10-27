@@ -497,7 +497,7 @@ fn renderInteractiveModelMenu(self: anytype, provider_name: []const u8, page_num
 
     const api_key = if (cfg_opt) |*cfg| cfg.getProviderKey(provider_name) else null;
     const base_url = if (cfg_opt) |*cfg| cfg.getProviderBaseUrl(provider_name) else null;
-    const models = onboard.fetchModels(self.allocator, provider_name, api_key, base_url) catch return null;
+    const models = onboard.fetchModels(self.allocator, provider_name, api_key, base_url, self.model_name) catch return null;
     defer freeOwnedStringSlice(self.allocator, models);
 
     return renderInteractiveModelMenuFromModels(
@@ -5624,7 +5624,7 @@ pub fn handleSlashCommand(self: anytype, message: []const u8) !?[]const u8 {
                 if (try renderInteractiveModelMenu(self, provider_name, page_number)) |menu| {
                     return menu;
                 }
-                return try std.fmt.allocPrint(self.allocator, "No models available for provider: {s}", .{provider_name});
+                return try std.fmt.allocPrint(self.allocator, "Could not fetch the model list for provider: {s}. Try again later.", .{provider_name});
             }
             if (cmd.arg.len == 0 or
                 std.ascii.eqlIgnoreCase(cmd.arg, "list") or
