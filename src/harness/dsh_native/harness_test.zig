@@ -1772,6 +1772,50 @@ test "dsh-native adapter: /goal commands change the projection and survive resta
     _ = (try restored.harness().handleLocalCommand("/goal clear")).?;
 }
 
+test "dsh-native adapter: direct log appenders redact PII (goal, todo)" {
+    // Regression: redaction walked only a key whitelist inside appendEvent,
+    // but the goal store and the todo tool append to the log directly, so
+    // `/goal ... alice@example.com` and todo content persisted raw addresses.
+    const allocator = testing.allocator;
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{
+            .id = "call-1",
+            .name = "todo_write",
+            .arguments = "{\"todos\":[{\"content\":\"email alice@example.com the report\",\"status\":\"pending\"}]}",
+        }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.redactor = &redactor;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const result = try h.runTurn(turnInput("checklist"));
+    defer allocator.free(result.reply);
+    _ = (try h.handleLocalCommand("/goal email alice@example.com about the release")).?;
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    const raw = try fs_compat.readFileAlloc(compat.fs.cwd(), allocator, path, 1 << 20);
+    defer allocator.free(raw);
+    try testing.expect(std.mem.indexOf(u8, raw, "alice@example.com") == null);
+    try testing.expect(std.mem.indexOf(u8, raw, "[EMAIL_1]") != null);
+
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    var saw_todo = false;
+    var saw_goal = false;
+    for (read.events) |event| {
+        if (std.mem.eql(u8, event.event_type, "todo/write")) saw_todo = true;
+        if (std.mem.eql(u8, event.event_type, "goal/change")) saw_goal = true;
+    }
+    try testing.expect(saw_todo);
+    try testing.expect(saw_goal);
+}
+
 test "dsh-native adapter: sandbox escalation fails closed without an approval channel" {
     const allocator = testing.allocator;
     const bash_args =

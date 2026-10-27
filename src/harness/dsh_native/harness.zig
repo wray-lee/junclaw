@@ -379,50 +379,15 @@ pub const DshNativeHarness = struct {
     }
 
     fn appendEvent(self: *Self, event_type: []const u8, data: Value, surface_op: ?types.SurfaceOp, seqs: ?[]const u64) !u64 {
+        // Every JSONL line is PII-redacted by `Log.append` itself, so this
+        // path and the direct appenders (goal store, todo tool) share one
+        // guarantee.
         const log = if (self.log) |*value| value else return error.NoSession;
-        // The JSONL is disk state native keeps redacted (turn persistence and
-        // every append site); walk the payload so auxiliary copies (stream
-        // chunks, tool-call arguments, summaries) carry no raw PII either.
-        if (self.opts.redactor != null) {
-            var redactable = data;
-            try self.redactEventData(self.arena.allocator(), &redactable);
-        }
         return log.append(event_type, data, .{
             .time_ms = self.now(),
             .surface_op = surface_op,
             .source_event_seqs = seqs,
         });
-    }
-
-    fn redactEventData(self: *Self, allocator: Allocator, value: *Value) !void {
-        switch (value.*) {
-            .object => |*object| {
-                var entries = object.iterator();
-                while (entries.next()) |entry| {
-                    if (redactedField(entry.key_ptr.*)) {
-                        switch (entry.value_ptr.*) {
-                            .string => |text| entry.value_ptr.* = .{ .string = try self.redactText(allocator, text) },
-                            .array => |*items| for (items.items) |*item| {
-                                if (item.* == .string) item.* = .{ .string = try self.redactText(allocator, item.string) };
-                            },
-                            else => {},
-                        }
-                        continue;
-                    }
-                    try self.redactEventData(allocator, entry.value_ptr);
-                }
-            },
-            .array => |*items| for (items.items) |*item| try self.redactEventData(allocator, item),
-            else => {},
-        }
-    }
-
-    /// dsh event fields that carry human/model text (content blocks, tool
-    /// arguments, stream runs); structural fields (ids, names, paths) stay.
-    fn redactedField(key: []const u8) bool {
-        const fields = [_][]const u8{ "text", "arguments", "argumentsDelta", "texts", "args" };
-        for (fields) |field| if (std.mem.eql(u8, key, field)) return true;
-        return false;
     }
 
     fn buildTools(self: *Self) !void {
@@ -702,6 +667,7 @@ pub const DshNativeHarness = struct {
             .delegation_depth = 0,
         };
         self.log = try session_store.createLog(self.allocator, self.opts.dsh_home, self.workspace(), id, header);
+        self.log.?.redactor = self.opts.redactor;
         if (self.goal_store) |store| store.attachLog(&self.log.?);
         if (self.todo) |ctx| ctx.log = &self.log.?;
         // dsh pins the missing permission facts before the session is
@@ -802,6 +768,7 @@ pub const DshNativeHarness = struct {
             try self.startFresh();
             return;
         };
+        self.log.?.redactor = self.opts.redactor;
         if (self.goal_store) |store| store.attachLog(&self.log.?);
         if (self.todo) |ctx| ctx.log = &self.log.?;
 

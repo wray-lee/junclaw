@@ -12,6 +12,7 @@
 const std = @import("std");
 const compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
+const redaction = @import("../../redaction.zig");
 const json = @import("json.zig");
 const surface = @import("surface.zig");
 const types = @import("types.zig");
@@ -50,6 +51,10 @@ pub const Log = struct {
     lock_file: compat.fs.File,
     header: types.Header,
     next_seq: u64,
+    /// Optional PII redactor: every string value of an appended event passes
+    /// through it, so append sites that never see the harness (goal store,
+    /// todo tool) cannot write raw PII to the JSONL either.
+    redactor: ?*redaction.Redactor = null,
     /// Byte length of the last committed record; a failed append rewinds here.
     end_pos: u64 = 0,
     /// Set after a write failure: the tail is untrusted, so later appends
@@ -144,11 +149,16 @@ pub const Log = struct {
     pub fn append(self: *Log, event_type: []const u8, data: std.json.Value, opts: AppendOptions) !u64 {
         if (!isKnownEventType(event_type) and !opts.ignorable) return error.UnsupportedEventType;
         if (self.broken) return error.LogBroken;
+        var redacted_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer redacted_arena.deinit();
         const event = types.Event{
             .event_type = event_type,
             .seq = self.next_seq,
             .time_ms = opts.time_ms orelse compat.time.milliTimestamp(),
-            .data = data,
+            .data = if (self.redactor) |redactor|
+                try redactedEventData(redacted_arena.allocator(), redactor, data)
+            else
+                data,
             .surface_op = opts.surface_op,
             .source_event_seqs = opts.source_event_seqs,
             .ignorable = opts.ignorable,
@@ -624,6 +634,28 @@ const TestPaths = struct {
         self.allocator.free(self.base);
     }
 };
+
+/// Deep-copy `data` and redact every string in the copy: the log-wide PII
+/// guarantee cannot depend on each append site remembering a key whitelist.
+/// The copy keeps the caller's value intact after the temporary arena dies.
+fn redactedEventData(allocator: Allocator, redactor: *redaction.Redactor, data: std.json.Value) !std.json.Value {
+    const text = try std.json.Stringify.valueAlloc(allocator, data, .{});
+    var copy = try std.json.parseFromSliceLeaky(std.json.Value, allocator, text, .{ .allocate = .alloc_always });
+    try redactStrings(allocator, redactor, &copy);
+    return copy;
+}
+
+fn redactStrings(allocator: Allocator, redactor: *redaction.Redactor, value: *std.json.Value) !void {
+    switch (value.*) {
+        .string => |text| value.* = .{ .string = try redactor.redact(allocator, text) },
+        .object => |*object| {
+            var entries = object.iterator();
+            while (entries.next()) |entry| try redactStrings(allocator, redactor, entry.value_ptr);
+        },
+        .array => |*items| for (items.items) |*item| try redactStrings(allocator, redactor, item),
+        else => {},
+    }
+}
 
 fn testHeader() types.Header {
     return .{
