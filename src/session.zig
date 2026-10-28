@@ -194,7 +194,11 @@ const DshNativeState = struct {
             .question_timeout_s = config.agent.dsh_question_timeout,
             .temperature = session.agent.temperature,
             .host_tools = host_tools,
-            .host_executor = .{ .context = @ptrCast(&session.agent), .call = hostToolCall },
+            // The session (not the agent): the worker route must come from the
+            // routed session key. `memory_session_id` is rewritten to
+            // `agent:{id}` for workspace-profile agents and then carries no
+            // channel or peer.
+            .host_executor = .{ .context = @ptrCast(session), .call = hostToolCall },
             // Same per-turn MCP exposure as the native agent; the bridge set
             // above is already the post-allowlist `session.agent.tools`.
             .tool_filter_groups = config.agent.tool_filter_groups,
@@ -286,12 +290,14 @@ fn hostToolCall(
     name: []const u8,
     args: std.json.Value,
 ) anyerror!dsh_bridge.HostResult {
-    const agent: *Agent = @ptrCast(@alignCast(context));
-    installScheduleThreadContext(agent.conversation_context, agent.memory_session_id);
+    const session: *Session = @ptrCast(@alignCast(context));
+    // Same inputs as the turn thread's setTurnToolContext, so the worker route
+    // cannot drift from the turn's: memory_session_id can be `agent:{id}`.
+    installScheduleThreadContext(session.agent.conversation_context, session.session_key);
     defer installScheduleThreadContext(null, null);
     const args_json = try std.json.Stringify.valueAlloc(allocator, args, .{});
-    const outcome = agent.executeHostTool(allocator, name, args_json);
-    const output = try sanitizeHostToolOutput(allocator, agent.redactor, outcome.output);
+    const outcome = session.agent.executeHostTool(allocator, name, args_json);
+    const output = try sanitizeHostToolOutput(allocator, session.agent.redactor, outcome.output);
     return .{ .success = outcome.success, .output = output };
 }
 
@@ -7087,6 +7093,48 @@ test "agent.harness defaults to the in-process dsh engine" {
     );
 }
 
+test "dsh turn installs the spawn origin route from the host conversation" {
+    // Regression: dsh bypasses Agent.turn, so nothing refreshed the spawn
+    // tool's origin route and subagent results went to the synthetic "system"
+    // channel instead of the originating chat.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "done" }});
+    defer provider.deinit();
+    // Plain fixture managers carry no tools; install a spawn tool so the
+    // session-level refresh has one to write the origin route into.
+    var spawn_tool = tools_mod.spawn.SpawnTool{};
+    var tools = [_]Tool{spawn_tool.tool()};
+    var noop = observability.NoopObserver{};
+    var sm = SessionManager.init(
+        testing.allocator,
+        &fixture.cfg,
+        provider.provider(),
+        &tools,
+        null,
+        noop.observer(),
+        null,
+        null,
+    );
+    defer sm.deinit();
+
+    const key = "telegram:direct:42";
+    const reply = try sm.processMessage(key, "hi", .{
+        .channel = "telegram",
+        .account_id = "tg-main",
+        .delivery_chat_id = "42",
+        .peer_id = "42",
+        .is_group = false,
+    });
+    defer testing.allocator.free(reply);
+
+    try testing.expectEqualStrings("telegram", spawn_tool.default_channel.?);
+    try testing.expectEqualStrings("tg-main", spawn_tool.default_account_id.?);
+    try testing.expectEqualStrings("42", spawn_tool.default_chat_id.?);
+    try testing.expectEqualStrings(key, spawn_tool.default_session_key.?);
+}
+
 test "dsh-native reply attachment markers reach the channel layer" {
     // Regression: dsh 引擎不知道附件标记，模型用 curl+bot token 自行发文件.
     var fixture = try DshNativeFixture.init();
@@ -9527,21 +9575,21 @@ test "dsh host tool workers inherit the turn's schedule delivery context" {
         .max_history_messages = 10,
         .auto_save = false,
     };
-    agent.memory_session_id = "agent:main:telegram:group:-10042";
-    agent.conversation_context = .{
-        .channel = "telegram",
-        .delivery_chat_id = "-10042",
-        .group_id = "-10042",
-        .is_group = true,
-    };
+    // A workspace-profile session rewrites memory_session_id to `agent:{id}`,
+    // and gateway WeChat/WeCom turns pass no conversation_context: the route
+    // must still come from the routed session key, not memory_session_id.
+    agent.memory_session_id = "agent:worker-probe";
+    var session: Session = undefined;
+    session.agent = agent;
+    session.session_key = "agent:main:telegram:group:-10042";
 
     const Probe = struct {
         outcome: ?anyerror = null,
         output: []const u8 = "",
     };
     const Worker = struct {
-        fn run(worker_agent: *Agent, probe: *Probe, arena: *std.heap.ArenaAllocator) void {
-            const result = hostToolCall(@ptrCast(worker_agent), arena.allocator(), "worker_ctx_probe", .{ .object = .{} }) catch |err| {
+        fn run(worker_session: *Session, probe: *Probe, arena: *std.heap.ArenaAllocator) void {
+            const result = hostToolCall(@ptrCast(worker_session), arena.allocator(), "worker_ctx_probe", .{ .object = .{} }) catch |err| {
                 probe.outcome = err;
                 return;
             };
@@ -9556,10 +9604,12 @@ test "dsh host tool workers inherit the turn's schedule delivery context" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var probe = Probe{};
-    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &agent, &probe, &arena });
+    const thread = try std.Thread.spawn(.{}, Worker.run, .{ &session, &probe, &arena });
     thread.join();
     try testing.expect(probe.outcome == null);
-    try testing.expectEqualStrings("telegram|-10042|-10042|group", probe.output);
+    // peer_kind only comes from the host context, which these channels do not
+    // send; the turn thread derives the same null through the same helper.
+    try testing.expectEqualStrings("telegram|-10042|-10042|null", probe.output);
 }
 
 test "processMessage updates last_active" {
