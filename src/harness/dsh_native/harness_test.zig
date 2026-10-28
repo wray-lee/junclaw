@@ -1101,8 +1101,10 @@ test "dsh-native adapter: max_tool_iterations caps the rounds and asks for a sum
     const result = try h.runTurn(turnInput("probe once"));
     defer allocator.free(result.reply);
 
-    try testing.expectEqualStrings("summary after the cap", result.reply);
+    // Native prefixes the capped summary and bypasses composeFinalReply.
+    try testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary after the cap", result.reply);
     try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expect(!result.usage_footer);
     try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
     // The summary step runs with no tool schemas and carries the native nudge.
     try testing.expect(!fx.provider.requests.items[0].tools_null);
@@ -1135,17 +1137,54 @@ test "dsh-native adapter: a tool call after the iteration cap is refused and end
     defer allocator.free(result.reply);
 
     try testing.expectEqual(@as(usize, 1), fake.calls);
-    try testing.expectEqualStrings("partway", result.reply);
+    // The capped round's text is the summary: native prefixes it.
+    try testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\npartway", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expect(!result.usage_footer);
     try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
 }
 
-test "dsh-native adapter: an identical tool call in one turn reuses the first result" {
-    // Regression: dsh ran every repeat again; native replays the first
-    // result for an identical name+arguments call within the turn.
+test "dsh-native adapter: a capped round with only a tool call still gets the cap text" {
+    // Regression: the blocked end skipped the empty-reply substitution, so a
+    // capped round with no text produced a blank reply where native still
+    // sends its `[Tool iteration limit: N/N]` text.
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "tool output" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{}" }} },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "probe", .arguments = "{}" }} },
+        .{ .text = "must not be reached" },
+    });
+    defer fx.deinit();
+    fx.max_tool_iterations = 1;
+    fx.host_tools = &.{
+        .{ .name = "probe", .description = "Probe", .input_schema_json = "{}", .concurrency_safe = true },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+
+    const result = try engine.harness().runTurn(turnInput("probe once"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\n", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expect(!result.usage_footer);
+}
+
+test "dsh-native adapter: only a repeated tool-call id reuses the first result" {
+    // Regression: the cache keyed name+arguments, but native's dedup
+    // fingerprint prefers the provider call id, so two distinct calls with
+    // the same arguments must both run.
     const allocator = testing.allocator;
     var fake = BridgeFake{ .output = "probe output" };
     var fx = try Fixture.init(allocator, &.{
         .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{\"x\":1}" }} },
+        // Same id: native replays the first result instead of executing again.
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{\"x\":1}" }} },
+        // Distinct id, same arguments: a separate call, executed again.
         .{ .tool_calls = &.{.{ .id = "call-2", .name = "probe", .arguments = "{\"x\":1}" }} },
         .{ .tool_calls = &.{.{ .id = "call-3", .name = "probe", .arguments = "{\"x\":2}" }} },
         .{ .text = "done" },
@@ -1164,7 +1203,7 @@ test "dsh-native adapter: an identical tool call in one turn reuses the first re
     defer allocator.free(result.reply);
 
     try testing.expectEqualStrings("done", result.reply);
-    try testing.expectEqual(@as(usize, 2), fake.calls);
+    try testing.expectEqual(@as(usize, 3), fake.calls);
     // The reused result still reaches the model as a tool result.
     try testing.expect(requestContains(fx.provider.requests.items[2], "probe output"));
 }
@@ -1193,6 +1232,140 @@ test "dsh-native adapter: an empty round is nudged once, then fails with a messa
     try testing.expect(requestContains(fx.provider.requests.items[1], "previous reply was empty"));
     // The nudge is the native text verbatim, web-search guidance included.
     try testing.expect(requestContains(fx.provider.requests.items[1], "web_search"));
+}
+
+test "dsh-native adapter: an empty length stop is nudged like native" {
+    // Regression: a max_tokens finish counted as a real end, so a truncated
+    // round with no visible text returned a blank reply instead of nudging.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "", .truncated = true },
+        .{ .text = "", .truncated = true },
+        .{ .text = "", .truncated = true },
+        .{ .text = "recovered answer", .pieces = &.{.{ .text = "recovered answer" }} },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    var first = turnInput("hello?");
+    first.live_stream = true;
+    const failed = try h.runTurn(first);
+    defer allocator.free(failed.reply);
+    try testing.expectEqualStrings("Model returned an empty response. Please retry or /new for a fresh session.", failed.reply);
+    try testing.expectEqual(port.EndReason.failed, failed.end_reason);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "previous reply was empty"));
+
+    // One nudge later a real answer is delivered, not the length-stop blank.
+    var second = turnInput("again?");
+    second.live_stream = true;
+    const recovered = try h.runTurn(second);
+    defer allocator.free(recovered.reply);
+    try testing.expectEqualStrings("recovered answer", recovered.reply);
+    try testing.expectEqual(@as(usize, 4), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[3], "previous reply was empty"));
+}
+
+test "dsh-native adapter: a reasoning-only round in .stream gets the reasoning nudge" {
+    // Regression: `.stream` (the production Telegram mode) did not record the
+    // reasoning block, so a reasoning-only round was classified as a generic
+    // empty reply and closed after one nudge instead of native's two.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "", .pieces = &.{.{ .text = "<think>first pondering</think>" }} },
+        .{ .text = "", .pieces = &.{.{ .text = "<think>second pondering</think>" }} },
+        .{ .text = "visible answer", .pieces = &.{.{ .text = "visible answer" }} },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .stream);
+    const h = engine.harness();
+
+    var input = turnInput("think first");
+    input.live_stream = true;
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+
+    try testing.expectEqualStrings("visible answer", result.reply);
+    try testing.expectEqual(@as(usize, 3), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "recorded reasoning"));
+    try testing.expect(requestContains(fx.provider.requests.items[2], "recorded reasoning"));
+}
+
+test "dsh-native adapter: the capped summary is prefixed and skips the reasoning quote" {
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "tool output" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{}" }} },
+        .{
+            .text = "summary text",
+            .pieces = &.{
+                .{ .text = "<think>secret trace</think>" },
+                .{ .text = "summary text" },
+            },
+        },
+    });
+    defer fx.deinit();
+    fx.max_tool_iterations = 1;
+    fx.host_tools = &.{
+        .{ .name = "probe", .description = "Probe", .input_schema_json = "{}", .concurrency_safe = true },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    engine.setCallConfig("test-model", null, .on);
+    const h = engine.harness();
+
+    var input = turnInput("probe once");
+    input.live_stream = true;
+    const result = try h.runTurn(input);
+    defer allocator.free(result.reply);
+
+    // Native's exhausted path returns before composeFinalReply.
+    try testing.expectEqualStrings("[Tool iteration limit: 1/1]\n\nsummary text", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expect(!result.usage_footer);
+    try testing.expect(std.mem.indexOf(u8, result.reply, "Reasoning:") == null);
+}
+
+test "dsh-native adapter: a goal continuation after the cap starts with tool schemas" {
+    // Regression: the guard state was reset once per host turn, so a goal
+    // round after a capped turn inherited `iteration_limited`: no tool
+    // schemas, every call refused, and the continuation closed immediately.
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "probe output" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":4}" }} },
+        .{ .text = "goal created" },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "probe", .arguments = "{}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.max_tool_iterations = 1;
+    fx.host_tools = &.{
+        .{ .name = "probe", .description = "Probe", .input_schema_json = "{}", .concurrency_safe = true },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("ship the goal"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqual(@as(usize, 4), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[2], "<goal_round>"));
+    // The continuation's step is not capped: schemas are present and the tool
+    // actually runs.
+    try testing.expect(!fx.provider.requests.items[2].tools_null);
+    try testing.expectEqual(@as(usize, 1), fake.calls);
 }
 
 test "dsh-native adapter: requestInterrupt cancels a blocking provider call" {

@@ -268,7 +268,7 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 
 该引擎会把与原生引擎相同的渠道附件标记说明注入运行时上下文，因此回复里写 `[FILE:...]`、`[DOCUMENT:...]`、`[IMAGE:...]` 等标记时，渠道会像原生引擎一样上传文件，并同样受工作区/`autonomy.allowed_paths` 范围过滤约束。
 
-该引擎还会对齐以下原生回合行为：最后一条提示里的 `[IMAGE:]` / `[PHOTO:]` 标记会读入 provider content parts；配置的模型没有视觉能力时则替换为原生占位文案；`agent.max_tool_iterations` 会限制工具轮数，到达上限的那一步不再提供工具 schema，并注入原生的"立即总结"提示后结束回合；`agent.usage_mode` 会在已投递回复后追加相同的 `[usage]` 页脚，而持久化记录保持干净；发生压缩的回合会报告 `compacted` 并在回复前加 `[Context compacted]`；同一回合内完全相同的工具调用会复用第一次的结果，不再重复执行；空回复或结构性停滞的轮次会先按原生文案提示重试一次（仅推理内容的重试两次），仍为空才以空回复失败文案结束。`model_routes` 仍只对原生引擎生效，见下文。
+该引擎还会对齐以下原生回合行为：最后一条提示里的 `[IMAGE:]` / `[PHOTO:]` 标记会读入 provider content parts；配置的模型没有视觉能力时则替换为原生占位文案；`agent.max_tool_iterations` 会限制工具轮数，到达上限的那一步不再提供工具 schema，并注入原生的"立即总结"提示后结束回合；耗尽后的回复带原生的 `[Tool iteration limit: N/N]` 前缀（更早轮次的文本合并在它之前），并像原生一样跳过推理引用与 `/usage` 页脚；`agent.usage_mode` 会在已投递回复后追加相同的 `[usage]` 页脚，而持久化记录保持干净；发生压缩的回合会报告 `compacted` 并在回复前加 `[Context compacted]`；同一回合内重复的 provider tool-call id 会复用第一次的结果（id 不同则即使参数相同也正常执行）；空回复或结构性停滞的轮次无论 finish reason（含截断的 length stop）都会先按原生文案提示重试一次（仅推理内容的重试两次，`.stream` 下同样适用），仍为空才以空回复失败文案结束。`model_routes` 仍只对原生引擎生效，见下文。
 
 该进程内引擎同时保留原生引擎的记忆与技能接线：`memory.auto_save` 开启时，每回合结束会把脱敏后的用户文本与已投递回复的摘要写入配置的记忆后端；压缩前（含手动 `/compact`）会把将要丢弃的消息里的持久事实刷入记忆（`agent.compaction_memory_flush`）。运行时上下文会带上原生记忆工具指引、`## Skills`、会话激活的 `## Active Skill Session`、`## Runtime Capabilities` 与 `## Runtime`（OS | Model）。命名 agent 的 `## Agent Profile` 提示词会并入引擎 persona；`AGENTS.md` 通过配置的 bootstrap provider 读取，因此数据库记忆后端（sqlite/postgres/redis）里的副本同样生效。`dsh-sidecar` 引擎没有这套接线。
 

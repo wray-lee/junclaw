@@ -6,9 +6,10 @@
 
 - streaming drafts no longer flash raw attachment control markers: the shared
   `TagFilter` masks `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]` and the other
-  marker kinds, including a marker split across chunks, on every engine. The
-  final message is unchanged, so the channel still parses the marker and sends
-  the file; an unterminated marker stays masked only in the ephemeral draft.
+  marker kinds, including a marker split across chunks, on channel drafts the
+  final message replaces. Append-only sinks (CLI stdout, A2A SSE) opt out:
+  their stream is the delivered text, so the marker and path stay visible and
+  match the persisted transcript.
 - in-process dsh engine: inbound `[IMAGE:]` / `[PHOTO:]` markers in the last
   prompt are read into provider content parts (workspace,
   `autonomy.allowed_paths` and the platform temp dir, under the same vision
@@ -18,19 +19,25 @@
 - in-process dsh engine: `agent.max_tool_iterations` now bounds the tool rounds.
   The step at the cap runs with no tool schemas and the native "summarize now"
   nudge; a tool call after that is refused and the turn ends instead of looping.
+  The exhausted reply carries native's `[Tool iteration limit: N/N]` prefix,
+  even when the capped round produced no text, merges text from earlier rounds
+  first, and skips the reasoning quote and `/usage` footer because native's
+  exhaustion path returns before `composeFinalReply`.
 - in-process dsh engine: `agent.usage_mode` (`/usage`, `/cost`) appends the
   same `[usage]` footer the native reply composer prints, and the persisted
   transcript stays clean.
 - in-process dsh engine: a compacted turn now reports `compacted` (so
   `last_consolidated` advances) and prefixes the reply with
   `[Context compacted]`, matching native.
-- in-process dsh engine: an identical tool call (same name and arguments)
-  within one turn reuses the first result instead of executing again, like
-  native's per-turn tool cache.
+- in-process dsh engine: a repeated provider tool-call id within one turn
+  reuses the first result instead of executing again, like native's per-turn
+  tool cache. Distinct calls with identical arguments both run.
 - in-process dsh engine: an empty or structural-stall round is retried with
-  the native nudge (twice for reasoning-only rounds); if the reply is still
-  empty the turn ends with the native "Model returned an empty response"
-  failure text instead of a blank message.
+  the native nudge (twice for reasoning-only rounds, including `.stream`);
+  the guard ignores the finish reason, so a truncated length stop is retried
+  too, and if the reply is still empty the turn ends with the native "Model
+  returned an empty response" failure text instead of a blank or stale
+  message.
 - docs: the outbound attachment path filter is documented as applying only to
   a named agent that defines its own `autonomy` block, and `model_routes` are
   documented as native-engine-only.

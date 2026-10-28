@@ -291,10 +291,17 @@ pub const DshNativeHarness = struct {
     total_tokens: u64 = 0,
     turn_model_calls: u64 = 0,
     turn_text: std.ArrayListUnmanaged(u8) = .empty,
-    /// Last assistant message's reasoning for `reasoning_mode = .on`; copied
-    /// out of the kernel settlement, which dies with the step.
+    /// Last assistant message's reasoning; copied out of the kernel
+    /// settlement, which dies with the step. Rendered only for
+    /// `reasoning_mode = .on`, but collected in every mode because the
+    /// empty-response guard classifies a reasoning-only round in `.stream`
+    /// too (native src/agent/root.zig:2869-2877).
     turn_reasoning: std.ArrayListUnmanaged(u8) = .empty,
+    /// Last assistant message with no tool calls (the visible answer).
     last_assistant_text: ?[]const u8 = null,
+    /// Text of the last assistant message, tool calls included. The exhausted
+    /// summary is that message; everything before it is interim text.
+    last_round_text: ?[]const u8 = null,
     /// `agent.max_tool_iterations` reached: the next step carries the
     /// summarize nudge with no tool schemas, and a further tool round ends
     /// the turn.
@@ -307,8 +314,9 @@ pub const DshNativeHarness = struct {
     tools_ran_this_turn: bool = false,
     /// The turn compacted its history (`[Context compacted]` + `TurnResult`).
     compacted_this_turn: bool = false,
-    /// Tool results already produced this turn, keyed by name+arguments.
-    /// Native skips an identical repeat and replays the first result.
+    /// Tool results already produced this turn, keyed like native's
+    /// `toolCallDedupFingerprint`: the provider call id when present, else
+    /// name+arguments. Native replays the first result for a repeated id.
     tool_results: std.AutoHashMapUnmanaged(u64, CachedToolResult) = .empty,
     tool_results_mutex: compat.sync.Mutex = .{},
     /// Current turn's conversation context. Native renders `## Conversation
@@ -1371,11 +1379,7 @@ pub const DshNativeHarness = struct {
 
         self.turn_text.clearRetainingCapacity();
         self.turn_reasoning.clearRetainingCapacity();
-        self.last_assistant_text = null;
-        self.iteration_limited = false;
-        self.last_finish = .stop;
-        self.empty_retries = 0;
-        self.tools_ran_this_turn = false;
+        self.resetTurnGuards();
         self.compacted_this_turn = false;
         self.clearToolResults();
         // A previous turn's stop must not abort this one's first provider
@@ -1421,34 +1425,47 @@ pub const DshNativeHarness = struct {
         };
         self.interrupt = false;
 
+        // Native's exhausted path bypasses composeFinalReply: interim text,
+        // then the `[Tool iteration limit: N/N]` prefix and the summary, with
+        // no reasoning quote and no /usage footer. An interrupted or failed
+        // summary keeps the normal reply.
+        const exhausted = self.iteration_limited and switch (reason) {
+            .completed, .blocked, .max_tokens => true,
+            else => false,
+        };
         // `reply` and `error` are owned by the host's allocator (native.zig
         // hands back Agent-allocated memory); the engine's arena copies here.
-        var reply = try self.composeReply();
+        var reply = if (exhausted)
+            try self.composeExhaustedReply()
+        else
+            try self.composeReply();
         errdefer self.allocator.free(reply);
-        // Native parity: after the nudges above, an empty completed turn is a
-        // classified failure with a user-visible message, never a blank reply.
-        const empty_final = switch (reason) {
-            .completed => std.mem.trim(u8, reply, " \t\r\n").len == 0,
+        // Native parity: after the nudges above, a terminal round with no
+        // visible text is a classified failure with a user-visible message,
+        // never a blank or stale-interim reply. The guard ignores the finish
+        // reason, so a length stop counts too.
+        const empty_final = !exhausted and switch (reason) {
+            .completed, .max_tokens => std.mem.trim(u8, self.last_assistant_text orelse "", " \t\r\n").len == 0,
             else => false,
         };
         if (empty_final) {
+            // Allocate before releasing the composed reply: an allocation
+            // failure must leave the errdefer its live pointer.
+            const fallback = try self.allocator.dupe(u8, empty_response_fallback);
             self.allocator.free(reply);
-            // Native's exhaustion fallback names the cap; its empty-response
-            // path reports the empty reply.
-            reply = if (self.iteration_limited)
-                try std.fmt.allocPrint(
-                    self.allocator,
-                    "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.",
-                    .{ self.opts.max_tool_iterations, self.opts.max_tool_iterations },
-                )
-            else
-                try self.allocator.dupe(u8, empty_response_fallback);
+            reply = fallback;
         }
         var result = port.TurnResult{
             .reply = reply,
             .persisted_reply = null,
+            .usage_footer = !exhausted,
             .total_tokens = self.total_tokens,
-            .end_reason = if (empty_final) port.EndReason.failed else mapEndReason(reason),
+            .end_reason = if (empty_final)
+                port.EndReason.failed
+            else if (exhausted)
+                port.EndReason.completed
+            else
+                mapEndReason(reason),
             .compacted = self.compacted_this_turn,
             .dsh_session_id = self.session_id,
             .turn_count = self.turn_model_calls - calls_before,
@@ -1698,6 +1715,10 @@ pub const DshNativeHarness = struct {
         const self = selfOf(context_ptr);
         switch (event) {
             .turn_start => |payload| {
+                // Goal continuation runs extra kernel turns inside one host
+                // turn; the cap and empty-response state must not leak into
+                // the next one (native starts every turn clean).
+                self.resetTurnGuards();
                 const seq = try self.appendPositional("turn/start", null, payload.turn, 0);
                 if (self.sink) |sink| sink.send(.{ .turn_start = .{ .turn = payload.turn } });
                 return seq;
@@ -1911,14 +1932,15 @@ pub const DshNativeHarness = struct {
         const text = try textOf(arena, message.content);
         try self.turn_text.appendSlice(self.allocator, text);
         // `.on` renders the last response's reasoning as a post-turn block,
-        // like native's `composeFinalReply`; copy it out of the step arena.
-        if (self.opts.reasoning_mode == .on) {
-            self.turn_reasoning.clearRetainingCapacity();
-            for (message.content) |block| switch (block) {
-                .reasoning => |trace| try self.turn_reasoning.appendSlice(self.allocator, trace),
-                else => {},
-            };
-        }
+        // like native's `composeFinalReply`; `.stream` only shows it live.
+        // Either way the empty-response guard needs to know the round carried
+        // reasoning, so copy it out of the step arena in every mode.
+        self.turn_reasoning.clearRetainingCapacity();
+        for (message.content) |block| switch (block) {
+            .reasoning => |trace| try self.turn_reasoning.appendSlice(self.allocator, trace),
+            else => {},
+        };
+        self.last_round_text = text;
         if (countToolCalls(message.content) == 0) self.last_assistant_text = text;
         if (self.sink) |sink| {
             if (text.len > 0) sink.send(.{ .assistant_message = .{ .text = text } });
@@ -2115,6 +2137,18 @@ pub const DshNativeHarness = struct {
         _ = try loop.inbox.steer(.{ .id = id, .data = data });
     }
 
+    /// Per-kernel-turn guard state. Reset at every `turn_start` (a goal
+    /// continuation runs another turn in the same host turn) and once before
+    /// the first `runTurn`, whose pre-turn abort skips the event.
+    fn resetTurnGuards(self: *Self) void {
+        self.last_assistant_text = null;
+        self.last_round_text = null;
+        self.iteration_limited = false;
+        self.last_finish = .stop;
+        self.empty_retries = 0;
+        self.tools_ran_this_turn = false;
+    }
+
     /// `agent/turn-stopping` gate: native retries an empty or structural-stall
     /// round with a nudge before closing the turn. The gate only vetoes the
     /// close after queueing the nudge as next-step input (dsh's rule), so the
@@ -2124,8 +2158,8 @@ pub const DshNativeHarness = struct {
         const self = selfOf(context_ptr);
         // The iteration cap owns the end of its turn (nudge + refusal).
         if (self.iteration_limited) return true;
-        // A max-tokens stop is a real end, not an empty round.
-        if (self.last_finish == .max_tokens) return true;
+        // Native's empty guard ignores the finish reason: a length stop with
+        // no visible text (or reasoning only) is still an empty round.
         const text = std.mem.trim(u8, self.last_assistant_text orelse "", " \t\r\n");
         if (text.len > 0) return true;
         const nudge: []const u8 = if (self.last_finish == .tool_calls)
@@ -3126,6 +3160,30 @@ pub const DshNativeHarness = struct {
         return buffer.toOwnedSlice();
     }
 
+    /// Native's degraded cap reply (src/agent/root.zig:3319-3321): interim
+    /// text, then the cap prefix and the summary text of the capped round
+    /// (empty still gets the prefix). `composeFinalReply` is bypassed.
+    fn composeExhaustedReply(self: *Self) ![]const u8 {
+        const summary = self.last_round_text orelse "";
+        var interim: []const u8 = self.turn_text.items;
+        // `turn_text` ends with the last round's text; the summary is that
+        // round, not interim text.
+        if (std.mem.endsWith(u8, interim, summary)) interim = interim[0 .. interim.len - summary.len];
+        interim = std.mem.trim(u8, interim, " \t\r\n");
+        if (interim.len == 0) {
+            return std.fmt.allocPrint(
+                self.allocator,
+                "[Tool iteration limit: {d}/{d}]\n\n{s}",
+                .{ self.opts.max_tool_iterations, self.opts.max_tool_iterations, summary },
+            );
+        }
+        return std.fmt.allocPrint(
+            self.allocator,
+            "{s}\n\n[Tool iteration limit: {d}/{d}]\n\n{s}",
+            .{ interim, self.opts.max_tool_iterations, self.opts.max_tool_iterations, summary },
+        );
+    }
+
     /// The turn's reply with native's `.on` reasoning quote. Stream mode
     /// already showed the thinking live; `persisted_reply` stays clean either
     /// way because the host derives it from `last_assistant_text`.
@@ -3256,8 +3314,17 @@ pub const DshNativeHarness = struct {
 
     fn toolCallFingerprint(call: types.ToolCall) u64 {
         var hasher = std.hash.Wyhash.init(0);
+        // Native `toolCallDedupFingerprint` prefers the provider call id.
+        // Distinct calls legitimately share name+arguments (two appends, a
+        // re-read after a state change) and must both run.
+        if (call.id.len > 0) {
+            hasher.update("id:");
+            hasher.update(call.id);
+            return hasher.final();
+        }
+        hasher.update("sig:");
         hasher.update(call.name);
-        hasher.update("\x00");
+        hasher.update("\n");
         hasher.update(call.arguments);
         return hasher.final();
     }

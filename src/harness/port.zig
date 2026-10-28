@@ -213,6 +213,10 @@ pub const TurnResult = struct {
     /// engine's allocator; the host frees it like `reply`. Null otherwise.
     @"error": ?[]const u8 = null,
     total_tokens: u64 = 0,
+    /// False when the engine already composed a native reply that bypasses
+    /// `composeFinalReply` (the tool-iteration exhaustion path); the host then
+    /// must not append the `/usage` footer.
+    usage_footer: bool = true,
     end_reason: EndReason = .completed,
     /// True when this turn compacted the history.
     compacted: bool = false,

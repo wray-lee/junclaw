@@ -3472,6 +3472,7 @@ pub const SessionManager = struct {
             // so the host adds the same footer here. `persisted_reply` stays
             // clean, exactly like native history.
             if (session.agent.usage_mode != .off and
+                turn_result.usage_footer and
                 turn_result.end_reason == .completed and
                 !session.agent.last_turn_interrupted)
             {
