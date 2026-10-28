@@ -1490,6 +1490,17 @@ pub const DshNativeHarness = struct {
         self.opts.memory_session_id = session_id;
     }
 
+    /// Host seam for `/config reload`: native re-renders the profile prompt on
+    /// the next turn; the engine caches its system prompt, so rebuild it here.
+    pub fn setPersona(self: *Self, persona: []const u8) !void {
+        const previous = self.opts.persona;
+        self.opts.persona = persona;
+        self.buildPrompt() catch |err| {
+            self.opts.persona = previous;
+            return err;
+        };
+    }
+
     fn nextMessageId(self: *Self) ![]const u8 {
         const id = try std.fmt.allocPrint(self.arena.allocator(), "msg-{d}", .{self.next_id});
         self.next_id += 1;

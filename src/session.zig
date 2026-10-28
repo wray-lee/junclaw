@@ -132,6 +132,9 @@ const DshNativeState = struct {
     /// Owned `agent.dsh_persona`, prefixed with the named agent's
     /// `## Agent Profile` block. The harness borrows this slice.
     persona: []u8,
+    /// `agent.dsh_persona` at creation; borrowed from the config. The named
+    /// profile can be hot-reloaded, so the persona is rebuilt from this base.
+    dsh_persona: ?[]const u8,
 
     fn init(allocator: Allocator, config: *const Config, session: *Session) !DshNativeState {
         const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
@@ -218,6 +221,7 @@ const DshNativeState = struct {
             .model = model,
             .host_tools = host_tools,
             .persona = persona,
+            .dsh_persona = config.agent.dsh_persona,
         };
     }
 
@@ -233,7 +237,18 @@ const DshNativeState = struct {
     /// `/model`, `/think` and `/reasoning` mutate the native agent; mirror the
     /// live selection before the next engine turn so the engine's request
     /// header and provider calls carry it (the `/model` shortcut is gone).
+    /// `/config reload` can also rewrite the named profile prompt, so rebuild
+    /// the persona and re-render the engine prompt when it changed.
     fn syncCallConfig(self: *DshNativeState, allocator: Allocator, agent: *Agent) !void {
+        const persona = try buildDshPersona(allocator, agent, self.dsh_persona);
+        if (std.mem.eql(u8, persona, self.persona)) {
+            allocator.free(persona);
+        } else {
+            errdefer allocator.free(persona);
+            try self.harness.setPersona(persona);
+            allocator.free(self.persona);
+            self.persona = persona;
+        }
         if (!std.mem.eql(u8, self.model, agent.model_name)) {
             const next = try allocator.dupe(u8, agent.model_name);
             // Point the engine at the new copy before releasing the old one.
@@ -3322,9 +3337,13 @@ pub const SessionManager = struct {
                 // in its runtime context (its generated prompt stays verbatim).
                 dsh_active_skill = agent_mod.commands.buildActiveSkillPromptSection(&session.agent) catch null;
                 if (dsh_active_skill) |text| input.active_skill_context = text;
+                // Native reloads the config each turn; do the same so a hot
+                // reload's channels / memory backend reach the inventory.
+                var turn_config: ?Config = Config.load(self.allocator) catch null;
+                defer if (turn_config) |*cfg| cfg.deinit();
                 dsh_capabilities = capabilities_mod.buildPromptSection(
                     self.allocator,
-                    self.config,
+                    if (turn_config) |*cfg| cfg else self.config,
                     session.agent.tools,
                 ) catch null;
                 if (dsh_capabilities) |text| input.capabilities_context = text;
@@ -8097,6 +8116,7 @@ test "dsh-native: auto recall rides the engine's runtime context" {
 test "dsh-native: named agent profile reaches the engine persona" {
     // Regression: only agent.dsh_persona reached the dsh prompt, so a named
     // agent's system_prompt silently did nothing under the default engine.
+    // A hot reload must also re-render the prompt, not only rewrite the agent.
     var fixture = try DshNativeFixture.init();
     defer fixture.deinit();
     fixture.cfg.agent.dsh_persona = "global persona";
@@ -8108,7 +8128,10 @@ test "dsh-native: named agent profile reaches the engine persona" {
         .system_prompt = "You are a coding specialist.",
     }};
 
-    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{});
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "ok" },
+        .{ .text = "ok again" },
+    });
     defer provider.deinit();
     var sm = fixture.manager(&provider);
     defer sm.deinit();
@@ -8119,6 +8142,28 @@ test "dsh-native: named agent profile reaches the engine persona" {
     try testing.expect(std.mem.indexOf(u8, persona, "Profile: Coder Agent") != null);
     try testing.expect(std.mem.indexOf(u8, persona, "You are a coding specialist.") != null);
     try testing.expect(std.mem.indexOf(u8, persona, "global persona") != null);
+
+    // The request itself carries the profile. A plain session keeps the
+    // manager's scripted provider (a named-agent session would dial the
+    // profile provider over the network).
+    const key = "cli:main:dsh-profile-request";
+    const plain = try sm.getOrCreate(key);
+    plain.agent.profile_name = "Coder Agent";
+    plain.agent.profile_system_prompt = "You are a coding specialist.";
+    try plain.dsh_native.?.syncCallConfig(testing.allocator, &plain.agent);
+    const first = try sm.processMessage(key, "hi", null);
+    defer testing.allocator.free(first);
+    try testing.expect(std.mem.indexOf(u8, provider.system.items, "You are a coding specialist.") != null);
+
+    // `/config reload` rewrites agent.profile_system_prompt and then calls
+    // syncCallConfig; the next request must carry the new profile.
+    plain.agent.profile_system_prompt = "Reloaded profile prompt";
+    try plain.dsh_native.?.syncCallConfig(testing.allocator, &plain.agent);
+    const second = try sm.processMessage(key, "again", null);
+    defer testing.allocator.free(second);
+    // dsh logs system messages, so the previous prompt stays in the surface;
+    // the refreshed one is appended after it.
+    try testing.expect(std.mem.indexOf(u8, provider.system.items, "Reloaded profile prompt") != null);
 }
 
 test "dsh-native: armed skill and capabilities ride the runtime context" {
