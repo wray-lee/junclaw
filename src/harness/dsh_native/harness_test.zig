@@ -992,10 +992,14 @@ test "dsh-native adapter: an attachment-marker reply becomes a telegram attachme
     // Combo check for the attachment work: the dsh-composed reply reaches
     // Telegram's legacy payload builder and yields the file attachment.
     const allocator = testing.allocator;
-    var fx = try Fixture.init(allocator, &.{
-        .{ .text = "Here is the report: [FILE:/tmp/report.txt]" },
-    });
+    var fx = try Fixture.init(allocator, &.{.{ .text = "unused" }});
     defer fx.deinit();
+    // Re-script with a workspace path so the test is path-portable.
+    const target = try std.fs.path.join(allocator, &.{ fx.workspace, "report.txt" });
+    defer allocator.free(target);
+    const scripted = try std.fmt.allocPrint(allocator, "Here is the report: [FILE:{s}]", .{target});
+    defer allocator.free(scripted);
+    fx.provider.replies = &.{.{ .text = scripted }};
 
     var engine = try fx.harness();
     defer engine.deinit(allocator);
@@ -1012,7 +1016,7 @@ test "dsh-native adapter: an attachment-marker reply becomes a telegram attachme
     );
     defer owned.deinit(allocator);
     try testing.expectEqual(@as(usize, 1), owned.attachments.len);
-    try testing.expectEqualStrings("/tmp/report.txt", owned.attachments[0].target);
+    try testing.expectEqualStrings(target, owned.attachments[0].target);
     try testing.expect(owned.attachments[0].kind == .document);
     try testing.expectEqualStrings("Here is the report:", std.mem.trim(u8, owned.text, " "));
 }
@@ -1061,13 +1065,17 @@ test "dsh-native adapter: a non-vision model strips inbound image markers" {
     defer engine.deinit(allocator);
     const h = engine.harness();
 
-    const result = try h.runTurn(turnInput("look [IMAGE:/tmp/example.png]"));
+    const missing = try std.fs.path.join(allocator, &.{ fx.workspace, "missing.png" });
+    defer allocator.free(missing);
+    const prompt = try std.fmt.allocPrint(allocator, "look [IMAGE:{s}]", .{missing});
+    defer allocator.free(prompt);
+    const result = try h.runTurn(turnInput(prompt));
     defer allocator.free(result.reply);
 
     const first = fx.provider.requests.items[0];
     try testing.expectEqual(@as(usize, 0), first.image_parts);
     try testing.expect(requestContains(first, "image(s) omitted because the current model does not support vision"));
-    try testing.expect(!requestContains(first, "/tmp/example.png"));
+    try testing.expect(!requestContains(first, missing));
 }
 
 test "dsh-native adapter: max_tool_iterations caps the rounds and asks for a summary" {
