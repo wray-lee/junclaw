@@ -1063,20 +1063,30 @@ fn readCandidate(
     max_source_bytes: usize,
     provider: ?bootstrap_mod.BootstrapProvider,
 ) !?LoadedFile {
+    // `statFile` is one fstatat on POSIX and never opens the path, so a FIFO is
+    // rejected before the provider can block reading it. Only the kind is
+    // checked here: a DB-backed provider may hold the document while the
+    // workspace copy is unusable, and its read is bounded below.
+    const disk_stat: ?compat.fs.File.Stat = compat.fs.cwd().statFile(absolute) catch null;
+    if (disk_stat) |stat| {
+        if (stat.kind != .file) return null;
+    }
     if (provider) |bp| {
-        // Bootstrap docs live in the memory backend for markdown/hybrid; the
-        // provider applies its own disk fallback when the DB has no entry.
-        if (bp.load(allocator, "AGENTS.md") catch null) |content| {
+        // Bootstrap docs live in the memory backend for DB-backed engines
+        // (sqlite/postgres/redis); file backends read the same workspace path
+        // and fall through to the direct read when the provider has no entry.
+        // One extra byte bounds the read and keeps the oversize-skip rule.
+        if (bp.load_excerpt(allocator, "AGENTS.md", max_source_bytes +| 1) catch null) |content| {
             if (content.len <= max_source_bytes) return .{
                 .absolute_path = absolute,
                 .display_path = display,
                 .content = content,
                 .group = group,
             };
+            allocator.free(content);
         }
     }
-    const stat = fs_compat.statPath(absolute) catch return null;
-    if (stat.kind != .file) return null;
+    const stat = disk_stat orelse return null;
     if (stat.size > max_source_bytes) return null;
     const content = fs_compat.readFileAlloc(
         compat.fs.cwd(),

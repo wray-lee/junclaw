@@ -3519,8 +3519,8 @@ test "dsh-native adapter: skills, runtime, capabilities and memory guidance ride
 
 test "dsh-native adapter: AGENTS.md comes from the bootstrap provider" {
     // Regression: dsh discovered AGENTS.md by scanning files only, so a
-    // markdown/hybrid workspace that keeps bootstrap docs in the memory
-    // backend lost its operational rules.
+    // DB-backed workspace (sqlite/postgres/redis) that keeps bootstrap docs in
+    // the memory backend lost its operational rules.
     const allocator = testing.allocator;
     var fx = try Fixture.init(allocator, &.{.{ .text = "ready" }});
     defer fx.deinit();
