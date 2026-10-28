@@ -4014,11 +4014,21 @@ pub const DshNativeHarness = struct {
             );
             self.surface_seqs.shrinkRetainingCapacity(new_len);
             try self.surface_seqs.insert(arena, idx, replacement_seq);
+
+            // The summary shadows the agent-instructions baseline only when it
+            // falls before the retained tail. Drop the tracker then so the next
+            // pre-step re-emits it; a baseline the tail keeps must not be
+            // duplicated.
+            if (self.instructions_seq) |baseline_seq| {
+                if (std.mem.indexOfScalar(u64, shadowed.seqs, baseline_seq) != null) {
+                    self.instructions_tracker = .{};
+                    self.instructions_seq = null;
+                }
+            }
         }
-        // Compaction shadows every surface node after the system head,
-        // including the runtime-context snapshot (Safety, guides, cwd). Drop
-        // the retained text so the next pre-step re-emits the whole snapshot
-        // instead of the "unchanged" check keeping Safety gone.
+        // Compaction shadows the runtime-context snapshot (Safety, guides,
+        // cwd). Drop the retained text so the next pre-step re-emits the whole
+        // snapshot instead of the "unchanged" check keeping Safety gone.
         self.runtime_tracker.deinit(self.allocator);
         self.last_usage = null;
         self.compaction_lock = .{};
