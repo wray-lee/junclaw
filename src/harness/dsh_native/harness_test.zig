@@ -11,6 +11,8 @@ const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
 const providers = @import("../../providers/root.zig");
 const redaction = @import("../../redaction.zig");
+const memory_mod = @import("../../memory/root.zig");
+const bootstrap_mod = @import("../../bootstrap/root.zig");
 const http_util = @import("../../http_util.zig");
 const port = @import("../port.zig");
 const native_prompt = @import("../../agent/prompt.zig");
@@ -90,6 +92,11 @@ const FakeProvider = struct {
     /// True when the provider observed the adapter's interrupt flag after the
     /// scripted `/stop`.
     saw_interrupt: bool = false,
+    /// `chatWithSystem` replies (the pre-compaction memory flush) and the
+    /// user-role text of every such call.
+    system_replies: []const []const u8 = &.{},
+    next_system: usize = 0,
+    system_prompts: std.ArrayListUnmanaged(u8) = .empty,
 
     /// Owned copy of what the adapter sent, so assertions stay valid after
     /// the adapter's per-call arena is reset.
@@ -108,6 +115,7 @@ const FakeProvider = struct {
     fn deinit(self: *FakeProvider) void {
         self.clearRequests();
         self.requests.deinit(self.allocator);
+        self.system_prompts.deinit(self.allocator);
     }
 
     /// Drops recorded requests and their list capacity. The soak test calls
@@ -215,8 +223,14 @@ const FakeProvider = struct {
         };
     }
 
-    fn chatWithSystem(_: *anyopaque, allocator: Allocator, _: ?[]const u8, _: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
-        return allocator.dupe(u8, "");
+    fn chatWithSystem(ptr: *anyopaque, allocator: Allocator, _: ?[]const u8, message: []const u8, _: []const u8, _: f64) anyerror![]const u8 {
+        const self: *FakeProvider = @ptrCast(@alignCast(ptr));
+        try self.system_prompts.appendSlice(self.allocator, message);
+        try self.system_prompts.append(self.allocator, '\n');
+        if (self.next_system >= self.system_replies.len) return allocator.dupe(u8, "");
+        const reply = self.system_replies[self.next_system];
+        self.next_system += 1;
+        return allocator.dupe(u8, reply);
     }
 
     fn recordRequest(self: *FakeProvider, request: providers.ChatRequest) !void {
@@ -506,6 +520,7 @@ const Fixture = struct {
     question_timeout_s: i32 = 120,
     host_tools: []const bridge.HostTool = &.{},
     host_executor: ?bridge.HostExecutor = null,
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
     redactor: ?*redaction.Redactor = null,
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
     policy: ?*const SecurityPolicy = null,
@@ -572,6 +587,7 @@ const Fixture = struct {
             .question_timeout_s = self.question_timeout_s,
             .host_tools = self.host_tools,
             .host_executor = self.host_executor,
+            .bootstrap_provider = self.bootstrap_provider,
             .redactor = self.redactor,
             .tool_filter_groups = self.tool_filter_groups,
             .policy = self.policy,
@@ -3450,6 +3466,139 @@ test "dsh-native adapter: runtime context is a pre-step user message" {
     try testing.expect(requestContains(fx.provider.requests.items[0], "Current Date & Time"));
     try testing.expect(requestContains(fx.provider.requests.items[0], "## Safety"));
     try testing.expect(requestContains(fx.provider.requests.items[0], "Do not exfiltrate private data."));
+}
+
+test "dsh-native adapter: skills, runtime, capabilities and memory guidance ride the runtime context" {
+    // These native system-prompt sections stay out of dsh's generated prompt
+    // (cache prefix), so they must reach the model as runtime context.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "ready" }});
+    defer fx.deinit();
+    const skill_dir = try std.fs.path.join(allocator, &.{ fx.workspace, "skills", "demo" });
+    defer allocator.free(skill_dir);
+    try fs_compat.makePath(skill_dir);
+    try writeWorkspaceFile(
+        allocator,
+        fx.workspace,
+        "skills/demo/skill.json",
+        "{\"name\": \"demo\", \"version\": \"1.0.0\", \"description\": \"Demo skill\", \"author\": \"dev\"}",
+    );
+    fx.host_tools = &.{.{
+        .name = "memory_store",
+        .description = "Store a memory",
+        .input_schema_json = "{\"type\":\"object\"}",
+    }};
+    var fake = BridgeFake{};
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    var input = turnInput("hello");
+    input.active_skill_context = "## Active Skill Session\n\nArmed demo skill.";
+    input.capabilities_context = "## Runtime Capabilities\n\nConfigured channels: telegram";
+    const result = try engine.harness().runTurn(input);
+    defer allocator.free(result.reply);
+
+    // dsh's own prompt stays verbatim.
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "## Skills") == null);
+    try testing.expect(std.mem.indexOf(u8, engine.system_prompt, "## Runtime") == null);
+
+    const request = fx.provider.requests.items[0];
+    try testing.expect(requestContains(request, "## Skills"));
+    try testing.expect(requestContains(request, "Demo skill"));
+    try testing.expect(requestContains(request, "Armed demo skill."));
+    try testing.expect(requestContains(request, "## Runtime Capabilities"));
+    try testing.expect(requestContains(request, "Configured channels: telegram"));
+    try testing.expect(requestContains(request, "Prefer memory tools"));
+    const runtime_line = try std.fmt.allocPrint(allocator, "OS: {s} | Model: test-model", .{
+        @tagName(@import("builtin").os.tag),
+    });
+    defer allocator.free(runtime_line);
+    try testing.expect(requestContains(request, runtime_line));
+}
+
+test "dsh-native adapter: AGENTS.md comes from the bootstrap provider" {
+    // Regression: dsh discovered AGENTS.md by scanning files only, so a
+    // markdown/hybrid workspace that keeps bootstrap docs in the memory
+    // backend lost its operational rules.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "ready" }});
+    defer fx.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    var provider_impl = bootstrap_mod.MemoryBootstrapProvider.init(allocator, sqlite_mem.memory(), null);
+    const provider = provider_impl.provider();
+    try provider.store("AGENTS.md", "DB bootstrap rules");
+    fx.bootstrap_provider = provider;
+    try writeWorkspaceFile(allocator, fx.workspace, "AGENTS.md", "disk bootstrap rules");
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const result = try engine.harness().runTurn(turnInput("hello"));
+    defer allocator.free(result.reply);
+
+    try testing.expect(requestContains(fx.provider.requests.items[0], "DB bootstrap rules"));
+    try testing.expect(!requestContains(fx.provider.requests.items[0], "disk bootstrap rules"));
+}
+
+test "dsh-native adapter: compaction flushes durable facts to memory" {
+    const allocator = testing.allocator;
+    const big_a = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big_a);
+    const big_b = try allocator.alloc(u8, 70_000);
+    defer allocator.free(big_b);
+    @memset(big_a, 'x');
+    @memset(big_b, 'y');
+    const first_text = try std.fmt.allocPrint(allocator, "marker-one {s}", .{big_a});
+    defer allocator.free(first_text);
+    const second_text = try std.fmt.allocPrint(allocator, "marker-two {s}", .{big_b});
+    defer allocator.free(second_text);
+
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "a", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "b", .prompt_tokens = 900, .completion_tokens = 10 },
+        // The auxiliary summary call.
+        .{ .text = "condensed history", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "c" },
+    });
+    defer fx.deinit();
+    fx.context_window = 1000;
+    fx.compaction_headroom_tokens = 10;
+    fx.inject_model_context = false;
+    // The pre-compaction flush provider call returns the extracted facts.
+    fx.provider.system_replies = &.{"fact one\nfact two"};
+    var sqlite_mem = try memory_mod.SqliteMemory.init(allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    var one = turnInput(first_text);
+    one.memory_flush = mem;
+    one.memory_session_id = "flush-scope";
+    const first = try h.runTurn(one);
+    defer allocator.free(first.reply);
+    var two = turnInput(second_text);
+    two.memory_flush = mem;
+    two.memory_session_id = "flush-scope";
+    const second = try h.runTurn(two);
+    defer allocator.free(second.reply);
+    var three = turnInput("third");
+    three.memory_flush = mem;
+    three.memory_session_id = "flush-scope";
+    const third = try h.runTurn(three);
+    defer allocator.free(third.reply);
+
+    // The flush saw the transcript of the messages the compaction dropped.
+    try testing.expect(std.mem.indexOf(u8, fx.provider.system_prompts.items, "marker-one") != null);
+    const entries = try mem.list(allocator, .conversation, "flush-scope");
+    defer memory_mod.freeEntries(allocator, entries);
+    var saw_flush = false;
+    for (entries) |entry| {
+        if (std.mem.startsWith(u8, entry.key, "flush_compact_")) saw_flush = true;
+    }
+    try testing.expect(saw_flush);
 }
 
 test "dsh-native adapter: attachment markers in the final reply reach the host" {

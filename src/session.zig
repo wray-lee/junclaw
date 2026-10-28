@@ -47,6 +47,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const cost_mod = @import("cost.zig");
 const harness_port = @import("harness/port.zig");
 const native_harness = @import("harness/native.zig");
+const capabilities_mod = @import("capabilities.zig");
 /// The in-process dsh engine (`agent.harness = "dsh"`, legacy alias
 /// `"dsh-native"`). No build flag gates it, so the import is unconditional.
 const dsh_native_mod = @import("harness/dsh_native/harness.zig");
@@ -128,6 +129,9 @@ const DshNativeState = struct {
     /// Owned descriptors for the session's bridged junclaw tools (the string
     /// slices inside are borrowed from the live tools).
     host_tools: []const dsh_bridge.HostTool = &.{},
+    /// Owned `agent.dsh_persona`, prefixed with the named agent's
+    /// `## Agent Profile` block. The harness borrows this slice.
+    persona: []u8,
 
     fn init(allocator: Allocator, config: *const Config, session: *Session) !DshNativeState {
         const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
@@ -160,6 +164,9 @@ const DshNativeState = struct {
             };
         }
 
+        const persona = try buildDshPersona(allocator, &session.agent, config.agent.dsh_persona);
+        errdefer allocator.free(persona);
+
         var harness = try dsh_native_mod.DshNativeHarness.init(allocator, .{
             .session_key = session.session_key,
             .dsh_home = dsh_home,
@@ -171,7 +178,7 @@ const DshNativeState = struct {
             .reasoning_effort = session.agent.reasoning_effort,
             .reasoning_mode = session.agent.reasoning_mode,
             .max_tokens = session.agent.max_tokens_override,
-            .persona = config.agent.dsh_persona orelse "",
+            .persona = persona,
             .timezone = config.agent.timezone,
             .bootstrap_provider = session.agent.bootstrap,
             .identity_config = config.identity,
@@ -210,6 +217,7 @@ const DshNativeState = struct {
             .session_dir = session_dir,
             .model = model,
             .host_tools = host_tools,
+            .persona = persona,
         };
     }
 
@@ -219,6 +227,7 @@ const DshNativeState = struct {
         allocator.free(self.dsh_home);
         allocator.free(self.session_dir);
         allocator.free(self.model);
+        allocator.free(self.persona);
     }
 
     /// `/model`, `/think` and `/reasoning` mutate the native agent; mirror the
@@ -236,6 +245,19 @@ const DshNativeState = struct {
         self.harness.setCallConfig(self.model, agent.reasoning_effort, agent.reasoning_mode);
     }
 };
+
+/// dsh persona slot = the named agent's `## Agent Profile` block (native
+/// format, same bytes as `Agent.turn`) followed by `agent.dsh_persona`.
+fn buildDshPersona(allocator: Allocator, agent: *const Agent, dsh_persona: ?[]const u8) ![]u8 {
+    const base = dsh_persona orelse "";
+    const profile = agent.profile_system_prompt orelse return allocator.dupe(u8, base);
+    if (profile.len == 0) return allocator.dupe(u8, base);
+    const name = agent.profile_name orelse "custom";
+    if (base.len == 0) {
+        return std.fmt.allocPrint(allocator, "## Agent Profile\n\nProfile: {s}\n\n{s}", .{ name, profile });
+    }
+    return std.fmt.allocPrint(allocator, "## Agent Profile\n\nProfile: {s}\n\n{s}\n\n{s}", .{ name, profile, base });
+}
 
 const TurnDeliveryRoute = struct {
     channel: ?[]const u8,
@@ -2825,6 +2847,37 @@ pub const SessionManager = struct {
         return redacted;
     }
 
+    const AutosaveRole = enum { user, assistant };
+
+    /// Native parity for `Agent.turn`'s per-turn autosave: store the redacted
+    /// user text (or the delivered reply's summary) in the session's memory
+    /// scope and keep the vector index in sync. No-op without memory.
+    fn autosaveDshText(self: *SessionManager, session: *Session, role: AutosaveRole, text: []const u8) void {
+        if (session.dsh_native == null or !session.agent.auto_save) return;
+        const mem = session.agent.mem orelse return;
+        const payload = switch (role) {
+            .user => text,
+            .assistant => Agent.autosaveSummary(text),
+        };
+        const safe = if (session.agent.redactor) |redactor|
+            redactor.redact(self.allocator, payload) catch null
+        else
+            null;
+        defer if (safe) |content| self.allocator.free(content);
+        const content = safe orelse payload;
+        const ts: u128 = @bitCast(std_compat.time.nanoTimestamp());
+        const key = switch (role) {
+            .user => std.fmt.allocPrint(self.allocator, "autosave_user_{d}", .{ts}) catch return,
+            .assistant => std.fmt.allocPrint(self.allocator, "autosave_assistant_{d}", .{ts}) catch return,
+        };
+        defer self.allocator.free(key);
+        if (mem.store(key, content, .conversation, session.agent.memory_session_id)) |_| {
+            if (session.agent.mem_rt) |rt| {
+                rt.syncVectorAfterStore(self.allocator, key, content, session.agent.memory_session_id);
+            }
+        } else |_| {}
+    }
+
     /// dsh-native usage: the in-process engine never calls
     /// `usage_record_callback`, so its `Event.usage` goes through the same
     /// ledger path here. Native and sidecar sessions never take this branch.
@@ -3251,6 +3304,25 @@ pub const SessionManager = struct {
             var input = turn_input;
             input.drain = drain;
             input.drain_ctx = drain_ctx;
+            var dsh_active_skill: ?[]const u8 = null;
+            defer if (dsh_active_skill) |text| self.allocator.free(text);
+            var dsh_capabilities: ?[]const u8 = null;
+            defer if (dsh_capabilities) |text| self.allocator.free(text);
+            if (session.dsh_native != null) {
+                // Native renders the armed skill and the capabilities
+                // inventory into the system prompt; dsh carries the same text
+                // in its runtime context (its generated prompt stays verbatim).
+                dsh_active_skill = agent_mod.commands.buildActiveSkillPromptSection(&session.agent) catch null;
+                if (dsh_active_skill) |text| input.active_skill_context = text;
+                dsh_capabilities = capabilities_mod.buildPromptSection(
+                    self.allocator,
+                    self.config,
+                    session.agent.tools,
+                ) catch null;
+                if (dsh_capabilities) |text| input.capabilities_context = text;
+                if (session.agent.compaction_memory_flush) input.memory_flush = session.agent.mem;
+                self.autosaveDshText(session, .user, turn_input.user_message);
+            }
             const result = session.turnHarness().runTurn(input) catch |err| {
                 finalizeSteerRefs(steer_sink, self.allocator, refs, .failed);
                 // A dsh engine failure is a reply the user can act on; native
@@ -3289,6 +3361,14 @@ pub const SessionManager = struct {
             (session.dsh_native != null and turn_result.end_reason == .aborted);
         if (harness_ran and session.dsh_native != null) {
             self.reconcileHarnessUsage(session, turn_result.total_tokens, usage_events_before);
+        }
+        if (harness_ran and session.dsh_native != null) {
+            // Native autosaves the delivered reply once the turn completes and
+            // drains the durable memory outbox afterwards.
+            if (!session.agent.last_turn_interrupted) {
+                self.autosaveDshText(session, .assistant, turn_result.reply);
+            }
+            if (session.agent.mem_rt) |rt| _ = rt.drainOutbox(self.allocator);
         }
         finalizeSteerRefs(steer_sink, self.allocator, refs, .done);
         return turn_result.reply;
@@ -7723,6 +7803,8 @@ const DshNativeScriptedProvider = struct {
     /// Runs inside the blocking call, where a real /stop lands.
     on_chat: ?*const fn (ctx: *anyopaque) void = null,
     on_chat_ctx: ?*anyopaque = null,
+    /// Answer to `chatWithSystem` calls (the pre-compaction memory flush).
+    system_response: []const u8 = "",
 
     const vtable = Provider.VTable{
         .chatWithSystem = chatWithSystem,
@@ -7747,14 +7829,15 @@ const DshNativeScriptedProvider = struct {
     }
 
     fn chatWithSystem(
-        _: *anyopaque,
+        ptr: *anyopaque,
         allocator: Allocator,
         _: ?[]const u8,
         _: []const u8,
         _: []const u8,
         _: f64,
     ) anyerror![]const u8 {
-        return allocator.dupe(u8, "");
+        const self: *DshNativeScriptedProvider = @ptrCast(@alignCast(ptr));
+        return allocator.dupe(u8, self.system_response);
     }
 
     fn chat(
@@ -7985,6 +8068,140 @@ test "dsh-native: auto recall rides the engine's runtime context" {
     defer testing.allocator.free(reply);
     try testing.expect(std.mem.indexOf(u8, provider.users.items, "[Memory context]") != null);
     try testing.expect(std.mem.indexOf(u8, provider.users.items, "- test-key: remembered value") != null);
+}
+
+test "dsh-native: named agent profile reaches the engine persona" {
+    // Regression: only agent.dsh_persona reached the dsh prompt, so a named
+    // agent's system_prompt silently did nothing under the default engine.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.agent.dsh_persona = "global persona";
+    fixture.cfg.default_provider = "openrouter";
+    fixture.cfg.agents = &.{.{
+        .name = "Coder Agent",
+        .provider = "ollama",
+        .model = "qwen2.5-coder:14b",
+        .system_prompt = "You are a coding specialist.",
+    }};
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:coder-agent:cli:main:dsh-profile");
+    const persona = session.dsh_native.?.harness.opts.persona;
+    try testing.expect(std.mem.indexOf(u8, persona, "## Agent Profile") != null);
+    try testing.expect(std.mem.indexOf(u8, persona, "Profile: Coder Agent") != null);
+    try testing.expect(std.mem.indexOf(u8, persona, "You are a coding specialist.") != null);
+    try testing.expect(std.mem.indexOf(u8, persona, "global persona") != null);
+}
+
+test "dsh-native: armed skill and capabilities ride the runtime context" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "ok" }});
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-skill";
+    const session = try sm.getOrCreate(key);
+    session.agent.active_skill_name = "demo";
+    session.agent.active_skill_description = "Demo skill";
+    session.agent.active_skill_path = "/skills/demo/SKILL.md";
+    session.agent.active_skill_interactive = false;
+
+    const reply = try sm.processMessage(key, "run the demo", null);
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "## Active Skill Session") != null);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "## Runtime Capabilities") != null);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "## Runtime") != null);
+    try testing.expect(std.mem.indexOf(u8, provider.users.items, "Model: test/mock-model") != null);
+}
+
+test "dsh-native: turns are autosaved to long-term memory" {
+    // Regression: dsh bypassed Agent.turn, so nothing a dsh session said ever
+    // reached the memory backend.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "hello back" }});
+    defer provider.deinit();
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-autosave";
+    const reply = try sm.processMessage(key, "remember this", null);
+    defer testing.allocator.free(reply);
+    const session = try sm.getOrCreate(key);
+    const entries = try mem.list(testing.allocator, .conversation, session.agent.memory_session_id);
+    defer memory_mod.freeEntries(testing.allocator, entries);
+    var saw_user = false;
+    var saw_assistant = false;
+    for (entries) |entry| {
+        if (std.mem.startsWith(u8, entry.key, "autosave_user_") and
+            std.mem.eql(u8, entry.content, "remember this")) saw_user = true;
+        if (std.mem.startsWith(u8, entry.key, "autosave_assistant_") and
+            std.mem.eql(u8, entry.content, "hello back")) saw_assistant = true;
+    }
+    try testing.expect(saw_user);
+    try testing.expect(saw_assistant);
+}
+
+test "dsh-native: compaction flushes durable facts into memory" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.agent.dsh_compaction_context_window = 1000;
+    fixture.cfg.agent.dsh_compaction_headroom_tokens = 10;
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const big_a = try testing.allocator.alloc(u8, 70_000);
+    defer testing.allocator.free(big_a);
+    const big_b = try testing.allocator.alloc(u8, 70_000);
+    defer testing.allocator.free(big_b);
+    @memset(big_a, 'x');
+    @memset(big_b, 'y');
+    const first_text = try std.fmt.allocPrint(testing.allocator, "marker-one {s}", .{big_a});
+    defer testing.allocator.free(first_text);
+    const second_text = try std.fmt.allocPrint(testing.allocator, "marker-two {s}", .{big_b});
+    defer testing.allocator.free(second_text);
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        // Usage drives the pressure probe: a 0-token anchor never compacts.
+        .{ .text = "a", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "b", .prompt_tokens = 900, .completion_tokens = 10 },
+        // The auxiliary summary call.
+        .{ .text = "condensed history", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "c" },
+    });
+    defer provider.deinit();
+    provider.system_response = "fact one\nfact two";
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-flush";
+    const session = try sm.getOrCreate(key);
+    const r1 = try sm.processMessage(key, first_text, null);
+    defer testing.allocator.free(r1);
+    const r2 = try sm.processMessage(key, second_text, null);
+    defer testing.allocator.free(r2);
+    const r3 = try sm.processMessage(key, "third", null);
+    defer testing.allocator.free(r3);
+
+    const entries = try mem.list(testing.allocator, .conversation, session.agent.memory_session_id);
+    defer memory_mod.freeEntries(testing.allocator, entries);
+    var saw_flush = false;
+    for (entries) |entry| {
+        if (std.mem.startsWith(u8, entry.key, "flush_compact_")) saw_flush = true;
+    }
+    try testing.expect(saw_flush);
 }
 
 test "dsh-native: plain turn runs in process, reports usage and selects the engine" {

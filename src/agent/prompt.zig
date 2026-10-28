@@ -853,6 +853,14 @@ pub fn appendScheduledTasksSection(w: anytype) !void {
     try w.writeAll("- For Telegram chats, results can be auto-delivered when chat context is available\n\n");
 }
 
+/// Native memory-tool guidance. Engines that keep their own system prompt
+/// (dsh-native) render it as a runtime-context section instead.
+pub fn appendMemoryToolGuidance(w: anytype) !void {
+    try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
+    try w.writeAll("If the user asks you to remember something across sessions, use `memory_store` before claiming it was saved.\n");
+    try w.writeAll("Do not promise persistent recall unless the memory tool succeeded. If storage fails or is unavailable, say so plainly.\n\n");
+}
+
 fn writeToolInstructionsSection(w: anytype, tools: anytype, ctx: PromptContext) !void {
     try w.writeAll("\n## Tool Use Protocol\n\n");
     try w.writeAll("To use a tool, you MUST wrap a JSON object in <tool_call></tool_call> or [TOOL_CALL][/TOOL_CALL] tags.\n");
@@ -876,9 +884,7 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype, ctx: PromptContext) 
         try w.writeAll("- Never end a turn with only a promise of future work when a tool can perform it now.\n");
         try w.writeAll("- Continue until the task is done or you hit a real blocker; report the blocker instead of promising to continue later.\n\n");
     }
-    try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
-    try w.writeAll("If the user asks you to remember something across sessions, use `memory_store` before claiming it was saved.\n");
-    try w.writeAll("Do not promise persistent recall unless the memory tool succeeded. If storage fails or is unavailable, say so plainly.\n\n");
+    try appendMemoryToolGuidance(w);
     try w.writeAll("### Available Tools\n\n");
 
     for (tools) |t| {

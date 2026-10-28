@@ -23,6 +23,7 @@ const std = @import("std");
 const compat = @import("compat");
 const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
+const bootstrap_mod = @import("../../bootstrap/root.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -35,12 +36,21 @@ pub const ContextOrder = struct {
     /// junclaw contributions injected ahead of dsh's own sentences.
     pub const junclaw_memory: i32 = 70;
     pub const junclaw_guides: i32 = 80;
+    /// Native memory-tool guidance (memory_store / memory_recall).
+    pub const junclaw_memory_tools: i32 = 81;
+    /// Native `## Skills` list and the session-armed `## Active Skill Session`.
+    pub const junclaw_skills: i32 = 82;
+    pub const junclaw_active_skill: i32 = 83;
+    /// Native `## Runtime Capabilities` inventory.
+    pub const junclaw_capabilities: i32 = 84;
     /// Channel attachment/choice marker guidance shared with the native prompt.
     pub const junclaw_channel_attachments: i32 = 85;
     /// Native `## Safety` policy, shared verbatim with the native prompt.
     pub const junclaw_safety: i32 = 86;
     /// Native conversation-context, group-chat and schedule guidance.
     pub const junclaw_turn_guidance: i32 = 87;
+    /// Native `## Runtime` (OS | Model) section.
+    pub const junclaw_runtime: i32 = 88;
     pub const current_datetime: i32 = 90;
     pub const working_directory: i32 = 100;
     pub const sandbox_policy: i32 = 110;
@@ -429,6 +439,10 @@ pub const Options = struct {
     max_bytes: usize = default_max_bytes,
     /// Per-file read cap; larger files are ignored (config.ts:13).
     max_source_bytes: usize = default_max_source_bytes,
+    /// Native workspace bootstrap provider. When set, the workspace-level
+    /// `AGENTS.md` is read through it (memory-backend bootstrap docs) instead
+    /// of the file system; ancestor directories keep the file scan.
+    bootstrap_provider: ?bootstrap_mod.BootstrapProvider = null,
 };
 
 /// One file read during discovery.
@@ -1007,7 +1021,15 @@ fn discover(
             if (seen.contains(absolute)) continue;
             const display = try projectDisplayPath(allocator, project_root, absolute);
             const group = std.fs.path.dirname(display) orelse ".";
-            if (try readCandidate(allocator, absolute, display, group, options.max_source_bytes)) |file| {
+            // The workspace-level AGENTS.md is the only bootstrap document a
+            // memory backend stores; ancestors remain file-only.
+            const provider = if (options.bootstrap_provider != null and
+                std.mem.eql(u8, dir, cwd) and
+                std.mem.eql(u8, candidate, "AGENTS.md"))
+                options.bootstrap_provider
+            else
+                null;
+            if (try readCandidate(allocator, absolute, display, group, options.max_source_bytes, provider)) |file| {
                 try seen.put(allocator, absolute, {});
                 try files.append(allocator, file);
             }
@@ -1027,7 +1049,7 @@ fn addUserGlobal(
     const absolute = try compat.fs.path.join(allocator, &.{ home, "AGENTS.md" });
     if (seen.contains(absolute)) return;
     const display = try compat.fs.path.join(allocator, &.{ display_root, "AGENTS.md" });
-    if (try readCandidate(allocator, absolute, display, "user-global", options.max_source_bytes)) |file| {
+    if (try readCandidate(allocator, absolute, display, "user-global", options.max_source_bytes, null)) |file| {
         try seen.put(allocator, absolute, {});
         try files.append(allocator, file);
     }
@@ -1039,7 +1061,20 @@ fn readCandidate(
     display: []const u8,
     group: []const u8,
     max_source_bytes: usize,
+    provider: ?bootstrap_mod.BootstrapProvider,
 ) !?LoadedFile {
+    if (provider) |bp| {
+        // Bootstrap docs live in the memory backend for markdown/hybrid; the
+        // provider applies its own disk fallback when the DB has no entry.
+        if (bp.load(allocator, "AGENTS.md") catch null) |content| {
+            if (content.len <= max_source_bytes) return .{
+                .absolute_path = absolute,
+                .display_path = display,
+                .content = content,
+                .group = group,
+            };
+        }
+    }
     const stat = fs_compat.statPath(absolute) catch return null;
     if (stat.kind != .file) return null;
     if (stat.size > max_source_bytes) return null;

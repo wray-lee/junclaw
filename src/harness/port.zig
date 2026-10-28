@@ -95,6 +95,13 @@ pub const TurnInput = struct {
     /// (`[Memory context]...`); borrowed. The host computes it from the same
     /// store and parameters the native engine uses.
     memory_context: ?[]const u8 = null,
+    /// Memory the engine writes a pre-compaction fact flush into; borrowed.
+    /// The host passes it only when `agent.compaction_memory_flush` is on.
+    memory_flush: ?memory_mod.Memory = null,
+    /// Native `## Runtime Capabilities` inventory for this turn; borrowed.
+    capabilities_context: ?[]const u8 = null,
+    /// Native `## Active Skill Session` block for this turn; borrowed.
+    active_skill_context: ?[]const u8 = null,
     /// Mirrors today's `stream_callback != null`: the host has a live draft to
     /// feed, so the engine may run the provider in streaming mode. False keeps
     /// the blocking provider path.

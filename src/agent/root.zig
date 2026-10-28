@@ -1126,7 +1126,8 @@ pub const Agent = struct {
     }
 
     /// Truncate the delivered reply to ~100 bytes on a valid UTF-8 boundary.
-    fn autosaveSummary(text: []const u8) []const u8 {
+    /// Public so the host can autosave dsh turns with the native semantics.
+    pub fn autosaveSummary(text: []const u8) []const u8 {
         if (text.len <= 100) return text;
         var end: usize = 100;
         while (end > 0 and text[end] & 0xC0 == 0x80) end -= 1;

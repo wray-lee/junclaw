@@ -29,9 +29,11 @@
 //! heap-pinned contexts and the kernel's host context points at `Self`.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
 const fs_compat = @import("../../fs_compat.zig");
 const agent_mod = @import("../../agent/root.zig");
+const agent_compaction = @import("../../agent/compaction.zig");
 const tool_filter = @import("../../tool_filter.zig");
 const dispatcher = @import("../../agent/dispatcher.zig");
 const native_prompt = @import("../../agent/prompt.zig");
@@ -284,6 +286,16 @@ pub const DshNativeHarness = struct {
     turn_memory_context: []const u8 = "",
     /// Native workspace guide block for this turn (owned when non-empty).
     turn_guides: ?[]u8 = null,
+    /// Native `## Skills` block, rendered once per turn (owned when non-empty).
+    turn_skills: ?[]const u8 = null,
+    /// Native `## Active Skill Session` block for this turn; borrowed.
+    turn_active_skill: []const u8 = "",
+    /// Native `## Runtime Capabilities` inventory for this turn; borrowed.
+    turn_capabilities: []const u8 = "",
+    /// Host memory runtime for the pre-compaction flush; borrowed.
+    turn_memory_flush: ?memory_mod.Memory = null,
+    /// Session-scope key for the pre-compaction flush; borrowed.
+    turn_memory_session_id: ?[]const u8 = null,
 
     /// Tool calls logged but not yet answered, in model order.
     pending_calls: std.ArrayListUnmanaged(PendingCall) = .empty,
@@ -674,7 +686,7 @@ pub const DshNativeHarness = struct {
         self.runtime_tracker.deinit(self.allocator);
         self.instructions_tracker = .{};
         self.instructions_seq = null;
-        self.freeTurnGuides();
+        self.freeTurnSections();
         self.turn_memory_context = "";
         // A fresh session starts from the full catalog; the per-turn filter is
         // recomputed at the next turn.
@@ -683,9 +695,11 @@ pub const DshNativeHarness = struct {
         self.tool_specs = self.all_specs;
     }
 
-    fn freeTurnGuides(self: *Self) void {
+    fn freeTurnSections(self: *Self) void {
         if (self.turn_guides) |text| self.allocator.free(text);
         self.turn_guides = null;
+        if (self.turn_skills) |text| self.allocator.free(text);
+        self.turn_skills = null;
     }
 
     // ── session lifecycle ────────────────────────────────────────────────────
@@ -1266,9 +1280,10 @@ pub const DshNativeHarness = struct {
             self.drain_ctx = null;
         }
 
-        // Native re-reads the workspace guides once per turn; the runtime
-        // context renders them on every pre-step, so they must live that long.
-        self.freeTurnGuides();
+        // Native re-reads the workspace guides and skills once per turn; the
+        // runtime context renders them on every pre-step, so they must live
+        // that long.
+        self.freeTurnSections();
         self.turn_memory_context = input.memory_context orelse "";
         if (self.opts.inject_model_context) {
             self.turn_guides = try native_prompt.buildWorkspaceGuides(self.allocator, .{
@@ -1276,11 +1291,20 @@ pub const DshNativeHarness = struct {
                 .bootstrap_provider = self.opts.bootstrap_provider,
                 .identity_config = self.opts.identity_config,
             });
+            self.turn_skills = try native_prompt.buildSkillsSection(self.allocator, self.workspace(), null);
         }
+        self.turn_active_skill = input.active_skill_context orelse "";
+        self.turn_capabilities = input.capabilities_context orelse "";
+        self.turn_memory_flush = input.memory_flush;
+        self.turn_memory_session_id = input.memory_session_id;
         self.turn_conversation_context = input.conversation_context;
         defer {
-            self.freeTurnGuides();
+            self.freeTurnSections();
             self.turn_memory_context = "";
+            self.turn_active_skill = "";
+            self.turn_capabilities = "";
+            self.turn_memory_flush = null;
+            self.turn_memory_session_id = null;
             self.turn_conversation_context = null;
         }
 
@@ -2048,6 +2072,7 @@ pub const DshNativeHarness = struct {
         return .{
             .cwd = self.workspace(),
             .dsh_home = self.opts.dsh_home,
+            .bootstrap_provider = self.opts.bootstrap_provider,
         };
     }
 
@@ -2081,6 +2106,44 @@ pub const DshNativeHarness = struct {
                 ));
             }
         }
+        if (self.memoryToolsExposed()) {
+            var guidance: std.ArrayListUnmanaged(u8) = .empty;
+            errdefer guidance.deinit(allocator);
+            var guidance_writer: std.Io.Writer.Allocating = .fromArrayList(allocator, &guidance);
+            try native_prompt.appendMemoryToolGuidance(&guidance_writer.writer);
+            guidance = guidance_writer.toArrayList();
+            try sections.append(allocator, context.customSection(
+                "junclaw:memory-tools",
+                context.ContextOrder.junclaw_memory_tools,
+                std.mem.trimEnd(u8, try guidance.toOwnedSlice(allocator), "\n"),
+            ));
+        }
+        if (self.turn_skills) |skills| {
+            const skills_text = std.mem.trimEnd(u8, skills, "\n");
+            if (skills_text.len > 0) {
+                try sections.append(allocator, context.customSection(
+                    "junclaw:skills",
+                    context.ContextOrder.junclaw_skills,
+                    skills_text,
+                ));
+            }
+        }
+        const active_skill_text = std.mem.trimEnd(u8, self.turn_active_skill, "\n");
+        if (active_skill_text.len > 0) {
+            try sections.append(allocator, context.customSection(
+                "junclaw:active-skill",
+                context.ContextOrder.junclaw_active_skill,
+                active_skill_text,
+            ));
+        }
+        const capabilities_text = std.mem.trimEnd(u8, self.turn_capabilities, "\n");
+        if (capabilities_text.len > 0) {
+            try sections.append(allocator, context.customSection(
+                "junclaw:capabilities",
+                context.ContextOrder.junclaw_capabilities,
+                capabilities_text,
+            ));
+        }
         if (self.channel_attachments) |text| {
             const attachments_text = std.mem.trimEnd(u8, text, "\n");
             if (attachments_text.len > 0) {
@@ -2109,10 +2172,29 @@ pub const DshNativeHarness = struct {
             ));
         }
         try sections.append(allocator, try context.dateTimeSection(allocator, self.opts.timezone, self.nowSeconds()));
+        // Native's `## Runtime` line (OS | Model) rides the snapshot so the
+        // model knows the platform and its own model name.
+        const runtime_text = try std.fmt.allocPrint(allocator, "## Runtime\n\nOS: {s} | Model: {s}", .{
+            @tagName(builtin.os.tag),
+            self.opts.model,
+        });
+        try sections.append(allocator, context.customSection(
+            "junclaw:runtime",
+            context.ContextOrder.junclaw_runtime,
+            runtime_text,
+        ));
         try sections.append(allocator, try context.workingDirectorySection(allocator, self.workspace()));
         try sections.append(allocator, try context.sandboxPolicySection(allocator, self.sandboxMode(), self.workspace()));
         try sections.append(allocator, context.approvalPolicySection(self.approvalPolicy()));
         return sections.toOwnedSlice(allocator);
+    }
+
+    fn memoryToolsExposed(self: *const Self) bool {
+        for (self.all_specs) |spec| {
+            if (std.mem.eql(u8, spec.name, "memory_store") or
+                std.mem.eql(u8, spec.name, "memory_recall")) return true;
+        }
+        return false;
     }
 
     fn nowSeconds(self: *const Self) i64 {
@@ -3392,7 +3474,57 @@ pub const DshNativeHarness = struct {
             const events = try compaction_mod.failureEvents(allocator, compaction_id, turn, @errorName(err));
             return .{ .failed = .{ .events = events, .err = err } };
         };
+        self.flushMemoriesBeforeDrop(allocator, result);
         return .{ .result = result };
+    }
+
+    /// Native parity (`flushMemoriesBeforeCompaction`): extract durable facts
+    /// from the messages this compaction drops. Best-effort by contract —
+    /// failures never block compaction.
+    fn flushMemoriesBeforeDrop(self: *Self, allocator: Allocator, result: compaction_mod.Result) void {
+        const mem = self.turn_memory_flush orelse return;
+        const session_id = self.turn_memory_session_id orelse return;
+        if (result.events.len != 4) return;
+        const summary = switch (result.events[1]) {
+            .summary => |value| value,
+            else => return,
+        };
+        var tmp = std.heap.ArenaAllocator.init(allocator);
+        defer tmp.deinit();
+        const a = tmp.allocator();
+        var transcript: std.ArrayListUnmanaged(u8) = .empty;
+        var writer: std.Io.Writer.Allocating = .fromArrayList(a, &transcript);
+        for (summary.shadowed_seqs) |seq| {
+            const index = indexOfSeq(self.surface_seqs.items, seq) orelse continue;
+            const message = self.messages.items[index];
+            const role: []const u8 = switch (message.role) {
+                .user => "USER",
+                .assistant => "ASSISTANT",
+                .tool => "TOOL",
+                .system, .developer => "SYSTEM",
+            };
+            writer.writer.print("{s}: ", .{role}) catch return;
+            for (message.content) |block| switch (block) {
+                .text => |text| {
+                    const safe = if (self.opts.redactor) |redactor|
+                        redactor.redact(a, text) catch null
+                    else
+                        null;
+                    const source = safe orelse text;
+                    const clipped = if (source.len > 500) util.truncateUtf8(source, 500) else source;
+                    writer.writer.print("{s}\n", .{clipped}) catch return;
+                },
+                else => {},
+            };
+            if (transcript.items.len >= 8_000) break;
+        }
+        transcript = writer.toArrayList();
+        const text = util.truncateUtf8(transcript.items, 8_000);
+        agent_compaction.flushMemoriesFromTranscript(a, self.opts.provider, self.opts.model, text, .{
+            .memory_flush = true,
+            .mem = mem,
+            .memory_session_id = session_id,
+        });
     }
 
     /// dsh's cache-reusing auxiliary call (`summarizer.ts:120-170`): replay the
