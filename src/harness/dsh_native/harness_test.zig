@@ -17,6 +17,7 @@ const http_util = @import("../../http_util.zig");
 const port = @import("../port.zig");
 const native_prompt = @import("../../agent/prompt.zig");
 const outbound = @import("../../outbound.zig");
+const telegram_channel = @import("../../channels/telegram.zig");
 const harness_mod = @import("harness.zig");
 const bridge = @import("tools/bridge.zig");
 const goal_mod = @import("goal.zig");
@@ -106,6 +107,10 @@ const FakeProvider = struct {
         model: []const u8,
         reasoning_effort: ?[]const u8,
         include_reasoning: ?bool,
+        /// True when the adapter sent the request with no tool schemas.
+        tools_null: bool = false,
+        /// Image content parts across every message.
+        image_parts: usize = 0,
     };
 
     fn init(allocator: Allocator, replies: []const Reply) FakeProvider {
@@ -236,9 +241,16 @@ const FakeProvider = struct {
     fn recordRequest(self: *FakeProvider, request: providers.ChatRequest) !void {
         const contents = try self.allocator.alloc([]const u8, request.messages.len);
         const roles = try self.allocator.alloc(providers.Role, request.messages.len);
+        var image_parts: usize = 0;
         for (request.messages, 0..) |message, index| {
             contents[index] = try self.allocator.dupe(u8, message.content);
             roles[index] = message.role;
+            if (message.content_parts) |parts| {
+                for (parts) |part| switch (part) {
+                    .text => {},
+                    else => image_parts += 1,
+                };
+            }
         }
         try self.requests.append(self.allocator, .{
             .contents = contents,
@@ -249,6 +261,8 @@ const FakeProvider = struct {
             else
                 null,
             .include_reasoning = request.include_reasoning,
+            .tools_null = request.tools == null,
+            .image_parts = image_parts,
         });
     }
 
@@ -525,6 +539,8 @@ const Fixture = struct {
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
     policy: ?*const SecurityPolicy = null,
     allowed_paths: []const []const u8 = &.{},
+    max_tool_iterations: u32 = 1000,
+    image_ingestion: harness_mod.ImageIngestion = .passthrough,
     now_ms_fn: *const fn (?*anyopaque) i64 = fixedClock,
     clock_context: ?*anyopaque = null,
     /// Production sessions inject the pre-step context; compaction mechanics
@@ -592,6 +608,8 @@ const Fixture = struct {
             .tool_filter_groups = self.tool_filter_groups,
             .policy = self.policy,
             .allowed_paths = self.allowed_paths,
+            .max_tool_iterations = self.max_tool_iterations,
+            .image_ingestion = self.image_ingestion,
         };
     }
 
@@ -968,6 +986,203 @@ test "dsh-native adapter: tool turn runs the read tool and feeds the result back
         if (std.mem.eql(u8, event.event_type, "tool/result")) saw_result = true;
     }
     try testing.expect(saw_call and saw_result);
+}
+
+test "dsh-native adapter: an attachment-marker reply becomes a telegram attachment" {
+    // Combo check for the attachment work: the dsh-composed reply reaches
+    // Telegram's legacy payload builder and yields the file attachment.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "Here is the report: [FILE:/tmp/report.txt]" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("send the report"));
+    defer allocator.free(result.reply);
+
+    var owned = try telegram_channel.buildOwnedOutboundPayloadFromLegacy(
+        allocator,
+        result.reply,
+        &.{},
+        false,
+    );
+    defer owned.deinit(allocator);
+    try testing.expectEqual(@as(usize, 1), owned.attachments.len);
+    try testing.expectEqualStrings("/tmp/report.txt", owned.attachments[0].target);
+    try testing.expect(owned.attachments[0].kind == .document);
+    try testing.expectEqualStrings("Here is the report:", std.mem.trim(u8, owned.text, " "));
+}
+
+test "dsh-native adapter: inbound [IMAGE:] markers become image content parts" {
+    // Regression: dsh flattened every inbound image to literal `[IMAGE:...]`
+    // text, so a vision model worked blind.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "I see it" }});
+    defer fx.deinit();
+    const png = try std.fs.path.join(allocator, &.{ fx.workspace, "pic.png" });
+    defer allocator.free(png);
+    {
+        const file = try fs_compat.createPath(png, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(&[_]u8{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0 });
+    }
+    const dirs = [_][]const u8{fx.workspace};
+    fx.image_ingestion = .{ .attach = .{ .allowed_dirs = &dirs } };
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const prompt = try std.fmt.allocPrint(allocator, "look [IMAGE:{s}]", .{png});
+    defer allocator.free(prompt);
+    const result = try h.runTurn(turnInput(prompt));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqualStrings("I see it", result.reply);
+    const first = fx.provider.requests.items[0];
+    try testing.expectEqual(@as(usize, 1), first.image_parts);
+    try testing.expect(requestContains(first, "look"));
+    // The marker path is gone; the bare `[IMAGE:` prefix stays only in the
+    // native `## Channel Attachments` guidance riding the runtime context.
+    try testing.expect(!requestContains(first, png));
+}
+
+test "dsh-native adapter: a non-vision model strips inbound image markers" {
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{.{ .text = "no picture" }});
+    defer fx.deinit();
+    fx.image_ingestion = .strip;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("look [IMAGE:/tmp/example.png]"));
+    defer allocator.free(result.reply);
+
+    const first = fx.provider.requests.items[0];
+    try testing.expectEqual(@as(usize, 0), first.image_parts);
+    try testing.expect(requestContains(first, "image(s) omitted because the current model does not support vision"));
+    try testing.expect(!requestContains(first, "/tmp/example.png"));
+}
+
+test "dsh-native adapter: max_tool_iterations caps the rounds and asks for a summary" {
+    // Regression: agent.max_tool_iterations was ignored by the in-process
+    // engine, so a tool-happy model ran unbounded rounds.
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "tool output" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{}" }} },
+        .{ .text = "summary after the cap" },
+    });
+    defer fx.deinit();
+    fx.max_tool_iterations = 1;
+    fx.host_tools = &.{
+        .{ .name = "probe", .description = "Probe", .input_schema_json = "{}", .concurrency_safe = true },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("probe once"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqualStrings("summary after the cap", result.reply);
+    try testing.expectEqual(port.EndReason.completed, result.end_reason);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    // The summary step runs with no tool schemas and carries the native nudge.
+    try testing.expect(!fx.provider.requests.items[0].tools_null);
+    try testing.expect(fx.provider.requests.items[1].tools_null);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "maximum number of tool iterations"));
+}
+
+test "dsh-native adapter: a tool call after the iteration cap is refused and ends the turn" {
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "tool output" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{}" }} },
+        // A rogue call on the summary step: schemas were withheld, but the
+        // scripted model emits text tool markup anyway.
+        .{ .text = "partway", .tool_calls = &.{.{ .id = "call-2", .name = "probe", .arguments = "{}" }} },
+        .{ .text = "must not be reached" },
+    });
+    defer fx.deinit();
+    fx.max_tool_iterations = 1;
+    fx.host_tools = &.{
+        .{ .name = "probe", .description = "Probe", .input_schema_json = "{}", .concurrency_safe = true },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("probe once"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqual(@as(usize, 1), fake.calls);
+    try testing.expectEqualStrings("partway", result.reply);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+}
+
+test "dsh-native adapter: an identical tool call in one turn reuses the first result" {
+    // Regression: dsh ran every repeat again; native replays the first
+    // result for an identical name+arguments call within the turn.
+    const allocator = testing.allocator;
+    var fake = BridgeFake{ .output = "probe output" };
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "probe", .arguments = "{\"x\":1}" }} },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "probe", .arguments = "{\"x\":1}" }} },
+        .{ .tool_calls = &.{.{ .id = "call-3", .name = "probe", .arguments = "{\"x\":2}" }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.host_tools = &.{
+        .{ .name = "probe", .description = "Probe", .input_schema_json = "{}", .concurrency_safe = true },
+    };
+    fx.host_executor = fake.executor();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("probe twice"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqualStrings("done", result.reply);
+    try testing.expectEqual(@as(usize, 2), fake.calls);
+    // The reused result still reaches the model as a tool result.
+    try testing.expect(requestContains(fx.provider.requests.items[2], "probe output"));
+}
+
+test "dsh-native adapter: an empty round is nudged once, then fails with a message" {
+    // Regression: the kernel closed an empty completed turn, so the user got
+    // a blank reply where native nudges and then reports empty_response.
+    const allocator = testing.allocator;
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "" },
+        .{ .text = "" },
+        .{ .text = "must not be reached" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+
+    const result = try h.runTurn(turnInput("hello?"));
+    defer allocator.free(result.reply);
+
+    try testing.expectEqualStrings("Model returned an empty response. Please retry or /new for a fresh session.", result.reply);
+    try testing.expectEqual(port.EndReason.failed, result.end_reason);
+    try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
+    try testing.expect(requestContains(fx.provider.requests.items[1], "previous reply was empty"));
 }
 
 test "dsh-native adapter: requestInterrupt cancels a blocking provider call" {
@@ -1912,6 +2127,13 @@ test "dsh-native adapter: pre-step pressure compacts and rewrites the surface" {
     try testing.expect(std.mem.indexOf(u8, log_text, "\"compaction/summary\"") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "\"compaction/end\"") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "compact-checkpoint") != null);
+
+    // Native parity: the compacted turn reports it and the delivered reply
+    // carries the one-shot notice; earlier turns stay untouched.
+    try testing.expect(!two.compacted);
+    try testing.expect(three.compacted);
+    try testing.expectEqualStrings("[Context compacted]\n\nc", three.reply);
+    try testing.expectEqualStrings("c", three.persisted_reply.?);
 }
 
 test "dsh-native adapter: Safety is re-emitted after compaction shadows runtime context" {

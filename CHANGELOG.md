@@ -9,6 +9,32 @@
   marker kinds, including a marker split across chunks, on every engine. The
   final message is unchanged, so the channel still parses the marker and sends
   the file; an unterminated marker stays masked only in the ephemeral draft.
+- in-process dsh engine: inbound `[IMAGE:]` / `[PHOTO:]` markers in the last
+  prompt are read into provider content parts (workspace,
+  `autonomy.allowed_paths` and the platform temp dir, under the same vision
+  checks as native). A model without vision gets the native placeholder text
+  instead of a literal marker. Provider-confirmed vision auto-disable is not
+  mirrored.
+- in-process dsh engine: `agent.max_tool_iterations` now bounds the tool rounds.
+  The step at the cap runs with no tool schemas and the native "summarize now"
+  nudge; a tool call after that is refused and the turn ends instead of looping.
+- in-process dsh engine: `agent.usage_mode` (`/usage`, `/cost`) appends the
+  same `[usage]` footer the native reply composer prints, and the persisted
+  transcript stays clean.
+- in-process dsh engine: a compacted turn now reports `compacted` (so
+  `last_consolidated` advances) and prefixes the reply with
+  `[Context compacted]`, matching native.
+- in-process dsh engine: an identical tool call (same name and arguments)
+  within one turn reuses the first result instead of executing again, like
+  native's per-turn tool cache.
+- in-process dsh engine: an empty or structural-stall round is retried with
+  the native nudge (twice for reasoning-only rounds); if the reply is still
+  empty the turn ends with the native "Model returned an empty response"
+  failure text instead of a blank message.
+- docs: the outbound attachment path filter is documented as applying only to
+  a named agent that defines its own `autonomy` block, and `model_routes` are
+  documented as native-engine-only.
+
 - dsh engine: the in-process engine's runtime context now carries the same
   channel attachment-marker guidance as the native system prompt, so the model
   emits `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]`, and the other markers

@@ -4026,7 +4026,7 @@ pub const Agent = struct {
     }
 
     /// Check if vision is disabled for current model (either configured or auto-detected).
-    fn isVisionDisabled(self: *const Agent, model_name: []const u8) bool {
+    pub fn isVisionDisabled(self: *const Agent, model_name: []const u8) bool {
         for (self.vision_disabled_models) |model| {
             if (std.mem.eql(u8, model, model_name)) return true;
         }

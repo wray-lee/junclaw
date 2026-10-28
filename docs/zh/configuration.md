@@ -268,6 +268,8 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 
 该引擎会把与原生引擎相同的渠道附件标记说明注入运行时上下文，因此回复里写 `[FILE:...]`、`[DOCUMENT:...]`、`[IMAGE:...]` 等标记时，渠道会像原生引擎一样上传文件，并同样受工作区/`autonomy.allowed_paths` 范围过滤约束。
 
+该引擎还会对齐以下原生回合行为：最后一条提示里的 `[IMAGE:]` / `[PHOTO:]` 标记会读入 provider content parts；配置的模型没有视觉能力时则替换为原生占位文案；`agent.max_tool_iterations` 会限制工具轮数，到达上限的那一步不再提供工具 schema，并注入原生的"立即总结"提示后结束回合；`agent.usage_mode` 会在已投递回复后追加相同的 `[usage]` 页脚，而持久化记录保持干净；发生压缩的回合会报告 `compacted` 并在回复前加 `[Context compacted]`；同一回合内完全相同的工具调用会复用第一次的结果，不再重复执行；空回复或结构性停滞的轮次会先按原生文案提示重试一次（仅推理内容的重试两次），仍为空才以空回复失败文案结束。`model_routes` 仍只对原生引擎生效，见下文。
+
 该进程内引擎同时保留原生引擎的记忆与技能接线：`memory.auto_save` 开启时，每回合结束会把脱敏后的用户文本与已投递回复的摘要写入配置的记忆后端；压缩前（含手动 `/compact`）会把将要丢弃的消息里的持久事实刷入记忆（`agent.compaction_memory_flush`）。运行时上下文会带上原生记忆工具指引、`## Skills`、会话激活的 `## Active Skill Session`、`## Runtime Capabilities` 与 `## Runtime`（OS | Model）。命名 agent 的 `## Agent Profile` 提示词会并入引擎 persona；`AGENTS.md` 通过配置的 bootstrap provider 读取，因此数据库记忆后端（sqlite/postgres/redis）里的副本同样生效。`dsh-sidecar` 引擎没有这套接线。
 
 示例：
@@ -379,6 +381,7 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 - `/model` 还会显示最近一次自动路由决策，方便查看选中了哪条路线以及原因。
 - 如果自动路由命中的提供方遇到配额或限流错误，这条路线会被临时降级，直到冷却时间结束才会再次尝试。
 - 路由元数据只会轻微影响评分，不会推翻保守策略。含糊请求仍然优先留在 `balanced`，`fast` 只给高置信度且便宜的任务，强烈的深度分析信号仍然会压过更便宜的路线。
+- `model_routes` 只对原生引擎生效。`dsh`（默认）与 `dsh-sidecar` 会话在整个会话期间都使用会话配置的模型。
 
 ### `agents.list`
 
@@ -471,7 +474,7 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
   - `/export` 会被拒绝：它接受任意绝对路径并截断/创建该文件，是一个可被绑定聊天对端触发的“整机文件写入”原语。
   - 当该 Telegram 对端当前被路由到拥有独立 autonomy 的 agent 时，`/bind` 会被拒绝。否则 guest 可以用 `/bind clear` 回退到默认路由，或用 `/bind <其他 agent>` 迁移到无限制的 agent，从而逃离受限 agent。（`/bind status` 仍为只读。）
   - 其余 slash 命令要么只影响自身会话（model、think、verbose、reasoning、usage、cost、queue、tts、focus/unfocus/dock/activation/send、session ttl、context、memory、skills、debug、stop、compact、doctor），要么作用于该 agent 自己的 subagent —— 而后者对它不可用，因为 `spawn` 工具已被移除（`/subagents spawn`、`/steer`、`/tell`、`/agents`、`/kill`、`/poll` 都会提示 subagent manager 已禁用）。`/bash`、`/approve`、`/exec`、`/elevated` 仍走该 agent 自己的 shell 工具与策略，因此下面的限制同样适用于它们。
-- 出站附件被限制：一次出站回复只能附带由**绝对路径**命名、且解析后（跟随符号链接）位于该 agent 工作区（及其自身 `allowed_paths`）之内的本地文件。相对路径会被拒绝，因为 channel 上传器（`curl --form file=@<target>`）会按自身进程 cwd 而非工作区解析它，导致上传的文件未必是检查所解析的那个。回复文本中目标落在工作区之外或为相对路径的旧式标记（`[IMAGE:…]`、`[DOCUMENT:…]`、`[FILE:…]`、`[PHOTO:…]`、`[VIDEO:…]`、`[AUDIO:…]`、`[VOICE:…]`）会在发送前被丢弃并记录日志，对所有会上传此类标记的 channel（Telegram、Slack、Max、Signal 等）都生效。远程 `http(s)` URL 不指向本地文件，不受影响。这是一条不经过工具调用的纯文本外泄路径，因此 `read_only` 同样适用。
+- 出站附件被限制：一次出站回复只能附带由**绝对路径**命名、且解析后（跟随符号链接）位于该 agent 工作区（及其自身 `allowed_paths`）之内的本地文件。相对路径会被拒绝，因为 channel 上传器（`curl --form file=@<target>`）会按自身进程 cwd 而非工作区解析它，导致上传的文件未必是检查所解析的那个。回复文本中目标落在工作区之外或为相对路径的旧式标记（`[IMAGE:…]`、`[DOCUMENT:…]`、`[FILE:…]`、`[PHOTO:…]`、`[VIDEO:…]`、`[AUDIO:…]`、`[VOICE:…]`）会在发送前被丢弃并记录日志，对所有会上传此类标记的 channel（Telegram、Slack、Max、Signal 等）都生效。远程 `http(s)` URL 不指向本地文件，不受影响。这是一条不经过工具调用的纯文本外泄路径，因此 `read_only` 同样适用。该过滤只对定义了自身 `autonomy` 的命名 agent（`has_own_autonomy`）生效；主 agent 以及没有自身 autonomy 的命名 agent 保持 native 的不做路径过滤行为。
 - shell 工具被限制在该 agent 的工作区内。命令会按 shell 视为 IFS 空白的所有字节（空格、tab、换行、垂直制表符、换页符）做词切分，随后任何命名路径的参数（绝对路径、`..` 回溯、`~`）都会被拒绝；命令中出现任何控制字节都会被直接拒绝，因为 shell 会据此切分出参数检查看不到的参数（`cat x\t/etc/passwd` 会执行 `cat x /etc/passwd`）。`$` 参数展开（`$IFS`、`$HOME`、`$1`、`$@` 等）、单引号之外的反斜杠转义，以及未加引号的 glob/花括号元字符也会被拒绝，因为 shell 会在执行时把它们展开或去转义成参数检查看不到的文本（`cat $IFS/etc/passwd` 和 `cat \/etc/passwd` 都会变成 `cat /etc/passwd`）。会直接拒绝执行来自工作区代码的命令 —— 包管理器及其 run/build 子命令（`npm`、`pnpm`、`yarn`、`npx`、`bun`、`deno`、`cargo`），以及会运行脚本的 git 子命令（`git bisect`、`git submodule`、`git filter-branch`、`git filter-repo`，外加 git `-c` 配置注入与 `!` 别名）—— 因为这类代码以 agent 进程的权限运行并绕过该限制。 此外，受限命令只能包含字母、数字、普通空格、分隔符 `;`、`|`、`&&`、`||` 以及标点 `-_./,:=+@%^`：任何引号、重定向（`<`、`>`）、转义、展开或通配字节都会被拒绝，因此 `cat ''/etc/passwd`、`cat '..'/x`、`cat </etc/passwd` 会被直接拒绝，而不会被 shell 重新解释。`find` 的写入/执行谓词（`-exec`、`-execdir`、`-ok`、`-okdir`、`-delete`、`-fprint*`、`-fls`）同样被拒绝。`nullclaw agent --agent <name>` 也使用同一套按 agent 的 autonomy。
 - **该 shell 限制是尽力而为的参数检查，而非文件系统 jail。** 它是在常见的无外部沙箱（bubblewrap/firejail/docker/landlock）场景下的纵深防御；若某命令通过该检查未覆盖的机制访问主机文件，仍可能绕过。对不可信的 guest，优先使用 `"level": "read_only"` —— 它会直接禁用**所有**工具调用，并让进程运行在外部沙箱中。
 - 没有 `autonomy` 块的 agent 仍然共用全局策略。

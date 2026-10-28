@@ -5527,6 +5527,16 @@ pub fn composeFinalReply(
     }
     try w.writeAll(clean_base);
 
+    try appendUsageFooter(self, w, usage);
+
+    out = out_writer.toArrayList();
+    return try out.toOwnedSlice(self.allocator);
+}
+
+/// Append the `/usage` footer (`agent.usage_mode`) for one turn. Shared by the
+/// native reply composer and the host-side dsh post-step, so both engines
+/// print the same bytes.
+pub fn appendUsageFooter(self: anytype, w: *std.Io.Writer, usage: providers.TokenUsage) !void {
     switch (self.usage_mode) {
         .off => {},
         .tokens => try w.print("\n\n[usage] total_tokens={d}", .{usage.total_tokens}),
@@ -5550,9 +5560,6 @@ pub fn composeFinalReply(
             }
         },
     }
-
-    out = out_writer.toArrayList();
-    return try out.toOwnedSlice(self.allocator);
 }
 
 fn handleDoctorCommand(self: anytype) ![]const u8 {

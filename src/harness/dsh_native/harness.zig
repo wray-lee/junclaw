@@ -41,6 +41,7 @@ const bootstrap_mod = @import("../../bootstrap/root.zig");
 const providers = @import("../../providers/root.zig");
 const provider_helpers = @import("../../providers/helpers.zig");
 const redaction = @import("../../redaction.zig");
+const multimodal_mod = @import("../../multimodal.zig");
 const http_util = @import("../../http_util.zig");
 const util = @import("../../util.zig");
 const config_types = @import("../../config_types.zig");
@@ -85,6 +86,32 @@ const types = @import("types.zig");
 const Allocator = std.mem.Allocator;
 const Value = std.json.Value;
 const Writer = std.Io.Writer;
+
+/// Native `Agent`'s tool-iteration exhaustion nudge. The step at the cap runs
+/// with tool schemas withheld, so the model must answer in text; one further
+/// tool round ends the turn instead of looping.
+const iteration_limit_nudge = "SYSTEM: You have reached the maximum number of tool iterations. You MUST NOT call any more tools. Summarize what you have accomplished so far and what remains to be done. Respond in the same language the user used.";
+
+/// Structural empty-response nudges, mirroring the native Agent's texts
+/// (root.zig `TOOL_USE_WITHOUT_CALL_NUDGE`, `SETTLED_TOOLS_NO_ANSWER_NUDGE`,
+/// `REASONING_ONLY_NUDGE`, generic). They key on provider structure, never on
+/// assistant prose.
+const tool_use_without_call_nudge = "SYSTEM: The previous turn stopped for tool use but contained no tool call, so nothing ran. Continue from the current state: call the tool you need through the tool interface instead of writing the call as text, or produce the visible answer now. Do not restart from scratch.";
+const settled_tools_no_answer_nudge = "SYSTEM: The previous assistant turn completed its tool calls but did not produce a user-visible answer. Continue from the current transcript and produce the final user-visible answer now. Do not repeat completed tool calls or restart from scratch.";
+const reasoning_only_nudge = "SYSTEM: The previous assistant turn recorded reasoning but did not produce a user-visible answer. Continue from that partial turn and produce the visible answer now. Do not restate the reasoning or restart from scratch.";
+const generic_empty_response_nudge = "SYSTEM: Your previous reply was empty. Respond with a direct user-visible answer or emit the necessary tool call(s). Do not return an empty response.";
+/// User-visible failure when the nudges are spent (native classifies the same
+/// case as `error.NoResponseContent`).
+const empty_response_fallback = "Model returned an empty response. Please retry or /new for a fresh session.";
+
+/// Inbound `[IMAGE:]` handling. Native reads the markers in the last user
+/// message, either attaching the file as a content part or stripping the
+/// marker for a non-vision model; `.passthrough` keeps dsh's raw text.
+pub const ImageIngestion = union(enum) {
+    passthrough,
+    strip,
+    attach: multimodal_mod.MultimodalConfig,
+};
 
 /// Borrowed for the harness lifetime (same contract as the sidecar's
 /// `Options`); the owner keeps every slice alive until `deinit`, except
@@ -134,6 +161,11 @@ pub const Options = struct {
     /// `autonomy.allowed_paths`: extra roots for the file and bash tools.
     allowed_paths: []const []const u8 = &.{},
     max_parallel_tools: usize = config_types.DEFAULT_DSH_MAX_PARALLEL_TOOLS,
+    /// `agent.max_tool_iterations`: model rounds per turn. Native's default is
+    /// 1000; the host passes the live agent value.
+    max_tool_iterations: u32 = 1000,
+    /// Inbound `[IMAGE:]` handling (native multimodal parity).
+    image_ingestion: ImageIngestion = .passthrough,
     /// `agent.tool_filter_groups`; empty exposes every tool. Applied per turn
     /// with the same `tool_filter.toolExposed` the native agent uses.
     tool_filter_groups: []const config_types.ToolFilterGroup = &.{},
@@ -263,6 +295,22 @@ pub const DshNativeHarness = struct {
     /// out of the kernel settlement, which dies with the step.
     turn_reasoning: std.ArrayListUnmanaged(u8) = .empty,
     last_assistant_text: ?[]const u8 = null,
+    /// `agent.max_tool_iterations` reached: the next step carries the
+    /// summarize nudge with no tool schemas, and a further tool round ends
+    /// the turn.
+    iteration_limited: bool = false,
+    /// Finish reason of the last assistant settlement (empty-response guard).
+    last_finish: stream.Finish = .stop,
+    /// Empty-response nudge attempts spent this turn.
+    empty_retries: u32 = 0,
+    /// Any tool ran this turn (empty-response nudge classification).
+    tools_ran_this_turn: bool = false,
+    /// The turn compacted its history (`[Context compacted]` + `TurnResult`).
+    compacted_this_turn: bool = false,
+    /// Tool results already produced this turn, keyed by name+arguments.
+    /// Native skips an identical repeat and replays the first result.
+    tool_results: std.AutoHashMapUnmanaged(u64, CachedToolResult) = .empty,
+    tool_results_mutex: compat.sync.Mutex = .{},
     /// Current turn's conversation context. Native renders `## Conversation
     /// Context`, group chat and schedule guidance into the system prompt; dsh
     /// carries the same bytes in its per-turn runtime context.
@@ -308,6 +356,12 @@ pub const DshNativeHarness = struct {
     call_arena: std.heap.ArenaAllocator,
     pending: std.ArrayListUnmanaged(stream.Event) = .empty,
     pending_index: usize = 0,
+
+    const CachedToolResult = struct {
+        is_error: bool,
+        /// Rendered output, owned by the harness allocator.
+        text: []const u8,
+    };
 
     pub fn init(allocator: Allocator, opts: Options) !Self {
         if (opts.dsh_home.len == 0) return error.MissingDshHome;
@@ -360,6 +414,8 @@ pub const DshNativeHarness = struct {
         // `allocator` is the host's free allocator, the same one `init` took.
         _ = allocator;
         self.closeSession();
+        self.clearToolResults();
+        self.tool_results.deinit(self.allocator);
         self.turn_text.deinit(self.allocator);
         self.turn_reasoning.deinit(self.allocator);
         self.pending_calls.deinit(self.allocator);
@@ -1058,6 +1114,7 @@ pub const DshNativeHarness = struct {
             .emit = hostEmit,
             .system_messages = hostSystemMessages,
             .pre_step = hostPreStep,
+            .can_turn_end = canTurnEnd,
             .serialize_message = hostSerializeMessage,
             .compaction = .{
                 .context = @ptrCast(self),
@@ -1315,6 +1372,12 @@ pub const DshNativeHarness = struct {
         self.turn_text.clearRetainingCapacity();
         self.turn_reasoning.clearRetainingCapacity();
         self.last_assistant_text = null;
+        self.iteration_limited = false;
+        self.last_finish = .stop;
+        self.empty_retries = 0;
+        self.tools_ran_this_turn = false;
+        self.compacted_this_turn = false;
+        self.clearToolResults();
         // A previous turn's stop must not abort this one's first provider
         // call; the kernel flag below still ends a pre-turn stop.
         self.stream_cancel.store(false, .monotonic);
@@ -1360,16 +1423,37 @@ pub const DshNativeHarness = struct {
 
         // `reply` and `error` are owned by the host's allocator (native.zig
         // hands back Agent-allocated memory); the engine's arena copies here.
-        const reply = try self.composeReply();
+        var reply = try self.composeReply();
         errdefer self.allocator.free(reply);
+        // Native parity: after the nudges above, an empty completed turn is a
+        // classified failure with a user-visible message, never a blank reply.
+        const empty_final = switch (reason) {
+            .completed => std.mem.trim(u8, reply, " \t\r\n").len == 0,
+            else => false,
+        };
+        if (empty_final) {
+            self.allocator.free(reply);
+            // Native's exhaustion fallback names the cap; its empty-response
+            // path reports the empty reply.
+            reply = if (self.iteration_limited)
+                try std.fmt.allocPrint(
+                    self.allocator,
+                    "[Tool iteration limit: {d}/{d}] Could not produce a summary. Try /new and repeat your request.",
+                    .{ self.opts.max_tool_iterations, self.opts.max_tool_iterations },
+                )
+            else
+                try self.allocator.dupe(u8, empty_response_fallback);
+        }
         var result = port.TurnResult{
             .reply = reply,
             .persisted_reply = null,
             .total_tokens = self.total_tokens,
-            .end_reason = mapEndReason(reason),
+            .end_reason = if (empty_final) port.EndReason.failed else mapEndReason(reason),
+            .compacted = self.compacted_this_turn,
             .dsh_session_id = self.session_id,
             .turn_count = self.turn_model_calls - calls_before,
         };
+        self.compacted_this_turn = false;
         if (self.last_assistant_text) |text| result.persisted_reply = text;
         switch (reason) {
             .aborted => |cause| result.abort_cause = switch (cause) {
@@ -1477,6 +1561,12 @@ pub const DshNativeHarness = struct {
             l.config.model = model;
             l.config.reasoning_effort = reasoning_effort;
         }
+    }
+
+    /// Host seam for `/model`: image ingestion follows the live model's
+    /// vision capability (attach vs strip) without rebuilding the harness.
+    pub fn setImageIngestion(self: *Self, ingestion: ImageIngestion) void {
+        self.opts.image_ingestion = ingestion;
     }
 
     /// Host seam for memory: the pre-compaction flush needs the session store
@@ -1631,7 +1721,12 @@ pub const DshNativeHarness = struct {
                 self.forwardDelta(payload.event);
                 return 0;
             },
-            .assistant_message => |payload| return self.appendAssistant(payload.position, payload.settlement, false),
+            .assistant_message => |payload| {
+                // Empty-response guard: distinguish "stopped for tool use with
+                // no call" from a plain empty round.
+                self.last_finish = payload.settlement.finish;
+                return self.appendAssistant(payload.position, payload.settlement, false);
+            },
             .assistant_attempt => |payload| return self.appendAssistant(payload.position, payload.settlement, true),
             .assistant_closer => |payload| return self.appendAssistantCloser(payload.position, payload.message),
             .tool_call => |payload| return self.appendToolCall(payload.position, payload.call),
@@ -2020,6 +2115,41 @@ pub const DshNativeHarness = struct {
         _ = try loop.inbox.steer(.{ .id = id, .data = data });
     }
 
+    /// `agent/turn-stopping` gate: native retries an empty or structural-stall
+    /// round with a nudge before closing the turn. The gate only vetoes the
+    /// close after queueing the nudge as next-step input (dsh's rule), so the
+    /// kernel runs exactly one more model round.
+    fn canTurnEnd(context_ptr: *anyopaque, turn: u64) anyerror!bool {
+        _ = turn;
+        const self = selfOf(context_ptr);
+        // The iteration cap owns the end of its turn (nudge + refusal).
+        if (self.iteration_limited) return true;
+        // A max-tokens stop is a real end, not an empty round.
+        if (self.last_finish == .max_tokens) return true;
+        const text = std.mem.trim(u8, self.last_assistant_text orelse "", " \t\r\n");
+        if (text.len > 0) return true;
+        const nudge: []const u8 = if (self.last_finish == .tool_calls)
+            tool_use_without_call_nudge
+        else if (self.turn_reasoning.items.len > 0)
+            reasoning_only_nudge
+        else if (self.tools_ran_this_turn)
+            settled_tools_no_answer_nudge
+        else
+            generic_empty_response_nudge;
+        // Mirrors native caps: reasoning-only retries twice, the rest once.
+        const cap: u32 = if (std.mem.eql(u8, nudge, reasoning_only_nudge)) 2 else 1;
+        if (self.empty_retries >= cap) return true;
+        const loop = if (self.loop) |*value| value else return true;
+        self.empty_retries += 1;
+        const allocator = self.arena.allocator();
+        const id = try self.nextMessageId();
+        _ = try loop.inject(.{
+            .id = id,
+            .data = try self.userMessageJson(allocator, id, nudge),
+        });
+        return false;
+    }
+
     /// `agent/pre-step`: commit a queued plan selection before the request
     /// header is snapshotted, then hand the narration to this step. Never
     /// vetoes; steer is pumped at the preceding `step_end` instead.
@@ -2037,6 +2167,18 @@ pub const DshNativeHarness = struct {
         // just before the step opens must not switch plan mode.
         if (self.loop) |*loop| {
             if (loop.isAborted()) return .{};
+        }
+        // Native parity: `agent.max_tool_iterations` caps the tool rounds.
+        // The step past the cap gets the native summarize nudge and runs with
+        // no tool schemas; a tool round after that closes the turn instead of
+        // looping forever.
+        if (position.step > self.opts.max_tool_iterations) {
+            if (self.iteration_limited) return .{ .kind = .reject };
+            self.iteration_limited = true;
+            const id = try self.nextMessageId();
+            try out.append(allocator, .{
+                .json = try self.userMessageJson(allocator, id, iteration_limit_nudge),
+            });
         }
         const boundary = self.plan_session.preStep();
         // A committed plan-mode change bumps dsh's surface projection
@@ -2252,13 +2394,16 @@ pub const DshNativeHarness = struct {
         self.streamed_live = false;
 
         const arena = self.call_arena.allocator();
-        const messages = try self.requestsFromMessages(arena, self.messages.items);
+        const converted = try self.requestsFromMessages(arena, self.messages.items);
+        const messages = try self.applyImageIngestion(arena, converted);
         const chat = providers.ChatRequest{
             .messages = messages,
             .model = self.opts.model,
             .temperature = self.opts.temperature,
             .max_tokens = self.opts.max_tokens,
-            .tools = self.tool_specs,
+            // At the iteration cap the model gets the summarize nudge with no
+            // tool schemas, exactly like the native summary call.
+            .tools = if (self.iteration_limited) null else self.tool_specs,
             .reasoning_effort = self.opts.reasoning_effort,
             .include_reasoning = self.opts.reasoning_mode != .off,
             .session_id = if (self.opts.session_key.len == 0) null else self.opts.session_key,
@@ -2864,9 +3009,22 @@ pub const DshNativeHarness = struct {
     /// `[Tool results]` user message, because `ChatMessage` cannot carry an
     /// assistant `tool_calls` array. Every text is redacted: this is the
     /// provider boundary native redacts in `redactMessagesForProvider`.
-    fn requestsFromMessages(self: *Self, allocator: Allocator, messages: []const types.Message) ![]providers.ChatMessage {
+    const ProviderMessages = struct {
+        messages: []providers.ChatMessage,
+        /// Index (in `messages`) of the last user-role message the model is
+        /// answering: a real user message or a tool result. dsh appends the
+        /// runtime-context projections *after* that message, so the literal
+        /// last user message is not the prompt; image markers must target
+        /// this one, matching native's last-user-message semantics.
+        image_target: ?usize = null,
+    };
+
+    fn requestsFromMessages(self: *Self, allocator: Allocator, messages: []const types.Message) !ProviderMessages {
         var out: std.ArrayListUnmanaged(providers.ChatMessage) = .empty;
+        var image_target: ?usize = null;
+        const target_source = lastImageTargetSource(messages);
         for (messages, 0..) |message, index| {
+            const is_image_target = if (target_source) |target| target == index else false;
             switch (message.role) {
                 .system => {
                     // Every turn logs its own system message; the provider
@@ -2878,16 +3036,20 @@ pub const DshNativeHarness = struct {
                     }
                     try out.append(allocator, .{ .role = .system, .content = text });
                 },
-                .developer, .user => try out.append(allocator, .{
-                    .role = .user,
-                    .content = try self.redactText(allocator, try textOf(allocator, message.content)),
-                }),
+                .developer, .user => {
+                    if (is_image_target) image_target = out.items.len;
+                    try out.append(allocator, .{
+                        .role = .user,
+                        .content = try self.redactText(allocator, try textOf(allocator, message.content)),
+                    });
+                },
                 .assistant => {
                     const text = try self.redactText(allocator, try assistantHistoryText(allocator, message.content));
                     if (text.len == 0) continue;
                     try out.append(allocator, .{ .role = .assistant, .content = text });
                 },
                 .tool => {
+                    if (is_image_target) image_target = out.items.len;
                     const name = toolNameFor(messages, message.tool_call_id);
                     const body = try self.redactText(allocator, try textOf(allocator, message.content));
                     const rendered = try std.fmt.allocPrint(
@@ -2899,7 +3061,48 @@ pub const DshNativeHarness = struct {
                 },
             }
         }
-        return out.toOwnedSlice(allocator);
+        return .{ .messages = try out.toOwnedSlice(allocator), .image_target = image_target };
+    }
+
+    /// Native multimodal parity: read the last prompt's `[IMAGE:]` markers
+    /// into provider content parts (vision models), or replace them with the
+    /// native placeholder for a model without vision. Only that one message is
+    /// processed, like `multimodal.countImageMarkersInLastUser`.
+    fn applyImageIngestion(self: *Self, arena: Allocator, converted: ProviderMessages) ![]providers.ChatMessage {
+        const index = converted.image_target orelse return converted.messages;
+        const config = switch (self.opts.image_ingestion) {
+            .passthrough => return converted.messages,
+            .strip => null,
+            .attach => |value| value,
+        };
+        var single = [_]providers.ChatMessage{converted.messages[index]};
+        const prepared = if (config) |value|
+            try multimodal_mod.prepareMessagesForProvider(arena, &single, value)
+        else
+            try multimodal_mod.stripImageMarkers(arena, &single);
+        const copy = try arena.dupe(providers.ChatMessage, converted.messages);
+        copy[index] = prepared[0];
+        return copy;
+    }
+
+    /// Last prompt/tool-result message in surface order. Runtime-context and
+    /// agent-instructions projections are user-role too, but they follow the
+    /// message they describe, so they must not shadow it.
+    fn lastImageTargetSource(messages: []const types.Message) ?usize {
+        var index = messages.len;
+        while (index > 0) {
+            index -= 1;
+            const message = messages[index];
+            switch (message.role) {
+                .user, .developer => switch (message.source) {
+                    .user => return index,
+                    else => {},
+                },
+                .tool => return index,
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn toolNameFor(messages: []const types.Message, call_id: ?[]const u8) []const u8 {
@@ -2934,8 +3137,12 @@ pub const DshNativeHarness = struct {
             if (util.isSilentTokenReply(text)) break :blk text;
             break :blk self.turn_text.items;
         } else self.turn_text.items;
+        // Native prefixes the one-shot compaction notice to a non-silent reply.
+        const silent = self.last_assistant_text != null and util.isSilentTokenReply(self.last_assistant_text.?);
+        const notice: []const u8 = if (self.compacted_this_turn and !silent) "[Context compacted]\n\n" else "";
         if (self.opts.reasoning_mode != .on or self.turn_reasoning.items.len == 0) {
-            return self.allocator.dupe(u8, base_text);
+            if (notice.len == 0) return self.allocator.dupe(u8, base_text);
+            return std.fmt.allocPrint(self.allocator, "{s}{s}", .{ notice, base_text });
         }
         const clean = try providers.stripToolCallMarkup(self.allocator, self.turn_reasoning.items);
         defer self.allocator.free(clean);
@@ -2949,6 +3156,7 @@ pub const DshNativeHarness = struct {
             try out.appendSlice(self.allocator, "\n");
         }
         try out.appendSlice(self.allocator, "\n\n");
+        try out.appendSlice(self.allocator, notice);
         try out.appendSlice(self.allocator, base_text);
         return out.toOwnedSlice(self.allocator);
     }
@@ -3014,7 +3222,80 @@ pub const DshNativeHarness = struct {
         const self = selfOf(context_ptr);
         if (signal.isAborted()) return error.Aborted;
         if (self.interrupt) return error.Aborted;
-        return execute.executeWithGate(&self.registry, allocator, call, self.gate());
+        if (self.iteration_limited) {
+            // The model can still emit text tool-call markup with the schemas
+            // withheld; refuse it so the turn cannot run tools past the cap.
+            const blocks = try allocator.alloc(types.ContentBlock, 1);
+            blocks[0] = .{ .text = "Tool calls are disabled: the turn reached the maximum number of tool iterations. Answer in text." };
+            return .{ .failure = .{
+                .error_info = .{
+                    .name = call.name,
+                    .code = "ITERATION_LIMIT",
+                    .reason = "tool calls are disabled after the iteration limit",
+                },
+                .content = blocks,
+            } };
+        }
+        self.tools_ran_this_turn = true;
+        const fingerprint = toolCallFingerprint(call);
+        {
+            self.tool_results_mutex.lock();
+            defer self.tool_results_mutex.unlock();
+            if (self.tool_results.get(fingerprint)) |cached| {
+                return try cachedToolResult(allocator, cached);
+            }
+        }
+        const result = try execute.executeWithGate(&self.registry, allocator, call, self.gate());
+        // Native parity: an identical call later in the same turn replays this
+        // result instead of executing again. shortcut: a duplicate inside one
+        // parallel batch can still race (both miss the cache); upgrade by
+        // reserving the key before dispatch if that ever matters.
+        self.rememberToolResult(fingerprint, result) catch {};
+        return result;
+    }
+
+    fn toolCallFingerprint(call: types.ToolCall) u64 {
+        var hasher = std.hash.Wyhash.init(0);
+        hasher.update(call.name);
+        hasher.update("\x00");
+        hasher.update(call.arguments);
+        return hasher.final();
+    }
+
+    fn cachedToolResult(allocator: Allocator, cached: CachedToolResult) !registry.ToolResult {
+        const blocks = try allocator.alloc(types.ContentBlock, 1);
+        blocks[0] = .{ .text = cached.text };
+        if (cached.is_error) {
+            return .{ .failure = .{
+                .error_info = .{
+                    .name = "tool",
+                    .code = "DUPLICATE_TOOL_CALL",
+                    .reason = "identical call already ran in this turn",
+                },
+                .content = blocks,
+            } };
+        }
+        return .{ .success = .{ .content = blocks } };
+    }
+
+    fn rememberToolResult(self: *Self, fingerprint: u64, result: registry.ToolResult) !void {
+        self.tool_results_mutex.lock();
+        defer self.tool_results_mutex.unlock();
+        if (self.tool_results.contains(fingerprint)) return;
+        const text = try toolOutputText(self.allocator, result);
+        errdefer self.allocator.free(text);
+        try self.tool_results.put(self.allocator, fingerprint, .{
+            .is_error = result.isError(),
+            .text = text,
+        });
+    }
+
+    fn clearToolResults(self: *Self) void {
+        self.tool_results_mutex.lock();
+        defer self.tool_results_mutex.unlock();
+        var it = self.tool_results.valueIterator();
+        while (it.next()) |cached| self.allocator.free(cached.text);
+        self.tool_results.clearRetainingCapacity();
     }
 
     // ── approval / questions / commands / compaction wiring ────────────────
@@ -3463,6 +3744,9 @@ pub const DshNativeHarness = struct {
                 defer result.deinit();
                 if (result.events.len == 0 and result.pruned.len == 0) return false;
                 try self.commitCompaction(result.*, null);
+                // Native parity: the next reply carries `[Context compacted]`
+                // and the turn reports `compacted`.
+                self.compacted_this_turn = true;
                 return true;
             },
         }
@@ -3542,7 +3826,7 @@ pub const DshNativeHarness = struct {
         input: compaction_mod.SummaryInput,
     ) anyerror!compaction_mod.SummaryOutput {
         const self = selfOf(context_ptr.?);
-        const messages = try self.requestsFromMessages(allocator, input.messages);
+        const messages = (try self.requestsFromMessages(allocator, input.messages)).messages;
         const chat = providers.ChatRequest{
             .messages = messages,
             .model = self.opts.model,

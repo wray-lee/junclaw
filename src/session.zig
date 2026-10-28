@@ -54,6 +54,8 @@ const dsh_native_mod = @import("harness/dsh_native/harness.zig");
 const dsh_bridge = @import("harness/dsh_native/tools/bridge.zig");
 const dsh_native_session_log = @import("harness/dsh_native/session_log.zig");
 const dsh_native_types = @import("harness/dsh_native/types.zig");
+const multimodal_mod = @import("multimodal.zig");
+const platform = @import("platform.zig");
 const build_options = @import("build_options");
 const dsh_enabled = build_options.enable_harness_dsh;
 const dsh_harness_mod = if (dsh_enabled) @import("harness/dsh/harness.zig") else struct {
@@ -135,6 +137,9 @@ const DshNativeState = struct {
     /// `agent.dsh_persona` at creation; borrowed from the config. The named
     /// profile can be hot-reloaded, so the persona is rebuilt from this base.
     dsh_persona: ?[]const u8,
+    /// Owned roots for inbound `[IMAGE:]` reads (workspace, allowed_paths,
+    /// platform temp dir); the harness borrows this slice.
+    image_dirs: []const []const u8 = &.{},
 
     fn init(allocator: Allocator, config: *const Config, session: *Session) !DshNativeState {
         const config_dir = std_compat.fs.path.dirname(config.config_path) orelse ".";
@@ -169,6 +174,8 @@ const DshNativeState = struct {
 
         const persona = try buildDshPersona(allocator, &session.agent, config.agent.dsh_persona);
         errdefer allocator.free(persona);
+        const image_dirs = try buildImageDirs(allocator, &session.agent);
+        errdefer freeImageDirs(allocator, image_dirs);
 
         var harness = try dsh_native_mod.DshNativeHarness.init(allocator, .{
             .session_key = session.session_key,
@@ -195,6 +202,12 @@ const DshNativeState = struct {
             // command-risk policy.
             .policy = session.agent.policy,
             .allowed_paths = session.agent.allowed_paths,
+            // Native parity: the same cap bounds the in-process engine's
+            // tool rounds; without it the configured value was ignored.
+            .max_tool_iterations = session.agent.max_tool_iterations,
+            // Native multimodal parity: inbound `[IMAGE:]` markers become
+            // provider content parts (or are stripped for a non-vision model).
+            .image_ingestion = imageIngestion(&session.agent, image_dirs),
             .max_parallel_tools = config.agent.dsh_max_parallel_tools,
             .on_corrupt = config.agent.dsh_on_corrupt,
             .context_window = config.agent.dsh_compaction_context_window,
@@ -222,6 +235,7 @@ const DshNativeState = struct {
             .host_tools = host_tools,
             .persona = persona,
             .dsh_persona = config.agent.dsh_persona,
+            .image_dirs = image_dirs,
         };
     }
 
@@ -232,6 +246,7 @@ const DshNativeState = struct {
         allocator.free(self.session_dir);
         allocator.free(self.model);
         allocator.free(self.persona);
+        freeImageDirs(allocator, self.image_dirs);
     }
 
     /// `/model`, `/think` and `/reasoning` mutate the native agent; mirror the
@@ -249,6 +264,9 @@ const DshNativeState = struct {
             allocator.free(self.persona);
             self.persona = persona;
         }
+        // `/model` may switch to a text-only model: attach images only while
+        // the live model supports vision, exactly like native.
+        self.harness.setImageIngestion(imageIngestion(agent, self.image_dirs));
         if (!std.mem.eql(u8, self.model, agent.model_name)) {
             const next = try allocator.dupe(u8, agent.model_name);
             // Point the engine at the new copy before releasing the old one.
@@ -272,6 +290,54 @@ fn buildDshPersona(allocator: Allocator, agent: *const Agent, dsh_persona: ?[]co
         return std.fmt.allocPrint(allocator, "## Agent Profile\n\nProfile: {s}\n\n{s}", .{ name, profile });
     }
     return std.fmt.allocPrint(allocator, "## Agent Profile\n\nProfile: {s}\n\n{s}\n\n{s}", .{ name, profile, base });
+}
+
+/// Roots the dsh engine may read for inbound `[IMAGE:]` markers, mirroring
+/// native `buildProviderMessages`: workspace, `autonomy.allowed_paths`, and
+/// the platform temp dir (Telegram downloads) unless the agent has its own
+/// autonomy.
+fn buildImageDirs(allocator: Allocator, agent: *const Agent) ![]const []const u8 {
+    var dirs: std.ArrayListUnmanaged([]const u8) = .empty;
+    errdefer {
+        for (dirs.items) |dir| allocator.free(dir);
+        dirs.deinit(allocator);
+    }
+    try appendImageDir(allocator, &dirs, agent.workspace_dir);
+    for (agent.allowed_paths) |dir| try appendImageDir(allocator, &dirs, dir);
+    if (!agent.has_own_autonomy or agent.multimodal_unrestricted) {
+        if (platform.getTempDir(allocator) catch null) |tmp| {
+            dirs.append(allocator, tmp) catch |err| {
+                allocator.free(tmp);
+                return err;
+            };
+        }
+    }
+    return dirs.toOwnedSlice(allocator);
+}
+
+fn appendImageDir(allocator: Allocator, dirs: *std.ArrayListUnmanaged([]const u8), dir: []const u8) !void {
+    if (dir.len == 0) return;
+    try dirs.append(allocator, try allocator.dupe(u8, dir));
+}
+
+fn freeImageDirs(allocator: Allocator, dirs: []const []const u8) void {
+    for (dirs) |dir| allocator.free(dir);
+    allocator.free(dirs);
+}
+
+/// Native's vision gate: a configured or auto-detected text-only model strips
+/// the markers; otherwise the engine reads them into content parts.
+fn imageIngestion(agent: *const Agent, dirs: []const []const u8) dsh_native_mod.ImageIngestion {
+    if (agent.isVisionDisabled(agent.model_name) or
+        !agent.provider.supportsVisionForModel(agent.model_name))
+    {
+        return .strip;
+    }
+    return .{ .attach = .{
+        .allowed_dirs = dirs,
+        .skip_dir_check = agent.multimodal_unrestricted,
+        .allow_remote_fetch = agent.multimodal_unrestricted,
+    } };
 }
 
 const TurnDeliveryRoute = struct {
@@ -2946,6 +3012,18 @@ pub const SessionManager = struct {
         d.reported_total_tokens = total;
     }
 
+    /// Append the native `/usage` footer to a dsh reply; the engine's own
+    /// `persisted_reply` is left untouched. Frees `reply` on success.
+    fn appendDshUsageFooter(self: *SessionManager, agent: *Agent, reply: []const u8) ![]const u8 {
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        errdefer out.deinit();
+        try out.writer.writeAll(reply);
+        try agent_mod.commands.appendUsageFooter(agent, &out.writer, agent.last_turn_usage);
+        const out_slice = try out.toOwnedSlice();
+        self.allocator.free(reply);
+        return out_slice;
+    }
+
     fn usageLedgerPath(self: *SessionManager) ?[]u8 {
         if (!self.config.diagnostics.token_usage_ledger_enabled) return null;
         const config_dir = std_compat.fs.path.dirname(self.config.config_path) orelse return null;
@@ -3293,7 +3371,7 @@ pub const SessionManager = struct {
         defer session.clearInterrupt();
         const usage_events_before = if (session.dsh_native) |*d| d.usage_events else 0;
         var harness_ran = false;
-        const turn_result = blk: {
+        var turn_result = blk: {
             // `Agent.turn` is native-only: an engine that owns turns receives
             // the prompt itself, so a local command would reach it as text.
             // Answer known commands on the engine instead. A pre-turn /stop
@@ -3386,14 +3464,26 @@ pub const SessionManager = struct {
         // in-process kernel reports /stop as `.aborted` with a user cause.
         session.agent.last_turn_interrupted = turn_result.end_reason == .interrupted or
             (session.dsh_native != null and turn_result.end_reason == .aborted);
+        if (session.dsh_native != null) session.agent.last_turn_compacted = turn_result.compacted;
         if (harness_ran and session.dsh_native != null) {
             self.reconcileHarnessUsage(session, turn_result.total_tokens, usage_events_before);
+            // Native `composeFinalReply` appends the `/usage` footer to the
+            // delivered reply; the in-process engine composes its own reply,
+            // so the host adds the same footer here. `persisted_reply` stays
+            // clean, exactly like native history.
+            if (session.agent.usage_mode != .off and
+                turn_result.end_reason == .completed and
+                !session.agent.last_turn_interrupted)
+            {
+                turn_result.reply = try self.appendDshUsageFooter(&session.agent, turn_result.reply);
+            }
         }
         if (harness_ran and session.dsh_native != null) {
             // Native autosaves the delivered reply once the turn completes and
             // drains the durable memory outbox afterwards. `persisted_reply` is
             // the clean final text; `reply` carries the `.on` reasoning quote.
-            if (!session.agent.last_turn_interrupted) {
+            // A failed turn (e.g. the empty-response fallback) is not stored.
+            if (!session.agent.last_turn_interrupted and turn_result.end_reason != .failed) {
                 self.autosaveDshText(session, .assistant, turn_result.persisted_reply orelse turn_result.reply);
             }
             if (session.agent.mem_rt) |rt| _ = rt.drainOutbox(self.allocator);
@@ -8460,6 +8550,28 @@ test "dsh-native: plain turn runs in process, reports usage and selects the engi
     defer testing.allocator.free(ledger);
     try testing.expect(std.mem.indexOf(u8, ledger, "\"total_tokens\":15") != null);
     try testing.expect(std.mem.indexOf(u8, ledger, "\"provider\":\"mock\"") != null);
+}
+
+test "dsh-native: agent.usage_mode appends the native usage footer to the reply" {
+    // Regression: /usage and /cost were acknowledged but the in-process
+    // engine never printed a footer; only the native reply composer did.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "hello from dsh-native" },
+    });
+    defer provider.deinit();
+    var sm = fixture.manager(&provider);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-usage";
+    const session = try sm.getOrCreate(key);
+    session.agent.usage_mode = .tokens;
+
+    const resp = try sm.processMessage(key, "hi", null);
+    defer testing.allocator.free(resp);
+    try testing.expectEqualStrings("hello from dsh-native\n\n[usage] total_tokens=15", resp);
 }
 
 test "dsh-native: a 64KB reply is returned without leaking" {
