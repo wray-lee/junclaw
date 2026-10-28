@@ -1183,6 +1183,8 @@ test "dsh-native adapter: an empty round is nudged once, then fails with a messa
     try testing.expectEqual(port.EndReason.failed, result.end_reason);
     try testing.expectEqual(@as(usize, 2), fx.provider.requests.items.len);
     try testing.expect(requestContains(fx.provider.requests.items[1], "previous reply was empty"));
+    // The nudge is the native text verbatim, web-search guidance included.
+    try testing.expect(requestContains(fx.provider.requests.items[1], "web_search"));
 }
 
 test "dsh-native adapter: requestInterrupt cancels a blocking provider call" {
