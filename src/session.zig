@@ -799,6 +799,12 @@ pub const Session = struct {
     /// agent call.
     fn handleLocalCommand(self: *Session, content: []const u8) !?[]const u8 {
         if (self.dsh_native) |*d| {
+            // `/compact` runs outside a turn, where `runTurn` is the only other
+            // place that hands the engine the flush handles.
+            d.harness.setMemoryFlush(
+                if (self.agent.compaction_memory_flush) self.agent.mem else null,
+                self.agent.memory_session_id,
+            );
             if (try d.harness.harness().handleLocalCommand(content)) |reply| {
                 // The engine's reply is borrowed; host replies are owned.
                 return try self.agent.allocator.dupe(u8, reply);
@@ -2851,7 +2857,9 @@ pub const SessionManager = struct {
 
     /// Native parity for `Agent.turn`'s per-turn autosave: store the redacted
     /// user text (or the delivered reply's summary) in the session's memory
-    /// scope and keep the vector index in sync. No-op without memory.
+    /// scope and keep the vector index in sync. No-op without memory. A
+    /// redaction failure skips the row instead of persisting plaintext, like
+    /// native's assistant autosave.
     fn autosaveDshText(self: *SessionManager, session: *Session, role: AutosaveRole, text: []const u8) void {
         if (session.dsh_native == null or !session.agent.auto_save) return;
         const mem = session.agent.mem orelse return;
@@ -2860,7 +2868,7 @@ pub const SessionManager = struct {
             .assistant => Agent.autosaveSummary(text),
         };
         const safe = if (session.agent.redactor) |redactor|
-            redactor.redact(self.allocator, payload) catch null
+            redactor.redact(self.allocator, payload) catch return
         else
             null;
         defer if (safe) |content| self.allocator.free(content);
@@ -3364,9 +3372,10 @@ pub const SessionManager = struct {
         }
         if (harness_ran and session.dsh_native != null) {
             // Native autosaves the delivered reply once the turn completes and
-            // drains the durable memory outbox afterwards.
+            // drains the durable memory outbox afterwards. `persisted_reply` is
+            // the clean final text; `reply` carries the `.on` reasoning quote.
             if (!session.agent.last_turn_interrupted) {
-                self.autosaveDshText(session, .assistant, turn_result.reply);
+                self.autosaveDshText(session, .assistant, turn_result.persisted_reply orelse turn_result.reply);
             }
             if (session.agent.mem_rt) |rt| _ = rt.drainOutbox(self.allocator);
         }
@@ -7783,6 +7792,8 @@ test "dsh upstream turn error reaches the user instead of an empty reply" {
 
 const DshNativeScriptedReply = struct {
     text: []const u8 = "",
+    /// Provider-returned reasoning text (`reasoning_mode` display and queries).
+    reasoning: ?[]const u8 = null,
     tool_calls: []const providers.ToolCall = &.{},
     prompt_tokens: u32 = 10,
     completion_tokens: u32 = 5,
@@ -7796,6 +7807,10 @@ const DshNativeScriptedProvider = struct {
     chat_calls: usize = 0,
     /// User-role text of the latest request, for history assertions.
     users: std.ArrayListUnmanaged(u8) = .empty,
+    /// System-role text of the latest request, for persona/profile assertions.
+    system: std.ArrayListUnmanaged(u8) = .empty,
+    /// `chatWithSystem` calls (the pre-compaction memory flush).
+    system_calls: usize = 0,
     /// Latest request call config, for `/model` and reasoning assertions.
     last_model: ?[]u8 = null,
     last_reasoning_effort: ?[]u8 = null,
@@ -7820,6 +7835,7 @@ const DshNativeScriptedProvider = struct {
 
     fn deinit(self: *DshNativeScriptedProvider) void {
         self.users.deinit(self.allocator);
+        self.system.deinit(self.allocator);
         if (self.last_model) |value| self.allocator.free(value);
         if (self.last_reasoning_effort) |value| self.allocator.free(value);
     }
@@ -7837,6 +7853,7 @@ const DshNativeScriptedProvider = struct {
         _: f64,
     ) anyerror![]const u8 {
         const self: *DshNativeScriptedProvider = @ptrCast(@alignCast(ptr));
+        self.system_calls += 1;
         return allocator.dupe(u8, self.system_response);
     }
 
@@ -7850,7 +7867,13 @@ const DshNativeScriptedProvider = struct {
         const self: *DshNativeScriptedProvider = @ptrCast(@alignCast(ptr));
         self.chat_calls += 1;
         self.users.clearRetainingCapacity();
+        self.system.clearRetainingCapacity();
         for (request.messages) |message| {
+            if (message.role == .system) {
+                if (self.system.items.len > 0) try self.system.appendSlice(self.allocator, "\n---\n");
+                try self.system.appendSlice(self.allocator, message.content);
+                continue;
+            }
             if (message.role != .user) continue;
             if (self.users.items.len > 0) try self.users.appendSlice(self.allocator, "\n---\n");
             try self.users.appendSlice(self.allocator, message.content);
@@ -7877,6 +7900,7 @@ const DshNativeScriptedProvider = struct {
         }
         return .{
             .content = try allocator.dupe(u8, script.text),
+            .reasoning_content = if (script.reasoning) |text| try allocator.dupe(u8, text) else null,
             .tool_calls = calls,
             .usage = .{
                 .prompt_tokens = script.prompt_tokens,
@@ -8150,6 +8174,161 @@ test "dsh-native: turns are autosaved to long-term memory" {
     }
     try testing.expect(saw_user);
     try testing.expect(saw_assistant);
+}
+
+test "dsh-native: autosave redacts PII before storing" {
+    // Regression: a redactor failure fell back to the plaintext payload, so
+    // user text and reply summaries could reach the memory backend unredacted.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{.{ .text = "hello back" }});
+    defer provider.deinit();
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-redacted-autosave";
+    const reply = try sm.processMessage(key, "mail me at user@example.com", null);
+    defer testing.allocator.free(reply);
+    const session = try sm.getOrCreate(key);
+    const entries = try mem.list(testing.allocator, .conversation, session.agent.memory_session_id);
+    defer memory_mod.freeEntries(testing.allocator, entries);
+    var saw_user = false;
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "autosave_user_")) continue;
+        saw_user = true;
+        try testing.expectEqualStrings("mail me at [EMAIL_1]", entry.content);
+    }
+    try testing.expect(saw_user);
+}
+
+test "dsh-native: reasoning_mode on autosaves the reply without the reasoning quote" {
+    // Regression: the autosave summary was cut from TurnResult.reply, which
+    // starts with the `Reasoning:` quote under `.on`; the 100-byte window kept
+    // the quote and dropped the actual answer.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.agent.reasoning_mode = .on;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "the answer", .reasoning = "secret thinking" },
+    });
+    defer provider.deinit();
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-reasoning-autosave";
+    const reply = try sm.processMessage(key, "question", null);
+    defer testing.allocator.free(reply);
+    try testing.expect(std.mem.startsWith(u8, reply, "Reasoning:"));
+
+    const session = try sm.getOrCreate(key);
+    const entries = try mem.list(testing.allocator, .conversation, session.agent.memory_session_id);
+    defer memory_mod.freeEntries(testing.allocator, entries);
+    var saw_assistant = false;
+    for (entries) |entry| {
+        if (!std.mem.startsWith(u8, entry.key, "autosave_assistant_")) continue;
+        saw_assistant = true;
+        try testing.expectEqualStrings("the answer", entry.content);
+    }
+    try testing.expect(saw_assistant);
+}
+
+test "dsh-native: manual /compact flushes memory outside a turn" {
+    // Regression: the flush handles lived only in runTurn, so the host's
+    // manual `/compact` path skipped the pre-compaction memory flush.
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "hello back" },
+        .{ .text = "condensed history" },
+    });
+    defer provider.deinit();
+    provider.system_response = "fact one";
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-manual-compact";
+    const big = try testing.allocator.alloc(u8, 4_000);
+    defer testing.allocator.free(big);
+    @memset(big, 'x');
+    const first_text = try std.fmt.allocPrint(testing.allocator, "marker-one {s}", .{big});
+    defer testing.allocator.free(first_text);
+    const reply = try sm.processMessage(key, first_text, null);
+    defer testing.allocator.free(reply);
+
+    const ack = (try sm.handleLocalSlashCommand(key, "/compact", null)) orelse
+        return error.CommandNotClaimed;
+    defer testing.allocator.free(ack);
+
+    const session = try sm.getOrCreate(key);
+    const entries = try mem.list(testing.allocator, .conversation, session.agent.memory_session_id);
+    defer memory_mod.freeEntries(testing.allocator, entries);
+    var saw_flush = false;
+    for (entries) |entry| {
+        if (std.mem.startsWith(u8, entry.key, "flush_compact_")) saw_flush = true;
+    }
+    try testing.expect(saw_flush);
+    try testing.expectEqual(@as(usize, 1), provider.system_calls);
+}
+
+test "dsh-native: compaction_memory_flush off skips the flush" {
+    var fixture = try DshNativeFixture.init();
+    defer fixture.deinit();
+    fixture.cfg.agent.compaction_memory_flush = false;
+    fixture.cfg.agent.dsh_compaction_context_window = 1000;
+    fixture.cfg.agent.dsh_compaction_headroom_tokens = 10;
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    const big_a = try testing.allocator.alloc(u8, 4_000);
+    defer testing.allocator.free(big_a);
+    const big_b = try testing.allocator.alloc(u8, 4_000);
+    defer testing.allocator.free(big_b);
+    @memset(big_a, 'x');
+    @memset(big_b, 'y');
+    const first_text = try std.fmt.allocPrint(testing.allocator, "marker-one {s}", .{big_a});
+    defer testing.allocator.free(first_text);
+    const second_text = try std.fmt.allocPrint(testing.allocator, "marker-two {s}", .{big_b});
+    defer testing.allocator.free(second_text);
+
+    var provider = DshNativeScriptedProvider.init(testing.allocator, &.{
+        .{ .text = "a", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "b", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "condensed history", .prompt_tokens = 900, .completion_tokens = 10 },
+        .{ .text = "c" },
+    });
+    defer provider.deinit();
+    provider.system_response = "fact one";
+    var sm = fixture.managerWithMemory(&provider, mem);
+    defer sm.deinit();
+
+    const key = "cli:main:dsh-native-flush-off";
+    const r1 = try sm.processMessage(key, first_text, null);
+    defer testing.allocator.free(r1);
+    const r2 = try sm.processMessage(key, second_text, null);
+    defer testing.allocator.free(r2);
+    const r3 = try sm.processMessage(key, "third", null);
+    defer testing.allocator.free(r3);
+
+    try testing.expectEqual(@as(usize, 0), provider.system_calls);
+    const session = try sm.getOrCreate(key);
+    const entries = try mem.list(testing.allocator, .conversation, session.agent.memory_session_id);
+    defer memory_mod.freeEntries(testing.allocator, entries);
+    for (entries) |entry| {
+        try testing.expect(!std.mem.startsWith(u8, entry.key, "flush_compact_"));
+    }
 }
 
 test "dsh-native: compaction flushes durable facts into memory" {

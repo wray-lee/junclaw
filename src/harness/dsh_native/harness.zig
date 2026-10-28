@@ -118,6 +118,10 @@ pub const Options = struct {
     /// log stores, and tool output are redacted, the same boundaries native
     /// redacts; the host rehydrates placeholders for allowed displays.
     redactor: ?*redaction.Redactor = null,
+    /// Session memory for the pre-compaction flush when a command runs outside
+    /// a turn (manual `/compact`); `runTurn` carries the same handles per turn.
+    memory_flush: ?memory_mod.Memory = null,
+    memory_session_id: ?[]const u8 = null,
     /// Test seam: the captured dsh fixtures ran without the runtime-context
     /// and agent-instructions plugins, so replaying them must not inject the
     /// pre-step context messages that a production session carries.
@@ -1473,6 +1477,17 @@ pub const DshNativeHarness = struct {
             l.config.model = model;
             l.config.reasoning_effort = reasoning_effort;
         }
+    }
+
+    /// Host seam for memory: the pre-compaction flush needs the session store
+    /// even when `/compact` runs outside a turn.
+    pub fn setMemoryFlush(
+        self: *Self,
+        mem: ?memory_mod.Memory,
+        session_id: ?[]const u8,
+    ) void {
+        self.opts.memory_flush = mem;
+        self.opts.memory_session_id = session_id;
     }
 
     fn nextMessageId(self: *Self) ![]const u8 {
@@ -3482,8 +3497,8 @@ pub const DshNativeHarness = struct {
     /// from the messages this compaction drops. Best-effort by contract —
     /// failures never block compaction.
     fn flushMemoriesBeforeDrop(self: *Self, allocator: Allocator, result: compaction_mod.Result) void {
-        const mem = self.turn_memory_flush orelse return;
-        const session_id = self.turn_memory_session_id orelse return;
+        const mem = self.turn_memory_flush orelse self.opts.memory_flush orelse return;
+        const session_id = self.turn_memory_session_id orelse self.opts.memory_session_id orelse return;
         if (result.events.len != 4) return;
         const summary = switch (result.events[1]) {
             .summary => |value| value,
@@ -3492,34 +3507,15 @@ pub const DshNativeHarness = struct {
         var tmp = std.heap.ArenaAllocator.init(allocator);
         defer tmp.deinit();
         const a = tmp.allocator();
-        var transcript: std.ArrayListUnmanaged(u8) = .empty;
-        var writer: std.Io.Writer.Allocating = .fromArrayList(a, &transcript);
-        for (summary.shadowed_seqs) |seq| {
-            const index = indexOfSeq(self.surface_seqs.items, seq) orelse continue;
-            const message = self.messages.items[index];
-            const role: []const u8 = switch (message.role) {
-                .user => "USER",
-                .assistant => "ASSISTANT",
-                .tool => "TOOL",
-                .system, .developer => "SYSTEM",
-            };
-            writer.writer.print("{s}: ", .{role}) catch return;
-            for (message.content) |block| switch (block) {
-                .text => |text| {
-                    const safe = if (self.opts.redactor) |redactor|
-                        redactor.redact(a, text) catch null
-                    else
-                        null;
-                    const source = safe orelse text;
-                    const clipped = if (source.len > 500) util.truncateUtf8(source, 500) else source;
-                    writer.writer.print("{s}\n", .{clipped}) catch return;
-                },
-                else => {},
-            };
-            if (transcript.items.len >= 8_000) break;
-        }
-        transcript = writer.toArrayList();
-        const text = util.truncateUtf8(transcript.items, 8_000);
+        const transcript = renderFlushTranscript(
+            a,
+            self.messages.items,
+            self.surface_seqs.items,
+            summary.shadowed_seqs,
+            self.opts.redactor,
+            8_000,
+        ) catch return;
+        const text = util.truncateUtf8(transcript, 8_000);
         agent_compaction.flushMemoriesFromTranscript(a, self.opts.provider, self.opts.model, text, .{
             .memory_flush = true,
             .mem = mem,
@@ -4294,6 +4290,49 @@ fn indexOfSeq(seqs: []const u64, seq: u64) ?usize {
     return null;
 }
 
+/// Native parity for `buildCompactionTranscript`: one `ROLE: text` block per
+/// dropped message. The role line is newline-terminated even when the message
+/// has no text block (a tool-call round), or the next message's role would
+/// merge into its line. A redaction failure aborts the flush like native's
+/// `try`, so unredacted text never reaches the extraction call.
+fn renderFlushTranscript(
+    allocator: Allocator,
+    messages: []const types.Message,
+    surface_seqs: []const u64,
+    shadowed_seqs: []const u64,
+    redactor: ?*redaction.Redactor,
+    max_bytes: usize,
+) ![]u8 {
+    var writer: std.Io.Writer.Allocating = .init(allocator);
+    defer writer.deinit();
+    for (shadowed_seqs) |seq| {
+        const index = indexOfSeq(surface_seqs, seq) orelse continue;
+        const message = messages[index];
+        const role: []const u8 = switch (message.role) {
+            .user => "USER",
+            .assistant => "ASSISTANT",
+            .tool => "TOOL",
+            .system, .developer => "SYSTEM",
+        };
+        try writer.writer.print("{s}: ", .{role});
+        var wrote_text = false;
+        for (message.content) |block| switch (block) {
+            .text => |text| {
+                const safe = if (redactor) |redact| try redact.redact(allocator, text) else null;
+                defer if (safe) |content| allocator.free(content);
+                const source = safe orelse text;
+                const clipped = if (source.len > 500) util.truncateUtf8(source, 500) else source;
+                try writer.writer.print("{s}\n", .{clipped});
+                wrote_text = true;
+            },
+            else => {},
+        };
+        if (!wrote_text) try writer.writer.writeByte('\n');
+        if (writer.written().len >= max_bytes) break;
+    }
+    return writer.toOwnedSlice();
+}
+
 /// Store role -> dsh role, mirroring the native restore mapping: assistant and
 /// system keep their role, everything else becomes user text. Runtime commands
 /// are host directives, not conversation, and are not imported.
@@ -4789,4 +4828,43 @@ test "dsh-native harness: a spill file is scrubbed and redacted in place" {
     try std.testing.expect(std.mem.indexOf(u8, after, "alice@example.com") == null);
     try std.testing.expect(std.mem.indexOf(u8, after, "[EMAIL_1]") != null);
     try std.testing.expect(std.mem.endsWith(u8, after, "xxx"));
+}
+
+test "dsh-native harness: flush transcript keeps tool-only rounds on their own line" {
+    // Regression: the role line was terminated only by a text block, so a
+    // tool-call round produced `ASSISTANT: TOOL: ...` and the tool output
+    // read as assistant text.
+    const allocator = std.testing.allocator;
+    const messages = [_]types.Message{
+        .{ .id = "m1", .role = .user, .content = &.{.{ .text = "mail alice@example.com" }}, .source = .user },
+        .{
+            .id = "m2",
+            .role = .assistant,
+            .content = &.{.{ .tool_call = .{ .id = "c1", .name = "read", .arguments = "{}" } }},
+            .source = .{ .model = .{ .provider = "test", .model = "test" } },
+        },
+        .{
+            .id = "m3",
+            .role = .tool,
+            .content = &.{.{ .text = "tool output" }},
+            .source = .{ .tool = .{ .call_id = "c1" } },
+            .tool_call_id = "c1",
+        },
+    };
+    const seqs = [_]u64{ 1, 2, 3 };
+    var redactor = redaction.Redactor.init(allocator, .{});
+    defer redactor.deinit();
+    const transcript = try renderFlushTranscript(
+        allocator,
+        &messages,
+        &seqs,
+        &seqs,
+        &redactor,
+        8_000,
+    );
+    defer allocator.free(transcript);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "ASSISTANT: \nTOOL: tool output\n") != null);
+    // The transcript is redacted before the extraction call.
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "alice@example.com") == null);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "USER: mail [EMAIL_1]\n") != null);
 }
