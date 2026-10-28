@@ -273,6 +273,15 @@ fn turnDeliveryRoute(session_key: []const u8, conversation_context: ?Conversatio
     return .{ .channel = channel, .account_id = account_id, .chat_id = chat_id, .peer_kind = peer_kind, .peer_id = peer_id };
 }
 
+/// Join two reply parts with the transport's blank-line separator. A
+/// token-only part means "say nothing": joining it with prose would post the
+/// literal token and defeat shouldSuppressReply, so drop that side instead.
+fn joinReplyParts(allocator: Allocator, left: []const u8, right: []const u8) Allocator.Error![]u8 {
+    if (util.isSilentTokenReply(left)) return allocator.dupe(u8, right);
+    if (util.isSilentTokenReply(right)) return allocator.dupe(u8, left);
+    return std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ left, right });
+}
+
 /// Install the turn's delivery route into this thread. dsh executes host tools
 /// on worker threads, so the turn thread's thread-local context (set by
 /// `setTurnToolContext`) does not follow; without this the schedule tool
@@ -3335,11 +3344,13 @@ pub const SessionManager = struct {
             self.persistTurnResult(session, session_key, late_content, null);
             var err_buf: [256]u8 = undefined;
             const notice = providers.userErrorMessage(&err_buf, err, true);
-            const combined = std.fmt.allocPrint(
+            const failure_notice = std.fmt.allocPrint(
                 self.allocator,
-                "{s}\n\n[Follow-up turn failed: {s} {s}]",
-                .{ response.*, notice, FOLLOW_UP_FAILED_NOTICE },
+                "[Follow-up turn failed: {s} {s}]",
+                .{ notice, FOLLOW_UP_FAILED_NOTICE },
             ) catch return true;
+            defer self.allocator.free(failure_notice);
+            const combined = joinReplyParts(self.allocator, response.*, failure_notice) catch return true;
             self.allocator.free(response.*);
             response.* = combined;
             return true;
@@ -3347,7 +3358,7 @@ pub const SessionManager = struct {
         self.persistTurnResult(session, session_key, late_content, follow_up_response);
         // Combine both answers instead of replacing the primary reply with the
         // follow-up's.
-        const combined = std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ response.*, follow_up_response }) catch {
+        const combined = joinReplyParts(self.allocator, response.*, follow_up_response) catch {
             log.warn("post-turn follow-up reply could not be combined; keeping the primary reply", .{});
             self.allocator.free(follow_up_response);
             completed_turns.* += 1;
@@ -3362,11 +3373,7 @@ pub const SessionManager = struct {
             // of running them as yet another turn.
             session.closeInjectionWindow();
             if ((session.discardPendingInjections(self.allocator) catch 0) > 0) {
-                const with_notice = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}\n\n{s}",
-                    .{ response.*, STOP_DISCARDED_NOTICE },
-                ) catch null;
+                const with_notice = joinReplyParts(self.allocator, response.*, STOP_DISCARDED_NOTICE) catch null;
                 if (with_notice) |text| {
                     self.allocator.free(response.*);
                     response.* = text;
@@ -3444,7 +3451,7 @@ pub const SessionManager = struct {
             self.persistTurnResult(session, session_key, late_content, follow_up_response);
             // Keep every successful reply instead of delivering only the last.
             const combined = if (reply) |previous|
-                std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ previous, follow_up_response }) catch {
+                joinReplyParts(self.allocator, previous, follow_up_response) catch {
                     self.allocator.free(follow_up_response);
                     break;
                 }
@@ -3465,11 +3472,7 @@ pub const SessionManager = struct {
                 const discarded = session.discardPendingInjections(self.allocator) catch 0;
                 if (discarded > 0) {
                     if (reply) |previous| {
-                        const with_notice = std.fmt.allocPrint(
-                            self.allocator,
-                            "{s}\n\n{s}",
-                            .{ previous, STOP_DISCARDED_NOTICE },
-                        ) catch null;
+                        const with_notice = joinReplyParts(self.allocator, previous, STOP_DISCARDED_NOTICE) catch null;
                         if (with_notice) |text| {
                             self.allocator.free(previous);
                             reply = text;
@@ -3484,7 +3487,7 @@ pub const SessionManager = struct {
         }
         if (reply) |successes| {
             if (failures) |notices| {
-                const combined = std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ successes, notices }) catch {
+                const combined = joinReplyParts(self.allocator, successes, notices) catch {
                     self.allocator.free(notices);
                     return successes;
                 };
@@ -3734,11 +3737,7 @@ pub const SessionManager = struct {
             session.closeInjectionWindow();
             if ((session.discardPendingInjections(self.allocator) catch 0) > 0) {
                 const notice = if (reset_turn) RESET_DISCARDED_NOTICE else STOP_DISCARDED_NOTICE;
-                const combined = std.fmt.allocPrint(
-                    self.allocator,
-                    "{s}\n\n{s}",
-                    .{ response, notice },
-                ) catch null;
+                const combined = joinReplyParts(self.allocator, response, notice) catch null;
                 if (combined) |text| {
                     self.allocator.free(response);
                     response = text;
@@ -8930,6 +8929,30 @@ test "drainLateInjection keeps the primary reply and asks the sender to resend" 
     try testing.expectEqual(@as(u64, 1), completed_turns);
     // The failed follow-up is consumed exactly once and never re-queued.
     try testing.expect(!session.hasInjection());
+}
+
+test "a silent primary reply is not joined with the follow-up answer" {
+    // Regression: joining a token-only primary reply (`[NO_REPLY]`) with a
+    // follow-up turn made the token part of prose, so shouldSuppressReply
+    // posted it literally.
+    var mock = MockProvider{ .response = "follow-up answer" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const key = "silent:join:follow-up";
+    const session = try sm.getOrCreate(key);
+    session.turn_running.store(true, .release);
+    try testing.expect(try session.appendMidTurnIfRunning(testing.allocator, "late message"));
+    session.turn_running.store(false, .release);
+
+    var response: []const u8 = try testing.allocator.dupe(u8, "[NO_REPLY]");
+    var completed_turns: u64 = 1;
+
+    try testing.expect(try sm.drainLateInjection(session, key, &response, &completed_turns, null, false, null));
+    defer testing.allocator.free(response);
+    try testing.expectEqualStrings("follow-up answer", response);
+    try testing.expect(!util.isSilentTokenReply(response));
 }
 
 test "failed-turn injection drain combines successes and reports the failure" {
