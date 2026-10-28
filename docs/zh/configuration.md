@@ -268,6 +268,8 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 
 该引擎会把与原生引擎相同的渠道附件标记说明注入运行时上下文，因此回复里写 `[FILE:...]`、`[DOCUMENT:...]`、`[IMAGE:...]` 等标记时，渠道会像原生引擎一样上传文件，并同样受工作区/`autonomy.allowed_paths` 范围过滤约束。
 
+该引擎同时保留原生引擎的记忆与技能接线：`memory.auto_save` 开启时，每回合结束会把脱敏后的用户文本与已投递回复的摘要写入配置的记忆后端；压缩前会把将要丢弃的消息里的持久事实刷入记忆（`agent.compaction_memory_flush`）。运行时上下文会带上原生记忆工具指引、`## Skills`、会话激活的 `## Active Skill Session`、`## Runtime Capabilities` 与 `## Runtime`（OS | Model）。命名 agent 的 `## Agent Profile` 提示词会并入引擎 persona；`AGENTS.md` 通过配置的 bootstrap provider 读取，因此 markdown/hybrid 记忆后端里的副本同样生效。手动 `/compact` 不执行压缩前记忆刷写。
+
 示例：
 
 ```json
