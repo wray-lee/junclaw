@@ -46,7 +46,7 @@ junclaw 在 1.0.0 中于上游 nullclaw 之上加入了代理引擎层，1.1.0 �
 
 ## 安装 junclaw
 
-发布二进制：[wray-lee/junclaw Releases](https://github.com/wray-lee/junclaw/releases/latest)（最新 `v1.1.1`，2026-10-28）。安装后的二进制名仍是 `nullclaw`。
+发布二进制：[wray-lee/junclaw Releases](https://github.com/wray-lee/junclaw/releases/latest)（最新 `v1.1.2`，2026-10-28）。安装后的二进制名仍是 `nullclaw`。
 
 | 平台 | 发布资产 |
 |---|---|
@@ -55,14 +55,14 @@ junclaw 在 1.0.0 中于上游 nullclaw 之上加入了代理引擎层，1.1.0 �
 | macOS aarch64 / x86_64 | `junclaw-macos-aarch64.bin`、`junclaw-macos-x86_64.bin` |
 | Windows x86_64 / aarch64 | `junclaw-windows-x86_64.zip` / `.exe`、`junclaw-windows-aarch64.zip` / `.exe`（内含 `nullclaw.exe`） |
 | Android aarch64 / armv7 / x86_64 | `junclaw-android-aarch64.bin`、`junclaw-android-armv7.bin`、`junclaw-android-x86_64.bin` |
-| 源码 | `junclaw-source-v1.1.1.tar.gz` |
+| 源码 | `junclaw-source-v1.1.2.tar.gz` |
 
 Linux（x86_64）：
 
 ```bash
 curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-linux-x86_64.bin
 chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
-nullclaw --version   # 1.1.1
+nullclaw --version   # 1.1.2
 ```
 
 macOS（Apple Silicon；Intel 用 `junclaw-macos-x86_64.bin`）：
@@ -70,24 +70,24 @@ macOS（Apple Silicon；Intel 用 `junclaw-macos-x86_64.bin`）：
 ```bash
 curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-macos-aarch64.bin
 chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
-nullclaw --version   # 1.1.1
+nullclaw --version   # 1.1.2
 ```
 
 Docker 镜像（`ghcr.io/wray-lee/junclaw`，仅 `linux/amd64`）：
 
 | 标签 | 内容 |
 |---|---|
-| `latest`、`v1.1.1`、`main-<sha>` | 精简镜像：发布二进制 + 进程内 dsh 引擎 |
-| `full-dsh`、`full-dsh-v1.1.1`、`full-dsh-main-<sha>` | 加 Node 22 与 dsh sidecar（设 `"harness": "dsh-sidecar"`） |
-| `main-lightpanda`、`main-lightpanda-<sha>`、`v1.1.1-lightpanda` | 加 Lightpanda（MCP） |
-| `main-browser`、`main-browser-<sha>`、`v1.1.1-browser` | 加 Firefox ESR + geckodriver（`browser` 工具） |
-| `full-dsh-browser`、`full-dsh-browser-<sha>`、`v1.1.1-full-dsh-browser` | `full-dsh` 加 Firefox |
+| `latest`、`v1.1.2`、`main-<sha>` | 精简镜像：发布二进制 + 进程内 dsh 引擎 |
+| `full-dsh`、`full-dsh-v1.1.2`、`full-dsh-main-<sha>` | 加 Node 22 与 dsh sidecar（设 `"harness": "dsh-sidecar"`） |
+| `main-lightpanda`、`main-lightpanda-<sha>`、`v1.1.2-lightpanda` | 加 Lightpanda（MCP） |
+| `main-browser`、`main-browser-<sha>`、`v1.1.2-browser` | 加 Firefox ESR + geckodriver（`browser` 工具） |
+| `full-dsh-browser`、`full-dsh-browser-<sha>`、`v1.1.2-full-dsh-browser` | `full-dsh` 加 Firefox |
 
 `full-dsh` 与 `full-dsh-v<version>` 由 `full-dsh-v*` 标签（每次发版一并推送）或手动运行 `image-full-dsh` workflow 重建。
 
 ```bash
-docker pull ghcr.io/wray-lee/junclaw:v1.1.1
-docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1 status
+docker pull ghcr.io/wray-lee/junclaw:v1.1.2
+docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.2 status
 ```
 
 ### 源码构建

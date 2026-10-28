@@ -7,7 +7,7 @@
 <p align="center">
   <strong>Null overhead. Null compromise. 100% Zig. 100% Agnostic.</strong><br>
   <strong>~6 MB static binary. A few MB of RAM idle. Runs on anything with a CPU.</strong><br>
-  <strong>v1.1.1 · <a href="https://github.com/wray-lee/junclaw/releases/latest">latest release</a></strong>
+  <strong>v1.1.2 · <a href="https://github.com/wray-lee/junclaw/releases/latest">latest release</a></strong>
 </p>
 
 <p align="center">
@@ -69,7 +69,7 @@ Choosing between them, configuration and the security model: [docs/en/browser.md
 
 ## Install junclaw
 
-Release binaries: [github.com/wray-lee/junclaw/releases](https://github.com/wray-lee/junclaw/releases/latest) (latest: `v1.1.1`, 2026-10-28). The installed binary is still named `nullclaw`.
+Release binaries: [github.com/wray-lee/junclaw/releases](https://github.com/wray-lee/junclaw/releases/latest) (latest: `v1.1.2`, 2026-10-28). The installed binary is still named `nullclaw`.
 
 | Platform | Release asset |
 |---|---|
@@ -78,14 +78,14 @@ Release binaries: [github.com/wray-lee/junclaw/releases](https://github.com/wray
 | macOS aarch64 / x86_64 | `junclaw-macos-aarch64.bin`, `junclaw-macos-x86_64.bin` |
 | Windows x86_64 / aarch64 | `junclaw-windows-x86_64.zip` / `.exe`, `junclaw-windows-aarch64.zip` / `.exe` (contains `nullclaw.exe`) |
 | Android aarch64 / armv7 / x86_64 | `junclaw-android-aarch64.bin`, `junclaw-android-armv7.bin`, `junclaw-android-x86_64.bin` |
-| Source | `junclaw-source-v1.1.1.tar.gz` |
+| Source | `junclaw-source-v1.1.2.tar.gz` |
 
 Linux (x86_64):
 
 ```bash
 curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-linux-x86_64.bin
 chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
-nullclaw --version   # 1.1.1
+nullclaw --version   # 1.1.2
 ```
 
 macOS (Apple Silicon; Intel: `junclaw-macos-x86_64.bin`):
@@ -93,7 +93,7 @@ macOS (Apple Silicon; Intel: `junclaw-macos-x86_64.bin`):
 ```bash
 curl -fsSL -o /tmp/nullclaw https://github.com/wray-lee/junclaw/releases/latest/download/junclaw-macos-aarch64.bin
 chmod +x /tmp/nullclaw && sudo mv /tmp/nullclaw /usr/local/bin/nullclaw
-nullclaw --version   # 1.1.1
+nullclaw --version   # 1.1.2
 ```
 
 Windows: download `junclaw-windows-x86_64.zip`, extract, and run `nullclaw.exe`.
@@ -102,18 +102,18 @@ Docker images ([GHCR](https://github.com/wray-lee/junclaw/pkgs/container/junclaw
 
 | Tag | Contents |
 |---|---|
-| `latest`, `v1.1.1`, `main-<sha>` | Slim image: release binary, in-process dsh engine |
-| `full-dsh`, `full-dsh-v1.1.1`, `full-dsh-main-<sha>` | Adds Node 22 and the dsh sidecar (set `"harness": "dsh-sidecar"`) |
-| `main-lightpanda`, `main-lightpanda-<sha>`, `v1.1.1-lightpanda` | Adds Lightpanda over MCP |
-| `main-browser`, `main-browser-<sha>`, `v1.1.1-browser` | Adds Firefox ESR + geckodriver (`browser` tool) |
-| `full-dsh-browser`, `full-dsh-browser-<sha>`, `v1.1.1-full-dsh-browser` | `full-dsh` plus Firefox |
+| `latest`, `v1.1.2`, `main-<sha>` | Slim image: release binary, in-process dsh engine |
+| `full-dsh`, `full-dsh-v1.1.2`, `full-dsh-main-<sha>` | Adds Node 22 and the dsh sidecar (set `"harness": "dsh-sidecar"`) |
+| `main-lightpanda`, `main-lightpanda-<sha>`, `v1.1.2-lightpanda` | Adds Lightpanda over MCP |
+| `main-browser`, `main-browser-<sha>`, `v1.1.2-browser` | Adds Firefox ESR + geckodriver (`browser` tool) |
+| `full-dsh-browser`, `full-dsh-browser-<sha>`, `v1.1.2-full-dsh-browser` | `full-dsh` plus Firefox |
 
 `full-dsh` and `full-dsh-v<version>` are rebuilt by a `full-dsh-v*` git tag (pushed with each release) or a manual `image-full-dsh` run.
 
 ```bash
-docker pull ghcr.io/wray-lee/junclaw:v1.1.1
-docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1 status
-docker run --rm -it -p 127.0.0.1:3000:3000 -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1
+docker pull ghcr.io/wray-lee/junclaw:v1.1.2
+docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.2 status
+docker run --rm -it -p 127.0.0.1:3000:3000 -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.2
 ```
 
 All images are `linux/amd64` only. On ARM, use the matching release binary or build the image locally.
@@ -270,8 +270,8 @@ nullclaw --help
 The published image is the shortest path:
 
 ```bash
-docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1 status
-docker run --rm -it -p 127.0.0.1:3000:3000 -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.1
+docker run --rm -it -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.2 status
+docker run --rm -it -p 127.0.0.1:3000:3000 -v nullclaw-data:/nullclaw-data ghcr.io/wray-lee/junclaw:v1.1.2
 ```
 
 Or build the image locally with the Makefile wrapper around Docker Compose:
@@ -1025,9 +1025,9 @@ src/
 
 ## Versioning
 
-junclaw releases use **semver** (`vMAJOR.MINOR.PATCH`) — latest `v1.1.1` (2026-10-28, see [Releases](https://github.com/wray-lee/junclaw/releases)). The version is recorded in `build.zig.zon`.
+junclaw releases use **semver** (`vMAJOR.MINOR.PATCH`) — latest `v1.1.2` (2026-10-28, see [Releases](https://github.com/wray-lee/junclaw/releases)). The version is recorded in `build.zig.zon`.
 
-- **Tag format:** `vX.Y.Z` (e.g. `v1.1.1`)
+- **Tag format:** `vX.Y.Z` (e.g. `v1.1.2`)
 - **Release binaries derive their embedded version from the git tag** (`v...` -> `nullclaw --version`)
 - **Non-release builds default to `dev`** unless you override with `zig build -Dversion=...`
 - **1.x:** config and CLI may still change between minor releases; fork-only features are documented in [CHANGELOG.md](CHANGELOG.md)

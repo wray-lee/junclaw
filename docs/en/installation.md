@@ -72,7 +72,7 @@ A named volume keeps the ownership it was first populated with. If yours was cre
 
 ```bash
 docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
-  --entrypoint sh ghcr.io/wray-lee/junclaw:v1.1.1 \
+  --entrypoint sh ghcr.io/wray-lee/junclaw:v1.1.2 \
   -c 'chown -R 65534:65534 /nullclaw-data'
 ```
 
@@ -83,7 +83,7 @@ Bind mounts are not covered by that command: they carry the host directory's own
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1 status
+  ghcr.io/wray-lee/junclaw:v1.1.2 status
 ```
 
 Initialize config interactively:
@@ -91,7 +91,7 @@ Initialize config interactively:
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1 onboard --interactive
+  ghcr.io/wray-lee/junclaw:v1.1.2 onboard --interactive
 ```
 
 Run the interactive agent:
@@ -99,7 +99,7 @@ Run the interactive agent:
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1 agent
+  ghcr.io/wray-lee/junclaw:v1.1.2 agent
 ```
 
 Run the HTTP gateway:
@@ -108,7 +108,7 @@ Run the HTTP gateway:
 docker run --rm -it \
   -p 127.0.0.1:3000:3000 \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1
+  ghcr.io/wray-lee/junclaw:v1.1.2
 ```
 
 ### Docker Compose
@@ -116,7 +116,7 @@ docker run --rm -it \
 The repository's `docker-compose.yml` builds `nullclaw:local` from the Dockerfile by default, and `make up` forces a rebuild. To use the published junclaw image instead, pull it and start compose directly:
 
 ```bash
-export NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1
+export NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.2
 docker compose --profile gateway pull gateway
 docker compose --profile gateway up -d gateway   # do not use `make up`; it adds --build
 ```
@@ -153,8 +153,8 @@ If you need LAN or public exposure, change the published host IP deliberately an
 To pin a release tag or switch registries later, override `NULLCLAW_IMAGE`:
 
 ```bash
-NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1 docker compose --profile gateway pull gateway
-NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1 docker compose --profile gateway up -d gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.2 docker compose --profile gateway pull gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.2 docker compose --profile gateway up -d gateway
 ```
 
 ### Full dsh image (optional)
@@ -168,7 +168,7 @@ docker pull ghcr.io/wray-lee/junclaw:full-dsh
 Tags:
 
 - `:full-dsh` — latest build of the `full-dsh` target
-- `:full-dsh-v<version>` — build from a `full-dsh-v*` tag, pushed with each release (e.g. `:full-dsh-v1.1.1`)
+- `:full-dsh-v<version>` — build from a `full-dsh-v*` tag, pushed with each release (e.g. `:full-dsh-v1.1.2`)
 - `:full-dsh-main-<sha>` — manual CI run
 
 Releases publish no `v<version>-full-dsh`; the full browser variant is `:v<version>-full-dsh-browser`.

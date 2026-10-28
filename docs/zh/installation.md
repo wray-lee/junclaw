@@ -68,7 +68,7 @@ junclaw 提供自己的 OCI 镜像：`ghcr.io/wray-lee/junclaw`（仅 `linux/amd
 
 ```bash
 docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
-  --entrypoint sh ghcr.io/wray-lee/junclaw:v1.1.1 \
+  --entrypoint sh ghcr.io/wray-lee/junclaw:v1.1.2 \
   -c 'chown -R 65534:65534 /nullclaw-data'
 ```
 
@@ -79,7 +79,7 @@ docker run --rm -u 0 -v nullclaw-data:/nullclaw-data \
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1 status
+  ghcr.io/wray-lee/junclaw:v1.1.2 status
 ```
 
 交互式初始化配置：
@@ -87,7 +87,7 @@ docker run --rm -it \
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1 onboard --interactive
+  ghcr.io/wray-lee/junclaw:v1.1.2 onboard --interactive
 ```
 
 运行交互式 agent：
@@ -95,7 +95,7 @@ docker run --rm -it \
 ```bash
 docker run --rm -it \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1 agent
+  ghcr.io/wray-lee/junclaw:v1.1.2 agent
 ```
 
 运行 HTTP gateway：
@@ -104,7 +104,7 @@ docker run --rm -it \
 docker run --rm -it \
   -p 127.0.0.1:3000:3000 \
   -v nullclaw-data:/nullclaw-data \
-  ghcr.io/wray-lee/junclaw:v1.1.1
+  ghcr.io/wray-lee/junclaw:v1.1.2
 ```
 
 ### Docker Compose
@@ -112,7 +112,7 @@ docker run --rm -it \
 仓库根目录的 `docker-compose.yml` 默认从本仓库 Dockerfile 构建 `nullclaw:local`，且 `make up` 会强制重建。要用已发布的 junclaw 镜像，先拉取再直接启动 compose：
 
 ```bash
-export NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1
+export NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.2
 docker compose --profile gateway pull gateway
 docker compose --profile gateway up -d gateway   # 不要用 `make up`，它带 --build
 ```
@@ -149,8 +149,8 @@ Profile 含义：
 如果你要固定版本标签，或者以后切换到其他镜像仓库，可以覆盖 `NULLCLAW_IMAGE`：
 
 ```bash
-NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1 docker compose --profile gateway pull gateway
-NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.1 docker compose --profile gateway up -d gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.2 docker compose --profile gateway pull gateway
+NULLCLAW_IMAGE=ghcr.io/wray-lee/junclaw:v1.1.2 docker compose --profile gateway up -d gateway
 ```
 
 ### full-dsh 镜像（可选）
@@ -164,7 +164,7 @@ docker pull ghcr.io/wray-lee/junclaw:full-dsh
 标签：
 
 - `:full-dsh` —— `full-dsh` target 的最新构建
-- `:full-dsh-v<version>` —— 由 `full-dsh-v*` 标签产生，每次发版一并推送（如 `:full-dsh-v1.1.1`）
+- `:full-dsh-v<version>` —— 由 `full-dsh-v*` 标签产生，每次发版一并推送（如 `:full-dsh-v1.1.2`）
 - `:full-dsh-main-<sha>` —— 手动 CI 运行
 
 发布不产生 `v<version>-full-dsh`；full 浏览器变体是 `:v<version>-full-dsh-browser`。

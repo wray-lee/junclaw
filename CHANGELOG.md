@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 1.1.2 - 2026-10-28
+
+The in-process dsh engine now matches the native engine: channel attachments,
+conversation context, memory, skills and security policy. Firefox WebDriver
+hardening.
+
 ### Security
 
 - SSRF host screening now reads ambiguous IPv4 literals the way browsers and
@@ -48,6 +54,9 @@
 
 ### Fixed
 
+- cron and heartbeat results that are only `[NO_REPLY]` are no longer
+  delivered, and the default workspace guidance now tells the model to answer
+  `[NO_REPLY]` (not `HEARTBEAT_OK`) when it has nothing to say.
 - streaming drafts no longer flash raw attachment control markers: the shared
   `TagFilter` masks `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]` and the other
   marker kinds, including a marker split across chunks, on channel drafts the
