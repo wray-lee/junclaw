@@ -35,6 +35,16 @@
   the kernel-assigned port, the `Listening on` banner from our own stderr, a
   live child and the matching `moz:profile` must all agree; otherwise junclaw
   retries on a fresh port and then fails closed.
+- in-process dsh engine: user input, tool results, outbound provider messages
+  and the session log now go through the same PII redactor native builds from
+  `agent.enable_pii_redaction` (and every appended log string is redacted, not
+  just a key whitelist), so emails, card numbers, keys and tokens no longer
+  reach the provider or disk unredacted.
+- in-process dsh engine: secret patterns are scrubbed from tool output before
+  it enters history or persistence, including tool metadata, error reasons and
+  bash spill files.
+- in-process dsh engine: the runtime context now carries the native `## Safety`
+  policy, so the model sees the same approval and security rules as native.
 
 ### Fixed
 
