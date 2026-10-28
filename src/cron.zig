@@ -15,6 +15,7 @@ const Config = @import("config.zig").Config;
 const process_util = @import("tools/process_util.zig");
 const security_policy = @import("security/policy.zig");
 const secrets = @import("security/secrets.zig");
+const util = @import("util.zig");
 
 const log = std.log.scoped(.cron);
 const DEFAULT_CRON_SHELL_TIMEOUT_NS: u64 = 60 * std.time.ns_per_s;
@@ -1377,6 +1378,10 @@ pub fn deliverResult(
 
     // Skip empty output
     if (output.len == 0) return false;
+
+    // A token-only result means the agent chose silence: publishing it would
+    // post the literal marker. Heartbeats and cron agent jobs share this path.
+    if (util.isSilentTokenReply(output)) return false;
 
     const chat_id = delivery.to orelse "default";
     const msg = if (delivery.account_id) |account_id|
@@ -3547,6 +3552,32 @@ test "deliverResult with no channel does nothing" {
     const delivered = try deliverResult(allocator, delivery, "should not appear", true, &test_bus);
     try std.testing.expect(!delivered);
     try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+}
+
+test "deliverResult skips a token-only silent reply" {
+    // Regression: the heartbeat prompt says [NO_REPLY] when nothing needs
+    // attention, but deliverResult published the literal token because nothing
+    // on this delivery path consulted the silent-reply check.
+    const allocator = std.testing.allocator;
+    var test_bus = bus.Bus.init();
+    defer test_bus.close();
+
+    const delivery = DeliveryConfig{
+        .mode = .always,
+        .channel = "telegram",
+        .to = "chat1",
+    };
+
+    const silent = try deliverResult(allocator, delivery, "[NO_REPLY]", true, &test_bus);
+    try std.testing.expect(!silent);
+    try std.testing.expectEqual(@as(usize, 0), test_bus.outboundDepth());
+
+    // Prose that merely mentions the token is still delivered.
+    const prose = "nothing to report [NO_REPLY] today";
+    try std.testing.expect(try deliverResult(allocator, delivery, prose, true, &test_bus));
+    var msg = test_bus.consumeOutbound().?;
+    defer msg.deinit(allocator);
+    try std.testing.expectEqualStrings(prose, msg.content);
 }
 
 test "deliverResult on_success skips on failure" {
