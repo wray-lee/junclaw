@@ -10,18 +10,19 @@
   instead of pasting file bodies or calling a channel API with its own
   credentials. The dsh system prompt stays verbatim, and the existing
   workspace/`autonomy.allowed_paths` marker-scope filter applies unchanged.
-- dsh engine: a completed turn now autosaves the redacted user text and the
-  delivered reply summary into the configured memory backend
-  (`memory.auto_save`), and a pre-compaction flush extracts durable facts
-  before dsh drops messages (`agent.compaction_memory_flush`). The native
-  memory-tool guidance is injected into the runtime context.
-- dsh engine: `## Skills`, the session-armed `## Active Skill Session`, the
-  named agent's `## Agent Profile` prompt, `## Runtime Capabilities`, and the
-  native `## Runtime` (OS | Model) line now reach the model instead of being
-  dropped. `AGENTS.md` is read through the configured bootstrap provider, so
-  copies stored in the markdown/hybrid memory backend apply.
-- `/compact` on the `dsh` engine does not run the pre-compaction memory flush;
-  automatic compaction does.
+- in-process dsh engine (`agent.harness: "dsh"`): a completed turn now
+  autosaves the redacted user text and the delivered reply summary into the
+  configured memory backend (`memory.auto_save`), and a pre-compaction flush
+  extracts durable facts before dsh drops messages
+  (`agent.compaction_memory_flush`), including a manual `/compact`. The native
+  memory-tool guidance is injected into the runtime context. The `dsh-sidecar`
+  engine does not have this wiring.
+- in-process dsh engine: `## Skills`, the session-armed
+  `## Active Skill Session`, the named agent's `## Agent Profile` prompt,
+  `## Runtime Capabilities`, and the native `## Runtime` (OS | Model) line now
+  reach the model instead of being dropped. `AGENTS.md` is read through the
+  configured bootstrap provider, so copies stored in a database memory backend
+  (sqlite/postgres/redis) apply.
 
 ## 1.1.1 - 2026-10-28
 
