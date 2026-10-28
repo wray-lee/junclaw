@@ -110,6 +110,11 @@ pub const OrphanThinkCloser = enum {
 pub const TagFilter = struct {
     inner: Sink = undefined,
     think: ThinkMode = .strip,
+    /// Mask channel attachment markers in the streamed bytes. Only a sink that
+    /// is later replaced (a channel live draft) should mask them; an
+    /// append-only sink (CLI stdout, A2A SSE) is the delivered text, so the
+    /// marker and path must stay visible.
+    mask_attachments: bool = true,
     /// How an orphan reasoning closer is handled (see `OrphanThinkCloser`).
     orphan_think_closer: OrphanThinkCloser = .release,
     /// Which region of the turn the next byte belongs to.
@@ -157,9 +162,10 @@ pub const TagFilter = struct {
     };
 
     // Channel attachment markers (`[FILE:/abs/path]`). They are control
-    // syntax, not text: the live draft masks them so a raw path never flashes
-    // on screen. The final message is untouched; the channel parses the
-    // marker and replaces the draft with the uploaded file. Same kinds as
+    // syntax, not text: a channel live draft masks them so a raw path never
+    // flashes on screen, and the final message replaces the draft with the
+    // uploaded file. Append-only sinks opt out (`mask_attachments`): there the
+    // stream IS the delivered text, so the marker must survive. Same kinds as
     // `telegram.parseAttachmentMarkers`, case-insensitive.
     const attachment_kinds = [_][]const u8{
         "image", "photo", "document", "file", "video", "audio", "voice",
@@ -371,12 +377,14 @@ pub const TagFilter = struct {
                     // suppression until the closing `]` (which may arrive in a
                     // later chunk); a partial one keeps buffering so the split
                     // never leaks half the marker.
-                    if (attachmentMarkerOpen(prefix)) {
-                        self.buf_len = 0;
-                        self.state = .attachment;
-                        continue;
+                    if (self.mask_attachments) {
+                        if (attachmentMarkerOpen(prefix)) {
+                            self.buf_len = 0;
+                            self.state = .attachment;
+                            continue;
+                        }
+                        if (attachmentMarkerPrefix(prefix)) continue;
                     }
-                    if (attachmentMarkerPrefix(prefix)) continue;
 
                     // A `</think>` inside a reasoning region closes it. The
                     // delimiter may be `>` or whitespace.
@@ -1091,6 +1099,20 @@ test "TagFilter masks an attachment marker split across chunks" {
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Here  done", col.joined(&buf));
+}
+
+test "TagFilter keeps attachment markers for an append-only sink" {
+    // Regression: the CLI's stream is the delivered reply, so masking there
+    // dropped the marker and path from the terminal output.
+    var col = collectChunks(64){};
+    var filter = TagFilter.init(col.sink());
+    filter.mask_attachments = false;
+    const s = filter.sink();
+    s.emitChunk("Here is the report: [FI");
+    s.emitChunk("LE:/tmp/report.txt]");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Here is the report: [FILE:/tmp/report.txt]", col.joined(&buf));
 }
 
 test "TagFilter masks every attachment kind case-insensitively" {

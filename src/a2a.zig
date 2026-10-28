@@ -544,8 +544,10 @@ pub const SseStreamCtx = struct {
         };
         self.filter = streaming.TagFilter.init(raw_sink);
         // An SSE stream is append-only: an orphan reasoning closer would emit
-        // the raw tag with no way to drop the leaked draft before it.
+        // the raw tag with no way to drop the leaked draft before it, and the
+        // bytes it carries are the response, so attachment markers stay.
         self.filter.orphan_think_closer = .suppress;
+        self.filter.mask_attachments = false;
         return self.filter.sink();
     }
 };

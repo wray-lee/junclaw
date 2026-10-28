@@ -181,6 +181,9 @@ fn cliStreamSinkCallback(ctx_ptr: *anyopaque, event: streaming.Event) void {
 
 fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) streaming.Sink {
     filter.* = streaming.TagFilter.init(raw_sink);
+    // The terminal is append-only: what the stream shows is the delivered
+    // reply, so attachment markers (and their paths) must not be masked.
+    filter.mask_attachments = false;
     // The terminal is append-only, so an orphan reasoning closer would print as
     // a raw `</ifm|think>` with no way to drop the leaked draft before it.
     filter.orphan_think_closer = .suppress;
@@ -192,6 +195,7 @@ fn makeCliStreamSink(raw_sink: streaming.Sink, filter: *streaming.TagFilter) str
 fn makeCliStreamSinkPassthrough(raw_sink: streaming.Sink, filter: *streaming.ThinkPassthroughFilter) streaming.Sink {
     filter.* = streaming.ThinkPassthroughFilter.init(raw_sink);
     filter.filter.orphan_think_closer = .suppress;
+    filter.filter.mask_attachments = false;
     return filter.sink();
 }
 
@@ -1177,6 +1181,39 @@ test "makeCliStreamSink strips streamed tool_call markup" {
     cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
 
     try std.testing.expectEqualStrings("Let me check the projects for you.", collector.buf[0..collector.len]);
+}
+
+test "makeCliStreamSink keeps attachment markers in the delivered stream" {
+    // Regression: the CLI stream is the only delivered output when streaming
+    // emitted text, so masking the marker hid the path from the terminal.
+    const Collector = struct {
+        buf: [128]u8 = undefined,
+        len: usize = 0,
+
+        fn callback(ctx_ptr: *anyopaque, event: streaming.Event) void {
+            if (event.stage != .chunk or event.text.len == 0) return;
+            const self: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            @memcpy(self.buf[self.len..][0..event.text.len], event.text);
+            self.len += event.text.len;
+        }
+    };
+
+    var collector = Collector{};
+    var filter: streaming.TagFilter = .{};
+    defer filter.deinit();
+    const raw_sink = streaming.Sink{
+        .callback = Collector.callback,
+        .ctx = @ptrCast(&collector),
+    };
+    const filtered_sink = makeCliStreamSink(raw_sink, &filter);
+
+    var ctx = CliStreamCtx{ .sink = filtered_sink };
+    defer ctx.deinit();
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("Here is the report: [FI"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.textDelta("LE:/tmp/report.txt]"));
+    cliStreamCallback(@ptrCast(&ctx), providers.StreamChunk.finalChunk());
+
+    try std.testing.expectEqualStrings("Here is the report: [FILE:/tmp/report.txt]", collector.buf[0..collector.len]);
 }
 
 test "makeCliStreamSinkPassthrough hides the streamed K2 tool call" {
