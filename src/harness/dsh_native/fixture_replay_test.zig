@@ -1481,6 +1481,9 @@ const CapturedRequest = struct {
     contents: []const []const u8,
     roles: []const providers.Role,
     tools: []const providers.ToolSpec,
+    /// The turn's host-interaction state, so the tool catalog can be checked
+    /// per request instead of session-wide.
+    expect_ask_user: ?bool = null,
 };
 
 /// Runs once, from the first provider call of a fixture turn.
@@ -1499,6 +1502,9 @@ const HarnessProvider = struct {
     arena: std.heap.ArenaAllocator,
     owner: Allocator,
     during: ?*DuringTurn = null,
+    /// Set for the duration of a prompt turn: whether that turn carries a host
+    /// interaction, hence whether ask_user_question must be advertised.
+    expect_ask_user: ?bool = null,
 
     fn init(allocator: Allocator, replies: []const HarnessReply) HarnessProvider {
         return .{
@@ -1579,7 +1585,12 @@ const HarnessProvider = struct {
                 .parameters_json = try arena.dupe(u8, tool.parameters_json),
             };
         }
-        try self.requests.append(self.owner, .{ .contents = contents, .roles = roles, .tools = tools });
+        try self.requests.append(self.owner, .{
+            .contents = contents,
+            .roles = roles,
+            .tools = tools,
+            .expect_ask_user = self.expect_ask_user,
+        });
     }
 
     fn supportsNativeTools(_: *anyopaque) bool {
@@ -1777,20 +1788,24 @@ fn manifestFlag(manifest: Value, group: []const u8, key: []const u8) bool {
     };
 }
 
-/// The ask_user_question schema the model sees must be the generated dsh text.
-/// It is only advertised on turns that carry a host interaction; a captured
-/// session whose every prompt step was `noInteraction` must not show it.
-fn checkGeneratedToolSchema(provider: *HarnessProvider, expect_ask_user: bool) !void {
-    var seen = false;
+/// The ask_user_question schema the model sees must be the generated dsh text,
+/// and it is only advertised on turns that carry a host interaction. Check
+/// every captured request against its own turn: a session-wide "any turn had
+/// an interaction" would miss a regression on the `noInteraction` steps of a
+/// mixed session.
+fn checkGeneratedToolSchema(provider: *HarnessProvider) !void {
     for (provider.requests.items) |captured| {
+        var seen = false;
         for (captured.tools) |tool| {
             if (!std.mem.eql(u8, tool.name, generated_interaction.ask_user_question.name)) continue;
             seen = true;
             try std.testing.expectEqualStrings(generated_interaction.ask_user_question.description, tool.description);
             try std.testing.expectEqualStrings(generated_interaction.ask_user_question.input_schema_json, tool.parameters_json);
         }
+        if (captured.expect_ask_user) |expect_ask_user| {
+            try std.testing.expectEqual(expect_ask_user, seen);
+        }
     }
-    try std.testing.expectEqual(expect_ask_user, seen);
 }
 
 fn expectCompactionInstruction(manifest: Value, provider: *HarnessProvider) !void {
@@ -1979,8 +1994,6 @@ fn runEventFixture(scenario: []const u8) !void {
     }
     try h.restore(.{ .messages = &.{}, .dsh_session_id = "fixture-session" });
 
-    // The question tool is only advertised on turns with a host interaction.
-    var expect_ask_user = false;
     for (input.steps) |step| {
         if (std.mem.eql(u8, step.op, "initialize")) continue;
         if (std.mem.eql(u8, step.op, "newSession")) {
@@ -2012,10 +2025,13 @@ fn runEventFixture(scenario: []const u8) !void {
                 .advance_ms = if (step.questions) |questions| questions.advanceMs else 0,
                 .plan_review = step.planReview,
             };
-            if (!step.noInteraction) expect_ask_user = true;
             var during = DuringTurn{ .harness = h, .command = step.commandDuringTurn };
             provider.during = if (step.commandDuringTurn != null) &during else null;
             defer provider.during = null;
+            // The question tool is only advertised on turns with a host
+            // interaction; record that per captured request, not per session.
+            provider.expect_ask_user = !step.noInteraction;
+            defer provider.expect_ask_user = null;
             const result = try h.runTurn(.{
                 .user_message = step.text orelse return error.MissingPrompt,
                 .workspace_dir = workspace,
@@ -2040,7 +2056,7 @@ fn runEventFixture(scenario: []const u8) !void {
     const log_bytes = try fs_compat.readFileAlloc(compat.fs.cwd(), allocator, log_path, 16 * 1024 * 1024);
     defer allocator.free(log_bytes);
 
-    try checkGeneratedToolSchema(&provider, expect_ask_user);
+    try checkGeneratedToolSchema(&provider);
     try expectCompactionInstruction(manifest, &provider);
 
     const actual_records = try fixture_compare.parseJsonl(fixture_allocator, log_bytes);
