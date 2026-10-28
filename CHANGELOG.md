@@ -4,6 +4,11 @@
 
 ### Fixed
 
+- streaming drafts no longer flash raw attachment control markers: the shared
+  `TagFilter` masks `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]` and the other
+  marker kinds, including a marker split across chunks, on every engine. The
+  final message is unchanged, so the channel still parses the marker and sends
+  the file; an unterminated marker stays masked only in the ephemeral draft.
 - dsh engine: the in-process engine's runtime context now carries the same
   channel attachment-marker guidance as the native system prompt, so the model
   emits `[FILE:...]`, `[DOCUMENT:...]`, `[IMAGE:...]`, and the other markers

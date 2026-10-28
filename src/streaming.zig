@@ -153,6 +153,16 @@ pub const TagFilter = struct {
         opaque_tag, // eating provider marker tag bytes up to '>'
         opaque_body, // suppressing a provider marker body
         opaque_body_lt, // saw '<' in a marker body, buffering
+        attachment, // suppressing an attachment marker up to ']'
+    };
+
+    // Channel attachment markers (`[FILE:/abs/path]`). They are control
+    // syntax, not text: the live draft masks them so a raw path never flashes
+    // on screen. The final message is untouched; the channel parses the
+    // marker and replaces the draft with the uploaded file. Same kinds as
+    // `telegram.parseAttachmentMarkers`, case-insensitive.
+    const attachment_kinds = [_][]const u8{
+        "image", "photo", "document", "file", "video", "audio", "voice",
     };
 
     // Opening tag prefixes. After matching, skip until '>'.
@@ -357,6 +367,17 @@ pub const TagFilter = struct {
                     const prefix = self.buf[0..self.buf_len];
                     clean_start = i + 1;
 
+                    // Attachment markers: a complete opener switches to
+                    // suppression until the closing `]` (which may arrive in a
+                    // later chunk); a partial one keeps buffering so the split
+                    // never leaks half the marker.
+                    if (attachmentMarkerOpen(prefix)) {
+                        self.buf_len = 0;
+                        self.state = .attachment;
+                        continue;
+                    }
+                    if (attachmentMarkerPrefix(prefix)) continue;
+
                     // A `</think>` inside a reasoning region closes it. The
                     // delimiter may be `>` or whitespace.
                     if (self.region == .think and isCloseTag(prefix, &think_close_names)) {
@@ -499,6 +520,13 @@ pub const TagFilter = struct {
                     self.emitRegion(self.buf[0..self.buf_len]);
                     self.buf_len = 0;
                     self.state = .normal;
+                },
+                .attachment => {
+                    // Drop the marker body (path, URL or data URI) as it
+                    // streams; a marker without a closer stays hidden, and the
+                    // final message still carries the literal text.
+                    clean_start = i + 1;
+                    if (b == ']') self.state = .normal;
                 },
                 .tool_body => {
                     clean_start = i + 1;
@@ -906,6 +934,32 @@ pub const TagFilter = struct {
         };
     }
 
+    /// True when `prefix` is a complete attachment opener (`[FILE:`,
+    /// `[image:`, …).
+    fn attachmentMarkerOpen(prefix: []const u8) bool {
+        if (prefix.len < 3 or prefix[0] != '[') return false;
+        const rest = prefix[1..];
+        for (attachment_kinds) |kind| {
+            if (rest.len == kind.len + 1 and rest[kind.len] == ':' and
+                std.ascii.eqlIgnoreCase(rest[0..kind.len], kind)) return true;
+        }
+        return false;
+    }
+
+    /// True when `prefix` could still grow into an attachment opener, so the
+    /// buffering caller keeps it instead of flushing it as text.
+    fn attachmentMarkerPrefix(prefix: []const u8) bool {
+        if (prefix.len < 2 or prefix[0] != '[') return false;
+        const rest = prefix[1..];
+        for (attachment_kinds) |kind| {
+            if (rest.len <= kind.len) {
+                if (std.ascii.eqlIgnoreCase(rest, kind[0..rest.len])) return true;
+            } else if (rest.len == kind.len + 1 and rest[kind.len] == ':' and
+                std.ascii.eqlIgnoreCase(rest[0..kind.len], kind)) return true;
+        }
+        return false;
+    }
+
     /// Returns true if `text` exactly matches any entry in `prefixes`.
     fn matchesAnyPrefix(text: []const u8, prefixes: []const []const u8) bool {
         for (prefixes) |p| {
@@ -1013,6 +1067,61 @@ test "TagFilter strips think blocks by default" {
     s.emitFinal();
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("Visible", col.joined(&buf));
+}
+
+test "TagFilter masks an attachment marker in the live draft" {
+    // Regression: the raw `[FILE:/abs/path]` control marker streamed into the
+    // draft before the final message replaced it with the uploaded file.
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Here [FILE:/tmp/report.txt] done");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Here  done", col.joined(&buf));
+}
+
+test "TagFilter masks an attachment marker split across chunks" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("Here [FI");
+    s.emitChunk("LE:/tmp/rep");
+    s.emitChunk("ort.txt] done");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("Here  done", col.joined(&buf));
+}
+
+test "TagFilter masks every attachment kind case-insensitively" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("[image:/tmp/a.png][Photo:/tmp/b.jpg][DOCUMENT:https://example.com/a.pdf]");
+    s.emitChunk("[file:/tmp/c.txt][video:/tmp/d.mp4][Audio:/tmp/e.mp3][VOICE:/tmp/f.ogg]ok");
+    s.emitFinal();
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("ok", col.joined(&buf));
+}
+
+test "TagFilter keeps bracketed prose that is not an attachment marker" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("[note] hi [filed] [file] [image] [FILE :/tmp/x] ok");
+    s.emitFinal();
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("[note] hi [filed] [file] [image] [FILE :/tmp/x] ok", col.joined(&buf));
+}
+
+test "TagFilter releases a partial attachment opener at end of stream" {
+    var col = collectChunks(16){};
+    var filter = TagFilter.init(col.sink());
+    const s = filter.sink();
+    s.emitChunk("[FIL");
+    s.emitFinal();
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("[FIL", col.joined(&buf));
 }
 
 test "TagFilter treats a namespaced think opener and closer as a reasoning region" {
