@@ -1341,7 +1341,7 @@ test "dsh-native adapter: a goal continuation after the cap starts with tool sch
     const allocator = testing.allocator;
     var fake = BridgeFake{ .output = "probe output" };
     var fx = try Fixture.init(allocator, &.{
-        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":4}" }} },
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "create_goal", .arguments = "{\"objective\":\"ship it\",\"max_goal_rounds\":1}" }} },
         .{ .text = "goal created" },
         .{ .tool_calls = &.{.{ .id = "call-2", .name = "probe", .arguments = "{}" }} },
         .{ .text = "done" },
