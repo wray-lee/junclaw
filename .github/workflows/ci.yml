@@ -17,3 +17,6 @@ jobs:
     with:
       binary_name: nullclaw
       artifact_prefix: nullclaw
+      # Bounded run: no per-test timeout or job timeout exists otherwise, so one
+      # blocking test hangs the job (PR #16 macOS, 5 h). See scripts/ci-test.sh.
+      test_command: bash scripts/ci-test.sh

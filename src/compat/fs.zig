@@ -404,6 +404,15 @@ pub fn makeDirAbsolute(absolute_path: []const u8) std.Io.Dir.CreateDirError!void
     try std.Io.Dir.createDirAbsolute(shared.io(), absolute_path, .default_dir);
 }
 
+/// POSIX mode bits for a directory or file; Windows has no equivalent (ACLs
+/// inherit).
+pub fn chmodAbsolute(absolute_path: []const u8, mode: File.Mode) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    // Directory fds opened without iterate are O_PATH on Linux, where fchmod
+    // fails EBADF and Zig treats it as a programmer bug panic; chmod by path.
+    try std.Io.Dir.setFilePermissions(std.Io.Dir.cwd(), shared.io(), absolute_path, permissionsFromMode(mode), .{});
+}
+
 pub fn deleteFileAbsolute(absolute_path: []const u8) std.Io.Dir.DeleteFileError!void {
     try std.Io.Dir.deleteFileAbsolute(shared.io(), absolute_path);
 }
@@ -605,4 +614,31 @@ test "streaming writers preserve interleaved redirected output" {
     var got: [32]u8 = undefined;
     const count = try file.read(&got);
     try std.testing.expectEqualStrings("prefix:pong\n", got[0..count]);
+}
+
+test "chmodAbsolute applies modes to directories and files" {
+    // Regression: CI 上 O_PATH 目录 fchmod BADF panic
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = Dir.wrap(tmp.dir);
+    try dir.makeDir("owner-only-dir");
+    const file = try dir.createFile("owner-only-file", .{});
+    file.close();
+
+    const base = try dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const dir_path = try path.join(allocator, &.{ base, "owner-only-dir" });
+    defer allocator.free(dir_path);
+    const file_path = try path.join(allocator, &.{ base, "owner-only-file" });
+    defer allocator.free(file_path);
+
+    try chmodAbsolute(dir_path, 0o700);
+    try chmodAbsolute(file_path, 0o600);
+
+    const dir_stat = try cwd().statFile(dir_path);
+    try std.testing.expectEqual(@as(File.Mode, 0o700), dir_stat.mode & 0o777);
+    const file_stat = try cwd().statFile(file_path);
+    try std.testing.expectEqual(@as(File.Mode, 0o600), file_stat.mode & 0o777);
 }

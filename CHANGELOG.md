@@ -2,6 +2,40 @@
 
 ## Unreleased
 
+### Security
+
+- SSRF host screening now reads ambiguous IPv4 literals the way browsers and
+  the C resolver do: leading-zero octal (`0177.0.0.1` is `127.0.0.1`), `0x`
+  hex, bare 32-bit integers (`2130706433`), short forms (`127.1`) and a
+  trailing dot. Previously the pinned-resolve check read `0177.0.0.1` as
+  `177.0.0.1` and approved it as public, while Firefox and the C resolver
+  read it as loopback, so the WebDriver backend navigated to `127.0.0.1`.
+  This changes global behavior for `web_fetch`, `http_request`, the WebDriver
+  browser backend and remote provider request pinning; domains such as
+  `1e100.net` and `08.com` are still treated as domains.
+- WebDriver browser sessions now force every HTTP(S) request through an
+  in-process filtering CONNECT proxy on a kernel-assigned loopback port.
+  Redirects, subresources, new windows and form submissions are checked at the
+  proxy; each host is resolved once, every address is screened with the SSRF
+  rules (allowlisted hosts keep the operator-trusted private-address
+  exception) and the connection is pinned to a checked address, closing DNS
+  rebinding between the check and the connect. A proxy start failure fails the
+  session (no direct fallback or escape-hatch switch), extra windows are
+  closed after each action, and tunnel reads and stalled writes are cut by the
+  idle deadline on POSIX instead of pinning a proxy worker.
+- WebDriver Firefox profiles now disable DoH/TRR, DNS prefetch,
+  speculative/preconnect/predictor connections, HTTP/3, Alt-Svc and WebRTC,
+  and turn off Safe Browsing, OCSP, Remote Settings, telemetry and update
+  endpoints, so browser-initiated traffic cannot bypass the proxy.
+- geckodriver and Firefox no longer outlive the agent: on POSIX a watchdog
+  kills the driver's process group when the agent's pipe closes, and Windows
+  uses a Job Object with `KILL_ON_JOB_CLOSE`. The one-shot profile and its
+  `downloads` directory are `0700` on POSIX.
+- A WebDriver endpoint is accepted only when it is the child junclaw started:
+  the kernel-assigned port, the `Listening on` banner from our own stderr, a
+  live child and the matching `moz:profile` must all agree; otherwise junclaw
+  retries on a fresh port and then fails closed.
+
 ### Fixed
 
 - streaming drafts no longer flash raw attachment control markers: the shared

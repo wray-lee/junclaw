@@ -396,6 +396,145 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
     return tcpConnectToAddress(addresses.addrs[0]);
 }
 
+/// Connect to an already-resolved address with a total timeout. Never resolves
+/// hostnames. Windows/WASI use a blocking connect: Zig 0.16's std.Io has no
+/// timeout connect there, and callers keep a deterministic stop path.
+pub fn connectWithTimeout(address: Address, timeout_ms: u32) !Stream {
+    switch (builtin.os.tag) {
+        .windows, .wasi => return tcpConnectToAddress(address),
+        else => {},
+    }
+
+    // Darwin defines posix.SOCK.CLOEXEC as a Zig-only shim, and
+    // `posix.system.socket` is the raw libc call there, which rejects the shim
+    // with EPROTOTYPE (macOS CI). Ask for atomic CLOEXEC only where the kernel
+    // implements it; Darwin falls back to fcntl below.
+    const atomic_cloexec = @hasDecl(posix.SOCK, "CLOEXEC") and !builtin.os.tag.isDarwin();
+    const rc = posix.system.socket(
+        @intCast(address.any.family),
+        @intCast(posix.SOCK.STREAM | (if (atomic_cloexec) posix.SOCK.CLOEXEC else 0)),
+        @intCast(posix.IPPROTO.TCP),
+    );
+    const fd: Stream.Handle = switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    };
+    errdefer closeStreamHandle(fd);
+    if (!atomic_cloexec) try setSocketCloseOnExec(fd);
+    try setSocketNonblocking(fd, true);
+
+    switch (posix.errno(posix.system.connect(fd, &address.any, address.getOsSockLen()))) {
+        .SUCCESS => {},
+        .INPROGRESS, .AGAIN => {
+            var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const timeout: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+            if (try posix.poll(&poll_fds, timeout) == 0) return error.ConnectionTimedOut;
+            // Raw call: posix.getpeername treats the EINVAL macOS returns for a
+            // refused connect as a programmer bug and panics.
+            var peer: posix.sockaddr = undefined;
+            var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+            if (posix.errno(posix.system.getpeername(fd, &peer, &peer_len)) != .SUCCESS) return error.ConnectionRefused;
+        },
+        .CONNREFUSED => return error.ConnectionRefused,
+        .NETUNREACH, .HOSTUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+    // Tunnel reads use poll() and writeAll expects a blocking socket.
+    try setSocketNonblocking(fd, false);
+    return .{ .handle = fd };
+}
+
+fn closeStreamHandle(fd: Stream.Handle) void {
+    const stream = Stream{ .handle = fd };
+    stream.close();
+}
+
+/// Read with a deadline. SO_RCVTIMEO is not usable: Zig 0.16's threaded Io
+/// treats EAGAIN on a blocking socket as a programmer bug and panics, so poll
+/// before reading. Windows/WASI fall back to a blocking read; the proxy's
+/// stopAndJoin shuts active tunnels down there.
+pub fn readWithTimeout(stream: Stream, buffer: []u8, timeout_ms: u32) !usize {
+    if (buffer.len == 0) return 0;
+    switch (builtin.os.tag) {
+        .windows, .wasi => return stream.read(buffer),
+        else => {},
+    }
+
+    var poll_fds = [_]posix.pollfd{.{
+        .fd = stream.handle,
+        .events = posix.POLL.IN,
+        .revents = 0,
+    }};
+    const timeout: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+    if (try posix.poll(&poll_fds, timeout) == 0) return error.Timeout;
+    return posix.read(stream.handle, buffer) catch |err| switch (err) {
+        error.WouldBlock => error.Timeout,
+        else => err,
+    };
+}
+
+/// Write with a deadline. `send` uses MSG_DONTWAIT so a blocking socket cannot
+/// stall past the buffer: a peer that stops reading surfaces as `error.Timeout`
+/// instead of pinning the worker. Windows/WASI keep the blocking write; only
+/// stopAndJoin's shutdown bounds them there.
+pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !void {
+    if (bytes.len == 0) return;
+    switch (builtin.os.tag) {
+        .windows, .wasi => return stream.writeAll(bytes),
+        else => {},
+    }
+
+    // MSG_DONTWAIT alone did not bound the send on the macOS CI runner: with a
+    // peer that stopped reading, the write loop slept for 300 s instead of
+    // timing out, so the kernel was sleeping inside sendto. A send timeout
+    // wakes that sleep without touching the socket's blocking mode, so a reader
+    // on the same fd is unaffected. Cleared (no timeout) on the way out.
+    const sndtimeo: posix.timeval = .{
+        .sec = @intCast(timeout_ms / 1000),
+        .usec = @intCast((timeout_ms % 1000) * 1000),
+    };
+    posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&sndtimeo)) catch {};
+    defer {
+        const clear: posix.timeval = .{ .sec = 0, .usec = 0 };
+        posix.setsockopt(stream.handle, posix.SOL.SOCKET, posix.SO.SNDTIMEO, std.mem.asBytes(&clear)) catch {};
+    }
+
+    const deadline = nowNanos() + @as(i96, timeout_ms) * std.time.ns_per_ms;
+    var written: usize = 0;
+    while (written < bytes.len) {
+        const remaining_ms = @divTrunc(deadline - nowNanos(), std.time.ns_per_ms);
+        if (remaining_ms <= 0) return error.Timeout;
+        var poll_fds = [_]posix.pollfd{.{
+            .fd = stream.handle,
+            .events = posix.POLL.OUT,
+            .revents = 0,
+        }};
+        const timeout: i32 = @intCast(@min(remaining_ms, @as(i96, std.math.maxInt(i32))));
+        if (try posix.poll(&poll_fds, timeout) == 0) return error.Timeout;
+        const rc = posix.system.sendto(
+            stream.handle,
+            bytes[written..].ptr,
+            bytes.len - written,
+            posix.MSG.DONTWAIT | posix.MSG.NOSIGNAL,
+            null,
+            0,
+        );
+        switch (posix.errno(rc)) {
+            .SUCCESS => {},
+            .INTR, .AGAIN => continue,
+            else => |err| return posix.unexpectedErrno(err),
+        }
+        const n: usize = @intCast(rc);
+        if (n == 0) return error.Unexpected;
+        written += n;
+    }
+}
+
+fn nowNanos() i96 {
+    return std.Io.Timestamp.now(shared.io(), .boot).nanoseconds;
+}
+
 fn shouldUseWindowsLocalhostFallback(name: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(name, "localhost")) return true;
 
@@ -811,4 +950,86 @@ test "compat net getAddressList returns UnknownHostName for invalid hostname on 
     if (builtin.os.tag != .windows) return;
     const result = getAddressList(std.testing.allocator, "bad host", 80);
     try std.testing.expectError(error.UnknownHostName, result);
+}
+
+test "compat net connectWithTimeout reaches a loopback listener" {
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try connectWithTimeout(server.listen_address, 5000);
+    defer client.close();
+    var conn = try server.accept();
+    defer conn.stream.close();
+}
+
+// Regression: macOS getpeername returned EINVAL after a refused non-blocking connect and
+// std panicked with "reached unreachable code" instead of reporting ConnectionRefused.
+test "compat net connectWithTimeout reports a refused loopback port" {
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    const closed = server.listen_address;
+    server.deinit();
+    if (builtin.os.tag == .windows) {
+        // Zig 0.16's Windows connect reports NTSTATUS 0xc0000236 (CONNECTION_REFUSED)
+        // as error.Unexpected, so assert only that a refused connect fails. The
+        // production caller treats any error as "try the next address".
+        if (connectWithTimeout(closed, 5000)) |stream| {
+            stream.close();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    } else {
+        try std.testing.expectError(error.ConnectionRefused, connectWithTimeout(closed, 5000));
+    }
+}
+
+test "compat net readWithTimeout reads data and then times out" {
+    if (builtin.os.tag == .windows) return;
+
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    try conn.stream.writeAll("x");
+    var buf: [4]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try readWithTimeout(client, &buf, 1000));
+    try std.testing.expectError(error.Timeout, readWithTimeout(client, &buf, 10));
+}
+
+test "compat net writeWithTimeout gives up on a peer that stops reading" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+
+    var server = try (try Address.parseIp4("127.0.0.1", 0)).listen(.{ .reuse_address = true });
+    defer server.deinit();
+
+    const client = try tcpConnectToAddress(server.listen_address);
+    defer client.close();
+    var conn = try server.accept();
+    defer conn.stream.close();
+
+    // Cap both buffers so a peer that never reads fills them after a few KiB;
+    // loopback otherwise absorbs the payload in the receiver's queue.
+    const small: c_int = 4096;
+    posix.setsockopt(client.handle, posix.SOL.SOCKET, posix.SO.SNDBUF, std.mem.asBytes(&small)) catch {};
+    posix.setsockopt(conn.stream.handle, posix.SOL.SOCKET, posix.SO.RCVBUF, std.mem.asBytes(&small)) catch {};
+
+    // macOS auto-tunes loopback buffers well past one small write, so keep
+    // feeding the peer until the deadline fires instead of assuming a single
+    // payload fills the queue. The cap only trips if the writer ignores its
+    // own deadline; it is not a timing assertion.
+    const chunk = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(chunk);
+    @memset(chunk, 0);
+    const write_cap = 64 * 1024 * 1024;
+    var total: usize = 0;
+    while (total < write_cap) {
+        writeWithTimeout(client, chunk, 100) catch |err| switch (err) {
+            error.Timeout => return,
+            else => return err,
+        };
+        total += chunk.len;
+    }
+    return error.TestUnexpectedResult;
 }

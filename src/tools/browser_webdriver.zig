@@ -19,6 +19,7 @@ const WebDriverClient = @import("webdriver_client.zig").WebDriverClient;
 const security = @import("webdriver_security.zig");
 
 const Allocator = std.mem.Allocator;
+const log = std.log.scoped(.browser);
 
 /// Same cap as the curl `read` path in browser.zig.
 pub const MAX_OUTPUT_BYTES: usize = 8192;
@@ -92,6 +93,59 @@ pub fn run(
     if (std.mem.eql(u8, action, "scroll")) return executeScroll(allocator, client, ctx, args);
     if (std.mem.eql(u8, action, "screenshot")) return executeScreenshot(allocator, client, ctx);
     return error.UnknownBrowserAction;
+}
+
+/// Defense in depth for F4: an action can open extra tabs/windows
+/// (`target=_blank`, `window.open`, form targets) that the URL checks never
+/// see. After a successful action keep the current window, close the rest and
+/// append what was closed to the result. Best effort: a driver that cannot
+/// enumerate or close windows is logged and never fails the action.
+pub fn closeExtraWindows(allocator: Allocator, client: *WebDriverClient, result: *ToolResult) void {
+    if (!result.success) return;
+    const record = convergeWindows(allocator, client) catch |err| {
+        log.debug("browser window cleanup skipped: {s}", .{@errorName(err)});
+        return;
+    };
+    const line = record orelse return;
+    defer allocator.free(line);
+    // Success outputs from this module are heap-allocated; failures are not
+    // converged, so an empty literal is never freed here.
+    const output = std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ result.output, line }) catch |err| {
+        log.debug("browser window cleanup record dropped: {s}", .{@errorName(err)});
+        return;
+    };
+    if (result.output.len > 0) allocator.free(result.output);
+    result.output = output;
+}
+
+/// Close every window except the current one and return a one-line record of
+/// the closed handles (null when there was nothing extra).
+fn convergeWindows(allocator: Allocator, client: *WebDriverClient) anyerror!?[]u8 {
+    const handles = try client.getWindowHandles(allocator);
+    defer {
+        for (handles) |handle| allocator.free(handle);
+        allocator.free(handles);
+    }
+    if (handles.len < 2) return null;
+    const current = try client.getWindowHandle(allocator);
+    defer allocator.free(current);
+
+    var closed: std.ArrayList(u8) = .empty;
+    defer closed.deinit(allocator);
+    var closed_count: usize = 0;
+    for (handles) |handle| {
+        if (std.mem.eql(u8, handle, current)) continue;
+        client.switchToWindow(handle) catch continue;
+        client.closeWindow() catch continue;
+        if (closed_count > 0) try closed.appendSlice(allocator, ", ");
+        try closed.appendSlice(allocator, handle);
+        closed_count += 1;
+    }
+    // A failed switch or close can leave another window current.
+    client.switchToWindow(current) catch {};
+    if (closed_count == 0) return null;
+    const line = try std.fmt.allocPrint(allocator, "Closed {d} extra browser window(s): {s}", .{ closed_count, closed.items });
+    return line;
 }
 
 fn executeOpen(allocator: Allocator, client: *WebDriverClient, ctx: Context, args: JsonObjectMap) !ToolResult {

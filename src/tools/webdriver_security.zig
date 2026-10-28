@@ -116,7 +116,11 @@ pub fn checkCurrentUrl(
 /// Prefs written to `<profile>/user.js` before Firefox starts. These are the
 /// outbound calls a browsing tool must never make on its own: telemetry,
 /// update checks, crash/breakpad reports, studies, region and captive-portal
-/// probes. Keep this list in sync with docs/{en,zh}/browser.md.
+/// probes. The lower block closes every name-resolution and transport path
+/// that would leave without the filtering proxy: DoH/TRR, DNS prefetch,
+/// speculative/prefetch connections, HTTP3/Alt-Svc and WebRTC. Safe Browsing,
+/// OCSP and Remote Settings are off for the same reason; the browser holds no
+/// user credentials. Keep this list in sync with docs/{en,zh}/browser.md.
 pub const user_js_prefs =
     \\user_pref("toolkit.telemetry.enabled", false);
     \\user_pref("toolkit.telemetry.unified", false);
@@ -147,23 +151,78 @@ pub const user_js_prefs =
     \\user_pref("browser.region.update.enabled", false);
     \\user_pref("browser.region.network.url", "");
     \\user_pref("browser.safebrowsing.downloads.remote.enabled", false);
+    \\user_pref("browser.safebrowsing.malware.enabled", false);
+    \\user_pref("browser.safebrowsing.phishing.enabled", false);
+    \\user_pref("browser.safebrowsing.downloads.enabled", false);
+    \\user_pref("security.OCSP.enabled", 0);
+    \\user_pref("security.OCSP.require", false);
+    \\user_pref("security.remote_settings.crlite_filters.enabled", false);
+    \\user_pref("security.remote_settings.intermediates.enabled", false);
+    \\user_pref("services.settings.server", "data:,");
+    \\user_pref("network.trr.mode", 5);
+    \\user_pref("network.trr.uri", "");
+    \\user_pref("network.trr.custom_uri", "");
+    \\user_pref("network.dns.disablePrefetch", true);
+    \\user_pref("network.dns.disablePrefetchFromHTTPS", true);
+    \\user_pref("network.prefetch-next", false);
+    \\user_pref("network.http.speculative-parallel-limit", 0);
+    \\user_pref("network.predictor.enabled", false);
+    \\user_pref("network.predictor.enable-prefetch", false);
+    \\user_pref("network.http.http3.enable", false);
+    \\user_pref("network.http.altsvc.enabled", false);
+    \\user_pref("browser.urlbar.speculativeConnect.enabled", false);
+    \\user_pref("media.peerconnection.enabled", false);
+    \\user_pref("media.peerconnection.ice.proxy_only", true);
+    \\user_pref("browser.search.suggest.enabled", false);
+    \\user_pref("extensions.update.enabled", false);
+    \\user_pref("extensions.systemAddon.update.enabled", false);
+    \\user_pref("geo.enabled", false);
+    \\user_pref("geo.provider.network.url", "");
+    \\user_pref("browser.send_pings", false);
+;
+
+/// Manual-proxy prefs written only while the in-process filtering proxy is
+/// running; `{d}` is its loopback port (http and ssl). failover_direct=false
+/// and allow_hijacking_localhost=true are load-bearing: the first stops
+/// Firefox from silently going direct when the proxy is down, the second
+/// stops it from bypassing the proxy for localhost/loopback targets.
+const proxy_js_prefs =
+    \\user_pref("network.proxy.type", 1);
+    \\user_pref("network.proxy.http", "127.0.0.1");
+    \\user_pref("network.proxy.http_port", {d});
+    \\user_pref("network.proxy.ssl", "127.0.0.1");
+    \\user_pref("network.proxy.ssl_port", {d});
+    \\user_pref("network.proxy.ftp", "");
+    \\user_pref("network.proxy.socks", "");
+    \\user_pref("network.proxy.socks_remote_dns", true);
+    \\user_pref("network.proxy.no_proxies_on", "");
+    \\user_pref("network.proxy.allow_hijacking_localhost", true);
+    \\user_pref("network.proxy.failover_direct", false);
+    \\user_pref("network.proxy.autoconfig_url", "");
 ;
 
 /// Complete user.js for a profile whose downloads land in `download_dir`.
 /// The directory lives inside the profile, so shutdown deletes it with the rest.
-pub fn userJsAlloc(allocator: Allocator, download_dir: []const u8) ![]u8 {
+/// `proxy_port` is null only for externally managed WebDriver endpoints
+/// (`Options.driver_url`), which have no proxy of ours to point at.
+pub fn userJsAlloc(allocator: Allocator, proxy_port: ?u16, download_dir: []const u8) ![]u8 {
     const escaped = try escapeUserJsPath(allocator, download_dir);
     defer allocator.free(escaped);
+    const proxy_prefs = if (proxy_port) |port|
+        try std.fmt.allocPrint(allocator, proxy_js_prefs, .{ port, port })
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(proxy_prefs);
     return std.fmt.allocPrint(
         allocator,
-        "{s}" ++
+        "{s}{s}" ++
             "user_pref(\"browser.download.folderList\", 2);\n" ++
             "user_pref(\"browser.download.dir\", \"{s}\");\n" ++
             "user_pref(\"browser.download.useDownloadDir\", true);\n" ++
             "user_pref(\"browser.download.always_ask_before_handling_new_types\", false);\n" ++
             "user_pref(\"browser.download.manager.showWhenStarting\", false);\n" ++
             "user_pref(\"browser.helperApps.neverAsk.saveToDisk\", \"\");\n",
-        .{ user_js_prefs, escaped },
+        .{ proxy_prefs, user_js_prefs, escaped },
     );
 }
 
@@ -175,20 +234,28 @@ fn escapeUserJsPath(allocator: Allocator, path: []const u8) ![]u8 {
     return out;
 }
 
+/// F8: the profile holds cookies/logins and downloads receive page content, so
+/// both directories are owner-only. Windows has no POSIX mode bits; the
+/// profile lives under the per-user temp directory and inherits its ACL.
+fn restrictProfileDir(path: []const u8) !void {
+    if (comptime builtin.os.tag == .windows) return;
+    try compat.fs.chmodAbsolute(path, 0o700);
+}
+
 /// A throwaway Firefox profile. Never points at the host profile, so no host
 /// cookies or logins are loaded; `deinit` removes the whole tree.
 pub const Profile = struct {
     allocator: Allocator,
     path: []u8,
 
-    pub fn create(allocator: Allocator) !Profile {
+    pub fn create(allocator: Allocator, proxy_port: ?u16) !Profile {
         const base = try tempBase(allocator);
         defer allocator.free(base);
-        return createIn(allocator, base);
+        return createIn(allocator, base, proxy_port);
     }
 
     /// `base` must already exist (tests pass a tmpDir path).
-    pub fn createIn(allocator: Allocator, base: []const u8) !Profile {
+    pub fn createIn(allocator: Allocator, base: []const u8, proxy_port: ?u16) !Profile {
         const name = try std.fmt.allocPrint(allocator, "nullclaw-wd-{x}", .{compat.crypto.random.int(u64)});
         defer allocator.free(name);
         const path = try compat.fs.path.join(allocator, &.{ base, name });
@@ -196,12 +263,14 @@ pub const Profile = struct {
 
         try compat.fs.makeDirAbsolute(path);
         errdefer compat.fs.deleteTreeAbsolute(path) catch {};
+        try restrictProfileDir(path);
 
         const downloads = try compat.fs.path.join(allocator, &.{ path, "downloads" });
         defer allocator.free(downloads);
         try compat.fs.makeDirAbsolute(downloads);
+        try restrictProfileDir(downloads);
 
-        const user_js = try userJsAlloc(allocator, downloads);
+        const user_js = try userJsAlloc(allocator, proxy_port, downloads);
         defer allocator.free(user_js);
         const user_js_path = try compat.fs.path.join(allocator, &.{ path, "user.js" });
         defer allocator.free(user_js_path);
@@ -389,9 +458,17 @@ test "navigateChecked fails closed when the final URL cannot be read" {
     try std.testing.expectEqual(@as(usize, 3), server.request_count);
 }
 
+fn readProfileUserJs(allocator: Allocator, profile_path: []const u8) ![]u8 {
+    const user_js_path = try compat.fs.path.join(allocator, &.{ profile_path, "user.js" });
+    defer allocator.free(user_js_path);
+    const file = try compat.fs.openFileAbsolute(user_js_path, .{});
+    defer file.close();
+    return file.readToEndAlloc(allocator, 64 * 1024);
+}
+
 test "one-shot profile writes user.js prefs and is removed on deinit" {
     const allocator = std.testing.allocator;
-    var profile = try Profile.create(allocator);
+    var profile = try Profile.create(allocator, 43111);
     var alive = true;
     defer if (alive) profile.deinit();
     const profile_path = try allocator.dupe(u8, profile.path);
@@ -401,22 +478,54 @@ test "one-shot profile writes user.js prefs and is removed on deinit" {
     defer allocator.free(downloads);
     try compat.fs.accessAbsolute(downloads, .{});
 
-    const user_js_path = try compat.fs.path.join(allocator, &.{ profile_path, "user.js" });
-    defer allocator.free(user_js_path);
-    const file = try compat.fs.openFileAbsolute(user_js_path, .{});
-    const content = try file.readToEndAlloc(allocator, 64 * 1024);
-    file.close();
+    const content = try readProfileUserJs(allocator, profile_path);
     defer allocator.free(content);
 
+    // Regression: Firefox used to leave directly, with DoH, prefetch,
+    // speculative connections and WebRTC open, so redirect hops and
+    // sub-resources never reached the filtering proxy or the URL policy.
     const required = [_][]const u8{
-        "toolkit.telemetry.enabled",
-        "toolkit.telemetry.server",
-        "datareporting.policy.dataSubmissionEnabled",
-        "app.update.enabled",
-        "browser.crashReports.unsubmittedCheck.enabled",
-        "breakpad.reportURL",
-        "browser.download.folderList",
-        "browser.download.dir",
+        "user_pref(\"toolkit.telemetry.enabled\", false);",
+        "user_pref(\"toolkit.telemetry.server\", \"\");",
+        "user_pref(\"datareporting.policy.dataSubmissionEnabled\", false);",
+        "user_pref(\"app.update.enabled\", false);",
+        "user_pref(\"browser.crashReports.unsubmittedCheck.enabled\", false);",
+        "user_pref(\"breakpad.reportURL\", \"\");",
+        "user_pref(\"browser.download.folderList\", 2);",
+        // Manual proxy; failover_direct=false and
+        // allow_hijacking_localhost=true close Firefox's two silent bypasses.
+        "user_pref(\"network.proxy.type\", 1);",
+        "user_pref(\"network.proxy.http\", \"127.0.0.1\");",
+        "user_pref(\"network.proxy.http_port\", 43111);",
+        "user_pref(\"network.proxy.ssl\", \"127.0.0.1\");",
+        "user_pref(\"network.proxy.ssl_port\", 43111);",
+        "user_pref(\"network.proxy.ftp\", \"\");",
+        "user_pref(\"network.proxy.socks\", \"\");",
+        "user_pref(\"network.proxy.socks_remote_dns\", true);",
+        "user_pref(\"network.proxy.no_proxies_on\", \"\");",
+        "user_pref(\"network.proxy.allow_hijacking_localhost\", true);",
+        "user_pref(\"network.proxy.failover_direct\", false);",
+        "user_pref(\"network.proxy.autoconfig_url\", \"\");",
+        // No DNS/QUIC/prefetch/speculation path of its own.
+        "user_pref(\"network.trr.mode\", 5);",
+        "user_pref(\"network.trr.uri\", \"\");",
+        "user_pref(\"network.dns.disablePrefetch\", true);",
+        "user_pref(\"network.dns.disablePrefetchFromHTTPS\", true);",
+        "user_pref(\"network.prefetch-next\", false);",
+        "user_pref(\"network.http.speculative-parallel-limit\", 0);",
+        "user_pref(\"network.predictor.enabled\", false);",
+        "user_pref(\"network.http.http3.enable\", false);",
+        "user_pref(\"network.http.altsvc.enabled\", false);",
+        "user_pref(\"media.peerconnection.enabled\", false);",
+        "user_pref(\"media.peerconnection.ice.proxy_only\", true);",
+        // Safe Browsing / OCSP / Remote Settings:
+        "user_pref(\"browser.safebrowsing.malware.enabled\", false);",
+        "user_pref(\"browser.safebrowsing.phishing.enabled\", false);",
+        "user_pref(\"browser.safebrowsing.downloads.enabled\", false);",
+        "user_pref(\"security.OCSP.enabled\", 0);",
+        "user_pref(\"security.OCSP.require\", false);",
+        "user_pref(\"security.remote_settings.crlite_filters.enabled\", false);",
+        "user_pref(\"services.settings.server\", \"data:,\");",
     };
     for (required) |needle| {
         try std.testing.expect(std.mem.indexOf(u8, content, needle) != null);
@@ -431,17 +540,46 @@ test "one-shot profile writes user.js prefs and is removed on deinit" {
     try std.testing.expectError(error.FileNotFound, compat.fs.accessAbsolute(profile_path, .{}));
 }
 
+test "one-shot profile and downloads directories are owner-only" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var profile = try Profile.create(allocator, null);
+    defer profile.deinit();
+
+    const downloads = try compat.fs.path.join(allocator, &.{ profile.path, "downloads" });
+    defer allocator.free(downloads);
+
+    // Regression: both directories used to be created with the default 0777
+    // minus umask, so other local users could read cookies and downloads.
+    const profile_stat = try compat.fs.Dir.cwd().statFile(profile.path);
+    try std.testing.expectEqual(@as(compat.fs.File.Mode, 0o700), profile_stat.mode & 0o777);
+    const downloads_stat = try compat.fs.Dir.cwd().statFile(downloads);
+    try std.testing.expectEqual(@as(compat.fs.File.Mode, 0o700), downloads_stat.mode & 0o777);
+}
+
+test "profile for an external WebDriver endpoint has no proxy prefs" {
+    const allocator = std.testing.allocator;
+    var profile = try Profile.create(allocator, null);
+    defer profile.deinit();
+
+    const content = try readProfileUserJs(allocator, profile.path);
+    defer allocator.free(content);
+    try std.testing.expect(std.mem.indexOf(u8, content, "network.proxy.") == null);
+    // The outbound hardening does not depend on the proxy.
+    try std.testing.expect(std.mem.indexOf(u8, content, "user_pref(\"network.trr.mode\", 5);") != null);
+}
+
 test "one-shot profiles use distinct directories" {
     const allocator = std.testing.allocator;
-    var first = try Profile.create(allocator);
+    var first = try Profile.create(allocator, null);
     defer first.deinit();
-    var second = try Profile.create(allocator);
+    var second = try Profile.create(allocator, null);
     defer second.deinit();
     try std.testing.expect(!std.mem.eql(u8, first.path, second.path));
 }
 
 test "user.js normalizes Windows download paths" {
-    const js = try userJsAlloc(std.testing.allocator, "C:\\Temp\\wd\\downloads");
+    const js = try userJsAlloc(std.testing.allocator, null, "C:\\Temp\\wd\\downloads");
     defer std.testing.allocator.free(js);
     try std.testing.expect(std.mem.indexOf(
         u8,
