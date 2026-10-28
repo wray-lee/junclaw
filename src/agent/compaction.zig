@@ -227,8 +227,7 @@ fn flushMemoriesBeforeCompaction(
     redactor: ?*redaction.Redactor,
 ) void {
     if (!config.memory_flush) return;
-    const mem = config.mem orelse return;
-    const session_id = config.memory_session_id orelse return;
+    if (config.mem == null or config.memory_session_id == null) return;
 
     const transcript = buildCompactionTranscript(
         allocator,
@@ -239,6 +238,21 @@ fn flushMemoriesBeforeCompaction(
         redactor,
     ) catch return;
     defer allocator.free(transcript);
+    flushMemoriesFromTranscript(allocator, provider, model_name, transcript, config);
+}
+
+/// Flush variant for engines that render their own transcript (dsh-native
+/// compacts inside the kernel). `transcript` is the already-redacted excerpt.
+pub fn flushMemoriesFromTranscript(
+    allocator: std.mem.Allocator,
+    provider: Provider,
+    model_name: []const u8,
+    transcript: []const u8,
+    config: CompactionConfig,
+) void {
+    if (!config.memory_flush) return;
+    const mem = config.mem orelse return;
+    const session_id = config.memory_session_id orelse return;
     if (transcript.len == 0) return;
 
     const system_prompt = "Extract durable facts and preferences about the user from this conversation excerpt. Output one fact per line, at most 10 lines. Output nothing if there is nothing worth remembering.";
