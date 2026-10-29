@@ -615,6 +615,40 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
     return list;
 }
 
+const DnsResolver = enum { libc_getaddrinfo, std_lookup };
+
+/// Android ships no /etc/resolv.conf, where Zig's std resolver would fall back
+/// to 127.0.0.1:53 and fail with NameServerFailure. bionic's getaddrinfo asks
+/// netd instead, so abi == .android must use libc. Every other non-Windows
+/// target already resolved through libc getaddrinfo here.
+fn dnsResolverFor(comptime os: std.Target.Os.Tag, comptime abi: std.Target.Abi) DnsResolver {
+    if (os == .windows) return .std_lookup;
+    return switch (abi) {
+        .android => .libc_getaddrinfo,
+        else => .libc_getaddrinfo,
+    };
+}
+
+/// Converts an addrinfo-shaped chain into Address values. No syscalls; any node
+/// with .addr and .next works, so tests build one by hand. Caller owns `arena`.
+fn addrsFromAddrinfoChain(arena: Allocator, res: anytype) GetAddressListError![]Address {
+    var addrs = std.ArrayList(Address).empty;
+    defer addrs.deinit(arena);
+
+    var it = res;
+    while (it) |info| : (it = info.next) {
+        const addr = info.addr orelse continue;
+        switch (addr.family) {
+            posix.AF.INET => try addrs.append(arena, .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(addr))).* } }),
+            posix.AF.INET6 => try addrs.append(arena, .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(addr))).* } }),
+            else => {},
+        }
+    }
+
+    if (addrs.items.len == 0) return error.UnknownHostName;
+    return addrs.toOwnedSlice(arena);
+}
+
 pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressListError!*AddressList {
     if (name.len > IoNet.HostName.max_len) return error.NameTooLong;
 
@@ -631,7 +665,7 @@ pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressLis
         return list;
     } else |_| {}
 
-    if (builtin.os.tag == .windows) {
+    if (comptime dnsResolverFor(builtin.os.tag, builtin.abi) == .std_lookup) {
         if (shouldUseWindowsLocalhostFallback(name)) {
             const fallback_name = "127.0.0.1";
             const fallback_addr = Address.parseIp(fallback_name, port) catch unreachable;
@@ -697,20 +731,7 @@ pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressLis
     }
     defer if (res) |some| posix.system.freeaddrinfo(some);
 
-    var addrs = std.ArrayList(Address).empty;
-    defer addrs.deinit(arena);
-
-    var it = res;
-    while (it) |info| : (it = info.next) {
-        const addr = info.addr orelse continue;
-        switch (addr.family) {
-            posix.AF.INET => try addrs.append(arena, .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(addr))).* } }),
-            posix.AF.INET6 => try addrs.append(arena, .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(addr))).* } }),
-            else => {},
-        }
-    }
-
-    result.addrs = try addrs.toOwnedSlice(arena);
+    result.addrs = try addrsFromAddrinfoChain(arena, res);
     return result;
 }
 
