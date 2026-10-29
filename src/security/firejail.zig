@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const probe = @import("probe.zig");
+const platform = @import("../platform.zig");
 const Sandbox = @import("sandbox.zig").Sandbox;
 
 /// Firejail sandbox backend for Linux.
@@ -48,7 +49,7 @@ pub const FirejailSandbox = struct {
 
     fn isAvailable(ptr: *anyopaque) bool {
         if (comptime builtin.os.tag != .linux) return false;
-        const smoke_argv = [_][]const u8{ "/bin/sh", "-c", "exit 0" };
+        const smoke_argv = [_][]const u8{ platform.getShell(), platform.getShellFlag(), "exit 0" };
         var wrapped_argv: [8][]const u8 = undefined;
         // Probe the same wrapper argv we execute later so auto-detect does not
         // advertise firejail when the host cannot actually sandbox a command.
@@ -147,7 +148,6 @@ test "firejail sandbox availability requires executable in PATH" {
         return;
     }
 
-    const platform = @import("../platform.zig");
     const c = @cImport({
         @cInclude("stdlib.h");
     });

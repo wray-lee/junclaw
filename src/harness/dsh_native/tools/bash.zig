@@ -205,7 +205,7 @@ fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry
     errdefer compat.fs.deleteFileAbsolute(stderr_temp.path) catch {};
 
     const child = std.process.spawn(io, .{
-        .argv = &.{ "sh", "-c", args.command },
+        .argv = &.{ platform.getShell(), platform.getShellFlag(), args.command },
         .cwd = if (workdir) |dir| .{ .path = dir } else .inherit,
         .environ_map = &env,
         .stdout = .{ .file = stdout_temp.file.toInner() },
@@ -269,10 +269,15 @@ fn createTempFile(allocator: Allocator, context: *const Context, label: []const 
     const hex = std.fmt.bytesToHex(random, .lower);
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "dsh-bash-{s}-{s}.log", .{ &hex, label });
-    // shortcut: POSIX-only fallback (the executor already refuses Windows);
+    // shortcut: non-Android keeps a fixed "/tmp" (the executor already refuses
+    // Windows); Android has no /tmp, so use the TMPDIR fallback chain there.
     // dsh spills under os.tmpdir() (subprocess-local/src/output.ts:32-36).
-    // Upgrade to a TMPDIR lookup when a sandboxed deployment needs it.
-    const dir = context.spill_dir orelse "/tmp";
+    const owned_dir: ?[]const u8 = if (context.spill_dir == null)
+        try platform.getSpoolTempDir(allocator)
+    else
+        null;
+    defer if (owned_dir) |value| allocator.free(value);
+    const dir = context.spill_dir orelse owned_dir.?;
     const path = try std.fs.path.join(allocator, &.{ dir, name });
     const file = compat.fs.createFileAbsolute(path, .{
         .truncate = true,
