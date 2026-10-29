@@ -29,15 +29,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Version mirrors the previous image workflow's "main-<sha>" style; tags use the tag name.
       - name: Resolve version and image
@@ -54,7 +54,7 @@ jobs:
 
       # Repository Dockerfile, release target (non-root). Zig cross-compiles for the baseline x86-64 CPU.
       - name: Build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -93,7 +93,7 @@ jobs:
       # Lightpanda variant: same junclaw binary plus the pinned browser. Built and
       # verified after the release push so it can never block or alter `latest`.
       - name: Build lightpanda
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -145,15 +145,15 @@ jobs:
             rolling: full-dsh-browser
             suffix: full-dsh-browser
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Tag convention from phase 1: <rolling> plus <rolling>-<sha> on main
       # and <release-tag>-<suffix> on a tag push.
@@ -175,7 +175,7 @@ jobs:
           echo "building ${image}:${{ matrix.rolling }} and :${version_tag}"
 
       - name: Build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
