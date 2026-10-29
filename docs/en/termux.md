@@ -45,6 +45,10 @@ zig version
 
 The output must be `0.16.0`.
 
+## TLS Trust Store
+
+Android builds embed the Mozilla CA bundle from curl.se and append `/system/etc/security/cacerts` and the Android 14+ Conscrypt APEX store, so WebSocket and HTTP TLS connections verify certificates and never fall back to unverified TLS.
+
 ## Native Termux Build
 
 ```bash
