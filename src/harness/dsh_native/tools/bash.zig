@@ -178,6 +178,12 @@ fn failure(allocator: Allocator, code: []const u8, message: []const u8) !registr
     } };
 }
 
+/// Shell used to run the command. Android has no PATH `sh`; it lives at
+/// /system/bin/sh. Takes the abi so host tests can assert both branches.
+fn shellCommand(abi: std.Target.Abi) []const u8 {
+    return platform.shellPath(abi);
+}
+
 fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry.ToolResult {
     const io = compat.io();
     const workdir = try resolveWorkdir(allocator, context, args.workdir);
@@ -770,4 +776,12 @@ test "bash builds the child environment from the safe list only" {
     defer env.deinit();
     try testing.expect(env.get(name) == null);
     try testing.expect(env.get("PATH") != null);
+}
+
+test "bash keeps sh from PATH off Android" {
+    // Regression: routing every platform through platform.getShell() spawned
+    // /bin/sh (and cmd.exe on Windows) instead of resolving "sh" from PATH;
+    // only Android needs the absolute bionic shell.
+    try testing.expectEqualStrings("sh", shellCommand(.gnu));
+    try testing.expectEqualStrings("/system/bin/sh", shellCommand(.android));
 }
