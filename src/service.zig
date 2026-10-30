@@ -145,9 +145,11 @@ pub fn handleCommand(
 const InstallTarget = enum { macos, linux, windows, unsupported };
 
 /// Pure install-target selection; takes the abi/os so host tests can assert
-/// Android behavior.
+/// Android behavior. Android reports os.tag == .linux but has no
+/// systemd/OpenRC/SysVinit, so it must fail closed instead of writing a unit
+/// that runs /bin/sh.
 fn installTarget(os: std.Target.Os.Tag, abi: std.Target.Abi) InstallTarget {
-    _ = abi;
+    if (abi == .android) return .unsupported;
     return switch (os) {
         .macos => .macos,
         .linux => .linux,
@@ -157,14 +159,11 @@ fn installTarget(os: std.Target.Os.Tag, abi: std.Target.Abi) InstallTarget {
 }
 
 fn install(allocator: std.mem.Allocator) !void {
-    if (comptime builtin.os.tag == .macos) {
-        try installMacos(allocator);
-    } else if (comptime builtin.os.tag == .linux) {
-        try installLinux(allocator);
-    } else if (comptime builtin.os.tag == .windows) {
-        try installWindows(allocator);
-    } else {
-        return error.UnsupportedPlatform;
+    switch (comptime installTarget(builtin.os.tag, builtin.abi)) {
+        .macos => try installMacos(allocator),
+        .linux => try installLinux(allocator),
+        .windows => try installWindows(allocator),
+        .unsupported => return error.UnsupportedPlatform,
     }
 }
 
