@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
 const net_security = @import("../root.zig").net_security;
+const platform = @import("../platform.zig");
 const WebDriverClient = @import("webdriver_client.zig").WebDriverClient;
 
 const Allocator = std.mem.Allocator;
@@ -295,7 +296,10 @@ pub const Profile = struct {
     }
 };
 
-fn tempBase(allocator: Allocator) ![]u8 {
+fn tempBase(allocator: Allocator) ![]const u8 {
+    // Android has no writable /tmp; getTempDir resolves and creates the
+    // NULLCLAW_HOME/HOME fallback chain.
+    if (comptime builtin.abi == .android) return platform.getTempDir(allocator);
     const names: []const []const u8 = if (builtin.os.tag == .windows)
         &.{ "TEMP", "TMP" }
     else
@@ -586,4 +590,20 @@ test "user.js normalizes Windows download paths" {
         js,
         "user_pref(\"browser.download.dir\", \"C:/Temp/wd/downloads\");",
     ) != null);
+}
+
+test "Android webdriver temp base follows the platform fallback chain" {
+    // Regression: Android has no writable /tmp, so the Firefox profile was
+    // created under /tmp and the browser could not start.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const expected = try compat.fs.path.join(allocator, &.{ root, "tmp" });
+    defer allocator.free(expected);
+    const base = try platform.androidTempDir(allocator, null, root, null);
+    defer allocator.free(base);
+    try std.testing.expectEqualStrings(expected, base);
+    try compat.fs.accessAbsolute(base, .{});
 }

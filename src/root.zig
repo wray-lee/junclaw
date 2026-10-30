@@ -110,6 +110,7 @@ test {
     // Run tests from all imported modules
     @import("std").testing.refAllDecls(@This());
     // Zig does not collect tests from nested module files on its own.
+    _ = @import("build_support.zig");
     _ = @import("harness/contract_test.zig");
     _ = @import("harness/differential_test.zig");
     _ = @import("harness/dsh_native/root.zig");

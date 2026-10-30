@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
 const process_util = @import("process_util.zig");
+const platform = @import("../platform.zig");
 const client_mod = @import("webdriver_client.zig");
 const WebDriverClient = client_mod.WebDriverClient;
 const webdriver_security = @import("webdriver_security.zig");
@@ -365,8 +366,8 @@ pub const WebDriverManager = struct {
 
         var child = if (use_wrapper)
             compat.process.Child.init(&.{
-                "/bin/sh",                     "-c",     driver_wrapper, "sh",
-                self.options.geckodriver_path, "--host", "127.0.0.1",    "--port",
+                platform.getShell(),           platform.getShellFlag(), driver_wrapper, "sh",
+                self.options.geckodriver_path, "--host",                "127.0.0.1",    "--port",
                 port_text,
             }, self.allocator)
         else

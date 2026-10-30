@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const root = @import("root.zig");
+const platform = @import("../platform.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
 
@@ -244,8 +245,10 @@ pub const WhatsAppChannel = struct {
         defer allocator.free(media_resp);
 
         // Step 3: Write to tmp file
-        var path_buf: [1024]u8 = undefined;
-        const local_path = std.fmt.bufPrint(&path_buf, "/tmp/whatsapp_{x}.dat", .{std_compat.crypto.random.int(u64)}) catch return null;
+        const tmp_dir = platform.getSpoolTempDir(allocator) catch return null;
+        defer allocator.free(tmp_dir);
+        const local_path = std.fmt.allocPrint(allocator, "{s}/whatsapp_{x}.dat", .{ tmp_dir, std_compat.crypto.random.int(u64) }) catch return null;
+        defer allocator.free(local_path);
 
         if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
             file.writeAll(media_resp) catch {

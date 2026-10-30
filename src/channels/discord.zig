@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const platform = @import("../platform.zig");
 const bus_mod = @import("../bus.zig");
 const interaction_choices = @import("../interactions/choices.zig");
 const websocket = @import("../websocket.zig");
@@ -1429,8 +1430,10 @@ pub const DiscordChannel = struct {
 
                                     // Make temp file
                                     const rand_id = rand.int(u64);
-                                    var path_buf: [1024]u8 = undefined;
-                                    const local_path = std.fmt.bufPrint(&path_buf, "/tmp/discord_{x}.dat", .{rand_id}) catch continue;
+                                    const tmp_dir = platform.getSpoolTempDir(self.allocator) catch continue;
+                                    defer self.allocator.free(tmp_dir);
+                                    const local_path = std.fmt.allocPrint(self.allocator, "{s}/discord_{x}.dat", .{ tmp_dir, rand_id }) catch continue;
+                                    defer self.allocator.free(local_path);
 
                                     if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
                                         file.writeAll(img_data) catch {
