@@ -178,6 +178,14 @@ fn failure(allocator: Allocator, code: []const u8, message: []const u8) !registr
     } };
 }
 
+/// Shell used to run the command. Android has no PATH `sh`; it lives at
+/// /system/bin/sh. Every other platform keeps the historical PATH lookup of
+/// "sh" (Git Bash on Windows, Nix profiles, ...). Takes the abi so host tests
+/// can assert both branches.
+fn shellCommand(abi: std.Target.Abi) []const u8 {
+    return if (abi == .android) "/system/bin/sh" else "sh";
+}
+
 fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry.ToolResult {
     const io = compat.io();
     const workdir = try resolveWorkdir(allocator, context, args.workdir);
@@ -205,7 +213,7 @@ fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry
     errdefer compat.fs.deleteFileAbsolute(stderr_temp.path) catch {};
 
     const child = std.process.spawn(io, .{
-        .argv = &.{ "sh", "-c", args.command },
+        .argv = &.{ shellCommand(builtin.abi), "-c", args.command },
         .cwd = if (workdir) |dir| .{ .path = dir } else .inherit,
         .environ_map = &env,
         .stdout = .{ .file = stdout_temp.file.toInner() },
@@ -269,10 +277,15 @@ fn createTempFile(allocator: Allocator, context: *const Context, label: []const 
     const hex = std.fmt.bytesToHex(random, .lower);
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "dsh-bash-{s}-{s}.log", .{ &hex, label });
-    // shortcut: POSIX-only fallback (the executor already refuses Windows);
+    // shortcut: non-Android keeps a fixed "/tmp" (the executor already refuses
+    // Windows); Android has no /tmp, so use the TMPDIR fallback chain there.
     // dsh spills under os.tmpdir() (subprocess-local/src/output.ts:32-36).
-    // Upgrade to a TMPDIR lookup when a sandboxed deployment needs it.
-    const dir = context.spill_dir orelse "/tmp";
+    const owned_dir: ?[]const u8 = if (context.spill_dir == null)
+        try platform.getSpoolTempDir(allocator)
+    else
+        null;
+    defer if (owned_dir) |value| allocator.free(value);
+    const dir = context.spill_dir orelse owned_dir.?;
     const path = try std.fs.path.join(allocator, &.{ dir, name });
     const file = compat.fs.createFileAbsolute(path, .{
         .truncate = true,
@@ -765,4 +778,12 @@ test "bash builds the child environment from the safe list only" {
     defer env.deinit();
     try testing.expect(env.get(name) == null);
     try testing.expect(env.get("PATH") != null);
+}
+
+test "bash keeps sh from PATH off Android" {
+    // Regression: routing every platform through platform.getShell() spawned
+    // /bin/sh (and cmd.exe on Windows) instead of resolving "sh" from PATH;
+    // only Android needs the absolute bionic shell.
+    try testing.expectEqualStrings("sh", shellCommand(.gnu));
+    try testing.expectEqualStrings("/system/bin/sh", shellCommand(.android));
 }

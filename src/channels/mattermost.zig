@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
 const root = @import("root.zig");
+const platform = @import("../platform.zig");
 const websocket = @import("../websocket.zig");
 const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
@@ -790,13 +791,13 @@ pub const MattermostChannel = struct {
 
         const tmp_env = std_compat.process.getEnvVarOwned(self.allocator, "TMPDIR") catch null;
         defer if (tmp_env) |v| self.allocator.free(v);
-        const tmp_dir = blk: {
-            if (tmp_env) |v| {
-                const trimmed = std_compat.mem.trimRight(u8, v, "/");
-                if (trimmed.len > 0) break :blk trimmed;
-            }
-            break :blk "/tmp";
-        };
+        const trimmed_env: []const u8 = if (tmp_env) |v| std_compat.mem.trimRight(u8, v, "/") else "";
+        const fallback_dir: ?[]const u8 = if (trimmed_env.len == 0)
+            platform.getSpoolTempDir(self.allocator) catch return null
+        else
+            null;
+        defer if (fallback_dir) |v| self.allocator.free(v);
+        const tmp_dir = if (trimmed_env.len > 0) trimmed_env else fallback_dir.?;
 
         const counter = self.tmp_counter.fetchAdd(1, .monotonic) + 1;
         const path = std.fmt.allocPrint(

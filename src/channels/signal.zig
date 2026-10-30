@@ -482,8 +482,10 @@ pub const SignalChannel = struct {
 
         // Generate temp file
         const rand_id = std_compat.crypto.random.int(u64);
-        var path_buf: [1024]u8 = undefined;
-        const local_path = try std.fmt.bufPrint(&path_buf, "/tmp/signal_{x}.dat", .{rand_id});
+        const tmp_dir = try platform.getSpoolTempDir(allocator);
+        defer allocator.free(tmp_dir);
+        const local_path = try std.fmt.allocPrint(allocator, "{s}/signal_{x}.dat", .{ tmp_dir, rand_id });
+        defer allocator.free(local_path);
 
         var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
         defer file.close();

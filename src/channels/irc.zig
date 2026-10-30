@@ -1,9 +1,11 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const root = @import("root.zig");
 const config_types = @import("../config_types.zig");
 const bus_mod = @import("../bus.zig");
 const thread_stacks = @import("../thread_stacks.zig");
+const tls_ca = @import("../tls/ca.zig");
 
 const log = std.log.scoped(.irc);
 
@@ -82,8 +84,13 @@ pub const IrcChannel = struct {
         write_buf: []u8,
         tls_read_buf: []u8,
         tls_write_buf: []u8,
+        /// Trust anchors selected by `selectTlsCa`; owned when `owns_ca_bundle`.
+        ca_bundle: std.crypto.Certificate.Bundle,
+        ca_bundle_lock: std.Io.RwLock,
+        owns_ca_bundle: bool,
 
         pub fn deinit(self: *TlsState, allocator: std.mem.Allocator) void {
+            if (self.owns_ca_bundle) self.ca_bundle.deinit(allocator);
             allocator.free(self.read_buf);
             allocator.free(self.write_buf);
             allocator.free(self.tls_read_buf);
@@ -369,6 +376,20 @@ pub const IrcChannel = struct {
         }
     }
 
+    /// Pick IRC's TLS trust anchors. Android must verify against the embedded
+    /// Mozilla bundle via `tls_ca.selectSource`; every other ABI keeps the
+    /// historical no-verification policy.
+    fn selectTlsCa(
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        now: std.Io.Timestamp,
+        abi: std.Target.Abi,
+        pem: []const u8,
+    ) !tls_ca.TlsCa {
+        if (abi == .android) return tls_ca.selectSource(gpa, io, now, abi, pem);
+        return .no_verification;
+    }
+
     /// Initialize TLS over an existing TCP stream.
     fn initTls(self: *IrcChannel, stream: std_compat.net.Stream) !void {
         const tls_buf_len = std.crypto.tls.Client.min_buffer_len;
@@ -391,6 +412,28 @@ pub const IrcChannel = struct {
         tls.write_buf = write_buf;
         tls.tls_read_buf = tls_read_buf;
         tls.tls_write_buf = tls_write_buf;
+        tls.ca_bundle = .empty;
+        tls.ca_bundle_lock = .init;
+        tls.owns_ca_bundle = false;
+        errdefer if (tls.owns_ca_bundle) tls.ca_bundle.deinit(self.allocator);
+
+        const is_android = comptime builtin.target.abi == .android;
+
+        switch (try selectTlsCa(
+            self.allocator,
+            std_compat.io(),
+            std.Io.Timestamp.now(std_compat.io(), .real),
+            builtin.target.abi,
+            tls_ca.embeddedPem(),
+        )) {
+            .bundle => |bundle| {
+                tls.ca_bundle = bundle;
+                tls.owns_ca_bundle = true;
+            },
+            // Android must never downgrade; selectSource fails instead.
+            .no_verification => if (is_android) return error.TlsInitializationFailed,
+        }
+
         tls.stream_reader = stream.reader(read_buf);
         tls.stream_writer = stream.writer(write_buf);
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
@@ -400,8 +443,15 @@ pub const IrcChannel = struct {
             &tls.stream_reader.interface,
             &tls.stream_writer.interface,
             .{
-                .host = if (self.tls) .{ .explicit = self.host } else .no_verification,
-                .ca = .no_verification,
+                // Android always verifies the host; other targets keep the
+                // historical check gated on the tls (verify) config flag.
+                .host = if (is_android or self.tls) .{ .explicit = self.host } else .no_verification,
+                .ca = if (tls.owns_ca_bundle) .{ .bundle = .{
+                    .gpa = self.allocator,
+                    .io = std_compat.io(),
+                    .lock = &tls.ca_bundle_lock,
+                    .bundle = &tls.ca_bundle,
+                } } else .no_verification,
                 .read_buffer = tls_read_buf,
                 .write_buffer = tls_write_buf,
                 .entropy = &entropy,
@@ -899,6 +949,22 @@ test "irc split long message" {
 test "irc use_tls defaults to false" {
     const ch = IrcChannel.init(std.testing.allocator, "irc.test", 6697, "bot", null, &.{}, &.{}, null, null, null, true);
     try std.testing.expect(!ch.use_tls);
+}
+
+test "irc TLS on Android never selects no_verification" {
+    // Regression: Android IRC passed .no_verification to the TLS client (MITM)
+    var ca = try IrcChannel.selectTlsCa(
+        std.testing.allocator,
+        std.testing.io,
+        std.Io.Timestamp.now(std.testing.io, .real),
+        .android,
+        @embedFile("../tls/cacert.pem"),
+    );
+    defer switch (ca) {
+        .bundle => |*bundle| bundle.deinit(std.testing.allocator),
+        .no_verification => {},
+    };
+    try std.testing.expect(std.meta.activeTag(ca) == .bundle);
 }
 
 test "irc sasl negotiation base64 encoding correct" {

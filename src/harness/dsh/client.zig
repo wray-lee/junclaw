@@ -8,6 +8,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const websocket = @import("../../websocket.zig");
 const protocol = @import("protocol.zig");
+const tls_ca = @import("../../tls/ca.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -170,6 +171,7 @@ pub fn httpRequest(
 ) !HttpResponse {
     var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     defer client.deinit();
+    try tls_ca.configureHttpClient(&client, allocator);
 
     var header_buf: [8]std.http.Header = undefined;
     if (headers.len > header_buf.len) return error.TooManyHeaders;

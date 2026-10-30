@@ -1,0 +1,20 @@
+Third-party data
+================
+
+Mozilla CA root certificates (src/tls/cacert.pem)
+-------------------------------------------------
+Source:  https://curl.se/ca/cacert.pem
+         (curl CA bundle extracted from Mozilla's root store;
+         https://curl.se/docs/caextract.html)
+License: Mozilla Public License 2.0 (MPL-2.0), https://mozilla.org/MPL/2.0/
+Version: certificate data from Mozilla as of Tue Oct 20 13:32:40 2026 GMT
+         (downloaded 2026-10-30)
+SHA-256: 796f1389bfea13c0ed78f663b765baaff54a508e5483786bd6ece73c5e3e3cbe
+Certs:   118
+
+This file is embedded only in Android builds (`@embedFile` under
+`builtin.abi == .android` in src/tls/ca.zig); other targets do not contain it.
+
+Update:  download https://curl.se/ca/cacert.pem, check its SHA-256 against
+         https://curl.se/ca/cacert.pem.sha256, replace src/tls/cacert.pem, and
+         update the version, download date, SHA-256 and certificate count here.

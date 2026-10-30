@@ -114,8 +114,63 @@ pub fn getHomeDir(allocator: std.mem.Allocator) ![]const u8 {
     }
 }
 
+/// Pure shell selection; takes the abi so host tests can assert Android behavior.
+pub fn shellPath(abi: std.Target.Abi) []const u8 {
+    // Android has no /bin/sh; it lives at /system/bin/sh.
+    if (abi == .android) return "/system/bin/sh";
+    return if (comptime builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
+}
+
+/// Pure temp-dir selection; takes the abi so host tests can assert Android behavior.
+/// Android has no writable /tmp: TMPDIR, else <base>/tmp where base is
+/// $NULLCLAW_HOME or $HOME (resolved by the caller).
+pub fn tempDirPath(
+    allocator: std.mem.Allocator,
+    abi: std.Target.Abi,
+    tmpdir: ?[]const u8,
+    base: ?[]const u8,
+) ![]const u8 {
+    if (tmpdir) |value| return allocator.dupe(u8, value);
+    if (abi != .android) return allocator.dupe(u8, "/tmp");
+    const parent = std_compat.mem.trimRight(u8, base orelse return error.TempDirNotFound, "/");
+    // An empty or "/" base would resolve to the unwritable /tmp.
+    if (parent.len == 0) return error.TempDirNotFound;
+    return std.fmt.allocPrint(allocator, "{s}/tmp", .{parent});
+}
+
+/// Android temp dir: TMPDIR, else <NULLCLAW_HOME|HOME>/tmp. Takes the env
+/// values so host tests can assert the fallback chain. Creates only the tmp
+/// directory (0700): a missing or invalid home base fails closed instead of
+/// being created as a side effect. Caller owns the returned slice.
+pub fn androidTempDir(
+    allocator: std.mem.Allocator,
+    tmpdir: ?[]const u8,
+    nullclaw_home: ?[]const u8,
+    home: ?[]const u8,
+) ![]const u8 {
+    const dir = try tempDirPath(allocator, .android, tmpdir, nullclaw_home orelse home);
+    errdefer allocator.free(dir);
+    if (tmpdir == null) {
+        std.Io.Dir.createDirAbsolute(std_compat.io(), dir, std_compat.fs.permissionsFromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+    return dir;
+}
+
+/// Temp dir for spooled payloads (attachment downloads, spilled output).
+/// Android has no writable /tmp, so use the Android fallback chain; other
+/// platforms keep the historical hardcoded "/tmp".
+/// Caller owns the returned slice.
+pub fn getSpoolTempDir(allocator: std.mem.Allocator) ![]const u8 {
+    if (comptime builtin.abi == .android) return getTempDir(allocator);
+    return allocator.dupe(u8, "/tmp");
+}
+
 /// Returns the system temp directory. Tries:
 ///   Windows: TEMP → TMP → "C:\\Temp"
+///   Android: TMPDIR → "$NULLCLAW_HOME/tmp" → "$HOME/tmp" (directory is created)
 ///   Unix:    TMPDIR → "/tmp"
 /// Caller owns the returned slice.
 pub fn getTempDir(allocator: std.mem.Allocator) ![]const u8 {
@@ -123,15 +178,24 @@ pub fn getTempDir(allocator: std.mem.Allocator) ![]const u8 {
         if (getEnvOrNull(allocator, "TEMP")) |v| return v;
         if (getEnvOrNull(allocator, "TMP")) |v| return v;
         return allocator.dupe(u8, "C:\\Temp");
-    } else {
+    }
+    if (comptime builtin.abi != .android) {
         if (getEnvOrNull(allocator, "TMPDIR")) |v| return v;
         return allocator.dupe(u8, "/tmp");
     }
+    // Android: no /tmp; TMPDIR, else $NULLCLAW_HOME/tmp or $HOME/tmp.
+    const tmpdir = getEnvOrNull(allocator, "TMPDIR");
+    defer if (tmpdir) |v| allocator.free(v);
+    const nullclaw_home = if (tmpdir == null) getEnvOrNull(allocator, "NULLCLAW_HOME") else null;
+    defer if (nullclaw_home) |v| allocator.free(v);
+    const home = if (tmpdir == null and nullclaw_home == null) getEnvOrNull(allocator, "HOME") else null;
+    defer if (home) |v| allocator.free(v);
+    return androidTempDir(allocator, tmpdir, nullclaw_home, home);
 }
 
 /// Returns the platform shell for executing commands.
 pub fn getShell() []const u8 {
-    return if (comptime builtin.os.tag == .windows) "cmd.exe" else "/bin/sh";
+    return shellPath(builtin.abi);
 }
 
 /// Returns the shell flag for passing a command string.
@@ -199,4 +263,77 @@ test "getTempDir returns a non-empty string" {
 test "getShell returns a known value" {
     const shell = getShell();
     try std.testing.expect(shell.len > 0);
+}
+
+test "shellPath selects /system/bin/sh on Android" {
+    // Regression: Android has no /bin/sh, so spawning the shell failed with ENOENT.
+    try std.testing.expectEqualStrings("/system/bin/sh", shellPath(.android));
+}
+
+test "shellPath keeps /bin/sh on non-Android Unix" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectEqualStrings("/bin/sh", shellPath(.gnu));
+}
+
+test "tempDirPath prefers TMPDIR on Android" {
+    // Regression: /tmp is not writable on Android.
+    const dir = try tempDirPath(std.testing.allocator, .android, "/data/local/tmp", null);
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectEqualStrings("/data/local/tmp", dir);
+}
+
+test "tempDirPath falls back under the home base on Android" {
+    // Regression: /tmp is not writable on Android; NULLCLAW_HOME/HOME/tmp is used.
+    const dir = try tempDirPath(std.testing.allocator, .android, null, "/data/user/0/com.example.app");
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectEqualStrings("/data/user/0/com.example.app/tmp", dir);
+}
+
+test "tempDirPath reports a missing Android temp base" {
+    try std.testing.expectError(error.TempDirNotFound, tempDirPath(std.testing.allocator, .android, null, null));
+}
+
+test "tempDirPath keeps /tmp on non-Android Unix" {
+    const dir = try tempDirPath(std.testing.allocator, .gnu, null, "/home/user");
+    defer std.testing.allocator.free(dir);
+    try std.testing.expectEqualStrings("/tmp", dir);
+}
+
+test "tempDirPath fails closed on empty or root Android base" {
+    // Regression: an empty or "/" HOME resolved to /tmp, which Android cannot
+    // create, and getTempDir created HOME as a side effect.
+    try std.testing.expectError(error.TempDirNotFound, tempDirPath(std.testing.allocator, .android, null, ""));
+    try std.testing.expectError(error.TempDirNotFound, tempDirPath(std.testing.allocator, .android, null, "/"));
+}
+
+test "androidTempDir does not create the home base" {
+    // Regression: getTempDir created HOME instead of failing closed when the
+    // base directory was missing.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const missing = try std_compat.fs.path.join(allocator, &.{ root, "missing-home" });
+    defer allocator.free(missing);
+    try std.testing.expectError(error.FileNotFound, androidTempDir(allocator, null, missing, null));
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(missing, .{}));
+}
+
+test "androidTempDir creates the tmp directory 0700" {
+    // Regression: HOME/tmp was created with the default 0755 mode.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dir = try androidTempDir(allocator, null, root, null);
+    defer allocator.free(dir);
+    const stat = try std_compat.fs.cwd().statFile(dir);
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o700), stat.mode & 0o777);
+    } else {
+        // Windows/WASI report no Unix mode bits; only existence is assertable.
+        try std.testing.expect(stat.kind == .directory);
+    }
 }

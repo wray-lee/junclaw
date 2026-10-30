@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_support = @import("src/build_support.zig");
 
 const VendoredFileHash = struct {
     path: []const u8,
@@ -372,7 +373,10 @@ fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build, target: std.Build.
         .optimize = optimize,
     });
     module.addIncludePath(wasm3_dep.path("source"));
-    module.linkLibrary(wasm3_dep.artifact("wasm3"));
+    const wasm3_lib = wasm3_dep.artifact("wasm3");
+    // Android executables are PIE; x86_64 rejects non-PIC 32-bit relocations.
+    if (target.result.abi == .android) wasm3_lib.root_module.pic = true;
+    module.linkLibrary(wasm3_lib);
 }
 
 pub fn build(b: *std.Build) void {
@@ -464,6 +468,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const sqlite3_artifact = sqlite3_dep.artifact("sqlite3");
+        // Android executables are PIE; x86_64 rejects non-PIC 32-bit relocations.
+        if (target.result.abi == .android) sqlite3_artifact.root_module.pic = true;
         sqlite3_artifact.root_module.addCMacro("SQLITE_ENABLE_FTS5", "1");
         break :blk sqlite3_artifact;
     } else null;
@@ -567,6 +573,14 @@ pub fn build(b: *std.Build) void {
             .root_module = exe_root_module,
             .linkage = .static,
         })
+    else if (target.result.abi == .android)
+        // Zig defaults Android API >= 29 executables to static linking; the
+        // NDK only ships bionic as shared libraries, so request dynamic PIE.
+        b.addExecutable(.{
+            .name = "nullclaw",
+            .root_module = exe_root_module,
+            .linkage = .dynamic,
+        })
     else
         b.addExecutable(.{
             .name = "nullclaw",
@@ -612,8 +626,13 @@ pub fn build(b: *std.Build) void {
         const spike_exe = b.addExecutable(.{
             .name = "dsh-spike",
             .root_module = spike_module,
-            // Static musl so the binary runs in the bare dsh Node image.
-            .linkage = if (target.result.os.tag == .linux) .static else null,
+            // Static musl so the binary runs in the bare dsh Node image;
+            // Android's bionic libc only supports dynamic executables.
+            .linkage = switch (build_support.dshSpikeLinkage(target.result.os.tag, target.result.abi)) {
+                .static => .static,
+                .dynamic => .dynamic,
+                .inherit => null,
+            },
         });
         const spike_step = b.step("dsh-spike", "Build the dsh sidecar P0 spike (requires -Dharness_dsh=true)");
         const install_spike = b.addInstallArtifact(spike_exe, .{});

@@ -142,15 +142,28 @@ pub fn handleCommand(
     };
 }
 
+const InstallTarget = enum { macos, linux, windows, unsupported };
+
+/// Pure install-target selection; takes the abi/os so host tests can assert
+/// Android behavior. Android reports os.tag == .linux but has no
+/// systemd/OpenRC/SysVinit, so it must fail closed instead of writing a unit
+/// that runs /bin/sh.
+fn installTarget(os: std.Target.Os.Tag, abi: std.Target.Abi) InstallTarget {
+    if (abi == .android) return .unsupported;
+    return switch (os) {
+        .macos => .macos,
+        .linux => .linux,
+        .windows => .windows,
+        else => .unsupported,
+    };
+}
+
 fn install(allocator: std.mem.Allocator) !void {
-    if (comptime builtin.os.tag == .macos) {
-        try installMacos(allocator);
-    } else if (comptime builtin.os.tag == .linux) {
-        try installLinux(allocator);
-    } else if (comptime builtin.os.tag == .windows) {
-        try installWindows(allocator);
-    } else {
-        return error.UnsupportedPlatform;
+    switch (comptime installTarget(builtin.os.tag, builtin.abi)) {
+        .macos => try installMacos(allocator),
+        .linux => try installLinux(allocator),
+        .windows => try installWindows(allocator),
+        .unsupported => return error.UnsupportedPlatform,
     }
 }
 
@@ -1698,4 +1711,12 @@ test "windowsServiceBinPath uses hidden service gateway entrypoint" {
 test "isWindowsServiceGatewayArg matches hidden service sentinel" {
     try std.testing.expect(isWindowsServiceGatewayArg("__windows-service-gateway"));
     try std.testing.expect(!isWindowsServiceGatewayArg("gateway"));
+}
+
+test "service install is unsupported on Android" {
+    // Regression: Android reports os.tag == .linux, so install wrote a
+    // SysVinit unit whose /bin/sh does not exist, then failed at start time.
+    try std.testing.expectEqual(InstallTarget.unsupported, installTarget(.linux, .android));
+    try std.testing.expectEqual(InstallTarget.linux, installTarget(.linux, .gnu));
+    try std.testing.expectEqual(InstallTarget.macos, installTarget(.macos, .gnu));
 }

@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const std_compat = @import("compat");
 const thread_stacks = @import("thread_stacks.zig");
+const tls_ca = @import("tls/ca.zig");
 
 const log = std.log.scoped(.websocket);
 
@@ -79,10 +80,6 @@ pub const WsClient = struct {
         opcode: Opcode,
         payload: []u8,
     };
-
-    fn shouldLoadSystemCaBundle() bool {
-        return builtin.target.abi != .android;
-    }
 
     /// Connect to wss://host:port/path.
     /// `extra_headers`: additional HTTP request headers (without trailing CRLF).
@@ -189,20 +186,21 @@ pub const WsClient = struct {
         var entropy: [std.crypto.tls.Client.Options.entropy_len]u8 = undefined;
         std_compat.crypto.random.bytes(&entropy);
 
-        var ca_bundle = std.crypto.Certificate.Bundle.empty;
         var has_ca_bundle = false;
-        if (shouldLoadSystemCaBundle()) {
-            if (ca_bundle.rescan(allocator, std_compat.io(), std.Io.Timestamp.now(std_compat.io(), .real))) |_| {
+        switch (try tls_ca.selectSource(
+            allocator,
+            std_compat.io(),
+            std.Io.Timestamp.now(std_compat.io(), .real),
+            builtin.target.abi,
+            tls_ca.embeddedPem(),
+        )) {
+            // On Android selectSource fails instead of downgrading here.
+            .bundle => |bundle| {
+                tls_state.ca_bundle = bundle;
+                tls_state.owns_ca_bundle = true;
                 has_ca_bundle = true;
-            } else |err| {
-                log.warn("WS TLS: system CA bundle unavailable, fallback to no verification: {}", .{err});
-            }
-        } else {
-            log.warn("WS TLS: skipping system CA bundle load on Android; using no verification", .{});
-        }
-        if (has_ca_bundle) {
-            tls_state.ca_bundle = ca_bundle;
-            tls_state.owns_ca_bundle = true;
+            },
+            .no_verification => {},
         }
 
         // tls_state now owns all buffers and the CA bundle (if any).
@@ -1469,10 +1467,6 @@ test "bounded connect abandons at the deadline and the worker releases a late re
     // byte queued above. std.posix.read maps EBADF to error.Unexpected
     // ("use after free"), hence the expected error rather than BadFileDescriptor.
     try std.testing.expectError(error.Unexpected, std.posix.read(sockets[0], &probe));
-}
-
-test "ws CA bundle loading matches target ABI policy" {
-    try std.testing.expectEqual(builtin.target.abi != .android, WsClient.shouldLoadSystemCaBundle());
 }
 
 test "readFrame rejects oversized payload claim before allocation" {
