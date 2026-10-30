@@ -291,3 +291,37 @@ test "tempDirPath keeps /tmp on non-Android Unix" {
     defer std.testing.allocator.free(dir);
     try std.testing.expectEqualStrings("/tmp", dir);
 }
+
+test "tempDirPath fails closed on empty or root Android base" {
+    // Regression: an empty or "/" HOME resolved to /tmp, which Android cannot
+    // create, and getTempDir created HOME as a side effect.
+    try std.testing.expectError(error.TempDirNotFound, tempDirPath(std.testing.allocator, .android, null, ""));
+    try std.testing.expectError(error.TempDirNotFound, tempDirPath(std.testing.allocator, .android, null, "/"));
+}
+
+test "androidTempDir does not create the home base" {
+    // Regression: getTempDir created HOME instead of failing closed when the
+    // base directory was missing.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const missing = try std_compat.fs.path.join(allocator, &.{ root, "missing-home" });
+    defer allocator.free(missing);
+    try std.testing.expectError(error.FileNotFound, androidTempDir(allocator, null, missing, null));
+    try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(missing, .{}));
+}
+
+test "androidTempDir creates the tmp directory 0700" {
+    // Regression: HOME/tmp was created with the default 0755 mode.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+    const dir = try androidTempDir(allocator, null, root, null);
+    defer allocator.free(dir);
+    const stat = try std_compat.fs.cwd().statFile(dir);
+    try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o700), stat.mode & 0o777);
+}
