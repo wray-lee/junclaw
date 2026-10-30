@@ -617,20 +617,21 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
 
 const DnsResolver = enum { libc_getaddrinfo, std_lookup };
 
-/// Android ships no /etc/resolv.conf, where Zig's std resolver would fall back
-/// to 127.0.0.1:53 and fail with NameServerFailure. bionic's getaddrinfo asks
-/// netd instead, so abi == .android must use libc. Every other non-Windows
-/// target already resolved through libc getaddrinfo here.
+/// Android ships no /etc/resolv.conf, where Zig's std resolver falls back to
+/// 127.0.0.1:53 and fails with NameServerFailure; bionic's getaddrinfo asks
+/// netd instead. Every non-Windows target, Android included, has always
+/// resolved through libc here: this is a pinned choice, not a fix.
 fn dnsResolverFor(comptime os: std.Target.Os.Tag, comptime abi: std.Target.Abi) DnsResolver {
     if (os == .windows) return .std_lookup;
-    return switch (abi) {
-        .android => .libc_getaddrinfo,
-        else => .libc_getaddrinfo,
-    };
+    // Non-Windows targets all resolve through libc; the parameter lets tests
+    // pin .android against a future switch to std_lookup.
+    _ = abi;
+    return .libc_getaddrinfo;
 }
 
 /// Converts an addrinfo-shaped chain into Address values. No syscalls; any node
 /// with .addr and .next works, so tests build one by hand. Caller owns `arena`.
+/// An empty chain yields an empty slice; callers keep their own empty policy.
 fn addrsFromAddrinfoChain(arena: Allocator, res: anytype) GetAddressListError![]Address {
     var addrs = std.ArrayList(Address).empty;
     defer addrs.deinit(arena);
@@ -645,7 +646,6 @@ fn addrsFromAddrinfoChain(arena: Allocator, res: anytype) GetAddressListError![]
         }
     }
 
-    if (addrs.items.len == 0) return error.UnknownHostName;
     return addrs.toOwnedSlice(arena);
 }
 
@@ -1056,10 +1056,10 @@ test "compat net writeWithTimeout gives up on a peer that stops reading" {
 }
 
 test "compat net selects libc getaddrinfo on android" {
-    // Regression: Android has no /etc/resolv.conf. Zig's std resolver falls back
-    // to 127.0.0.1:53 there and fails with NameServerFailure, so abi == .android
-    // must resolve through bionic getaddrinfo (netd). Nothing pinned that choice
-    // before this test; Linux and the other non-Windows targets keep using libc.
+    // Android has no /etc/resolv.conf, so Zig's std resolver would fall back to
+    // 127.0.0.1:53 and fail with NameServerFailure; bionic getaddrinfo asks
+    // netd. compat already used libc before this pin (no regression), so the
+    // test only guards the choice against a future switch to std.
     try std.testing.expectEqual(DnsResolver.libc_getaddrinfo, dnsResolverFor(.linux, .android));
     try std.testing.expectEqual(DnsResolver.libc_getaddrinfo, dnsResolverFor(.linux, .gnu));
     try std.testing.expectEqual(DnsResolver.std_lookup, dnsResolverFor(.windows, .gnu));
@@ -1100,14 +1100,15 @@ test "compat net converts an addrinfo chain to addresses" {
     try std.testing.expectEqual(@as(u8, 1), addrs[1].in6.sa.addr[15]);
 }
 
-test "compat net rejects an empty addrinfo result" {
-    // Regression: a successful libc call with no usable node used to produce a
-    // zero-length address list; it must surface as UnknownHostName instead.
+test "compat net maps an empty addrinfo chain to an empty list" {
+    // Baseline (463a7bd1) behavior: a successful libc call with no usable node
+    // produced a zero-length address list, and getAddressList still does.
     const TestNode = struct {
         addr: ?*posix.sockaddr,
         next: ?*const @This() = null,
     };
-    try std.testing.expectError(error.UnknownHostName, addrsFromAddrinfoChain(std.testing.allocator, @as(?*const TestNode, null)));
+    const addrs = try addrsFromAddrinfoChain(std.testing.allocator, @as(?*const TestNode, null));
+    try std.testing.expectEqual(@as(usize, 0), addrs.len);
 }
 
 test "compat net resolves localhost through libc getaddrinfo" {
