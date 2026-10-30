@@ -179,9 +179,11 @@ fn failure(allocator: Allocator, code: []const u8, message: []const u8) !registr
 }
 
 /// Shell used to run the command. Android has no PATH `sh`; it lives at
-/// /system/bin/sh. Takes the abi so host tests can assert both branches.
+/// /system/bin/sh. Every other platform keeps the historical PATH lookup of
+/// "sh" (Git Bash on Windows, Nix profiles, ...). Takes the abi so host tests
+/// can assert both branches.
 fn shellCommand(abi: std.Target.Abi) []const u8 {
-    return platform.shellPath(abi);
+    return if (abi == .android) "/system/bin/sh" else "sh";
 }
 
 fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry.ToolResult {
@@ -211,7 +213,7 @@ fn runPosix(context: *const Context, allocator: Allocator, args: Args) !registry
     errdefer compat.fs.deleteFileAbsolute(stderr_temp.path) catch {};
 
     const child = std.process.spawn(io, .{
-        .argv = &.{ platform.getShell(), platform.getShellFlag(), args.command },
+        .argv = &.{ shellCommand(builtin.abi), "-c", args.command },
         .cwd = if (workdir) |dir| .{ .path = dir } else .inherit,
         .environ_map = &env,
         .stdout = .{ .file = stdout_temp.file.toInner() },
