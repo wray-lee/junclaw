@@ -37,10 +37,34 @@ fn resolvePathFor(
     protocol: std.http.Client.Protocol,
     host: []const u8,
 ) ResolvePath {
-    _ = abi;
-    _ = protocol;
-    _ = host;
-    return .std_resolver;
+    if (abi != .android) return .std_resolver;
+    if (protocol != .plain) return .std_resolver;
+    // Bracketed IPv6 is not a HostName; std rejects it either way.
+    if (std.mem.indexOfScalar(u8, host, ':') != null) return .std_resolver;
+    if (std_compat.net.Address.resolveIp(host, 0)) |_| return .std_resolver else |_| {}
+    const name = if (std.mem.endsWith(u8, host, ".")) host[0 .. host.len - 1] else host;
+    if (std.ascii.eqlIgnoreCase(name, "localhost")) return .std_resolver;
+    if (name.len > ".localhost".len and std.ascii.endsWithIgnoreCase(name, ".localhost")) return .std_resolver;
+    return .compat_resolver;
+}
+
+/// Resolves `host` through compat.net (bionic getaddrinfo on Android) and
+/// returns the first IPv4 result as text. std.http's HostName cannot carry
+/// IPv6 literals, so IPv6-only hosts would have to keep the std path.
+fn compatIp4Text(
+    allocator: std.mem.Allocator,
+    host: []const u8,
+    port: u16,
+    buf: []u8,
+) ![]const u8 {
+    const list = try std_compat.net.getAddressList(allocator, host, port);
+    defer list.deinit();
+    for (list.addrs) |addr| {
+        if (addr.any.family != std.posix.AF.INET) continue;
+        const bytes = std.mem.asBytes(&addr.in.sa.addr);
+        return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] });
+    }
+    return error.UnknownHostName;
 }
 
 test "sse resolves real hostnames through compat on android" {
@@ -48,8 +72,16 @@ test "sse resolves real hostnames through compat on android" {
     // Literal IPs and loopback never need a DNS lookup; keep them on std.
     try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .plain, "127.0.0.1"));
     try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .plain, "localhost"));
+    try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .plain, "localhost."));
+    try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .plain, "signal.localhost"));
     try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.gnu, .plain, "signal.example.com"));
     try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .tls, "signal.example.com"));
+}
+
+test "sse compat resolver formats an ipv4 host" {
+    var buf: [std.Io.net.HostName.max_len]u8 = undefined;
+    const ip = try compatIp4Text(std.testing.allocator, "localhost", 8080, &buf);
+    try std.testing.expectEqualStrings("127.0.0.1", ip);
 }
 
 /// SSE connection that maintains a persistent HTTP connection for streaming
@@ -110,9 +142,9 @@ pub const SseConnection = struct {
     /// Returns the HTTP status code
     pub fn connect(self: *SseConnection) !u16 {
         // Android note: this persistent streaming request cannot use the
-        // buffered curl fallback in http_util. Signal's supported default is
-        // the local 127.0.0.1 daemon (no DNS lookup); a remote hostname still
-        // requires a dedicated long-lived curl transport.
+        // buffered curl fallback in http_util. Plain-HTTP hostnames resolve
+        // through compat.net there; a TLS hostname still requires a dedicated
+        // long-lived transport.
         // URL already includes account query param from Signal channel config.
         const uri = try std.Uri.parse(self.url);
         self.body_reader = null;
@@ -128,13 +160,16 @@ pub const SseConnection = struct {
             extra_headers_buf[n_headers] = .{ .name = "Last-Event-ID", .value = id };
             n_headers += 1;
         }
-        const options: std.http.Client.RequestOptions = .{ .extra_headers = extra_headers_buf[0..n_headers] };
-
         // Replace any previous request before opening a new stream.
         if (self.request) |*req| {
             req.deinit();
             self.request = null;
         }
+
+        const options: std.http.Client.RequestOptions = .{
+            .extra_headers = extra_headers_buf[0..n_headers],
+            .connection = try self.compatConnection(uri),
+        };
 
         self.request = try self.client.client.request(.GET, uri, options);
         const req = &self.request.?;
@@ -161,6 +196,21 @@ pub const SseConnection = struct {
 
         log.info("SSE connected to {s} (status: {d})", .{ self.url, status_code });
         return status_code;
+    }
+
+    /// Pre-connects through compat.net when Android must resolve the host.
+    /// The request still uses the original URI, so Host stays the hostname.
+    fn compatConnection(self: *SseConnection, uri: std.Uri) !?*std.http.Client.Connection {
+        var host_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host = uri.getHost(&host_buf) catch return null;
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return null;
+        if (resolvePathFor(builtin.abi, protocol, host.bytes) != .compat_resolver) return null;
+
+        const port = uri.port orelse 80;
+        var ip_buf: [std.Io.net.HostName.max_len]u8 = undefined;
+        const ip = try compatIp4Text(self.allocator, host.bytes, port, &ip_buf);
+        const ip_host = std.Io.net.HostName.init(ip) catch unreachable; // digits and dots only
+        return try self.client.client.connectTcp(ip_host, port, .plain);
     }
 
     /// Read data from the SSE stream into the provided buffer
