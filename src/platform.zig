@@ -133,12 +133,15 @@ pub fn tempDirPath(
     if (tmpdir) |value| return allocator.dupe(u8, value);
     if (abi != .android) return allocator.dupe(u8, "/tmp");
     const parent = std_compat.mem.trimRight(u8, base orelse return error.TempDirNotFound, "/");
+    // An empty or "/" base would resolve to the unwritable /tmp.
+    if (parent.len == 0) return error.TempDirNotFound;
     return std.fmt.allocPrint(allocator, "{s}/tmp", .{parent});
 }
 
 /// Android temp dir: TMPDIR, else <NULLCLAW_HOME|HOME>/tmp. Takes the env
-/// values so host tests can assert the fallback chain. The directory is
-/// created; caller owns the returned slice.
+/// values so host tests can assert the fallback chain. Creates only the tmp
+/// directory (0700): a missing or invalid home base fails closed instead of
+/// being created as a side effect. Caller owns the returned slice.
 pub fn androidTempDir(
     allocator: std.mem.Allocator,
     tmpdir: ?[]const u8,
@@ -147,8 +150,12 @@ pub fn androidTempDir(
 ) ![]const u8 {
     const dir = try tempDirPath(allocator, .android, tmpdir, nullclaw_home orelse home);
     errdefer allocator.free(dir);
-    if (nullclaw_home orelse home) |base| try std_compat.fs.cwd().makePath(base);
-    try std_compat.fs.cwd().makePath(dir);
+    if (tmpdir == null) {
+        std.Io.Dir.createDirAbsolute(std_compat.io(), dir, std_compat.fs.permissionsFromMode(0o700)) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
     return dir;
 }
 
