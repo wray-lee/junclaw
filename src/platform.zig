@@ -136,6 +136,22 @@ pub fn tempDirPath(
     return std.fmt.allocPrint(allocator, "{s}/tmp", .{parent});
 }
 
+/// Android temp dir: TMPDIR, else <NULLCLAW_HOME|HOME>/tmp. Takes the env
+/// values so host tests can assert the fallback chain. The directory is
+/// created; caller owns the returned slice.
+pub fn androidTempDir(
+    allocator: std.mem.Allocator,
+    tmpdir: ?[]const u8,
+    nullclaw_home: ?[]const u8,
+    home: ?[]const u8,
+) ![]const u8 {
+    const dir = try tempDirPath(allocator, .android, tmpdir, nullclaw_home orelse home);
+    errdefer allocator.free(dir);
+    if (nullclaw_home orelse home) |base| try std_compat.fs.cwd().makePath(base);
+    try std_compat.fs.cwd().makePath(dir);
+    return dir;
+}
+
 /// Temp dir for spooled payloads (attachment downloads, spilled output).
 /// Android has no writable /tmp, so use the Android fallback chain; other
 /// platforms keep the historical hardcoded "/tmp".
@@ -167,11 +183,7 @@ pub fn getTempDir(allocator: std.mem.Allocator) ![]const u8 {
     defer if (nullclaw_home) |v| allocator.free(v);
     const home = if (tmpdir == null and nullclaw_home == null) getEnvOrNull(allocator, "HOME") else null;
     defer if (home) |v| allocator.free(v);
-    const dir = try tempDirPath(allocator, .android, tmpdir, nullclaw_home orelse home);
-    errdefer allocator.free(dir);
-    if (nullclaw_home orelse home) |base| try std_compat.fs.cwd().makePath(base);
-    try std_compat.fs.cwd().makePath(dir);
-    return dir;
+    return androidTempDir(allocator, tmpdir, nullclaw_home, home);
 }
 
 /// Returns the platform shell for executing commands.

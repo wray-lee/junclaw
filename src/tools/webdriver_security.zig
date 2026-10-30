@@ -296,7 +296,10 @@ pub const Profile = struct {
     }
 };
 
-fn tempBase(allocator: Allocator) ![]u8 {
+fn tempBase(allocator: Allocator) ![]const u8 {
+    // Android has no writable /tmp; getTempDir resolves and creates the
+    // NULLCLAW_HOME/HOME fallback chain.
+    if (comptime builtin.abi == .android) return platform.getTempDir(allocator);
     const names: []const []const u8 = if (builtin.os.tag == .windows)
         &.{ "TEMP", "TMP" }
     else
