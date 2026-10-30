@@ -615,6 +615,40 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
     return list;
 }
 
+const DnsResolver = enum { libc_getaddrinfo, std_lookup };
+
+/// Android ships no /etc/resolv.conf, where Zig's std resolver falls back to
+/// 127.0.0.1:53 and fails with NameServerFailure; bionic's getaddrinfo asks
+/// netd instead. Every non-Windows target, Android included, has always
+/// resolved through libc here: this is a pinned choice, not a fix.
+fn dnsResolverFor(comptime os: std.Target.Os.Tag, comptime abi: std.Target.Abi) DnsResolver {
+    if (os == .windows) return .std_lookup;
+    // Non-Windows targets all resolve through libc; the parameter lets tests
+    // pin .android against a future switch to std_lookup.
+    _ = abi;
+    return .libc_getaddrinfo;
+}
+
+/// Converts an addrinfo-shaped chain into Address values. No syscalls; any node
+/// with .addr and .next works, so tests build one by hand. Caller owns `arena`.
+/// An empty chain yields an empty slice; callers keep their own empty policy.
+fn addrsFromAddrinfoChain(arena: Allocator, res: anytype) GetAddressListError![]Address {
+    var addrs = std.ArrayList(Address).empty;
+    defer addrs.deinit(arena);
+
+    var it = res;
+    while (it) |info| : (it = info.next) {
+        const addr = info.addr orelse continue;
+        switch (addr.family) {
+            posix.AF.INET => try addrs.append(arena, .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(addr))).* } }),
+            posix.AF.INET6 => try addrs.append(arena, .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(addr))).* } }),
+            else => {},
+        }
+    }
+
+    return addrs.toOwnedSlice(arena);
+}
+
 pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressListError!*AddressList {
     if (name.len > IoNet.HostName.max_len) return error.NameTooLong;
 
@@ -631,7 +665,7 @@ pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressLis
         return list;
     } else |_| {}
 
-    if (builtin.os.tag == .windows) {
+    if (comptime dnsResolverFor(builtin.os.tag, builtin.abi) == .std_lookup) {
         if (shouldUseWindowsLocalhostFallback(name)) {
             const fallback_name = "127.0.0.1";
             const fallback_addr = Address.parseIp(fallback_name, port) catch unreachable;
@@ -697,20 +731,7 @@ pub fn getAddressList(gpa: Allocator, name: []const u8, port: u16) GetAddressLis
     }
     defer if (res) |some| posix.system.freeaddrinfo(some);
 
-    var addrs = std.ArrayList(Address).empty;
-    defer addrs.deinit(arena);
-
-    var it = res;
-    while (it) |info| : (it = info.next) {
-        const addr = info.addr orelse continue;
-        switch (addr.family) {
-            posix.AF.INET => try addrs.append(arena, .{ .in = .{ .sa = @as(*const posix.sockaddr.in, @ptrCast(@alignCast(addr))).* } }),
-            posix.AF.INET6 => try addrs.append(arena, .{ .in6 = .{ .sa = @as(*const posix.sockaddr.in6, @ptrCast(@alignCast(addr))).* } }),
-            else => {},
-        }
-    }
-
-    result.addrs = try addrs.toOwnedSlice(arena);
+    result.addrs = try addrsFromAddrinfoChain(arena, res);
     return result;
 }
 
@@ -1032,4 +1053,90 @@ test "compat net writeWithTimeout gives up on a peer that stops reading" {
         total += chunk.len;
     }
     return error.TestUnexpectedResult;
+}
+
+test "compat net selects libc getaddrinfo on android" {
+    // Android has no /etc/resolv.conf, so Zig's std resolver would fall back to
+    // 127.0.0.1:53 and fail with NameServerFailure; bionic getaddrinfo asks
+    // netd. compat already used libc before this pin (no regression), so the
+    // test only guards the choice against a future switch to std.
+    try std.testing.expectEqual(DnsResolver.libc_getaddrinfo, dnsResolverFor(.linux, .android));
+    try std.testing.expectEqual(DnsResolver.libc_getaddrinfo, dnsResolverFor(.linux, .gnu));
+    try std.testing.expectEqual(DnsResolver.std_lookup, dnsResolverFor(.windows, .gnu));
+}
+
+test "compat net converts an addrinfo chain to addresses" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var v4: posix.sockaddr.in = .{
+        .port = std.mem.nativeToBig(u16, 443),
+        .addr = @bitCast([4]u8{ 127, 0, 0, 1 }),
+    };
+    var v6: posix.sockaddr.in6 = .{
+        .port = std.mem.nativeToBig(u16, 8443),
+        .flowinfo = 0,
+        .addr = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 },
+        .scope_id = 0,
+    };
+    // Any node with .addr and .next stands in for posix.addrinfo, which does not
+    // exist on every host the tests run on.
+    const TestNode = struct {
+        addr: ?*posix.sockaddr,
+        next: ?*const @This() = null,
+    };
+    var n4: TestNode = .{ .addr = @ptrCast(&v4) };
+    var n6: TestNode = .{ .addr = @ptrCast(&v6) };
+    n4.next = &n6;
+
+    const addrs = try addrsFromAddrinfoChain(arena, @as(?*const TestNode, &n4));
+    try std.testing.expectEqual(@as(usize, 2), addrs.len);
+    try std.testing.expectEqual(posix.AF.INET, addrs[0].any.family);
+    try std.testing.expectEqual(@as(u16, 443), addrs[0].in.getPort());
+    try std.testing.expectEqualSlices(u8, &.{ 127, 0, 0, 1 }, std.mem.asBytes(&addrs[0].in.sa.addr));
+    try std.testing.expectEqual(posix.AF.INET6, addrs[1].any.family);
+    try std.testing.expectEqual(@as(u16, 8443), addrs[1].in6.getPort());
+    try std.testing.expectEqual(@as(u8, 1), addrs[1].in6.sa.addr[15]);
+}
+
+test "compat net maps an empty addrinfo chain to an empty list" {
+    // Baseline (463a7bd1) behavior: a successful libc call with no usable node
+    // produced a zero-length address list, and getAddressList still does.
+    const TestNode = struct {
+        addr: ?*posix.sockaddr,
+        next: ?*const @This() = null,
+    };
+    const addrs = try addrsFromAddrinfoChain(std.testing.allocator, @as(?*const TestNode, null));
+    try std.testing.expectEqual(@as(usize, 0), addrs.len);
+}
+
+test "compat net resolves localhost through libc getaddrinfo" {
+    if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    // The compat test binary links libc (build.zig), as does the Android build,
+    // so this exercises the same getaddrinfo call Android takes through netd.
+    if (!builtin.link_libc) return error.SkipZigTest;
+
+    const list = try getAddressList(std.testing.allocator, "localhost", 80);
+    defer list.deinit();
+    try std.testing.expect(list.addrs.len > 0);
+
+    var saw_loopback = false;
+    for (list.addrs) |addr| {
+        switch (addr.any.family) {
+            posix.AF.INET => {
+                if (std.mem.eql(u8, std.mem.asBytes(&addr.in.sa.addr), &.{ 127, 0, 0, 1 })) saw_loopback = true;
+            },
+            posix.AF.INET6 => {
+                const bytes = &addr.in6.sa.addr;
+                var all_zero = true;
+                for (bytes[0..15]) |b| {
+                    if (b != 0) all_zero = false;
+                }
+                if (all_zero and bytes[15] == 1) saw_loopback = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expect(saw_loopback);
 }
