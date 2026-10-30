@@ -142,6 +142,20 @@ pub fn handleCommand(
     };
 }
 
+const InstallTarget = enum { macos, linux, windows, unsupported };
+
+/// Pure install-target selection; takes the abi/os so host tests can assert
+/// Android behavior.
+fn installTarget(os: std.Target.Os.Tag, abi: std.Target.Abi) InstallTarget {
+    _ = abi;
+    return switch (os) {
+        .macos => .macos,
+        .linux => .linux,
+        .windows => .windows,
+        else => .unsupported,
+    };
+}
+
 fn install(allocator: std.mem.Allocator) !void {
     if (comptime builtin.os.tag == .macos) {
         try installMacos(allocator);
@@ -1698,4 +1712,12 @@ test "windowsServiceBinPath uses hidden service gateway entrypoint" {
 test "isWindowsServiceGatewayArg matches hidden service sentinel" {
     try std.testing.expect(isWindowsServiceGatewayArg("__windows-service-gateway"));
     try std.testing.expect(!isWindowsServiceGatewayArg("gateway"));
+}
+
+test "service install is unsupported on Android" {
+    // Regression: Android reports os.tag == .linux, so install wrote a
+    // SysVinit unit whose /bin/sh does not exist, then failed at start time.
+    try std.testing.expectEqual(InstallTarget.unsupported, installTarget(.linux, .android));
+    try std.testing.expectEqual(InstallTarget.linux, installTarget(.linux, .gnu));
+    try std.testing.expectEqual(InstallTarget.macos, installTarget(.macos, .gnu));
 }
