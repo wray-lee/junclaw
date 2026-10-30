@@ -25,6 +25,33 @@ const MAX_BUFFER_SIZE = 8192;
 /// Keeps polling loops responsive to shutdown and reconnect signals.
 const READ_TIMEOUT_MS: i32 = 1000;
 
+const ResolvePath = enum { std_resolver, compat_resolver };
+
+/// Android has no /etc/resolv.conf: std.Io's resolver falls back to
+/// 127.0.0.1:53 and fails with NameServerFailure, so a plain-HTTP URL with a
+/// real hostname must resolve through compat.net (bionic getaddrinfo).
+/// TLS keeps the std path: a compat-resolved socket is pre-connected, and
+/// std.http could then only send the IP, not the hostname, in SNI.
+fn resolvePathFor(
+    comptime abi: std.Target.Abi,
+    protocol: std.http.Client.Protocol,
+    host: []const u8,
+) ResolvePath {
+    _ = abi;
+    _ = protocol;
+    _ = host;
+    return .std_resolver;
+}
+
+test "sse resolves real hostnames through compat on android" {
+    try std.testing.expectEqual(ResolvePath.compat_resolver, resolvePathFor(.android, .plain, "signal.example.com"));
+    // Literal IPs and loopback never need a DNS lookup; keep them on std.
+    try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .plain, "127.0.0.1"));
+    try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .plain, "localhost"));
+    try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.gnu, .plain, "signal.example.com"));
+    try std.testing.expectEqual(ResolvePath.std_resolver, resolvePathFor(.android, .tls, "signal.example.com"));
+}
+
 /// SSE connection that maintains a persistent HTTP connection for streaming
 pub const SseConnection = struct {
     allocator: std.mem.Allocator,
