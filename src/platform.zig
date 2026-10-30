@@ -330,5 +330,10 @@ test "androidTempDir creates the tmp directory 0700" {
     const dir = try androidTempDir(allocator, null, root, null);
     defer allocator.free(dir);
     const stat = try std_compat.fs.cwd().statFile(dir);
-    try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o700), stat.mode & 0o777);
+    if (comptime builtin.os.tag != .windows and builtin.os.tag != .wasi) {
+        try std.testing.expectEqual(@as(std_compat.fs.File.Mode, 0o700), stat.mode & 0o777);
+    } else {
+        // Windows/WASI report no Unix mode bits; only existence is assertable.
+        try std.testing.expect(stat.kind == .directory);
+    }
 }
