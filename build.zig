@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const build_support = @import("src/build_support.zig");
 
 const VendoredFileHash = struct {
     path: []const u8,
@@ -627,12 +628,11 @@ pub fn build(b: *std.Build) void {
             .root_module = spike_module,
             // Static musl so the binary runs in the bare dsh Node image;
             // Android's bionic libc only supports dynamic executables.
-            .linkage = if (target.result.abi == .android)
-                .dynamic
-            else if (target.result.os.tag == .linux)
-                .static
-            else
-                null,
+            .linkage = switch (build_support.dshSpikeLinkage(target.result.os.tag, target.result.abi)) {
+                .static => .static,
+                .dynamic => .dynamic,
+                .inherit => null,
+            },
         });
         const spike_step = b.step("dsh-spike", "Build the dsh sidecar P0 spike (requires -Dharness_dsh=true)");
         const install_spike = b.addInstallArtifact(spike_exe, .{});

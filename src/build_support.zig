@@ -8,7 +8,7 @@ pub const DshSpikeLinkage = enum { inherit, static, dynamic };
 /// Node image; Android's bionic only ships shared libc, so it must be a
 /// dynamic PIE. Other targets keep Zig's default.
 pub fn dshSpikeLinkage(os: std.Target.Os.Tag, abi: std.Target.Abi) DshSpikeLinkage {
-    _ = abi;
+    if (abi == .android) return .dynamic;
     if (os == .linux) return .static;
     return .inherit;
 }
