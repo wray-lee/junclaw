@@ -37,6 +37,10 @@ zig version
 
 输出必须是 `0.16.0`。
 
+## TLS 信任库
+
+Android 构建内置 curl.se 的 Mozilla CA bundle，并追加 `/system/etc/security/cacerts` 与 Android 14+ 的 Conscrypt APEX 目录，因此 WebSocket 与 HTTP 的 TLS 连接都会校验证书，不再降级为不校验。
+
 ## 直接在 Termux 里构建
 
 ```bash

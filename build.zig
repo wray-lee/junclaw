@@ -372,7 +372,10 @@ fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build, target: std.Build.
         .optimize = optimize,
     });
     module.addIncludePath(wasm3_dep.path("source"));
-    module.linkLibrary(wasm3_dep.artifact("wasm3"));
+    const wasm3_artifact = wasm3_dep.artifact("wasm3");
+    // Android is linked as a PIE; x86_64 rejects non-PIC objects.
+    if (target.result.abi == .android) wasm3_artifact.root_module.pic = true;
+    module.linkLibrary(wasm3_artifact);
 }
 
 pub fn build(b: *std.Build) void {
@@ -464,6 +467,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         });
         const sqlite3_artifact = sqlite3_dep.artifact("sqlite3");
+        // Android is linked as a PIE; x86_64 rejects non-PIC objects.
+        if (target.result.abi == .android) sqlite3_artifact.root_module.pic = true;
         sqlite3_artifact.root_module.addCMacro("SQLITE_ENABLE_FTS5", "1");
         break :blk sqlite3_artifact;
     } else null;
@@ -571,6 +576,9 @@ pub fn build(b: *std.Build) void {
         b.addExecutable(.{
             .name = "nullclaw",
             .root_module = exe_root_module,
+            // Bionic has no static libc (ziglang/zig#23906), and Zig 0.16
+            // otherwise picks static linkage for Android API 29+.
+            .linkage = if (target.result.abi == .android) .dynamic else null,
         });
     exe.root_module.addImport("build_options", build_options_module);
 

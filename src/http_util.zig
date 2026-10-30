@@ -12,6 +12,7 @@ const Allocator = std.mem.Allocator;
 const AtomicBool = std.atomic.Value(bool);
 const net_security = @import("net_security.zig");
 const platform = @import("platform.zig");
+const tls_ca = @import("tls/ca.zig");
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
@@ -593,6 +594,7 @@ fn buildSecureCurlCommand(
     header_arg: ?[]const u8,
     response_headers_path: []const u8,
     max_redirects: ?[]const u8,
+    ca_path: ?[]const u8,
 ) !CurlCommand {
     var command: CurlCommand = .{};
     try command.append("curl");
@@ -627,6 +629,12 @@ fn buildSecureCurlCommand(
     if (spec.resolve_entry) |entry| {
         try command.append("--resolve");
         try command.append(entry);
+    }
+    // Android has no usable default CA store for curl; verify against the same
+    // embedded Mozilla bundle the in-process TLS paths use.
+    if (ca_path) |path| {
+        try command.append("--cacert");
+        try command.append(path);
     }
     if (spec.max_time) |max_time| {
         try command.append("--max-time");
@@ -794,12 +802,23 @@ fn secureCurlRequestWithStatusAndHeaders(
         try std.fmt.bufPrint(&redirects_buf, "{d}", .{max_redirects})
     else
         null;
+    // curl only takes a CA bundle by path, and Android's default store is not
+    // usable, so spill the embedded bundle to a 0600 temp file per request.
+    var ca_temp: CurlTempPath = .{};
+    defer ca_temp.deinit();
+    const ca_path: ?[]const u8 = if (comptime builtin.abi == .android) ca_file: {
+        var file = try createSecureCurlTempFile(allocator, &ca_temp, "curl_ca_bundle");
+        defer file.close();
+        try file.writeAll(tls_ca.embeddedPem());
+        break :ca_file ca_temp.path();
+    } else null;
     const command = try buildSecureCurlCommand(
         spec,
         config.path(),
         prepared_headers.arg,
         response_headers_temp.path(),
         redirects_arg,
+        ca_path,
     );
 
     var child = std_compat.process.Child.init(command.slice(), allocator);
@@ -953,6 +972,7 @@ fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !P
     errdefer proxy_arena.deinit();
     var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
     errdefer client.deinit();
+    try tls_ca.configureHttpClient(&client, allocator);
     var env_map = std_compat.process.EnvMap.init(proxy_arena.allocator());
     try env_map.put("HTTPS_PROXY", proxy.?);
     try env_map.put("https_proxy", proxy.?);
@@ -1310,6 +1330,7 @@ pub const ProxyHttpClient = struct {
 
         var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
         errdefer client.deinit();
+        try tls_ca.configureHttpClient(&client, allocator);
 
         try initClientDefaultProxies(&client, proxy_arena.allocator());
 
@@ -2205,6 +2226,7 @@ test "secure curl command preserves methods and keeps secrets out of argv" {
             "/tmp/curl-config",
             "@/tmp/curl-headers",
             "/tmp/curl-response-headers",
+            null,
             null,
         );
 
