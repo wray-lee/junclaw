@@ -600,7 +600,10 @@ test "Android webdriver temp base follows the platform fallback chain" {
     defer tmp.cleanup();
     const root = try compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
     defer allocator.free(root);
-    const expected = try compat.fs.path.join(allocator, &.{ root, "tmp" });
+    // androidTempDir always returns Android-style separators, even when the
+    // .android abi is exercised on a Windows host; do not build the expectation
+    // with the host path separator.
+    const expected = try std.fmt.allocPrint(allocator, "{s}/tmp", .{root});
     defer allocator.free(expected);
     const base = try platform.androidTempDir(allocator, null, root, null);
     defer allocator.free(base);
