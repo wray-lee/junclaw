@@ -4388,6 +4388,10 @@ fn serveStdHttpTest(ctx: *StdHttpTestServerCtx) void {
 }
 
 test "android std http keeps status body headers and post payload" {
+    // Windows: the loopback mock server thread does not complete there. The std
+    // transport is Android-only; Windows goes through curl (tested elsewhere).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{});
     var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "{\"ok\":true}" };
@@ -4419,6 +4423,10 @@ test "android std http keeps status body headers and post payload" {
 }
 
 test "android std http response cap rejects and truncates" {
+    // Windows: the loopback mock server thread does not complete there. The std
+    // transport is Android-only; Windows goes through curl (tested elsewhere).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{});
     var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };

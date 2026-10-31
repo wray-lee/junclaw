@@ -2199,6 +2199,10 @@ fn serveStdHttpSse(ctx: *StdHttpSseServerCtx) void {
 }
 
 test "android std http SSE stream parses deltas and terminal sentinel" {
+    // Windows: like the curlStream loopback test above, the local server thread
+    // does not complete there; the std transport is Android-only anyway.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
     const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{});
     var ctx: StdHttpSseServerCtx = .{ .server = &server };
