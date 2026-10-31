@@ -840,6 +840,67 @@ fn waitBodyReadable(
     return false;
 }
 
+pub fn mapStdHttpError(err: anyerror) anyerror {
+    if (interruptRequested()) return error.CurlInterrupted;
+    const name = @errorName(err);
+    if (std.mem.startsWith(u8, name, "Tls") or std.mem.startsWith(u8, name, "Certificate")) {
+        return error.CurlTlsError;
+    }
+    return switch (err) {
+        error.Canceled, error.Interrupted, error.CurlInterrupted => error.CurlInterrupted,
+        error.Timeout, error.ConnectionTimedOut, error.CurlTimeout => error.CurlTimeout,
+        error.UnknownHostName,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.DetectingNetworkConfigurationFailed,
+        error.CurlDnsError,
+        => error.CurlDnsError,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.AddressFamilyUnsupported,
+        error.ConnectionPending,
+        error.SocketModeUnsupported,
+        error.CurlConnectError,
+        => error.CurlConnectError,
+        error.TooManyHttpRedirects,
+        error.HttpRedirectLocationMissing,
+        error.HttpRedirectLocationOversize,
+        error.HttpRedirectLocationInvalid,
+        error.RedirectRequiresResend,
+        error.HttpContentEncodingUnsupported,
+        error.HttpHeadersInvalid,
+        error.HttpHeadersOversize,
+        error.HttpChunkInvalid,
+        error.HttpChunkTruncated,
+        error.TunnelNotSupported,
+        error.CurlFailed,
+        => error.CurlFailed,
+        error.WriteFailed, error.CurlWriteError => error.CurlWriteError,
+        error.EndOfStream, error.CurlReadError => error.CurlReadError,
+        error.OutOfMemory,
+        error.InvalidHeader,
+        error.InvalidUrl,
+        error.UnsupportedUriScheme,
+        error.UnsupportedProxyScheme,
+        error.TooManyHeaders,
+        error.TempFileCreateFailed,
+        error.CurlPreSendError,
+        error.CurlWaitError,
+        error.HttpStatusError,
+        error.HttpStatusIndeterminate,
+        => err,
+        else => error.CurlFailed,
+    };
+}
+
 fn bodyReadError(response: *std.http.Client.Response, err: anyerror) anyerror {
     if (interruptRequested()) return error.CurlInterrupted;
     if (response.bodyErr()) |body_err| {
@@ -1073,7 +1134,28 @@ pub const HttpStream = struct {
         timeout_secs: u64,
     ) !*HttpStream {
         _ = try validateHttpUrl(url);
+
+        var header_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+        errdefer header_list.deinit(allocator);
+        for (headers) |header| {
+            try validateCurlHeaderLine(header);
+            try header_list.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
+        }
+
         try validateStdProxyForUrl(allocator, url, null);
+
+        return openInner(allocator, url, header_list, body, timeout_secs) catch |err| {
+            return mapStdHttpError(err);
+        };
+    }
+
+    fn openInner(
+        allocator: Allocator,
+        url: []const u8,
+        headers: std.ArrayListUnmanaged(std.http.Header),
+        body: []const u8,
+        timeout_secs: u64,
+    ) !*HttpStream {
         const self = try allocator.create(HttpStream);
         errdefer allocator.destroy(self);
         const now = std_compat.time.milliTimestamp();
@@ -1085,6 +1167,7 @@ pub const HttpStream = struct {
             .transfer_buffer = undefined,
             .decompress = undefined,
             .decompress_buffer = &.{},
+            .headers = headers,
             .status_code = 0,
             .deadline_ms = if (timeout_secs == 0) null else now +| @as(i64, @intCast(@min(
                 std.math.mul(u64, timeout_secs, std.time.ms_per_s) catch std.math.maxInt(u64),
@@ -1094,11 +1177,6 @@ pub const HttpStream = struct {
         };
         errdefer self.http.deinit();
         errdefer self.headers.deinit(allocator);
-
-        for (headers) |header| {
-            try validateCurlHeaderLine(header);
-            try self.headers.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
-        }
 
         const uri = try std.Uri.parse(url);
         self.request = try self.http.client.request(.POST, uri, .{
@@ -1248,8 +1326,6 @@ pub const HttpStream = struct {
 /// bionic. The URL was already validated by net_security at the call site.
 fn stdHttpRequest(allocator: Allocator, spec: CurlRequestSpec) !HttpResponseWithHeaders {
     _ = try validateHttpUrl(spec.url);
-    try validateStdProxyForUrl(allocator, spec.url, spec.proxy);
-    const uri = try std.Uri.parse(spec.url);
 
     var header_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
     defer header_list.deinit(allocator);
@@ -1262,6 +1338,20 @@ fn stdHttpRequest(allocator: Allocator, spec: CurlRequestSpec) !HttpResponseWith
         try header_list.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
     }
 
+    try validateStdProxyForUrl(allocator, spec.url, spec.proxy);
+    const uri = try std.Uri.parse(spec.url);
+
+    return stdHttpRequestInner(allocator, spec, uri, header_list.items) catch |err| {
+        return mapStdHttpError(err);
+    };
+}
+
+fn stdHttpRequestInner(
+    allocator: Allocator,
+    spec: CurlRequestSpec,
+    uri: std.Uri,
+    headers: []const std.http.Header,
+) !HttpResponseWithHeaders {
     var client = try initProxyClientWithOptionalProxy(allocator, spec.proxy);
     defer client.deinit();
 
@@ -1270,7 +1360,7 @@ fn stdHttpRequest(allocator: Allocator, spec: CurlRequestSpec) !HttpResponseWith
     var req = try client.client.request(spec.method, uri, .{
         .redirect_behavior = redirect_behavior,
         .headers = .{ .accept_encoding = if (spec.accept_compression) .default else .omit },
-        .extra_headers = header_list.items,
+        .extra_headers = headers,
     });
     defer req.deinit();
 
@@ -1598,9 +1688,6 @@ pub fn httpRequestWithStatusAndHeaders(
     content_type: ?[]const u8,
     proxy: ?[]const u8,
 ) !HttpResponseWithHeaders {
-    if (comptime stdHttpTransport(builtin.abi)) {
-        try validateStdProxyForUrl(allocator, url, proxy);
-    }
     var header_buf: [20]std.http.Header = undefined;
     var header_count: usize = 0;
     if (content_type) |ct| {
@@ -1618,6 +1705,10 @@ pub fn httpRequestWithStatusAndHeaders(
     const uri = try std.Uri.parse(url);
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
         return error.UnsupportedUriScheme;
+    }
+
+    if (comptime stdHttpTransport(builtin.abi)) {
+        try validateStdProxyForUrl(allocator, url, proxy);
     }
 
     var client = try initProxyClientWithOptionalProxy(allocator, proxy);
@@ -4647,4 +4738,56 @@ test "android std http stream deadline applies while data is buffered" {
     stream.deadline_ms = std_compat.time.milliTimestamp() - 1;
     var buf: [16]u8 = undefined;
     try std.testing.expectError(error.CurlTimeout, stream.stream().read(&buf));
+}
+
+test "android std http maps connection refused to CurlConnectError" {
+    // Regression: stdHttpRequest and HttpStream on Android must map ConnectionRefused to CurlConnectError
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectError(
+        error.CurlConnectError,
+        stdHttpRequest(std.testing.allocator, .{
+            .method = .GET,
+            .url = "http://127.0.0.1:1/",
+        }),
+    );
+    try std.testing.expectError(
+        error.CurlConnectError,
+        HttpStream.open(std.testing.allocator, "http://127.0.0.1:1/", &.{}, "{}", 0),
+    );
+}
+
+test "android std http rejects header injection before validating proxy" {
+    // Regression: stdHttpRequest on Android must validate headers before proxy scheme
+    try std.testing.expectError(
+        error.InvalidHeader,
+        stdHttpRequest(std.testing.allocator, .{
+            .method = .GET,
+            .url = "https://example.com/",
+            .headers = &.{"X-Test: ok\r\nX-Injected: bad"},
+            .proxy = "unsupported://proxy",
+        }),
+    );
+}
+
+test "mapStdHttpError aligns std http transport errors with curl identities" {
+    // Regression: E1/E2 std error mapping for DNS, TLS, timeout, redirect limits, and connection
+    try std.testing.expectEqual(error.CurlConnectError, mapStdHttpError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.CurlConnectError, mapStdHttpError(error.NetworkUnreachable));
+    try std.testing.expectEqual(error.CurlDnsError, mapStdHttpError(error.UnknownHostName));
+    try std.testing.expectEqual(error.CurlTlsError, mapStdHttpError(error.TlsInitializationFailed));
+    try std.testing.expectEqual(error.CurlTlsError, mapStdHttpError(error.TlsAlert));
+    try std.testing.expectEqual(error.CurlTlsError, mapStdHttpError(error.CertificateBundleLoadFailure));
+    try std.testing.expectEqual(error.CurlTimeout, mapStdHttpError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.CurlTimeout, mapStdHttpError(error.Timeout));
+    try std.testing.expectEqual(error.CurlFailed, mapStdHttpError(error.TooManyHttpRedirects));
+    try std.testing.expectEqual(error.CurlInterrupted, mapStdHttpError(error.Canceled));
+    try std.testing.expectEqual(error.OutOfMemory, mapStdHttpError(error.OutOfMemory));
+    try std.testing.expectEqual(error.InvalidHeader, mapStdHttpError(error.InvalidHeader));
+
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.ConnectionRefused)));
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.UnknownHostName)));
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.TlsAlert)));
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.TooManyHttpRedirects)));
+    try std.testing.expect(!isCurlTransportError(mapStdHttpError(error.OutOfMemory)));
+    try std.testing.expect(!isCurlTransportError(mapStdHttpError(error.InvalidHeader)));
 }
