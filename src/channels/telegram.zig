@@ -779,6 +779,9 @@ pub const TelegramChannel = struct {
         ch.account_id = cfg.account_id;
         ch.reply_in_private = cfg.reply_in_private;
         ch.proxy = cfg.proxy;
+        if (cfg.api_base) |base| {
+            ch.api_base = base;
+        }
         ch.interactive = cfg.interactive;
         ch.require_mention = cfg.require_mention;
         ch.streaming_enabled = cfg.streaming;
@@ -7263,6 +7266,17 @@ test "telegram escapeRichMarkdown wraps tables wider than 20 columns in a code f
     try std.testing.expect(std.mem.startsWith(u8, escaped, "```\n"));
     try std.testing.expect(std.mem.endsWith(u8, escaped, "\n```"));
     try std.testing.expect(std.mem.indexOf(u8, escaped, input.items) != null);
+}
+
+test "telegram initFromConfig sets custom api_base" {
+    const ch = TelegramChannel.initFromConfig(std.testing.allocator, .{
+        .bot_token = "test-token",
+        .api_base = "http://127.0.0.1:8080/",
+    });
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/", ch.api_base);
+    var url_buf: [128]u8 = undefined;
+    const url = try ch.apiUrl(&url_buf, "getMe");
+    try std.testing.expectEqualStrings("http://127.0.0.1:8080/bottest-token/getMe", url);
 }
 
 test "telegram initFromConfig enables rich messages when requested" {

@@ -804,6 +804,8 @@ pub const MaxConfig = struct {
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
+    /// Bot API base URL. Defaults to "https://api.telegram.org".
+    api_base: ?[]const u8 = null,
     /// Secret required in Telegram's X-Telegram-Bot-Api-Secret-Token header for webhook delivery.
     webhook_secret: ?[]const u8 = null,
     allow_from: []const []const u8 = &.{},
@@ -844,6 +846,10 @@ pub const TelegramConfig = struct {
     /// Publish Telegram slash-command menu:
     /// off = clear it, flat = one global list, scoped = separate private/group menus.
     commands_menu_mode: TelegramCommandsMenuMode = .flat,
+
+    pub fn isValidApiBase(raw: []const u8) bool {
+        return ProviderEntry.isValidBaseUrl(raw);
+    }
 
     pub fn isValidWebhookSecret(raw: []const u8) bool {
         return WebConfig.isValidAuthToken(raw);
