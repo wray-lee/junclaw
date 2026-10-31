@@ -457,15 +457,19 @@ fn createSecureCurlTempFile(
     return error.TempFileCreateFailed;
 }
 
+fn validateParsedHttpUri(uri: std.Uri) !void {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        return error.UnsupportedUriScheme;
+    }
+    if (uri.host == null) return error.InvalidUrl;
+}
+
 fn validateHttpUrl(url: []const u8) !std.Uri {
     if (std.mem.indexOfScalar(u8, url, 0) != null or std.mem.indexOfAny(u8, url, "\r\n") != null) {
         return error.InvalidUrl;
     }
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
-        return error.UnsupportedUriScheme;
-    }
-    if (uri.host == null) return error.InvalidUrl;
+    try validateParsedHttpUri(uri);
     return uri;
 }
 
@@ -1356,43 +1360,87 @@ fn stdHttpRequestInner(
 ) !HttpResponseWithHeaders {
     var client = try initProxyClientWithOptionalProxy(allocator, spec.proxy);
     defer client.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
 
-    const redirect_behavior: std.http.Client.Request.RedirectBehavior =
-        if (spec.max_redirects) |max| @enumFromInt(max) else .unhandled;
-    var req = try client.client.request(spec.method, uri, .{
-        .redirect_behavior = redirect_behavior,
-        .headers = .{ .accept_encoding = if (spec.accept_compression) .default else .omit },
-        .extra_headers = headers,
-    });
-    defer req.deinit();
+    // std.http replays extra_headers to every redirect target and has no
+    // per-hop hook, so follow redirects here: curl's budget, each Location
+    // validated like the first hop, and caller headers dropped on a new origin.
+    var remaining = redirectBudget(spec);
+    var request_uri = uri;
+    var request_method = spec.method;
+    var request_body = spec.body;
+    var request_headers = headers;
 
-    if (spec.body) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var request_body = try req.sendBodyUnflushed(&.{});
-        try request_body.writer.writeAll(payload);
-        try request_body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
+    while (true) {
+        var req = try client.client.request(request_method, request_uri, .{
+            .redirect_behavior = .unhandled,
+            .headers = .{ .accept_encoding = if (spec.accept_compression) .default else .omit },
+            .extra_headers = request_headers,
+        });
+        defer req.deinit();
+
+        if (request_body) |payload| {
+            req.transfer_encoding = .{ .content_length = payload.len };
+            var body_writer = try req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(payload);
+            try body_writer.end();
+            try req.connection.?.flush();
+        } else {
+            try req.sendBodiless();
+        }
+
+        var response = try req.receiveHead(&.{});
+
+        if (remaining != 0) {
+            if (response.head.location) |location| {
+                var aux_buf: []u8 = try scratch.allocator().alloc(u8, 8 * 1024);
+                switch (try redirectDecision(
+                    request_uri,
+                    location,
+                    &aux_buf,
+                    @intFromEnum(response.head.status),
+                    request_method,
+                    remaining,
+                )) {
+                    .stop => {},
+                    .follow => |hop| {
+                        remaining -= 1;
+                        request_uri = hop.uri;
+                        request_method = hop.method;
+                        if (hop.drop_body) request_body = null;
+                        request_headers = try redirectHopHeaders(
+                            scratch.allocator(),
+                            headers,
+                            hop.drop_body,
+                            // Generated headers are ours to replay; only caller
+                            // headers are origin-bound.
+                            hop.strip_caller_headers and !spec.generated_redirect_headers_only,
+                        );
+                        continue;
+                    },
+                }
+            }
+        }
+
+        const status_code: u16 = @intFromEnum(response.head.status);
+        if (spec.fail_on_http_error and status_code >= 400) return error.CurlFailed;
+        const response_headers = try allocator.dupe(u8, response.head.bytes);
+        errdefer allocator.free(response_headers);
+
+        var body_spec = spec;
+        body_spec.method = request_method;
+        const result = try readStdHttpBody(allocator, &req, &response, body_spec, try maxTimeDeadlineMs(spec.max_time));
+        errdefer allocator.free(result.body);
+        if (spec.response_writer) |writer| try writer.flush();
+
+        return .{
+            .status_code = status_code,
+            .headers = response_headers,
+            .body = result.body,
+            .truncated = result.truncated,
+        };
     }
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    const status_code: u16 = @intFromEnum(response.head.status);
-    if (spec.fail_on_http_error and status_code >= 400) return error.CurlFailed;
-    const response_headers = try allocator.dupe(u8, response.head.bytes);
-    errdefer allocator.free(response_headers);
-
-    const result = try readStdHttpBody(allocator, &req, &response, spec, try maxTimeDeadlineMs(spec.max_time));
-    errdefer allocator.free(result.body);
-    if (spec.response_writer) |writer| try writer.flush();
-
-    return .{
-        .status_code = status_code,
-        .headers = response_headers,
-        .body = result.body,
-        .truncated = result.truncated,
-    };
 }
 
 fn secureCurlRequestWithStatusAndHeaders(
@@ -2004,6 +2052,14 @@ fn appendFetchHeaderValue(
     }
 }
 
+/// Which redirect policy `ProxyHttpClient.fetch` applies on `abi`. Android has
+/// no curl binary, but it must still refuse the redirects curl refuses.
+const FetchRedirectPolicy = enum { curl, std };
+
+fn fetchRedirectPolicy(comptime abi: std.Target.Abi) FetchRedirectPolicy {
+    return if (stdHttpTransport(abi)) .curl else .std;
+}
+
 fn fetchHasCallerHeaders(options: std.http.Client.FetchOptions) bool {
     return options.extra_headers.len > 0 or
         options.privileged_headers.len > 0 or
@@ -2053,8 +2109,12 @@ pub const ProxyHttpClient = struct {
     }
 
     pub fn fetch(self: *ProxyHttpClient, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
-        if (comptime stdHttpTransport(builtin.abi)) {
+        if (comptime fetchRedirectPolicy(builtin.abi) == .curl) {
+            // std.http follows up to 3 redirects and replays extra_headers to
+            // any target; fetchWithCurl reduces to stdHttpRequest here but
+            // keeps fetchCurlMaxRedirects, so caller headers never follow.
             try validateFetchProxy(self.client.allocator, options.location);
+            return self.fetchWithCurl(options);
         }
         return self.client.fetch(options);
     }
@@ -3084,11 +3144,30 @@ const RedirectDecision = union(enum) {
     },
 };
 
+/// Curl `-L` budget for this request; 0 means the 3xx goes back to the caller.
 fn redirectBudget(spec: CurlRequestSpec) u16 {
-    _ = spec;
-    return 0;
+    return safeCurlMaxRedirects(spec) orelse 0;
 }
 
+/// Same origin means same scheme, host, and effective port. Anything else is
+/// treated as a new source, so the hop loses its caller headers.
+fn sameOrigin(a: std.Uri, b: std.Uri) bool {
+    const host_a = a.host orelse return false;
+    const host_b = b.host orelse return false;
+    var buf_a: [std.Io.net.HostName.max_len]u8 = undefined;
+    var buf_b: [std.Io.net.HostName.max_len]u8 = undefined;
+    const raw_a = host_a.toRaw(&buf_a) catch return false;
+    const raw_b = host_b.toRaw(&buf_b) catch return false;
+    return std.ascii.eqlIgnoreCase(a.scheme, b.scheme) and
+        std.ascii.eqlIgnoreCase(raw_a, raw_b) and
+        defaultPortForScheme(a) == defaultPortForScheme(b);
+}
+
+/// One redirect hop, decided without I/O so the policy is host-testable.
+/// `location` bytes are copied into `aux_buf` for RFC 3986 merging and the
+/// returned URI points into it. Validation matches the first hop
+/// (`validateHttpUrl`): no control bytes, http(s) only, host present. It is
+/// deliberately not stricter, or intentional private api_base targets break.
 fn redirectDecision(
     current: std.Uri,
     location: []const u8,
@@ -3097,13 +3176,49 @@ fn redirectDecision(
     method: std.http.Method,
     remaining: u16,
 ) !RedirectDecision {
-    _ = current;
-    _ = location;
-    _ = aux_buf;
-    _ = status;
-    _ = method;
-    _ = remaining;
-    return .stop;
+    const redirecting = switch (status) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+    if (!redirecting) return .stop;
+    if (remaining == 0) return .stop;
+    if (std.mem.indexOfScalar(u8, location, 0) != null or
+        std.mem.indexOfAny(u8, location, "\r\n") != null) return error.HttpRedirectLocationInvalid;
+    if (location.len > aux_buf.*.len) return error.HttpRedirectLocationOversize;
+    @memcpy(aux_buf.*[0..location.len], location);
+    const uri = current.resolveInPlace(location.len, aux_buf) catch
+        return error.HttpRedirectLocationInvalid;
+    try validateParsedHttpUri(uri);
+
+    const drop_body = switch (status) {
+        303 => true,
+        301, 302 => method == .POST,
+        else => false,
+    };
+    return .{ .follow = .{
+        .uri = uri,
+        .method = if (drop_body) .GET else method,
+        .drop_body = drop_body,
+        .strip_caller_headers = !sameOrigin(current, uri),
+    } };
+}
+
+/// Headers for a redirect hop: caller headers never cross origins, and a
+/// method rewrite to GET drops the body's Content-Type.
+fn redirectHopHeaders(
+    arena: Allocator,
+    headers: []const std.http.Header,
+    drop_body: bool,
+    strip_caller_headers: bool,
+) ![]const std.http.Header {
+    if (strip_caller_headers) return &.{};
+    if (!drop_body) return headers;
+    var kept: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Content-Type")) continue;
+        try kept.append(arena, header);
+    }
+    return kept.items;
 }
 
 fn expectFormattedUri(expected: []const u8, uri: std.Uri) !void {
@@ -3239,6 +3354,31 @@ test "android std redirect decision does not tighten first-hop validation" {
         .stop => return error.TestUnexpectedResult,
         .follow => |hop| try std.testing.expect(hop.strip_caller_headers),
     }
+}
+
+test "android std redirect hop headers drop caller headers and body content type" {
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer test-key" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "User-Agent", .value = "test-agent" },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try redirectHopHeaders(arena.allocator(), &headers, false, true)).len,
+    );
+    const kept = try redirectHopHeaders(arena.allocator(), &headers, true, false);
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("Authorization", kept[0].name);
+    try std.testing.expectEqualStrings("User-Agent", kept[1].name);
+}
+
+test "android fetch keeps the curl redirect policy" {
+    // Regression: Android fetch called std.http.Client.fetch, which followed
+    // three redirects and replayed extra_headers to every target.
+    try std.testing.expectEqual(FetchRedirectPolicy.curl, fetchRedirectPolicy(.android));
+    try std.testing.expectEqual(FetchRedirectPolicy.std, fetchRedirectPolicy(.gnu));
 }
 
 const LegacyCredentialedCurlHelper = enum {
