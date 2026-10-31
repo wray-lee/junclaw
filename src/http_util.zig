@@ -1144,7 +1144,7 @@ pub const HttpStream = struct {
 
         try validateStdProxyForUrl(allocator, url, null);
 
-        return openInner(allocator, url, header_list, body, timeout_secs) catch |err| {
+        return openInner(allocator, url, &header_list, body, timeout_secs) catch |err| {
             return mapStdHttpError(err);
         };
     }
@@ -1152,7 +1152,7 @@ pub const HttpStream = struct {
     fn openInner(
         allocator: Allocator,
         url: []const u8,
-        headers: std.ArrayListUnmanaged(std.http.Header),
+        headers: *std.ArrayListUnmanaged(std.http.Header),
         body: []const u8,
         timeout_secs: u64,
     ) !*HttpStream {
@@ -1167,7 +1167,7 @@ pub const HttpStream = struct {
             .transfer_buffer = undefined,
             .decompress = undefined,
             .decompress_buffer = &.{},
-            .headers = headers,
+            .headers = .empty,
             .status_code = 0,
             .deadline_ms = if (timeout_secs == 0) null else now +| @as(i64, @intCast(@min(
                 std.math.mul(u64, timeout_secs, std.time.ms_per_s) catch std.math.maxInt(u64),
@@ -1176,7 +1176,6 @@ pub const HttpStream = struct {
             .idle_deadline_ms = now +| STREAM_IDLE_TIMEOUT_MS,
         };
         errdefer self.http.deinit();
-        errdefer self.headers.deinit(allocator);
 
         const uri = try std.Uri.parse(url);
         self.request = try self.http.client.request(.POST, uri, .{
@@ -1184,7 +1183,7 @@ pub const HttpStream = struct {
             // curl's SSE calls did not request compression; keep the body
             // unframed by a decompressor.
             .headers = .{ .accept_encoding = .omit },
-            .extra_headers = self.headers.items,
+            .extra_headers = headers.items,
         });
         errdefer self.request.deinit();
 
@@ -1197,6 +1196,7 @@ pub const HttpStream = struct {
         var redirect_buffer: [8 * 1024]u8 = undefined;
         var response = try self.request.receiveHead(&redirect_buffer);
         self.status_code = @intFromEnum(response.head.status);
+
         self.body_available = hasResponseBody(
             .POST,
             response.head.status,
@@ -1212,6 +1212,8 @@ pub const HttpStream = struct {
             &self.decompress,
             &self.decompress_buffer,
         );
+        self.headers = headers.*;
+        headers.* = .empty;
         return self;
     }
 
@@ -1688,6 +1690,28 @@ pub fn httpRequestWithStatusAndHeaders(
     content_type: ?[]const u8,
     proxy: ?[]const u8,
 ) !HttpResponseWithHeaders {
+    return httpRequestWithStatusAndHeadersInner(
+        allocator,
+        method,
+        url,
+        body,
+        headers,
+        content_type,
+        proxy,
+    ) catch |err| {
+        return mapStdHttpError(err);
+    };
+}
+
+fn httpRequestWithStatusAndHeadersInner(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type: ?[]const u8,
+    proxy: ?[]const u8,
+) !HttpResponseWithHeaders {
     var header_buf: [20]std.http.Header = undefined;
     var header_count: usize = 0;
     if (content_type) |ct| {
@@ -1753,7 +1777,7 @@ pub fn httpRequestWithStatusAndHeaders(
     var decompress: std.http.Decompress = undefined;
     const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
     _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
+        error.ReadFailed => return response.bodyErr() orelse error.CurlReadError,
         else => |e| return e,
     };
 
