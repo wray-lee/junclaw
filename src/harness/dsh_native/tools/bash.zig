@@ -277,8 +277,8 @@ fn createTempFile(allocator: Allocator, context: *const Context, label: []const 
     const hex = std.fmt.bytesToHex(random, .lower);
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "dsh-bash-{s}-{s}.log", .{ &hex, label });
-    // shortcut: non-Android keeps a fixed "/tmp" (the executor already refuses
-    // Windows); Android has no /tmp, so use the TMPDIR fallback chain there.
+    // Spills go to platform.getSpoolTempDir (which resolves TMPDIR/nullclaw-spool
+    // with cross-platform fallbacks) unless caller provided context.spill_dir.
     // dsh spills under os.tmpdir() (subprocess-local/src/output.ts:32-36).
     const owned_dir: ?[]const u8 = if (context.spill_dir == null)
         try platform.getSpoolTempDir(allocator)

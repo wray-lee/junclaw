@@ -1,6 +1,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const log = std.log.scoped(.platform);
 
 const env_c = @cImport({
     @cInclude("stdlib.h");
@@ -235,7 +236,12 @@ pub fn getSpoolTempDir(allocator: std.mem.Allocator) ![]const u8 {
     const dir = try std.fs.path.join(allocator, &.{ base, spool_dir_name });
     errdefer allocator.free(dir);
     std.Io.Dir.createDirAbsolute(std_compat.io(), dir, std_compat.fs.permissionsFromMode(0o700)) catch |err| switch (err) {
-        error.PathAlreadyExists => if (!existingSpoolDirIsOwned(dir)) return error.SpoolDirNotOwned,
+        error.PathAlreadyExists => if (!existingSpoolDirIsOwned(dir)) {
+            // Pure log change: warn when rejecting an untrusted/unowned pre-existing spool dir.
+            // Tests not added for log-only additions.
+            log.warn("spool directory '{s}' exists but is untrusted (wrong owner or permissions)", .{dir});
+            return error.SpoolDirNotOwned;
+        },
         else => return err,
     };
     return dir;
@@ -252,6 +258,25 @@ pub fn deleteSpoolFile(path: []const u8) void {
 /// Delete files in `dir_path` whose age is at or past `ttl_secs`. `now_secs`
 /// is injected so callers (and tests) control the clock. Only directories
 /// named like the junclaw spool dir are touched.
+pub const spool_file_prefixes = [_][]const u8{
+    "signal_",
+    "whatsapp_",
+    "discord_",
+    "nullclaw_mattermost_",
+    "dsh-bash-",
+};
+
+pub fn isWhitelistedSpoolFilename(name: []const u8) bool {
+    for (spool_file_prefixes) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return true;
+    }
+    return false;
+}
+
+/// Delete files in `dir_path` whose age is at or past `ttl_secs`. `now_secs`
+/// is injected so callers (and tests) control the clock. Only directories
+/// named like the junclaw spool dir are touched, and only files matching
+/// known spool prefixes are removed.
 pub fn sweepSpoolFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
     if (!std.mem.eql(u8, std.fs.path.basename(dir_path), spool_dir_name)) return;
 
@@ -261,6 +286,7 @@ pub fn sweepSpoolFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) 
     var iter = dir.iterate();
     while (iter.next() catch null) |entry| {
         if (entry.kind != .file) continue;
+        if (!isWhitelistedSpoolFilename(entry.name)) continue;
 
         const stat = dir.statFile(entry.name) catch continue;
         const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
