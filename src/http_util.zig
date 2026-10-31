@@ -2087,6 +2087,19 @@ pub const ProxyHttpClient = struct {
     client: std.http.Client,
 
     pub fn init(allocator: Allocator) !ProxyHttpClient {
+        return initForAbi(builtin.abi, allocator, null);
+    }
+
+    pub fn initWithEnvMap(allocator: Allocator, env_map: *const std_compat.process.EnvMap) !ProxyHttpClient {
+        return initForAbi(builtin.abi, allocator, env_map);
+    }
+
+    pub fn initForAbi(
+        comptime abi: std.Target.Abi,
+        allocator: Allocator,
+        env_map: ?*const std_compat.process.EnvMap,
+    ) !ProxyHttpClient {
+        _ = abi;
         var proxy_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer proxy_arena.deinit();
 
@@ -2094,7 +2107,11 @@ pub const ProxyHttpClient = struct {
         errdefer client.deinit();
         try tls_ca.configureHttpClient(&client, allocator);
 
-        try initClientDefaultProxies(&client, proxy_arena.allocator());
+        if (env_map) |em| {
+            try initClientDefaultProxiesFromEnvMap(&client, proxy_arena.allocator(), em);
+        } else {
+            try initClientDefaultProxies(&client, proxy_arena.allocator());
+        }
 
         return .{
             .proxy_arena = proxy_arena,
@@ -4917,6 +4934,30 @@ test "android std http response cap rejects and truncates" {
     defer std.testing.allocator.free(response.body);
     try std.testing.expectEqualStrings("0123", response.body);
     try std.testing.expect(response.truncated);
+}
+
+test "android proxy http client init rejects unsupported proxy schemes in env" {
+    // Regression: on Android, ProxyHttpClient.init silently discarded unsupported proxy
+    // schemes (like socks5) via std.http.Client.initDefaultProxies and connected direct
+    // (fail-open), bypassing configured proxies.
+    const unsupported_schemes = [_][]const u8{
+        "socks5://proxy.example.com:1080",
+        "socks5h://proxy.example.com:1080",
+        "ftp://proxy.example.com:21",
+    };
+
+    for (unsupported_schemes) |bad_proxy| {
+        for (proxy_env_var_names) |var_name| {
+            var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+            defer env_map.deinit();
+            try env_map.put(var_name, bad_proxy);
+
+            try std.testing.expectError(
+                error.UnsupportedProxyScheme,
+                ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map),
+            );
+        }
+    }
 }
 
 test "android std http rejects proxies it cannot honor" {
