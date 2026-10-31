@@ -4754,6 +4754,30 @@ test "android std http maps connection refused to CurlConnectError" {
         error.CurlConnectError,
         HttpStream.open(std.testing.allocator, "http://127.0.0.1:1/", &.{}, "{}", 0),
     );
+    // Regression: HttpStream.open with non-empty headers double freed header_list on failure
+    try std.testing.expectError(
+        error.CurlConnectError,
+        HttpStream.open(
+            std.testing.allocator,
+            "http://127.0.0.1:1/",
+            &.{"Authorization: Bearer test-key"},
+            "{}",
+            0,
+        ),
+    );
+    // Regression: httpRequestWithStatusAndHeaders must map std http transport errors to CurlConnectError
+    try std.testing.expectError(
+        error.CurlConnectError,
+        httpRequestWithStatusAndHeaders(
+            std.testing.allocator,
+            .GET,
+            "http://127.0.0.1:1/",
+            null,
+            &.{"Authorization: Bearer test-key"},
+            null,
+            null,
+        ),
+    );
 }
 
 test "android std http rejects header injection before validating proxy" {
