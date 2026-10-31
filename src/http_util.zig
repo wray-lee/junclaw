@@ -1711,10 +1711,8 @@ fn validateFetchProxy(allocator: Allocator, location: std.http.Client.FetchOptio
 }
 
 fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !ProxyHttpClient {
-    var proxy_client = try ProxyHttpClient.init(allocator);
-    if (proxy == null) return proxy_client;
+    if (proxy == null) return ProxyHttpClient.init(allocator);
 
-    proxy_client.deinit();
     var proxy_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer proxy_arena.deinit();
     var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.net.httpIo() };
@@ -1725,7 +1723,7 @@ fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !P
     try env_map.put("https_proxy", proxy.?);
     try env_map.put("HTTP_PROXY", proxy.?);
     try env_map.put("http_proxy", proxy.?);
-    try client.initDefaultProxies(proxy_arena.allocator(), &env_map);
+    try initClientDefaultProxiesFromEnvMap(&client, proxy_arena.allocator(), &env_map);
     return .{ .proxy_arena = proxy_arena, .client = client };
 }
 
@@ -2099,7 +2097,6 @@ pub const ProxyHttpClient = struct {
         allocator: Allocator,
         env_map: ?*const std_compat.process.EnvMap,
     ) !ProxyHttpClient {
-        _ = abi;
         var proxy_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer proxy_arena.deinit();
 
@@ -2107,11 +2104,7 @@ pub const ProxyHttpClient = struct {
         errdefer client.deinit();
         try tls_ca.configureHttpClient(&client, allocator);
 
-        if (env_map) |em| {
-            try initClientDefaultProxiesFromEnvMap(&client, proxy_arena.allocator(), em);
-        } else {
-            try initClientDefaultProxies(&client, proxy_arena.allocator());
-        }
+        try initClientDefaultProxiesForAbi(abi, &client, proxy_arena.allocator(), env_map);
 
         return .{
             .proxy_arena = proxy_arena,
@@ -2771,18 +2764,48 @@ fn getProxyOverrideOwned(allocator: Allocator) !?[]u8 {
     return try allocator.dupe(u8, value);
 }
 
-fn initClientDefaultProxiesFromEnvMap(
+fn validateStdProxyEnvMap(env_map: *const std_compat.process.EnvMap) !void {
+    for (proxy_env_var_names) |key| {
+        if (env_map.get(key)) |raw_val| {
+            const trimmed = std.mem.trim(u8, raw_val, " \t\r\n");
+            if (trimmed.len > 0) {
+                try validateStdProxyScheme(trimmed);
+            }
+        }
+    }
+}
+
+pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !void {
+    return initClientDefaultProxiesForAbi(builtin.abi, client, arena, null);
+}
+
+pub fn initClientDefaultProxiesFromEnvMap(
     client: *std.http.Client,
     arena: Allocator,
     env_map: *const std_compat.process.EnvMap,
 ) !void {
-    var merged_env_map = try env_map.clone(arena);
-    _ = try applyProxyOverrideToEnvMap(&merged_env_map);
-    try client.initDefaultProxies(arena, &merged_env_map);
+    return initClientDefaultProxiesForAbi(builtin.abi, client, arena, env_map);
 }
 
-pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !void {
-    var env_map = try buildProxyEnvMapFromProcess(arena);
+pub fn initClientDefaultProxiesForAbi(
+    comptime abi: std.Target.Abi,
+    client: *std.http.Client,
+    arena: Allocator,
+    explicit_env_map: ?*const std_compat.process.EnvMap,
+) !void {
+    var env_map = if (explicit_env_map) |em|
+        try em.clone(arena)
+    else
+        try buildProxyEnvMapFromProcess(arena);
+
+    if (explicit_env_map != null) {
+        _ = try applyProxyOverrideToEnvMap(&env_map);
+    }
+
+    if (comptime stdHttpTransport(abi)) {
+        try validateStdProxyEnvMap(&env_map);
+    }
+
     try client.initDefaultProxies(arena, &env_map);
 }
 
@@ -4957,6 +4980,36 @@ test "android proxy http client init rejects unsupported proxy schemes in env" {
                 ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map),
             );
         }
+    }
+
+    // Non-Android ABI keeps std.http silent discard (does not return UnsupportedProxyScheme at init):
+    {
+        var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+        defer env_map.deinit();
+        try env_map.put("all_proxy", "socks5://proxy.example.com:1080");
+        var client = try ProxyHttpClient.initForAbi(.gnu, std.testing.allocator, &env_map);
+        defer client.deinit();
+    }
+
+    // Android ABI succeeds when proxy scheme is supported:
+    {
+        var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+        defer env_map.deinit();
+        try env_map.put("http_proxy", "http://proxy-http.example.com:8080");
+        try env_map.put("https_proxy", "https://proxy-https.example.com:8443");
+        var client = try ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map);
+        defer client.deinit();
+        try std.testing.expect(client.client.http_proxy != null);
+        try std.testing.expect(client.client.https_proxy != null);
+    }
+
+    // Empty proxy env value is ignored and does not error:
+    {
+        var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+        defer env_map.deinit();
+        try env_map.put("all_proxy", "");
+        var client = try ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map);
+        defer client.deinit();
     }
 }
 

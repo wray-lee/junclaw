@@ -107,6 +107,10 @@ Android 构建打包在宿主 App 内，随 APK 一同更新；`junclaw update` 
 
 设备能力的审批由宿主负责，junclaw 不重复审批。但设备工具仍是普通的 junclaw 工具：执行前照常经过 agent 的 `SecurityPolicy`（只读 autonomy、动作限流、按 agent 收窄工具等），桥接不会绕过这些通用限制。
 
+### 出站 HTTP 与代理安全
+
+Android 构建通过 `std.http` 发起出站 HTTP 请求（不附带 curl 二进制）。当代理配置（标准环境变量 `http_proxy`、`https_proxy`、`all_proxy` 及其大写变体，或运行时代理覆盖）指定了 `std.http` 不支持的 scheme（如 `socks5://`）时，客户端初始化会立即报错失败（`error.UnsupportedProxyScheme`），请求被阻断，绝不静默绕过代理回退为直连（fail-closed）。非 Android 平台行为保持不变。
+
 ## 测试
 
 `zig build test` 覆盖分帧（含超长行拒绝）、descriptor 校验与过滤、前缀加/去、text/image/error 映射，以及针对假 unix socket 宿主的一次性连接往返（list、invoke、JSON-RPC 错误、宿主不响应时的超时）。AF_UNIX 集成测试在 Windows 上跳过（该测试环境不依赖 unix socket）。
