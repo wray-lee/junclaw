@@ -379,10 +379,31 @@ fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build, target: std.Build.
     module.linkLibrary(wasm3_lib);
 }
 
+/// Wire a test binary into the `test` step. On Android the host cannot run it:
+/// force dynamic linkage (Zig defaults API >= 29 to static, but the NDK ships
+/// bionic only as shared libraries) and install the binary for the device
+/// instead of executing it.
+fn addTestRun(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    tests: *std.Build.Step.Compile,
+    android: bool,
+    install_name: []const u8,
+) void {
+    if (android) {
+        tests.linkage = .dynamic;
+        test_step.dependOn(&b.addInstallFileWithDir(tests.getEmittedBin(), .bin, install_name).step);
+    }
+    const run = b.addRunArtifact(tests);
+    run.skip_foreign_checks = android;
+    test_step.dependOn(&run.step);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
+    const is_android = target.result.abi == .android;
     const is_static = b.option(bool, "static", "Static build") orelse false;
     const enable_embedded_wasm3 = b.option(bool, "embedded_wasm3", "Embed wasm3 runtime into nullclaw binary (default: true; use -Dembedded_wasm3=false to disable)") orelse true;
     const harness_dsh = b.option(bool, "harness_dsh", "Build dsh sidecar harness (default false)") orelse false;
@@ -529,6 +550,12 @@ pub fn build(b: *std.Build) void {
         });
         module.addImport("build_options", build_options_module);
         module.addImport("compat", compat_module);
+        if (is_android) {
+            // NDK r27c annotates array parameters with _Nonnull, which
+            // translate-c rejects; strip nullability so @cImport parses.
+            module.addCMacro("_Nonnull", "");
+            module.addCMacro("_Nullable", "");
+        }
         if (sqlite3) |lib| {
             module.linkLibrary(lib);
         }
@@ -663,7 +690,7 @@ pub fn build(b: *std.Build) void {
     if (!is_wasi) {
         const compat_tests = b.addTest(.{ .root_module = compat_module });
         compat_tests.root_module.link_libc = true;
-        test_step.dependOn(&b.addRunArtifact(compat_tests).step);
+        addTestRun(b, test_step, compat_tests, is_android, "nullclaw-compat-tests-android");
 
         const lib_tests = b.addTest(.{ .root_module = lib_mod.? });
         if (sqlite3) |lib| {
@@ -672,10 +699,20 @@ pub fn build(b: *std.Build) void {
         if (enable_postgres) {
             lib_tests.root_module.linkSystemLibrary("pq", .{});
         }
+        addTestRun(b, test_step, lib_tests, is_android, "nullclaw-lib-tests-android");
+
+        // Android CA tests get their own artifact so the gate does not depend
+        // on transitive test collection from other modules.
+        const ca_tests = b.addTest(.{ .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tls/ca.zig"),
+            .target = target,
+            .optimize = optimize,
+        }) });
+        if (is_android) ca_tests.root_module.link_libc = true;
+        addTestRun(b, test_step, ca_tests, is_android, "nullclaw-ca-tests-android");
 
         const exe_tests = b.addTest(.{ .root_module = exe.root_module });
-        test_step.dependOn(&b.addRunArtifact(lib_tests).step);
-        test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+        addTestRun(b, test_step, exe_tests, is_android, "nullclaw-exe-tests-android");
     }
 }
 
