@@ -503,12 +503,7 @@ pub const SignalChannel = struct {
         const local_path = try std.fmt.allocPrint(allocator, "{s}/signal_{x}.dat", .{ tmp_dir, rand_id });
         defer allocator.free(local_path);
 
-        var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
-        defer file.close();
-        errdefer platform.deleteSpoolFile(local_path);
-        try file.writeAll(decoded);
-
-        return try allocator.dupe(u8, local_path);
+        return writeSpoolAttachment(allocator, local_path, decoded);
     }
 
     // ── JSON-RPC Send ───────────────────────────────────────────────
@@ -3739,4 +3734,31 @@ test "signal channel spool attachment is deleted after message deinit" {
     msg.deinit(allocator);
 
     try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/signal_test.dat"));
+}
+
+pub fn writeSpoolAttachment(allocator: std.mem.Allocator, local_path: []const u8, decoded: []const u8) !?[]u8 {
+    var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
+    errdefer platform.deleteSpoolFile(local_path);
+    defer file.close();
+    try file.writeAll(decoded);
+
+    return try allocator.dupe(u8, local_path);
+}
+
+test "signal writeSpoolAttachment cleans up file on dupe OOM" {
+    // Regression: file handle must close before deleting spool file, and OOM cleans up spool
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    const sub_path = platform.spool_dir_name ++ "/signal_test.dat";
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name);
+    defer allocator.free(path);
+    const local_path = try std.fs.path.join(allocator, &.{ path, "signal_test.dat" });
+    defer allocator.free(local_path);
+
+    var failing_alloc = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, writeSpoolAttachment(failing_alloc.allocator(), local_path, "signal-payload"));
+    try std.testing.expectError(error.FileNotFound, dir.statFile(sub_path));
 }
