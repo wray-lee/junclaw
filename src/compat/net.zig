@@ -624,8 +624,97 @@ const DnsResolver = enum { libc_getaddrinfo, std_lookup };
 pub const HttpLookupBackend = enum { io_native, libc_getaddrinfo };
 
 pub fn httpLookupBackend(comptime abi: std.Target.Abi) HttpLookupBackend {
-    _ = abi;
+    if (abi == .android) return .libc_getaddrinfo;
     return .io_native;
+}
+
+var http_vtable_mutex: std.Io.Mutex = .init;
+var http_vtable: std.Io.VTable = undefined;
+var http_vtable_ready = false;
+
+/// Io for std.http clients. On Android its `netLookup` asks bionic's
+/// getaddrinfo (netd), matching `getAddressList`; every other vtable entry
+/// still forwards to the process Io with the original userdata. Other ABIs get
+/// the process Io unchanged.
+pub fn httpIo() std.Io {
+    if (comptime httpLookupBackend(builtin.abi) == .io_native) return shared.io();
+    const base = shared.io();
+    http_vtable_mutex.lockUncancelable(base);
+    defer http_vtable_mutex.unlock(base);
+    if (!http_vtable_ready) {
+        http_vtable = base.vtable.*;
+        http_vtable.netLookup = libcHttpNetLookup;
+        http_vtable_ready = true;
+    }
+    return .{ .userdata = base.userdata, .vtable = &http_vtable };
+}
+
+fn putHttpLookupResults(
+    io: std.Io,
+    resolved: *std.Io.Queue(IoNet.HostName.LookupResult),
+    host_name: IoNet.HostName,
+    options: IoNet.HostName.LookupOptions,
+    addresses: []const IoNet.IpAddress,
+) (std.Io.Cancelable || error{UnknownHostName})!void {
+    var results: [32]IoNet.HostName.LookupResult = undefined;
+    var count: usize = 0;
+    for (addresses) |address| {
+        if (count == results.len - 1) break;
+        if (options.family) |family| {
+            if (std.meta.activeTag(address) != family) continue;
+        }
+        results[count] = .{ .address = address };
+        count += 1;
+    }
+    if (count == 0) return error.UnknownHostName;
+    if (options.canonical_name_buffer) |buffer| {
+        const name = if (std.mem.endsWith(u8, host_name.bytes, "."))
+            host_name.bytes[0 .. host_name.bytes.len - 1]
+        else
+            host_name.bytes;
+        @memcpy(buffer[0..name.len], name);
+        results[count] = .{ .canonical_name = .{ .bytes = buffer[0..name.len] } };
+        count += 1;
+    }
+    resolved.putAll(io, results[0..count]) catch return error.Canceled;
+}
+
+fn libcHttpNetLookup(
+    userdata: ?*anyopaque,
+    host_name: IoNet.HostName,
+    resolved: *std.Io.Queue(IoNet.HostName.LookupResult),
+    options: IoNet.HostName.LookupOptions,
+) IoNet.HostName.LookupError!void {
+    const io: std.Io = .{ .userdata = userdata, .vtable = &http_vtable };
+    defer resolved.close(io);
+
+    if (IoNet.IpAddress.parseIp6(host_name.bytes, options.port)) |address| {
+        try putHttpLookupResults(io, resolved, host_name, options, &.{address});
+        return;
+    } else |_| {}
+    if (IoNet.IpAddress.parseIp4(host_name.bytes, options.port)) |address| {
+        try putHttpLookupResults(io, resolved, host_name, options, &.{address});
+        return;
+    } else |_| {}
+
+    const list = getAddressList(std.heap.page_allocator, host_name.bytes, options.port) catch |err| switch (err) {
+        error.UnknownHostName, error.NameTooLong => return error.UnknownHostName,
+        error.TemporaryNameServerFailure, error.NameServerFailure => return error.NameServerFailure,
+        error.AddressFamilyNotSupported => return error.AddressFamilyUnsupported,
+        error.SystemResources => return error.SystemResources,
+        else => return error.UnknownHostName,
+    };
+    defer list.deinit();
+
+    var addresses: [32]IoNet.IpAddress = undefined;
+    var count: usize = 0;
+    for (list.addrs) |address| {
+        if (count == addresses.len) break;
+        addresses[count] = address.toCurrent();
+        count += 1;
+    }
+    if (count == 0) return error.UnknownHostName;
+    try putHttpLookupResults(io, resolved, host_name, options, addresses[0..count]);
 }
 
 test "android std http lookups use libc getaddrinfo" {

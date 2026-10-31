@@ -790,6 +790,10 @@ pub const GeminiProvider = struct {
         callback: root.StreamCallback,
         ctx: *anyopaque,
     ) !root.StreamChatResult {
+        if (comptime http_util.stdHttpTransport(@import("builtin").abi)) {
+            return stdGeminiStream(allocator, url, body, headers, timeout_secs, callback, ctx);
+        }
+
         // Build argv on stack (max 36 args)
         var argv_buf: [36][]const u8 = undefined;
         var argc: usize = 0;
@@ -865,29 +869,60 @@ pub const GeminiProvider = struct {
 
         try child.spawn();
 
-        // Abort the in-flight stream when the agent /stop raises the interrupt
-        // flag: the watcher kills curl and the read loop below returns
-        // error.Interrupted instead of running the request to completion.
-        var cancel_done = std.atomic.Value(bool).init(false);
-        var cancel_watcher: ?std.Thread = null;
-        var cancel_ctx: http_util.CancelWatcherCtx = undefined;
-        http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
-        defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+        var source: http_util.CurlByteStream = undefined;
+        source.init(&child);
+        defer source.deinit();
 
         if (child.stdin) |stdin_file| {
             stdin_file.writeAll(body) catch {
                 stdin_file.close();
                 child.stdin = null;
-                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                source.abort();
                 return error.GeminiApiError;
             };
             stdin_file.close();
             child.stdin = null;
         } else {
-            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            source.abort();
             return error.GeminiApiError;
         }
 
+        return consumeGeminiStream(allocator, source.stream(), callback, ctx);
+    }
+
+    fn stdGeminiStream(
+        allocator: std.mem.Allocator,
+        url: []const u8,
+        body: []const u8,
+        headers: []const []const u8,
+        timeout_secs: u64,
+        callback: root.StreamCallback,
+        ctx: *anyopaque,
+    ) !root.StreamChatResult {
+        const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+        defer if (resolve_entry) |entry| allocator.free(entry);
+
+        var header_buf: [16][]const u8 = undefined;
+        var header_count: usize = 0;
+        header_buf[header_count] = "Content-Type: application/json";
+        header_count += 1;
+        for (headers) |hdr| {
+            if (header_count >= header_buf.len) return error.TooManyHeaders;
+            header_buf[header_count] = hdr;
+            header_count += 1;
+        }
+
+        const stream = try http_util.HttpStream.open(allocator, url, header_buf[0..header_count], body, timeout_secs);
+        defer stream.deinit();
+        return consumeGeminiStream(allocator, stream.stream(), callback, ctx);
+    }
+
+    fn consumeGeminiStream(
+        allocator: std.mem.Allocator,
+        source: http_util.ByteStream,
+        callback: root.StreamCallback,
+        ctx: *anyopaque,
+    ) !root.StreamChatResult {
         // Read stdout line by line, parse SSE events
         var accumulated: std.ArrayListUnmanaged(u8) = .empty;
         defer accumulated.deinit(allocator);
@@ -896,7 +931,6 @@ pub const GeminiProvider = struct {
         defer line_buf.deinit(allocator);
 
         var stream_usage = root.TokenUsage{};
-        const file = child.stdout.?;
         var read_buf: [4096]u8 = undefined;
         var saw_done = false;
 
@@ -904,10 +938,10 @@ pub const GeminiProvider = struct {
             // /stop: stop reading at the next delta boundary instead of draining
             // every delta the provider already buffered.
             if (http_util.interruptRequested()) {
-                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                source.abort();
                 return error.Interrupted;
             }
-            const n = file.read(&read_buf) catch break;
+            const n = source.read(&read_buf) catch break;
             if (n == 0) break;
 
             for (read_buf[0..n]) |byte| {
@@ -924,7 +958,7 @@ pub const GeminiProvider = struct {
                         .delta => |text| {
                             defer allocator.free(text);
                             if (http_util.interruptRequested()) {
-                                http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                                source.abort();
                                 return error.Interrupted;
                             }
                             try accumulated.appendSlice(allocator, text);
@@ -965,46 +999,24 @@ pub const GeminiProvider = struct {
         // A /stop killed curl before the stream finished: report the interrupt
         // instead of salvaging the partial text as a completed response.
         if (!saw_done and http_util.interruptRequested()) {
-            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            source.abort();
             return error.Interrupted;
         }
 
         // Drain remaining stdout to prevent deadlock on wait()
         while (true) {
-            const n = file.read(&read_buf) catch break;
+            const n = source.read(&read_buf) catch break;
             if (n == 0) break;
         }
 
-        // Join the watcher before reaping curl (PID-reuse window; see
-        // stopCancelWatcherAndReap). The stdout stream is already at EOF.
-        http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
-        const term = child.wait() catch |err| {
-            log.err("curlStreamGemini child.wait failed: {}", .{err});
+        source.finish() catch |err| {
             if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                log.warn("curlStreamGemini proceeding despite wait failure after partial stream output", .{});
+                log.warn("gemini stream transport failed ({}) after partial output; returning accumulated output", .{err});
                 callback(ctx, root.StreamChunk.finalChunk());
                 return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
             }
-            return error.CurlWaitError;
+            return err;
         };
-        switch (term) {
-            .exited => |code| if (code != 0) {
-                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                    log.warn("curlStreamGemini exit code {d} after partial stream output; returning accumulated output", .{code});
-                    callback(ctx, root.StreamChunk.finalChunk());
-                    return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
-                }
-                return error.CurlFailed;
-            },
-            else => {
-                if (root.shouldRecoverPartialStream(accumulated.items.len, saw_done)) {
-                    log.warn("curlStreamGemini abnormal termination after partial stream output; returning accumulated output", .{});
-                    callback(ctx, root.StreamChunk.finalChunk());
-                    return finalizeRecoveredGeminiStreamResult(allocator, accumulated.items, stream_usage);
-                }
-                return error.CurlFailed;
-            },
-        }
 
         // Signal completion only after successful process exit.
         callback(ctx, root.StreamChunk.finalChunk());
