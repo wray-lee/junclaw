@@ -670,6 +670,11 @@ pub fn allTools(
         }
     }
 
+    // Android device capabilities: the host advertises its tools over the
+    // per-request unix socket. Off Android (or without the env var) this is a
+    // no-op, so the tool list is unchanged.
+    android_device.registerTools(allocator, &list, workspace_dir);
+
     applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
 
     return list.toOwnedSlice(allocator);
