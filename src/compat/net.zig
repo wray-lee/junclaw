@@ -617,6 +617,23 @@ fn getAddressListWindows(gpa: Allocator, name: []const u8, port: u16) GetAddress
 
 const DnsResolver = enum { libc_getaddrinfo, std_lookup };
 
+/// Which resolver backs `std.Io` name lookups. std.Io.Threaded sends every
+/// Linux target (Android's os tag is .linux) through its own wire resolver and
+/// never reaches the libc branch, which is the phase-1 failure. Android pins
+/// this to libc; all other ABIs keep the standard Io lookup untouched.
+pub const HttpLookupBackend = enum { io_native, libc_getaddrinfo };
+
+pub fn httpLookupBackend(comptime abi: std.Target.Abi) HttpLookupBackend {
+    _ = abi;
+    return .io_native;
+}
+
+test "android std http lookups use libc getaddrinfo" {
+    try std.testing.expectEqual(HttpLookupBackend.libc_getaddrinfo, httpLookupBackend(.android));
+    try std.testing.expectEqual(HttpLookupBackend.io_native, httpLookupBackend(.gnu));
+    try std.testing.expectEqual(HttpLookupBackend.io_native, httpLookupBackend(.musl));
+}
+
 /// Android ships no /etc/resolv.conf, where Zig's std resolver falls back to
 /// 127.0.0.1:53 and fails with NameServerFailure; bionic's getaddrinfo asks
 /// netd instead. Every non-Windows target, Android included, has always
