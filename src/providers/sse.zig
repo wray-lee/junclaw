@@ -1585,6 +1585,9 @@ test "stdinWriteFailureIsInterrupt reports a stop, not a write error" {
 
 test "curlStream aborts a never-ending stream promptly when the interrupt flag is raised" {
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    // Android test images ship no curl; curlStream spawns the real binary and
+    // the local server thread would block in accept() forever without it.
+    if (comptime @import("builtin").abi == .android) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
 
