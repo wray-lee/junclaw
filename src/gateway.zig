@@ -577,7 +577,23 @@ fn publishToBus(
     session_key: []const u8,
     metadata_json: ?[]const u8,
 ) bool {
-    const msg = bus_mod.makeInboundFull(
+    return publishToBusWithSpoolPath(eb, allocator, channel, sender_id, chat_id, content, session_key, metadata_json, null);
+}
+
+/// Same as publishToBus, but hands a downloaded attachment spool file to the
+/// message so it is deleted after the turn finishes.
+fn publishToBusWithSpoolPath(
+    eb: *bus_mod.Bus,
+    allocator: std.mem.Allocator,
+    channel: []const u8,
+    sender_id: []const u8,
+    chat_id: []const u8,
+    content: []const u8,
+    session_key: []const u8,
+    metadata_json: ?[]const u8,
+    spool_path: ?[]const u8,
+) bool {
+    var msg = bus_mod.makeInboundFull(
         allocator,
         channel,
         sender_id,
@@ -586,7 +602,17 @@ fn publishToBus(
         session_key,
         &.{},
         metadata_json,
-    ) catch return false;
+    ) catch {
+        if (spool_path) |path| platform.deleteSpoolFile(path);
+        return false;
+    };
+    if (spool_path) |path| {
+        msg.appendSpoolPath(allocator, path) catch {
+            msg.deinit(allocator);
+            platform.deleteSpoolFile(path);
+            return false;
+        };
+    }
     // Bounded wait: never wedge the accept loop on a full inbound queue.
     eb.publishInboundTimeout(msg, INBOUND_PUBLISH_TIMEOUT_MS) catch |err| {
         log.warn("inbound bus publish for {s} failed ({}): queue saturated or closed", .{ channel, err });
@@ -594,6 +620,16 @@ fn publishToBus(
         return false;
     };
     return true;
+}
+
+/// Extract the local path from a freshly built `[IMAGE:...]` media marker.
+/// Only call this on content produced by downloadMediaFromPayload, never on
+/// arbitrary user text.
+fn spoolPathFromMediaMarker(content: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, content, "[IMAGE:")) return null;
+    const end = std.mem.lastIndexOfScalar(u8, content, ']') orelse return null;
+    if (end <= "[IMAGE:".len) return null;
+    return content["[IMAGE:".len..end];
 }
 
 /// Check if all registered health components are OK.
@@ -3781,6 +3817,10 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
         return;
     }
 
+    // Each webhook is the WhatsApp channel's existing periodic point; no new
+    // thread is needed to age out leftovers.
+    platform.sweepSpoolTempDir(ctx.state.allocator, std_compat.time.timestamp(), platform.spool_ttl_secs);
+
     const is_get = std.mem.eql(u8, ctx.method, "GET");
     if (is_get) {
         const mode = parseQueryParam(ctx.target, "hub.mode");
@@ -3873,9 +3913,19 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"unauthorized\"}";
             break :sig_check;
         }
-        const msg_text = jsonStringField(body, "text") orelse jsonStringField(body, "body") orelse
-            channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(ctx.req_allocator, wa_access_token, body);
+        const msg_text_field = jsonStringField(body, "text") orelse jsonStringField(body, "body");
+        const media_content = if (msg_text_field == null)
+            channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(ctx.req_allocator, wa_access_token, body)
+        else
+            null;
+        const spool_path = if (media_content) |mc| spoolPathFromMediaMarker(mc) else null;
+        const msg_text = msg_text_field orelse media_content;
         if (msg_text) |mt| {
+            var spool_handed_off = false;
+            defer if (!spool_handed_off) {
+                if (spool_path) |path| platform.deleteSpoolFile(path);
+            };
+
             var wa_key_buf: [256]u8 = undefined;
             const wa_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
             const routed_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, body, wa_cfg_opt, wa_account_id);
@@ -3893,7 +3943,8 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     wa_peer_kind,
                     wa_peer_id,
                 }) catch null;
-                _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta);
+                _ = publishToBusWithSpoolPath(eb, ctx.state.allocator, "whatsapp", wa_sender_id, wa_chat_target, mt, wa_session_key, meta, spool_path);
+                spool_handed_off = true;
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
                 const conversation_context: ?ConversationContext = simpleConversationContext(
@@ -3943,9 +3994,19 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"unauthorized\"}";
             return;
         }
-        const msg_text = jsonStringField(b, "text") orelse jsonStringField(b, "body") orelse
-            channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(ctx.req_allocator, wa_access_token, b);
+        const msg_text_field = jsonStringField(b, "text") orelse jsonStringField(b, "body");
+        const media_content = if (msg_text_field == null)
+            channels.whatsapp.WhatsAppChannel.downloadMediaFromPayload(ctx.req_allocator, wa_access_token, b)
+        else
+            null;
+        const spool_path = if (media_content) |mc| spoolPathFromMediaMarker(mc) else null;
+        const msg_text = msg_text_field orelse media_content;
         if (msg_text) |mt| {
+            var spool_handed_off = false;
+            defer if (!spool_handed_off) {
+                if (spool_path) |path| platform.deleteSpoolFile(path);
+            };
+
             var wa_key_buf: [256]u8 = undefined;
             const wa_cfg_opt: ?*const Config = if (ctx.config_opt) |cfg| cfg else null;
             const routed_key = whatsappSessionKeyRouted(ctx.req_allocator, &wa_key_buf, b, wa_cfg_opt, wa_account_id);
@@ -3963,7 +4024,8 @@ fn handleWhatsAppWebhookRoute(ctx: *WebhookHandlerContext) void {
                     wa_peer_kind,
                     wa_peer_id,
                 }) catch null;
-                _ = publishToBus(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta);
+                _ = publishToBusWithSpoolPath(eb, ctx.state.allocator, "whatsapp", wa_sender_ns, wa_chat_target_ns, mt, wa_session_key, meta, spool_path);
+                spool_handed_off = true;
                 ctx.response_body = "{\"status\":\"received\"}";
             } else if (ctx.session_mgr_opt) |sm| {
                 const conversation_context: ?ConversationContext = simpleConversationContext(
@@ -5998,6 +6060,7 @@ pub fn run(
     tunnel_url_opt: ?[]const u8,
 ) !void {
     health.markComponentOk("gateway");
+    platform.sweepSpoolTempDir(allocator, std_compat.time.timestamp(), platform.spool_ttl_secs);
 
     const daemon_mode = event_bus != null;
     const public_bind = isPublicBindHost(host);

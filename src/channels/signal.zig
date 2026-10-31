@@ -364,6 +364,14 @@ pub const SignalChannel = struct {
         // Determine message text and fetch attachments.
         var text_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer text_buf.deinit(allocator);
+        var spool_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (spool_paths.items) |path| {
+                platform.deleteSpoolFile(path);
+                allocator.free(path);
+            }
+            spool_paths.deinit(allocator);
+        }
 
         if (has_message_text) {
             try text_buf.appendSlice(allocator, dm_message.?);
@@ -374,10 +382,17 @@ pub const SignalChannel = struct {
             const target_id = dm_group_id orelse sender_raw;
             for (dm_attachment_ids) |att_id| {
                 if (try self.fetchAttachmentLocally(allocator, att_id, is_group, target_id)) |local_path| {
+                    var keep = false;
+                    defer if (!keep) {
+                        platform.deleteSpoolFile(local_path);
+                        allocator.free(local_path);
+                    };
                     if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "\n");
                     try text_buf.appendSlice(allocator, "[IMAGE:");
                     try text_buf.appendSlice(allocator, local_path);
                     try text_buf.appendSlice(allocator, "]");
+                    try spool_paths.append(allocator, local_path);
+                    keep = true;
                 } else {
                     if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "\n");
                     try text_buf.appendSlice(allocator, "[Attachment]");
@@ -418,6 +433,7 @@ pub const SignalChannel = struct {
             .is_group = dm_group_id != null,
             .sender_uuid = if (source) |src| if (src.len > 0 and isUuid(src)) try allocator.dupe(u8, src) else null else null,
             .group_id = if (dm_group_id) |gid| try allocator.dupe(u8, gid) else null,
+            .spool_paths = try spool_paths.toOwnedSlice(allocator),
         };
 
         return msg;
@@ -489,6 +505,7 @@ pub const SignalChannel = struct {
 
         var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
         defer file.close();
+        errdefer platform.deleteSpoolFile(local_path);
         try file.writeAll(decoded);
 
         return try allocator.dupe(u8, local_path);

@@ -170,33 +170,59 @@ pub const spool_ttl_secs: i64 = 24 * 60 * 60;
 
 /// Temp dir for spooled payloads (attachment downloads, spilled output).
 /// Android has no writable /tmp, so use the Android fallback chain; other
-/// platforms keep the historical hardcoded "/tmp".
+/// platforms keep the historical hardcoded "/tmp". The returned directory is
+/// the junclaw-owned subdirectory and is created (0700) if needed, so sweeps
+/// never have to touch unrelated temp files.
 /// Caller owns the returned slice.
 pub fn getSpoolTempDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (comptime builtin.abi == .android) return getTempDir(allocator);
-    return allocator.dupe(u8, "/tmp");
+    const base = if (comptime builtin.abi == .android)
+        try getTempDir(allocator)
+    else
+        try allocator.dupe(u8, "/tmp");
+    defer allocator.free(base);
+    const dir = try std.fs.path.join(allocator, &.{ base, spool_dir_name });
+    errdefer allocator.free(dir);
+    std.Io.Dir.createDirAbsolute(std_compat.io(), dir, std_compat.fs.permissionsFromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return dir;
 }
 
 /// Remove a single spool file. Refuses paths outside a junclaw spool directory
 /// so a bad caller cannot delete arbitrary files.
 pub fn deleteSpoolFile(path: []const u8) void {
-    _ = path;
+    const parent = std.fs.path.dirname(path) orelse return;
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), spool_dir_name)) return;
+    std_compat.fs.deleteFileAbsolute(path) catch {};
 }
 
 /// Delete files in `dir_path` whose age is at or past `ttl_secs`. `now_secs`
 /// is injected so callers (and tests) control the clock. Only directories
 /// named like the junclaw spool dir are touched.
 pub fn sweepSpoolFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
-    _ = dir_path;
-    _ = now_secs;
-    _ = ttl_secs;
+    if (!std.mem.eql(u8, std.fs.path.basename(dir_path), spool_dir_name)) return;
+
+    var dir = std_compat.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+
+        const stat = dir.statFile(entry.name) catch continue;
+        const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+        if ((now_secs - mtime_secs) < ttl_secs) continue;
+
+        dir.deleteFile(entry.name) catch continue;
+    }
 }
 
 /// Sweep the platform spool directory.
 pub fn sweepSpoolTempDir(allocator: std.mem.Allocator, now_secs: i64, ttl_secs: i64) void {
-    _ = allocator;
-    _ = now_secs;
-    _ = ttl_secs;
+    const dir = getSpoolTempDir(allocator) catch return;
+    defer allocator.free(dir);
+    sweepSpoolFilesInDir(dir, now_secs, ttl_secs);
 }
 
 /// Returns the system temp directory. Tries:

@@ -11,6 +11,7 @@ const testing = std.testing;
 const outbound = @import("outbound.zig");
 const streaming = @import("streaming.zig");
 const thread_stacks = @import("thread_stacks.zig");
+const platform = @import("platform.zig");
 
 // ---------------------------------------------------------------------------
 // Message types
@@ -31,12 +32,31 @@ pub const InboundMessage = struct {
     pub fn deinit(self: *const InboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);
         if (self.media.len > 0) allocator.free(self.media);
+        for (self.spool_paths) |path| {
+            platform.deleteSpoolFile(path);
+            allocator.free(path);
+        }
+        if (self.spool_paths.len > 0) allocator.free(self.spool_paths);
         if (self.metadata_json) |md| allocator.free(md);
         allocator.free(self.channel);
         allocator.free(self.sender_id);
         allocator.free(self.chat_id);
         allocator.free(self.content);
         allocator.free(self.session_key);
+    }
+
+    /// Append an owned copy of a spool path. The file is deleted when the
+    /// message is deinited, whether the turn succeeded or failed.
+    pub fn appendSpoolPath(self: *InboundMessage, allocator: Allocator, path: []const u8) !void {
+        const dup = try allocator.dupe(u8, path);
+        errdefer allocator.free(dup);
+
+        const old = self.spool_paths;
+        const new = try allocator.alloc([]const u8, old.len + 1);
+        @memcpy(new[0..old.len], old);
+        new[old.len] = dup;
+        if (old.len > 0) allocator.free(old);
+        self.spool_paths = new;
     }
 };
 

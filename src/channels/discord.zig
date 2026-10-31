@@ -65,6 +65,7 @@ pub const DiscordChannel = struct {
     heartbeat_interval_ms: Atomic(u64) = Atomic(u64).init(0),
     heartbeat_stop: Atomic(bool) = Atomic(bool).init(false),
     last_gateway_activity_ms: Atomic(i64) = Atomic(i64).init(0),
+    spool_sweep_ticks: u32 = 0,
     session_id: ?[]u8 = null,
     resume_gateway_url: ?[]u8 = null,
     bot_user_id: ?[]u8 = null,
@@ -913,7 +914,12 @@ pub const DiscordChannel = struct {
 
     // ── Gateway loop ─────────────────────────────────────────────────
 
+    fn sweepSpoolFiles(self: *DiscordChannel) void {
+        platform.sweepSpoolTempDir(self.allocator, std_compat.time.timestamp(), platform.spool_ttl_secs);
+    }
+
     fn gatewayLoop(self: *DiscordChannel) void {
+        self.sweepSpoolFiles();
         while (self.running.load(.acquire)) {
             var backoff_ms: u64 = 5000;
             self.runGatewayOnce() catch |err| switch (err) {
@@ -1068,6 +1074,12 @@ pub const DiscordChannel = struct {
             ws.writeText(hb_json) catch |err| {
                 log.warn("Discord heartbeat failed: {}", .{err});
             };
+
+            self.spool_sweep_ticks += 1;
+            if (self.spool_sweep_ticks >= 20) {
+                self.spool_sweep_ticks = 0;
+                self.sweepSpoolFiles();
+            }
         }
     }
 
@@ -1410,6 +1422,14 @@ pub const DiscordChannel = struct {
         // Process attachments (if any)
         var content_buf: std.ArrayListUnmanaged(u8) = .empty;
         defer content_buf.deinit(self.allocator);
+        var spool_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (spool_paths.items) |path| {
+                platform.deleteSpoolFile(path);
+                self.allocator.free(path);
+            }
+            spool_paths.deinit(self.allocator);
+        }
 
         if (content.len > 0) {
             content_buf.appendSlice(self.allocator, content) catch {};
@@ -1438,6 +1458,7 @@ pub const DiscordChannel = struct {
                                     if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
                                         file.writeAll(img_data) catch {
                                             file.close();
+                                            platform.deleteSpoolFile(local_path);
                                             continue;
                                         };
                                         file.close();
@@ -1446,6 +1467,16 @@ pub const DiscordChannel = struct {
                                         content_buf.appendSlice(self.allocator, "[IMAGE:") catch {};
                                         content_buf.appendSlice(self.allocator, local_path) catch {};
                                         content_buf.appendSlice(self.allocator, "]") catch {};
+
+                                        const owned_path = self.allocator.dupe(u8, local_path) catch {
+                                            platform.deleteSpoolFile(local_path);
+                                            continue;
+                                        };
+                                        spool_paths.append(self.allocator, owned_path) catch {
+                                            self.allocator.free(owned_path);
+                                            platform.deleteSpoolFile(local_path);
+                                            continue;
+                                        };
                                     } else |_| {}
                                 } else |err| {
                                     log.warn("Discord: failed to download attachment: {}", .{err});
@@ -1492,7 +1523,7 @@ pub const DiscordChannel = struct {
         try mw.writeByte('}');
         metadata_buf = metadata_writer.toArrayList();
 
-        const msg = try bus_mod.makeInboundFull(
+        var msg = try bus_mod.makeInboundFull(
             self.allocator,
             "discord",
             author_id,
@@ -1502,6 +1533,13 @@ pub const DiscordChannel = struct {
             &.{},
             metadata_buf.items,
         );
+        if (spool_paths.items.len > 0) {
+            msg.spool_paths = spool_paths.toOwnedSlice(self.allocator) catch |err| {
+                msg.deinit(self.allocator);
+                return err;
+            };
+            spool_paths = .empty;
+        }
 
         if (self.bus) |b| {
             b.publishInbound(msg) catch |err| {
