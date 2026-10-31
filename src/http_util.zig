@@ -3074,6 +3074,173 @@ test "android fetch adapter never auto-redirects caller headers" {
     }));
 }
 
+const RedirectDecision = union(enum) {
+    stop,
+    follow: struct {
+        uri: std.Uri,
+        method: std.http.Method,
+        drop_body: bool,
+        strip_caller_headers: bool,
+    },
+};
+
+fn redirectBudget(spec: CurlRequestSpec) u16 {
+    _ = spec;
+    return 0;
+}
+
+fn redirectDecision(
+    current: std.Uri,
+    location: []const u8,
+    aux_buf: *[]u8,
+    status: u16,
+    method: std.http.Method,
+    remaining: u16,
+) !RedirectDecision {
+    _ = current;
+    _ = location;
+    _ = aux_buf;
+    _ = status;
+    _ = method;
+    _ = remaining;
+    return .stop;
+}
+
+fn expectFormattedUri(expected: []const u8, uri: std.Uri) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try uri.format(&out.writer);
+    try std.testing.expectEqualStrings(expected, out.writer.buffer[0..out.writer.end]);
+}
+
+test "android std redirect budget disables caller-header redirects" {
+    // Regression: stdHttpRequest honored spec.max_redirects directly, so an
+    // Android request carrying caller headers followed redirects that the curl
+    // policy (safeCurlMaxRedirects) refuses, leaking the headers across origins.
+    try std.testing.expectEqual(@as(u16, 0), redirectBudget(.{
+        .method = .GET,
+        .url = "https://example.com/start",
+        .headers = &.{"Authorization: Bearer test-key"},
+        .max_redirects = 3,
+    }));
+    try std.testing.expectEqual(@as(u16, 0), redirectBudget(.{
+        .method = .POST,
+        .url = "https://example.com/start",
+        .body = "{}",
+        .max_redirects = 3,
+        .generated_redirect_headers_only = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 3), redirectBudget(.{
+        .method = .GET,
+        .url = "https://example.com/start",
+        .headers = &.{STD_HTTP_USER_AGENT_HEADER},
+        .max_redirects = 3,
+        .generated_redirect_headers_only = true,
+    }));
+}
+
+test "android std redirect decision keeps caller headers for the same origin" {
+    var aux_buf: [4096]u8 = undefined;
+    var aux: []u8 = &aux_buf;
+    const current = try std.Uri.parse("https://example.com/start");
+    switch (try redirectDecision(current, "/next", &aux, 302, .GET, 3)) {
+        .stop => return error.TestUnexpectedResult,
+        .follow => |hop| {
+            try std.testing.expect(!hop.strip_caller_headers);
+            try std.testing.expect(!hop.drop_body);
+            try std.testing.expectEqual(std.http.Method.GET, hop.method);
+            try expectFormattedUri("https://example.com/next", hop.uri);
+        },
+    }
+    // A relative Location resolves against the current path, not the root.
+    var aux2_buf: [4096]u8 = undefined;
+    var aux2: []u8 = &aux2_buf;
+    switch (try redirectDecision(current, "sub/page", &aux2, 302, .GET, 3)) {
+        .stop => return error.TestUnexpectedResult,
+        .follow => |hop| try expectFormattedUri("https://example.com/sub/page", hop.uri),
+    }
+}
+
+test "android std redirect decision strips caller headers when the origin changes" {
+    const current = try std.Uri.parse("https://example.com/start");
+    const cases = [_][]const u8{
+        "https://api.example.net/v1", // different host
+        "//api.example.net/v1", // protocol-relative
+        "http://example.com/v1", // scheme downgrade
+        "https://example.com:8443/v1", // different port
+    };
+    for (cases) |location| {
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        switch (try redirectDecision(current, location, &aux, 302, .GET, 3)) {
+            .stop => return error.TestUnexpectedResult,
+            .follow => |hop| try std.testing.expect(hop.strip_caller_headers),
+        }
+    }
+}
+
+test "android std redirect decision rewrites methods like std.http" {
+    const current = try std.Uri.parse("https://example.com/start");
+    const Case = struct { status: u16, method: std.http.Method, want_method: std.http.Method, drop: bool };
+    const cases = [_]Case{
+        .{ .status = 303, .method = .POST, .want_method = .GET, .drop = true },
+        .{ .status = 303, .method = .GET, .want_method = .GET, .drop = true },
+        .{ .status = 302, .method = .POST, .want_method = .GET, .drop = true },
+        .{ .status = 301, .method = .POST, .want_method = .GET, .drop = true },
+        .{ .status = 301, .method = .PUT, .want_method = .PUT, .drop = false },
+        .{ .status = 307, .method = .POST, .want_method = .POST, .drop = false },
+        .{ .status = 308, .method = .POST, .want_method = .POST, .drop = false },
+    };
+    for (cases) |case| {
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        switch (try redirectDecision(current, "/next", &aux, case.status, case.method, 3)) {
+            .stop => return error.TestUnexpectedResult,
+            .follow => |hop| {
+                try std.testing.expectEqual(case.want_method, hop.method);
+                try std.testing.expectEqual(case.drop, hop.drop_body);
+            },
+        }
+    }
+}
+
+test "android std redirect decision stops at the hop budget" {
+    var aux_buf: [4096]u8 = undefined;
+    var aux: []u8 = &aux_buf;
+    const current = try std.Uri.parse("https://example.com/start");
+    switch (try redirectDecision(current, "/next", &aux, 302, .GET, 0)) {
+        .stop => {},
+        .follow => return error.TestUnexpectedResult,
+    }
+}
+
+test "android std redirect decision rejects non-http targets" {
+    const current = try std.Uri.parse("https://example.com/start");
+    const bad = [_]struct { location: []const u8, err: anyerror }{
+        .{ .location = "ftp://example.com/x", .err = error.UnsupportedUriScheme },
+        .{ .location = "javascript:alert(1)", .err = error.UnsupportedUriScheme },
+        .{ .location = "https:///nohost", .err = error.InvalidUrl },
+        .{ .location = "https://example.com/\r\nX-Injected: 1", .err = error.HttpRedirectLocationInvalid },
+    };
+    for (bad) |case| {
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        try std.testing.expectError(case.err, redirectDecision(current, case.location, &aux, 302, .GET, 3));
+    }
+}
+
+test "android std redirect decision does not tighten first-hop validation" {
+    // The first hop only runs validateHttpUrl, so a private api_base is legal.
+    // Hops must not be stricter or intentional local providers break.
+    const current = try std.Uri.parse("http://127.0.0.1:8080/start");
+    var aux_buf: [4096]u8 = undefined;
+    var aux: []u8 = &aux_buf;
+    switch (try redirectDecision(current, "http://127.0.0.1:9090/next", &aux, 302, .GET, 3)) {
+        .stop => return error.TestUnexpectedResult,
+        .follow => |hop| try std.testing.expect(hop.strip_caller_headers),
+    }
+}
+
 const LegacyCredentialedCurlHelper = enum {
     get_body,
     get_status,
