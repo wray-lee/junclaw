@@ -558,6 +558,36 @@ test "sweepSpoolFilesInDir ignores directories that are not the spool dir" {
     try std.testing.expect(kept.size > 0);
 }
 
+test "sweepSpoolFilesInDir deletes only junclaw spool filenames" {
+    // Regression: the sweep deleted every stale regular file in the spool dir,
+    // so an unrelated file a user or another tool kept in TMPDIR/nullclaw-spool
+    // disappeared with it.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(spool_dir_name);
+    const stale_spool = [_][]const u8{
+        spool_dir_name ++ "/signal_ab12.dat",
+        spool_dir_name ++ "/whatsapp_ab12.dat",
+        spool_dir_name ++ "/discord_ab12.dat",
+        spool_dir_name ++ "/nullclaw_mattermost_1_1.bin",
+        spool_dir_name ++ "/dsh-bash-aabbcc-label.log",
+    };
+    for (stale_spool) |sub_path| try dir.writeFile(.{ .sub_path = sub_path, .data = "x" });
+    try dir.writeFile(.{ .sub_path = spool_dir_name ++ "/notes.txt", .data = "keep" });
+    const spool = try dir.realpathAlloc(allocator, spool_dir_name);
+    defer allocator.free(spool);
+
+    sweepSpoolFilesInDir(spool, std.math.maxInt(i64), 0);
+
+    for (stale_spool) |sub_path| {
+        try std.testing.expectError(error.FileNotFound, dir.statFile(sub_path));
+    }
+    const kept = try dir.statFile(spool_dir_name ++ "/notes.txt");
+    try std.testing.expectEqual(@as(u64, 4), kept.size);
+}
+
 test "androidTempDir creates the tmp directory 0700" {
     // Regression: HOME/tmp was created with the default 0755 mode.
     const allocator = std.testing.allocator;
