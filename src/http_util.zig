@@ -747,11 +747,22 @@ fn streamCurlStdout(file: std_compat.fs.File, writer: ?*std.Io.Writer, max_bytes
     }
 }
 
-fn maxTimeDeadlineMs(max_time: ?[]const u8) ?i64 {
+/// curl `--max-time` takes fractional seconds and treats `0` as "no limit";
+/// a value curl would reject must not silently disable the bound here.
+fn maxTimeMs(max_time: ?[]const u8) !?u64 {
     const text = max_time orelse return null;
-    const secs = std.fmt.parseInt(u64, text, 10) catch return null;
+    const secs = std.fmt.parseFloat(f64, text) catch return error.InvalidCurlConfigValue;
+    if (!std.math.isFinite(secs) or secs < 0) return error.InvalidCurlConfigValue;
     if (secs == 0) return null;
-    const ms = std.math.mul(u64, secs, std.time.ms_per_s) catch std.math.maxInt(u64);
+    const scaled = secs * @as(f64, @floatFromInt(std.time.ms_per_s));
+    return if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(u64))))
+        std.math.maxInt(u64)
+    else
+        @intFromFloat(scaled);
+}
+
+fn maxTimeDeadlineMs(max_time: ?[]const u8) !?i64 {
+    const ms = (try maxTimeMs(max_time)) orelse return null;
     return std_compat.time.milliTimestamp() +| @as(i64, @intCast(@min(ms, @as(u64, std.math.maxInt(i64)))));
 }
 
@@ -879,31 +890,32 @@ fn readStdHttpBody(
 
     while (true) {
         if (interruptRequested()) return error.CurlInterrupted;
-        if (reader.bufferedLen() > 0) {
-            const chunk = reader.take(@min(reader.bufferedLen(), 8192)) catch |err| switch (err) {
-                error.EndOfStream => break,
-                else => return bodyReadError(response, err),
-            };
-            if (chunk.len == 0) break;
-            if (discard) continue;
-            if (chunk.len > cap - total) {
-                if (!spec.truncate_response) return error.CurlReadError;
-                truncated = true;
-                try emitStdHttpChunk(allocator, spec, &output, chunk[0 .. cap - total]);
-                total = cap;
-                break;
-            }
-            try emitStdHttpChunk(allocator, spec, &output, chunk);
-            total += chunk.len;
-            continue;
-        }
-
+        // A fast server keeps the buffer non-empty, so the deadline has to be
+        // checked here and not only on the poll path.
         var poll_ms: i32 = 1000;
         if (deadline_ms) |deadline| {
             const remaining = deadline - std_compat.time.milliTimestamp();
             if (remaining <= 0) return error.CurlTimeout;
             poll_ms = @intCast(@min(remaining, 1000));
         }
+        if (reader.bufferedLen() > 0) {
+            const chunk = reader.take(@min(reader.bufferedLen(), 8192)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return bodyReadError(response, err),
+            };
+            if (chunk.len == 0) break;
+            if (chunk.len > cap - total) {
+                if (!spec.truncate_response) return error.CurlReadError;
+                truncated = true;
+                if (!discard) try emitStdHttpChunk(allocator, spec, &output, chunk[0 .. cap - total]);
+                total = cap;
+                break;
+            }
+            if (!discard) try emitStdHttpChunk(allocator, spec, &output, chunk);
+            total += chunk.len;
+            continue;
+        }
+
         const readable = try waitBodyReadable(req, reader, poll_ms);
         if (!readable) {
             if (deadline_ms) |deadline| {
@@ -916,13 +928,12 @@ fn readStdHttpBody(
             else => return bodyReadError(response, err),
         };
         if (first.len == 0) break;
-        if (discard) continue;
         if (total == cap) {
             if (!spec.truncate_response) return error.CurlReadError;
             truncated = true;
             break;
         }
-        try emitStdHttpChunk(allocator, spec, &output, first);
+        if (!discard) try emitStdHttpChunk(allocator, spec, &output, first);
         total += first.len;
     }
 
@@ -1147,9 +1158,13 @@ pub const HttpStream = struct {
     fn read(ptr: *anyopaque, buf: []u8) anyerror!usize {
         const self: *HttpStream = @ptrCast(@alignCast(ptr));
         if (buf.len == 0) return 0;
+        if (self.failed) |err| return err;
         if (!self.body_available) return 0;
         while (true) {
             if (interruptRequested()) return self.fail(error.Interrupted);
+            if (self.deadline_ms) |deadline| {
+                if (std_compat.time.milliTimestamp() >= deadline) return self.fail(error.CurlTimeout);
+            }
             if (self.reader.bufferedLen() > 0) {
                 const n = @min(buf.len, self.reader.bufferedLen());
                 const chunk = self.reader.take(n) catch |err| return self.fail(err);
@@ -1190,7 +1205,17 @@ pub const HttpStream = struct {
         }
     }
 
-    fn abort(_: *anyopaque) void {}
+    /// /stop: mark the stream failed and drop the socket so a blocked read
+    /// cannot keep draining what the server already sent.
+    fn abort(ptr: *anyopaque) void {
+        const self: *HttpStream = @ptrCast(@alignCast(ptr));
+        if (self.failed == null) self.failed = error.Interrupted;
+        if (self.request.connection) |connection| {
+            connection.closing = true;
+            self.http.client.connection_pool.release(connection, self.http.client.io);
+            self.request.connection = null;
+        }
+    }
 
     fn finish(ptr: *anyopaque) anyerror!void {
         const self: *HttpStream = @ptrCast(@alignCast(ptr));
@@ -1266,7 +1291,7 @@ fn stdHttpRequest(allocator: Allocator, spec: CurlRequestSpec) !HttpResponseWith
     const response_headers = try allocator.dupe(u8, response.head.bytes);
     errdefer allocator.free(response_headers);
 
-    const result = try readStdHttpBody(allocator, &req, &response, spec, maxTimeDeadlineMs(spec.max_time));
+    const result = try readStdHttpBody(allocator, &req, &response, spec, try maxTimeDeadlineMs(spec.max_time));
     errdefer allocator.free(result.body);
     if (spec.response_writer) |writer| try writer.flush();
 
@@ -4491,4 +4516,135 @@ test "android std http treats head and empty frames as bodyless" {
     try std.testing.expect(hasResponseBody(.GET, .ok, .none, 12));
     try std.testing.expect(hasResponseBody(.GET, .ok, .chunked, null));
     try std.testing.expect(hasResponseBody(.GET, .ok, .none, null));
+}
+
+// Regression: readStdHttpBody skipped the max_response_bytes check when the
+// body was discarded, so a discard request read an unbounded body while curl
+// rejects it at the cap.
+test "android std http discard path enforces the response cap" {
+    // Windows: the loopback mock server thread does not complete there. The std
+    // transport is Android-only; Windows goes through curl (tested elsewhere).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/discard-cap",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectError(error.CurlReadError, stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url,
+        .discard_response_body = true,
+        .max_response_bytes = 4,
+    }));
+}
+
+test "android std http discard path truncates at the response cap" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/discard-truncate",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const response = try stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url,
+        .discard_response_body = true,
+        .max_response_bytes = 4,
+        .truncate_response = true,
+    });
+    defer std.testing.allocator.free(response.headers);
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("", response.body);
+    try std.testing.expect(response.truncated);
+}
+
+// Regression: HttpStream.abort was a no-op, so /stop kept draining the buffered
+// body and finish() reported success instead of an interrupt.
+test "android std http stream abort fails the stream" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/abort",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const stream = try HttpStream.open(std.testing.allocator, url, &.{}, "{}", 0);
+    defer stream.deinit();
+    stream.stream().abort();
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.Interrupted, stream.stream().read(&buf));
+    try std.testing.expectError(error.Interrupted, stream.stream().finish());
+}
+
+// Regression: only integer seconds parsed, so "1.5" silently became "no
+// timeout" while curl enforced 1.5s.
+test "max time accepts fractional seconds and rejects garbage" {
+    try std.testing.expectEqual(@as(?u64, 2000), try maxTimeMs("2"));
+    try std.testing.expectEqual(@as(?u64, 1500), try maxTimeMs("1.5"));
+    try std.testing.expectEqual(@as(?u64, 250), try maxTimeMs("0.25"));
+    try std.testing.expect(try maxTimeMs("0") == null);
+    try std.testing.expect(try maxTimeMs(null) == null);
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("1.5s"));
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("abc"));
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("-1"));
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("inf"));
+}
+
+// Regression: the std http stream only compared max_time when the body reader
+// had nothing buffered, so a fast server could extend the transfer forever.
+test "android std http stream deadline applies while data is buffered" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/deadline",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const stream = try HttpStream.open(std.testing.allocator, url, &.{}, "{}", 0);
+    defer stream.deinit();
+    var first: [1]u8 = undefined;
+    _ = try stream.stream().read(&first);
+    try std.testing.expect(stream.reader.bufferedLen() > 0);
+    stream.deadline_ms = std_compat.time.milliTimestamp() - 1;
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.CurlTimeout, stream.stream().read(&buf));
 }
