@@ -828,17 +828,7 @@ pub const MattermostChannel = struct {
         defer self.allocator.free(tmp_dir);
 
         const counter = self.tmp_counter.fetchAdd(1, .monotonic) + 1;
-        const path = std.fmt.allocPrint(
-            self.allocator,
-            "{s}/nullclaw_mattermost_{d}_{d}.bin",
-            .{ tmp_dir, std_compat.time.timestamp(), counter },
-        ) catch return null;
-        errdefer self.allocator.free(path);
-
-        const file = std_compat.fs.createFileAbsolute(path, .{ .read = false }) catch return null;
-        defer file.close();
-        file.writeAll(data) catch return null;
-        return path;
+        return writeSpoolFile(self.allocator, tmp_dir, counter, data);
     }
 
     fn isDirectSenderAllowed(self: *const MattermostChannel, sender_id: []const u8, sender_name: ?[]const u8) bool {
@@ -1385,4 +1375,32 @@ test "mattermost inbound spool attachment is deleted after message deinit" {
     msg.deinit(allocator);
 
     try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/mattermost_test.bin"));
+}
+
+pub fn writeSpoolFile(allocator: std.mem.Allocator, tmp_dir: []const u8, counter: u64, data: []const u8) ?[]u8 {
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}/nullclaw_mattermost_{d}_{d}.bin",
+        .{ tmp_dir, std_compat.time.timestamp(), counter },
+    ) catch return null;
+
+    const file = std_compat.fs.createFileAbsolute(path, .{ .read = false }) catch {
+        allocator.free(path);
+        return null;
+    };
+    defer file.close();
+    file.writeAll(data) catch {
+        platform.deleteSpoolFile(path);
+        allocator.free(path);
+        return null;
+    };
+    return path;
+}
+
+test "mattermost writeSpoolFile frees path on create failure" {
+    // Regression: errdefer self.allocator.free(path) was never executed because function returned ?[]u8
+    const allocator = std.testing.allocator;
+    const non_existent_dir = "/non_existent_directory_for_test/nullclaw-spool";
+    const res = writeSpoolFile(allocator, non_existent_dir, 1, "test-data");
+    try std.testing.expect(res == null);
 }
