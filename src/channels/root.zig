@@ -80,6 +80,9 @@ pub const ChannelMessage = struct {
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).
     group_id: ?[]const u8 = null,
+    /// Owned temp attachment paths to delete once this message has been
+    /// processed (deinit), whether the turn succeeded or failed.
+    spool_paths: []const []const u8 = &.{},
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);

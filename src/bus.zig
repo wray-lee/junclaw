@@ -24,6 +24,9 @@ pub const InboundMessage = struct {
     session_key: []const u8, // "channel:chatID" for session lookup
     media: []const []const u8 = &.{}, // file paths/URLs (images, voice, docs)
     metadata_json: ?[]const u8 = null, // channel-specific JSON (message_id, thread_ts, is_group)
+    /// Owned temp attachment paths to delete once this message has been
+    /// processed (deinit), whether the turn succeeded or failed.
+    spool_paths: []const []const u8 = &.{},
 
     pub fn deinit(self: *const InboundMessage, allocator: Allocator) void {
         for (self.media) |m| allocator.free(m);

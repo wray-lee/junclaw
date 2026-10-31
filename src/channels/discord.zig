@@ -2521,3 +2521,24 @@ test "discord reconnect request keeps session until exhaustion" {
     try std.testing.expect(ch.resume_gateway_url != null);
     try std.testing.expectEqual(@as(i64, 77), ch.sequence.load(.acquire));
 }
+
+test "discord inbound spool attachment is deleted after message deinit" {
+    // Regression: Discord attachment spool files were left in the temp dir
+    // after the inbound message was handled (success or failure).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/discord_test.dat", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/discord_test.dat");
+    defer allocator.free(path);
+
+    var msg = try bus_mod.makeInboundFull(allocator, "discord", "sender", "chat", "[IMAGE:x]", "discord:chat", &.{}, null);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+    msg.spool_paths = paths;
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/discord_test.dat"));
+}

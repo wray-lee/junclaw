@@ -3696,3 +3696,30 @@ test "SignalChannel start + stop under is_test leaks zero bytes" {
     // Double stop — must not double-free or crash.
     ch.stop();
 }
+
+test "signal channel spool attachment is deleted after message deinit" {
+    // Regression: Signal attachment spool files were never deleted after the
+    // inbound message was processed, so /tmp accumulated signal_*.dat files.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/signal_test.dat", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/signal_test.dat");
+    defer allocator.free(path);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+
+    var msg = root.ChannelMessage{
+        .id = try allocator.dupe(u8, "id"),
+        .sender = try allocator.dupe(u8, "sender"),
+        .content = try allocator.dupe(u8, "[IMAGE:x]"),
+        .channel = "signal",
+        .timestamp = 0,
+        .spool_paths = paths,
+    };
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/signal_test.dat"));
+}

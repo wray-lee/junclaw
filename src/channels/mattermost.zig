@@ -1337,3 +1337,24 @@ test "MattermostChannel create + healthCheck + stop leaks zero bytes" {
     _ = ch.healthCheck();
     ch.stop();
 }
+
+test "mattermost inbound spool attachment is deleted after message deinit" {
+    // Regression: Mattermost attachment spool files were left in TMPDIR after
+    // the inbound message was handled (success or failure).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/mattermost_test.bin", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/mattermost_test.bin");
+    defer allocator.free(path);
+
+    var msg = try bus_mod.makeInboundFull(allocator, "mattermost", "sender", "chat", "[IMAGE:x]", "mattermost:chat", &.{}, null);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+    msg.spool_paths = paths;
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/mattermost_test.bin"));
+}
