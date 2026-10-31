@@ -13,6 +13,7 @@ This guide covers the practical Android / Termux path for NullClaw.
 **Read this next**
 
 - Open [Installation](./installation.md) if you want the broader install matrix first
+- Open [Android Device Capability Bridge](./android.md) when an Android host app provides device tools to the agent
 - Open [Configuration](./configuration.md) after the binary runs
 - Open [Usage and Operations](./usage.md) when you are ready to test `agent` or `gateway`
 

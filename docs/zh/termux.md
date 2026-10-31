@@ -6,6 +6,7 @@
 
 - 这页适合谁：想直接在 Android 手机的 Termux 里构建和运行 NullClaw 的用户。
 - 看完去哪里：二进制能跑起来后，继续看 [配置指南](./configuration.md)；准备验证常用命令时看 [使用与运维](./usage.md)。
+- 如果 Android 宿主 App 要给 agent 提供设备能力：看 [Android 设备能力桥](./android.md)。
 - 如果你想先看完整安装矩阵：先回到 [安装指南](./installation.md)。
 
 ## 先有预期
