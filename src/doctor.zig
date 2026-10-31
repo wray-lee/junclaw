@@ -9,6 +9,7 @@
 //!   - Sandbox, cron status, channel connectivity (nullclaw-specific)
 
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const platform = @import("platform.zig");
 const Config = @import("config.zig").Config;
@@ -747,8 +748,10 @@ pub fn checkEnvironment(
         try items.append(allocator, DiagItem.warn(cat, "git not found"));
     }
 
-    // curl
-    if (try checkCommandAvailable(allocator, "curl")) |ver| {
+    // curl (Android uses std.http and does not need the binary)
+    if (builtin.abi == .android) {
+        try items.append(allocator, DiagItem.ok(cat, "curl: not required (Android uses built-in HTTP)"));
+    } else if (try checkCommandAvailable(allocator, "curl")) |ver| {
         defer allocator.free(ver);
         try items.append(allocator, DiagItem.ok(cat, try std.fmt.allocPrint(allocator, "curl: {s}", .{ver})));
     } else {

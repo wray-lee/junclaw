@@ -747,10 +747,543 @@ fn streamCurlStdout(file: std_compat.fs.File, writer: ?*std.Io.Writer, max_bytes
     }
 }
 
+fn maxTimeDeadlineMs(max_time: ?[]const u8) ?i64 {
+    const text = max_time orelse return null;
+    const secs = std.fmt.parseInt(u64, text, 10) catch return null;
+    if (secs == 0) return null;
+    const ms = std.math.mul(u64, secs, std.time.ms_per_s) catch std.math.maxInt(u64);
+    return std_compat.time.milliTimestamp() +| @as(i64, @intCast(@min(ms, @as(u64, std.math.maxInt(i64)))));
+}
+
+fn responseBodyReader(
+    allocator: Allocator,
+    req: *std.http.Client.Request,
+    response: *std.http.Client.Response,
+    transfer_buffer: []u8,
+    decompress: *std.http.Decompress,
+    decompress_buffer: *[]u8,
+) !*std.Io.Reader {
+    switch (response.head.content_encoding) {
+        .identity => return req.reader.bodyReader(transfer_buffer, response.head.transfer_encoding, response.head.content_length),
+        .zstd => {
+            decompress_buffer.* = try allocator.alloc(u8, std.compress.zstd.default_window_len);
+            return response.readerDecompressing(transfer_buffer, decompress, decompress_buffer.*);
+        },
+        .deflate, .gzip => {
+            decompress_buffer.* = try allocator.alloc(u8, std.compress.flate.max_window_len);
+            return response.readerDecompressing(transfer_buffer, decompress, decompress_buffer.*);
+        },
+        .compress => return error.UnsupportedCompressionMethod,
+    }
+}
+
+/// True when the body reader can make progress without touching the socket.
+/// HTTP framing (chunk sizes) or TLS records may sit in the connection reader
+/// while the body reader reports no decoded bytes yet.
+fn bodyBuffered(req: *std.http.Client.Request, reader: *std.Io.Reader) bool {
+    if (reader.bufferedLen() > 0) return true;
+    const conn = req.connection orelse return false;
+    return conn.reader().bufferedLen() > 0;
+}
+
+/// HTTP bodies that are known empty before reading: HEAD/TRACE responses and
+/// 204/304 statuses end at the head, and `Content-Length: 0` frames no bytes.
+/// Reading them would otherwise poll a socket that never becomes readable.
+fn hasResponseBody(
+    method: std.http.Method,
+    status: std.http.Status,
+    transfer_encoding: std.http.TransferEncoding,
+    content_length: ?u64,
+) bool {
+    if (!method.responseHasBody()) return false;
+    if (status == .no_content or status == .not_modified) return false;
+    if (transfer_encoding == .none) {
+        if (content_length) |len| return len != 0;
+    }
+    return true;
+}
+
+fn waitBodyReadable(
+    req: *std.http.Client.Request,
+    reader: *std.Io.Reader,
+    timeout_ms: i32,
+) anyerror!bool {
+    if (bodyBuffered(req, reader)) return true;
+    const conn = req.connection orelse return error.ConnectionClosed;
+    if (comptime builtin.os.tag == .windows) {
+        if (timeout_ms > 0) std_compat.thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
+        return bodyBuffered(req, reader);
+    }
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = conn.stream_reader.stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = undefined,
+    }};
+    const events = std.posix.poll(&poll_fds, timeout_ms) catch return error.CurlReadError;
+    if (events == 0) return false;
+    const revents = poll_fds[0].revents;
+    if (revents & std.posix.POLL.IN != 0) return true;
+    if (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+        return error.CurlReadError;
+    }
+    return false;
+}
+
+fn bodyReadError(response: *std.http.Client.Response, err: anyerror) anyerror {
+    if (interruptRequested()) return error.CurlInterrupted;
+    if (response.bodyErr()) |body_err| {
+        if (body_err == error.Timeout) return error.CurlTimeout;
+    }
+    return switch (err) {
+        error.Canceled => error.CurlInterrupted,
+        else => error.CurlReadError,
+    };
+}
+
+const StdHttpBodyResult = struct {
+    body: []u8,
+    truncated: bool,
+};
+
+/// Read a std.http body with the curl executor's limits: `max_response_bytes`
+/// is a hard cap unless `truncate_response`, `max_time` bounds the whole read,
+/// `/stop` aborts between chunks, and `response_writer` streams instead of
+/// buffering.
+fn readStdHttpBody(
+    allocator: Allocator,
+    req: *std.http.Client.Request,
+    response: *std.http.Client.Response,
+    spec: CurlRequestSpec,
+    deadline_ms: ?i64,
+) !StdHttpBodyResult {
+    if (!hasResponseBody(
+        spec.method,
+        response.head.status,
+        response.head.transfer_encoding,
+        response.head.content_length,
+    )) {
+        return .{ .body = try allocator.dupe(u8, ""), .truncated = false };
+    }
+    var transfer_buffer: [4096]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buffer: []u8 = &.{};
+    defer if (decompress_buffer.len != 0) allocator.free(decompress_buffer);
+    const reader = try responseBodyReader(allocator, req, response, &transfer_buffer, &decompress, &decompress_buffer);
+
+    const discard = spec.discard_response_body or spec.method == .HEAD;
+    const cap = spec.max_response_bytes;
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var total: usize = 0;
+    var truncated = false;
+
+    while (true) {
+        if (interruptRequested()) return error.CurlInterrupted;
+        if (reader.bufferedLen() > 0) {
+            const chunk = reader.take(@min(reader.bufferedLen(), 8192)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return bodyReadError(response, err),
+            };
+            if (chunk.len == 0) break;
+            if (discard) continue;
+            if (chunk.len > cap - total) {
+                if (!spec.truncate_response) return error.CurlReadError;
+                truncated = true;
+                try emitStdHttpChunk(allocator, spec, &output, chunk[0 .. cap - total]);
+                total = cap;
+                break;
+            }
+            try emitStdHttpChunk(allocator, spec, &output, chunk);
+            total += chunk.len;
+            continue;
+        }
+
+        var poll_ms: i32 = 1000;
+        if (deadline_ms) |deadline| {
+            const remaining = deadline - std_compat.time.milliTimestamp();
+            if (remaining <= 0) return error.CurlTimeout;
+            poll_ms = @intCast(@min(remaining, 1000));
+        }
+        const readable = try waitBodyReadable(req, reader, poll_ms);
+        if (!readable) {
+            if (deadline_ms) |deadline| {
+                if (std_compat.time.milliTimestamp() >= deadline) return error.CurlTimeout;
+            }
+            continue;
+        }
+        const first = reader.take(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return bodyReadError(response, err),
+        };
+        if (first.len == 0) break;
+        if (discard) continue;
+        if (total == cap) {
+            if (!spec.truncate_response) return error.CurlReadError;
+            truncated = true;
+            break;
+        }
+        try emitStdHttpChunk(allocator, spec, &output, first);
+        total += first.len;
+    }
+
+    return .{
+        .body = if (spec.response_writer != null or discard)
+            try allocator.dupe(u8, "")
+        else
+            try output.toOwnedSlice(allocator),
+        .truncated = truncated,
+    };
+}
+
+fn emitStdHttpChunk(
+    allocator: Allocator,
+    spec: CurlRequestSpec,
+    output: *std.ArrayListUnmanaged(u8),
+    chunk: []const u8,
+) !void {
+    if (spec.response_writer) |writer| {
+        try writer.writeAll(chunk);
+    } else {
+        try output.appendSlice(allocator, chunk);
+    }
+}
+
+/// Common byte source for provider SSE loops: curl stdout off Android, an
+/// std.http response body on Android. `finish` implements the post-EOF status
+/// mapping each transport needs; `abort` stops an in-flight transfer.
+pub const ByteStream = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    /// Set by curl sources; Codex maps specific exit codes to transport errors.
+    exit_code: ?*const ?u8 = null,
+
+    pub const VTable = struct {
+        read: *const fn (ptr: *anyopaque, buf: []u8) anyerror!usize,
+        abort: *const fn (ptr: *anyopaque) void,
+        finish: *const fn (ptr: *anyopaque) anyerror!void,
+    };
+
+    pub fn read(self: ByteStream, buf: []u8) anyerror!usize {
+        return self.vtable.read(self.ptr, buf);
+    }
+
+    pub fn abort(self: ByteStream) void {
+        self.vtable.abort(self.ptr);
+    }
+
+    pub fn finish(self: ByteStream) anyerror!void {
+        return self.vtable.finish(self.ptr);
+    }
+};
+
+/// ByteStream over a spawned curl child's stdout. Keeps the interrupt watcher
+/// semantics of the existing provider loops.
+pub const CurlByteStream = struct {
+    child: *std_compat.process.Child,
+    cancel_done: AtomicBool = .init(false),
+    cancel_watcher: ?std.Thread = null,
+    cancel_ctx: CancelWatcherCtx = undefined,
+    exit_code: ?u8 = null,
+
+    pub fn init(self: *CurlByteStream, child: *std_compat.process.Child) void {
+        self.* = .{ .child = child };
+        spawnCancelWatcher(child, &self.cancel_done, &self.cancel_watcher, &self.cancel_ctx);
+    }
+
+    pub fn deinit(self: *CurlByteStream) void {
+        stopCancelWatcher(&self.cancel_done, &self.cancel_watcher);
+    }
+
+    pub fn stream(self: *CurlByteStream) ByteStream {
+        return .{ .ptr = self, .vtable = &vtable, .exit_code = &self.exit_code };
+    }
+
+    const vtable: ByteStream.VTable = .{
+        .read = read,
+        .abort = abortPtr,
+        .finish = finish,
+    };
+
+    fn read(ptr: *anyopaque, buf: []u8) anyerror!usize {
+        const self: *CurlByteStream = @ptrCast(@alignCast(ptr));
+        return self.child.stdout.?.read(buf);
+    }
+
+    pub fn abort(self: *CurlByteStream) void {
+        abortPtr(self);
+    }
+
+    fn abortPtr(ptr: *anyopaque) void {
+        const self: *CurlByteStream = @ptrCast(@alignCast(ptr));
+        stopCancelWatcherAndReap(self.child, &self.cancel_done, &self.cancel_watcher);
+    }
+
+    fn finish(ptr: *anyopaque) anyerror!void {
+        const self: *CurlByteStream = @ptrCast(@alignCast(ptr));
+        stopCancelWatcher(&self.cancel_done, &self.cancel_watcher);
+        const term = self.child.wait() catch return error.CurlWaitError;
+        switch (term) {
+            .exited => |code| {
+                self.exit_code = code;
+                if (code == 0) return;
+            },
+            else => {},
+        }
+        return error.CurlFailed;
+    }
+};
+
+const STREAM_IDLE_TIMEOUT_MS: i64 = 60_000;
+
+/// std.http streaming POST used by provider SSE loops on Android. Buffered
+/// variants use `stdHttpRequest`; this keeps the body unread so callers parse
+/// deltas as they arrive. Poll-based reads preserve `timeout_secs` and the
+/// 60-second stall bound curl had, and check the agent interrupt flag.
+pub const HttpStream = struct {
+    allocator: Allocator,
+    http: ProxyHttpClient,
+    request: std.http.Client.Request,
+    reader: *std.Io.Reader,
+    transfer_buffer: [4096]u8,
+    decompress: std.http.Decompress,
+    decompress_buffer: []u8,
+    headers: std.ArrayListUnmanaged(std.http.Header) = .empty,
+    status_code: u16,
+    body_available: bool = true,
+    deadline_ms: ?i64,
+    idle_deadline_ms: i64,
+    failed: ?anyerror = null,
+
+    pub fn open(
+        allocator: Allocator,
+        url: []const u8,
+        headers: []const []const u8,
+        body: []const u8,
+        timeout_secs: u64,
+    ) !*HttpStream {
+        _ = try validateHttpUrl(url);
+        try validateStdProxyForUrl(allocator, url, null);
+        const self = try allocator.create(HttpStream);
+        errdefer allocator.destroy(self);
+        const now = std_compat.time.milliTimestamp();
+        self.* = .{
+            .allocator = allocator,
+            .http = try ProxyHttpClient.init(allocator),
+            .request = undefined,
+            .reader = undefined,
+            .transfer_buffer = undefined,
+            .decompress = undefined,
+            .decompress_buffer = &.{},
+            .status_code = 0,
+            .deadline_ms = if (timeout_secs == 0) null else now +| @as(i64, @intCast(@min(
+                std.math.mul(u64, timeout_secs, std.time.ms_per_s) catch std.math.maxInt(u64),
+                @as(u64, std.math.maxInt(i64)),
+            ))),
+            .idle_deadline_ms = now +| STREAM_IDLE_TIMEOUT_MS,
+        };
+        errdefer self.http.deinit();
+        errdefer self.headers.deinit(allocator);
+
+        for (headers) |header| {
+            try validateCurlHeaderLine(header);
+            try self.headers.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
+        }
+
+        const uri = try std.Uri.parse(url);
+        self.request = try self.http.client.request(.POST, uri, .{
+            .redirect_behavior = .unhandled,
+            // curl's SSE calls did not request compression; keep the body
+            // unframed by a decompressor.
+            .headers = .{ .accept_encoding = .omit },
+            .extra_headers = self.headers.items,
+        });
+        errdefer self.request.deinit();
+
+        self.request.transfer_encoding = .{ .content_length = body.len };
+        var request_body = try self.request.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(body);
+        try request_body.end();
+        try self.request.connection.?.flush();
+
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+        var response = try self.request.receiveHead(&redirect_buffer);
+        self.status_code = @intFromEnum(response.head.status);
+        self.body_available = hasResponseBody(
+            .POST,
+            response.head.status,
+            response.head.transfer_encoding,
+            response.head.content_length,
+        );
+        errdefer if (self.decompress_buffer.len != 0) allocator.free(self.decompress_buffer);
+        self.reader = try responseBodyReader(
+            allocator,
+            &self.request,
+            &response,
+            &self.transfer_buffer,
+            &self.decompress,
+            &self.decompress_buffer,
+        );
+        return self;
+    }
+
+    pub fn deinit(self: *HttpStream) void {
+        self.request.deinit();
+        self.http.deinit();
+        self.headers.deinit(self.allocator);
+        if (self.decompress_buffer.len != 0) self.allocator.free(self.decompress_buffer);
+        self.allocator.destroy(self);
+    }
+
+    pub fn stream(self: *HttpStream) ByteStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: ByteStream.VTable = .{
+        .read = read,
+        .abort = abort,
+        .finish = finish,
+    };
+
+    fn read(ptr: *anyopaque, buf: []u8) anyerror!usize {
+        const self: *HttpStream = @ptrCast(@alignCast(ptr));
+        if (buf.len == 0) return 0;
+        if (!self.body_available) return 0;
+        while (true) {
+            if (interruptRequested()) return self.fail(error.Interrupted);
+            if (self.reader.bufferedLen() > 0) {
+                const n = @min(buf.len, self.reader.bufferedLen());
+                const chunk = self.reader.take(n) catch |err| return self.fail(err);
+                if (chunk.len == 0) return 0;
+                @memcpy(buf[0..chunk.len], chunk);
+                self.touch();
+                return chunk.len;
+            }
+
+            var poll_ms: i32 = 1000;
+            if (self.deadline_ms) |deadline| {
+                const remaining = deadline - std_compat.time.milliTimestamp();
+                if (remaining <= 0) return self.fail(error.CurlTimeout);
+                poll_ms = @intCast(@min(remaining, 1000));
+            }
+            const idle_remaining = self.idle_deadline_ms - std_compat.time.milliTimestamp();
+            if (idle_remaining <= 0) return self.fail(error.CurlTimeout);
+            poll_ms = @min(poll_ms, @as(i32, @intCast(@max(idle_remaining, 1))));
+
+            const readable = waitBodyReadable(&self.request, self.reader, poll_ms) catch |err| return self.fail(err);
+            if (!readable) continue;
+
+            const first = self.reader.take(1) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                else => return self.fail(err),
+            };
+            if (first.len == 0) return 0;
+            buf[0] = first[0];
+            var n: usize = 1;
+            while (n < buf.len and self.reader.bufferedLen() > 0) {
+                const chunk = self.reader.take(@min(buf.len - n, self.reader.bufferedLen())) catch break;
+                if (chunk.len == 0) break;
+                @memcpy(buf[n..][0..chunk.len], chunk);
+                n += chunk.len;
+            }
+            self.touch();
+            return n;
+        }
+    }
+
+    fn abort(_: *anyopaque) void {}
+
+    fn finish(ptr: *anyopaque) anyerror!void {
+        const self: *HttpStream = @ptrCast(@alignCast(ptr));
+        if (self.failed) |err| return switch (err) {
+            error.CurlTimeout => error.CurlTimeout,
+            error.Interrupted => error.Interrupted,
+            else => error.CurlFailed,
+        };
+        if (self.status_code >= 400) return error.CurlFailed;
+    }
+
+    fn touch(self: *HttpStream) void {
+        self.idle_deadline_ms = std_compat.time.milliTimestamp() +| STREAM_IDLE_TIMEOUT_MS;
+    }
+
+    fn fail(self: *HttpStream, err: anyerror) anyerror {
+        const mapped = switch (err) {
+            error.Canceled, error.Interrupted => error.Interrupted,
+            error.Timeout, error.CurlTimeout => error.CurlTimeout,
+            else => error.CurlReadError,
+        };
+        self.failed = mapped;
+        return mapped;
+    }
+};
+
+/// std.http replacement for the curl executor on Android. The curl-specific
+/// fields (resolve pinning, generated redirect headers) do not apply: Android
+/// has no curl binary, and `compat.net.httpIo` resolves every hop through
+/// bionic. The URL was already validated by net_security at the call site.
+fn stdHttpRequest(allocator: Allocator, spec: CurlRequestSpec) !HttpResponseWithHeaders {
+    _ = try validateHttpUrl(spec.url);
+    try validateStdProxyForUrl(allocator, spec.url, spec.proxy);
+    const uri = try std.Uri.parse(spec.url);
+
+    var header_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    defer header_list.deinit(allocator);
+    if (spec.content_type) |content_type| {
+        if (content_type.len == 0 or std.mem.indexOfAny(u8, content_type, "\r\n\x00") != null) return error.InvalidHeader;
+        try header_list.append(allocator, .{ .name = "Content-Type", .value = content_type });
+    }
+    for (spec.headers) |header| {
+        try validateCurlHeaderLine(header);
+        try header_list.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
+    }
+
+    var client = try initProxyClientWithOptionalProxy(allocator, spec.proxy);
+    defer client.deinit();
+
+    const redirect_behavior: std.http.Client.Request.RedirectBehavior =
+        if (spec.max_redirects) |max| @enumFromInt(max) else .unhandled;
+    var req = try client.client.request(spec.method, uri, .{
+        .redirect_behavior = redirect_behavior,
+        .headers = .{ .accept_encoding = if (spec.accept_compression) .default else .omit },
+        .extra_headers = header_list.items,
+    });
+    defer req.deinit();
+
+    if (spec.body) |payload| {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var request_body = try req.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(payload);
+        try request_body.end();
+        try req.connection.?.flush();
+    } else {
+        try req.sendBodiless();
+    }
+
+    var redirect_buffer: [8 * 1024]u8 = undefined;
+    var response = try req.receiveHead(&redirect_buffer);
+    const status_code: u16 = @intFromEnum(response.head.status);
+    if (spec.fail_on_http_error and status_code >= 400) return error.CurlFailed;
+    const response_headers = try allocator.dupe(u8, response.head.bytes);
+    errdefer allocator.free(response_headers);
+
+    const result = try readStdHttpBody(allocator, &req, &response, spec, maxTimeDeadlineMs(spec.max_time));
+    errdefer allocator.free(result.body);
+    if (spec.response_writer) |writer| try writer.flush();
+
+    return .{
+        .status_code = status_code,
+        .headers = response_headers,
+        .body = result.body,
+        .truncated = result.truncated,
+    };
+}
+
 fn secureCurlRequestWithStatusAndHeaders(
     allocator: Allocator,
     spec: CurlRequestSpec,
 ) !HttpResponseWithHeaders {
+    if (comptime stdHttpTransport(builtin.abi)) return stdHttpRequest(allocator, spec);
+
     _ = try validateHttpUrl(spec.url);
 
     var all_headers: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -940,13 +1473,35 @@ pub fn curlRequestWithStatusAndHeaders(
     return secureCurlRequestWithStatusAndHeaders(allocator, options);
 }
 
-fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
-    // Regression: aarch64-linux-android.24 (Termux) — std.http.Client cannot
-    // complete credentialed HTTPS requests to remote service endpoints.
-    // Force the curl subprocess path on Android; credentials still flow via
-    // `-H @<tempfile>` (see prepareCurlHeaderArg), so argv stays clean.
-    if (comptime builtin.abi == .android) return false;
+/// Whether HTTP transport on `abi` uses std.http instead of the curl
+/// subprocess. Android embeds no curl binary: phase 1 supplied a libc DNS hook
+/// (compat.net) and embedded Mozilla CAs, so provider, OAuth, embedding, and
+/// tool requests all go through std.http there. Other ABIs keep curl.
+pub fn stdHttpTransport(comptime abi: std.Target.Abi) bool {
+    return abi == .android;
+}
+
+/// True when curl subprocesses remain the transport for `abi`. On Android the
+/// secure executor swaps its body for `stdHttpRequest`, so every caller keeps
+/// its timeout, size cap, and credential handling without a curl binary.
+pub fn usesCurlTransport(comptime abi: std.Target.Abi) bool {
+    return !stdHttpTransport(abi);
+}
+
+fn credentialedCurlUsesHttpFallbackFor(
+    comptime abi: std.Target.Abi,
+    url: []const u8,
+    headers: []const []const u8,
+    resolve_entry: ?[]const u8,
+) bool {
+    // Android's Android-branch in secureCurlRequestWithStatusAndHeaders keeps
+    // the full spec (timeouts, caps); do not divert to the lossier wrapper.
+    if (!usesCurlTransport(abi)) return false;
     return hasCredentialedCurlArgs(url, headers) and resolve_entry == null;
+}
+
+fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
+    return credentialedCurlUsesHttpFallbackFor(builtin.abi, url, headers, resolve_entry);
 }
 
 fn parseHeader(header: []const u8) ?std.http.Header {
@@ -963,6 +1518,33 @@ fn contentTypeHeaderValue(header: []const u8) ?[]const u8 {
     return parsed.value;
 }
 
+/// std.http understands HTTP(S) proxies only. Android has no curl fallback, so
+/// fail instead of silently connecting direct when the configured proxy (flag,
+/// config override, or environment) uses another scheme such as socks5.
+pub fn validateStdProxyForUrl(allocator: Allocator, url: []const u8, explicit: ?[]const u8) !void {
+    if (explicit) |proxy| return validateStdProxyScheme(proxy);
+    var selected = try getProxyForUrl(allocator, url);
+    defer selected.deinit(allocator);
+    if (selected.value) |proxy| try validateStdProxyScheme(proxy);
+}
+
+fn validateStdProxyScheme(proxy: []const u8) !void {
+    const uri = std.Uri.parse(proxy) catch return error.UnsupportedProxyScheme;
+    if (std.http.Client.Protocol.fromScheme(uri.scheme) == null) return error.UnsupportedProxyScheme;
+}
+
+fn validateFetchProxy(allocator: Allocator, location: std.http.Client.FetchOptions.Location) !void {
+    switch (location) {
+        .url => |url| try validateStdProxyForUrl(allocator, url, null),
+        .uri => |uri| {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            try uri.format(&writer.writer);
+            try validateStdProxyForUrl(allocator, writer.writer.buffer[0..writer.writer.end], null);
+        },
+    }
+}
+
 fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !ProxyHttpClient {
     var proxy_client = try ProxyHttpClient.init(allocator);
     if (proxy == null) return proxy_client;
@@ -970,7 +1552,7 @@ fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !P
     proxy_client.deinit();
     var proxy_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer proxy_arena.deinit();
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.net.httpIo() };
     errdefer client.deinit();
     try tls_ca.configureHttpClient(&client, allocator);
     var env_map = std_compat.process.EnvMap.init(proxy_arena.allocator());
@@ -991,6 +1573,9 @@ pub fn httpRequestWithStatusAndHeaders(
     content_type: ?[]const u8,
     proxy: ?[]const u8,
 ) !HttpResponseWithHeaders {
+    if (comptime stdHttpTransport(builtin.abi)) {
+        try validateStdProxyForUrl(allocator, url, proxy);
+    }
     var header_buf: [20]std.http.Header = undefined;
     var header_count: usize = 0;
     if (content_type) |ct| {
@@ -1008,25 +1593,6 @@ pub fn httpRequestWithStatusAndHeaders(
     const uri = try std.Uri.parse(url);
     if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
         return error.UnsupportedUriScheme;
-    }
-
-    // Regression: Termux has no resolver configuration where Zig expects it,
-    // so std.http reports NameServerFailure. Keep the public wrapper semantics
-    // while using a secure curl subprocess on Android.
-    if (comptime builtin.abi == .android) {
-        return secureCurlRequestWithStatusAndHeaders(allocator, .{
-            .method = method,
-            .url = url,
-            .body = body,
-            .headers = headers,
-            .content_type = content_type,
-            .proxy = proxy,
-            // curl forwards arbitrary custom headers across origins. Only
-            // follow automatically when there are no caller headers to leak.
-            .max_redirects = if (method == .GET and body == null and headers.len == 0 and content_type == null) 3 else null,
-            .accept_compression = true,
-            .std_http_defaults = true,
-        });
     }
 
     var client = try initProxyClientWithOptionalProxy(allocator, proxy);
@@ -1328,7 +1894,7 @@ pub const ProxyHttpClient = struct {
         var proxy_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer proxy_arena.deinit();
 
-        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.net.httpIo() };
         errdefer client.deinit();
         try tls_ca.configureHttpClient(&client, allocator);
 
@@ -1346,13 +1912,10 @@ pub const ProxyHttpClient = struct {
         self.* = undefined;
     }
 
-    /// Use std.http everywhere except Android, where Termux lacks the resolver
-    /// configuration Zig expects. The curl adapter preserves request/response
-    /// semantics but returns non-GET and caller-header redirects unhandled:
-    /// curl cannot both reproduce std.http method rewriting and safely scope
-    /// opaque headers to the original origin.
     pub fn fetch(self: *ProxyHttpClient, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
-        if (comptime builtin.abi == .android) return self.fetchWithCurl(options);
+        if (comptime stdHttpTransport(builtin.abi)) {
+            try validateFetchProxy(self.client.allocator, options.location);
+        }
         return self.client.fetch(options);
     }
 
@@ -2042,6 +2605,18 @@ pub fn curlGetSSE(
     url: []const u8,
     timeout_secs: []const u8,
 ) ![]u8 {
+    if (comptime stdHttpTransport(builtin.abi)) {
+        const response = try stdHttpRequest(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{"Accept: text/event-stream"},
+            .max_time = timeout_secs,
+            .max_response_bytes = DEFAULT_CURL_GET_MAX_BYTES,
+            .fail_on_http_error = true,
+        });
+        allocator.free(response.headers);
+        return response.body;
+    }
     var config = try prepareProtectedCurlConfig(allocator, url, null);
     defer config.deinit();
     var argv_buf: [40][]const u8 = undefined;
@@ -2178,27 +2753,25 @@ test "credentialed curl args route to std http fallback" {
     try std.testing.expect(!hasCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"}));
 }
 
-// Regression: aarch64-linux-android (Termux) — std.http.Client cannot complete
-// credentialed HTTPS requests, so the curl subprocess path must be used on
-// Android. Verified at comptime; the curl subprocess itself is exercised by
-// the existing curlGet/curlPost test suite on every host platform.
-test "credentialed curl falls through to curl on android" {
+// Regression: aarch64-linux-android (Termux) — std.http.Client could not
+// resolve names, so every request was forced through a curl subprocess that
+// the APK does not ship. compat.net's libc lookup now backs std.http on
+// Android, so both credentialed and plain requests must select it.
+test "android routes all curl helpers to std http" {
     const cred_headers = [_][]const u8{"Authorization: Bearer test-token"};
-    if (comptime builtin.abi == .android) {
-        try std.testing.expect(!credentialedCurlUsesHttpFallback(
-            "https://example.com/v1",
-            &cred_headers,
-            null,
-        ));
-    } else {
-        // On non-Android platforms the existing std.http fallback path is
-        // preserved. Behavior is unchanged from before this fix.
-        try std.testing.expect(credentialedCurlUsesHttpFallback(
-            "https://example.com/v1",
-            &cred_headers,
-            null,
-        ));
-    }
+    const plain_headers = [_][]const u8{"User-Agent: nullclaw-test"};
+    try std.testing.expect(stdHttpTransport(.android));
+    try std.testing.expect(!usesCurlTransport(.android));
+    // Android never diverts to the lossy wrapper: the secure executor keeps
+    // the spec and swaps its transport internally.
+    try std.testing.expect(!credentialedCurlUsesHttpFallbackFor(.android, "https://example.com/v1", &cred_headers, null));
+    try std.testing.expect(!credentialedCurlUsesHttpFallbackFor(.android, "https://example.com/v1", &plain_headers, null));
+    // Non-Android keeps the existing split: credentialed args use std.http to
+    // stay out of argv, everything else stays on curl.
+    try std.testing.expect(!stdHttpTransport(.gnu));
+    try std.testing.expect(usesCurlTransport(.gnu));
+    try std.testing.expect(credentialedCurlUsesHttpFallbackFor(.gnu, "https://example.com/v1", &cred_headers, null));
+    try std.testing.expect(!credentialedCurlUsesHttpFallbackFor(.gnu, "https://example.com/v1", &plain_headers, null));
 }
 
 test "secure curl command preserves methods and keeps secrets out of argv" {
@@ -3780,4 +4353,134 @@ test "curlPostRawWithContentType rejects header injection before any request" {
             null,
         ),
     );
+}
+
+const StdHttpTestServerCtx = struct {
+    server: *std_compat.net.Server,
+    body: []const u8,
+    saw_post_body: AtomicBool = AtomicBool.init(false),
+};
+
+fn serveStdHttpTest(ctx: *StdHttpTestServerCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+
+    var buf: [8192]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = conn.stream.read(buf[filled..]) catch return;
+        if (n == 0) break;
+        filled += n;
+        if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+    }
+    if (std.mem.indexOf(u8, buf[0..filled], "{\"ping\":true}") != null) {
+        ctx.saw_post_body.store(true, .release);
+    }
+
+    var head_buf: [256]u8 = undefined;
+    const response = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{ctx.body.len},
+    ) catch return;
+    conn.stream.writeAll(response) catch {};
+    conn.stream.writeAll(ctx.body) catch {};
+}
+
+test "android std http keeps status body headers and post payload" {
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "{\"ok\":true}" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/test",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const response = try stdHttpRequest(std.testing.allocator, .{
+        .method = .POST,
+        .url = url,
+        .body = "{\"ping\":true}",
+        .headers = &.{"X-Test: yes"},
+        .content_type = "application/json",
+    });
+    defer std.testing.allocator.free(response.headers);
+    defer std.testing.allocator.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("{\"ok\":true}", response.body);
+    try std.testing.expect(std.mem.indexOf(u8, response.headers, "application/json") != null);
+    try std.testing.expect(ctx.saw_post_body.load(.acquire));
+}
+
+test "android std http response cap rejects and truncates" {
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/cap",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectError(error.CurlReadError, stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url,
+        .max_response_bytes = 4,
+    }));
+
+    var server2 = try addr.listen(.{});
+    var ctx2: StdHttpTestServerCtx = .{ .server = &server2, .body = "0123456789" };
+    var thread2 = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx2});
+    defer thread2.join();
+    defer server2.deinit();
+
+    const url2 = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/truncate",
+        .{server2.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url2);
+
+    const response = try stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url2,
+        .max_response_bytes = 4,
+        .truncate_response = true,
+    });
+    defer std.testing.allocator.free(response.headers);
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("0123", response.body);
+    try std.testing.expect(response.truncated);
+}
+
+test "android std http rejects proxies it cannot honor" {
+    try std.testing.expectError(error.UnsupportedProxyScheme, validateStdProxyScheme("socks5://127.0.0.1:1080"));
+    try std.testing.expectError(error.UnsupportedProxyScheme, validateStdProxyForUrl(
+        std.testing.allocator,
+        "https://example.com",
+        "socks5://127.0.0.1:1080",
+    ));
+    try validateStdProxyScheme("http://proxy.example:8080");
+    try validateStdProxyScheme("https://proxy.example:8443");
+}
+
+test "android std http treats head and empty frames as bodyless" {
+    try std.testing.expect(!hasResponseBody(.HEAD, .ok, .none, 12));
+    try std.testing.expect(!hasResponseBody(.GET, .no_content, .none, null));
+    try std.testing.expect(!hasResponseBody(.DELETE, .not_modified, .none, 4));
+    try std.testing.expect(!hasResponseBody(.POST, .ok, .none, 0));
+    try std.testing.expect(hasResponseBody(.GET, .ok, .none, 12));
+    try std.testing.expect(hasResponseBody(.GET, .ok, .chunked, null));
+    try std.testing.expect(hasResponseBody(.GET, .ok, .none, null));
 }

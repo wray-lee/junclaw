@@ -49,6 +49,10 @@ The output must be `0.16.0`.
 
 Android builds embed the Mozilla CA bundle from curl.se and append `/system/etc/security/cacerts` and the Android 14+ Conscrypt APEX store, so WebSocket and HTTP TLS connections verify certificates and never fall back to unverified TLS.
 
+## HTTP and Streaming
+
+Android builds perform HTTP and HTTPS directly through Zig's `std.http` client; no `curl` binary is required for model providers, OAuth, embeddings, or the `http_request` tool. Name resolution uses Android's libc `getaddrinfo` (netd), TLS verifies against the embedded Mozilla bundle plus the system/APEX stores, and streaming provider responses (SSE) are parsed incrementally. `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`, and `NO_PROXY` are honored. Only HTTP(S) proxies are supported by this transport; a configured `socks5://` proxy fails with `UnsupportedProxyScheme` instead of silently connecting directly. Requests that use a configured proxy still rely on the platform resolver; the per-request DNS pinning that the curl path applies with `--resolve` is not used on Android.
+
 ## Native Termux Build
 
 ```bash

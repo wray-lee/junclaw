@@ -41,6 +41,10 @@ zig version
 
 Android 构建内置 curl.se 的 Mozilla CA bundle，并追加 `/system/etc/security/cacerts` 与 Android 14+ 的 Conscrypt APEX 目录，因此 WebSocket 与 HTTP 的 TLS 连接都会校验证书，不再降级为不校验。
 
+## HTTP 与流式响应
+
+Android 构建直接使用 Zig 的 `std.http` 发起 HTTP/HTTPS 请求，模型 provider、OAuth、embeddings 与 `http_request` 工具都不再需要外部 `curl` 可执行文件。域名解析走 Android libc 的 `getaddrinfo`（netd），TLS 使用内置 Mozilla CA 与系统/APEX 证书库校验，provider 的 SSE 流式响应按增量解析。支持 `HTTPS_PROXY`、`HTTP_PROXY`、`ALL_PROXY`、`NO_PROXY`。该传输只支持 HTTP(S) 代理；配置 `socks5://` 代理会以 `UnsupportedProxyScheme` 报错，不会静默改走直连。通过代理的请求仍由平台解析器解析；curl 路径用 `--resolve` 做的逐请求 DNS 固定不适用于 Android。
+
 ## 直接在 Termux 里构建
 
 ```bash

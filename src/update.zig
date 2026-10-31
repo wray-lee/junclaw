@@ -6,6 +6,7 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
+const http_util = @import("http_util.zig");
 
 const log = std.log.scoped(.update);
 
@@ -202,26 +203,39 @@ pub const ReleaseInfo = struct {
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const url = "https://api.github.com/repos/" ++ release_repo ++ "/releases/latest";
 
-    // Use curl subprocess approach (from http_util pattern)
-    const result = std_compat.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-q", "-sf", "--proto", "=https", "--max-time", "30", url },
-        .max_output_bytes = 10 * 1024 * 1024,
-    }) catch |err| {
-        log.err("curl failed: {}", .{err});
-        return error.CurlFailed;
-    };
-    defer {
-        allocator.free(result.stdout);
+    const stdout: []u8 = if (builtin.abi == .android) blk: {
+        const response = http_util.curlRequestWithStatusAndHeaders(allocator, .{
+            .method = .GET,
+            .url = url,
+            .max_time = "30",
+            .max_response_bytes = 10 * 1024 * 1024,
+            .fail_on_http_error = true,
+        }) catch |err| {
+            log.err("release request failed: {}", .{err});
+            return error.CurlFailed;
+        };
+        allocator.free(response.headers);
+        break :blk response.body;
+    } else blk: {
+        const result = std_compat.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "curl", "-q", "-sf", "--proto", "=https", "--max-time", "30", url },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch |err| {
+            log.err("curl failed: {}", .{err});
+            return error.CurlFailed;
+        };
         allocator.free(result.stderr);
-    }
+        break :blk result.stdout;
+    };
+    defer allocator.free(stdout);
 
-    if (result.stdout.len == 0) {
+    if (stdout.len == 0) {
         return error.EmptyResponse;
     }
 
     // Parse JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout, .{}) catch |err| {
         log.err("JSON parse failed: {}", .{err});
         return error.InvalidJson;
     };
@@ -366,6 +380,28 @@ inline fn logDownloadToFileError(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_compat.fs.File) !usize {
+    if (builtin.abi == .android) {
+        var buffer: [64 * 1024]u8 = undefined;
+        var writer = file.writer(&buffer);
+        const response = http_util.curlRequestWithStatusAndHeaders(allocator, .{
+            .method = .GET,
+            .url = url,
+            .max_time = "60",
+            .response_writer = &writer.interface,
+            .fail_on_http_error = true,
+        }) catch |err| {
+            logDownloadToFileError("http download failed: {}", .{err});
+            return error.CurlFailed;
+        };
+        allocator.free(response.headers);
+        allocator.free(response.body);
+        writer.flush() catch |err| {
+            logDownloadToFileError("download write failed: {}", .{err});
+            return error.CurlFailed;
+        };
+        return @intCast(writer.pos);
+    }
+
     // Production updates are HTTPS-only. Tests use a local file URL so they can
     // exercise streaming deterministically without a network dependency.
     const allowed_protocols = if (builtin.is_test) "=file,https" else "=https";
