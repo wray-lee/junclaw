@@ -396,6 +396,63 @@ pub fn tcpConnectToHost(allocator: Allocator, host: []const u8, port: u16) !Stre
     return tcpConnectToAddress(addresses.addrs[0]);
 }
 
+/// Connect to an AF_UNIX socket path with a total timeout.
+pub fn connectUnixWithTimeout(path: []const u8, timeout_ms: u32) !Stream {
+    if (comptime !IoNet.has_unix_sockets) return error.UnixSocketsNotSupported;
+    const ua = try IoNet.UnixAddress.init(path);
+
+    switch (builtin.os.tag) {
+        .windows, .wasi => {
+            const inner = try ua.connect(shared.io());
+            return .{ .handle = inner.socket.handle };
+        },
+        else => {},
+    }
+
+    const atomic_cloexec = @hasDecl(posix.SOCK, "CLOEXEC") and !builtin.os.tag.isDarwin();
+    const rc = posix.system.socket(
+        posix.AF.UNIX,
+        @intCast(posix.SOCK.STREAM | (if (atomic_cloexec) posix.SOCK.CLOEXEC else 0)),
+        0,
+    );
+    const fd: Stream.Handle = switch (posix.errno(rc)) {
+        .SUCCESS => @intCast(rc),
+        else => |err| return posix.unexpectedErrno(err),
+    };
+    errdefer closeStreamHandle(fd);
+    if (!atomic_cloexec) try setSocketCloseOnExec(fd);
+    try setSocketNonblocking(fd, true);
+
+    var un: posix.sockaddr.un = .{ .path = undefined };
+    un.family = posix.AF.UNIX;
+    if (ua.path.len > un.path.len) return error.NameTooLong;
+    @memset(&un.path, 0);
+    @memcpy(un.path[0..ua.path.len], ua.path);
+    const addr_ptr: *const posix.sockaddr = @ptrCast(@alignCast(&un));
+    const addr_len: posix.socklen_t = @intCast(@offsetOf(posix.sockaddr.un, "path") + ua.path.len + 1);
+
+    switch (posix.errno(posix.system.connect(fd, addr_ptr, addr_len))) {
+        .SUCCESS => {},
+        .INPROGRESS, .AGAIN => {
+            var poll_fds = [_]posix.pollfd{.{ .fd = fd, .events = posix.POLL.OUT, .revents = 0 }};
+            const timeout: i32 = @intCast(@min(timeout_ms, @as(u32, std.math.maxInt(i32))));
+            if (try posix.poll(&poll_fds, timeout) == 0) return error.ConnectionTimedOut;
+            var peer: posix.sockaddr = undefined;
+            var peer_len: posix.socklen_t = @sizeOf(posix.sockaddr);
+            if (posix.errno(posix.system.getpeername(fd, &peer, &peer_len)) != .SUCCESS) return error.ConnectionRefused;
+        },
+        .CONNREFUSED => return error.ConnectionRefused,
+        .NETUNREACH, .HOSTUNREACH => return error.NetworkUnreachable,
+        .TIMEDOUT => return error.ConnectionTimedOut,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        .ACCES, .PERM => return error.AccessDenied,
+        else => |err| return posix.unexpectedErrno(err),
+    }
+    try setSocketNonblocking(fd, false);
+    return .{ .handle = fd };
+}
+
 /// Connect to an already-resolved address with a total timeout. Never resolves
 /// hostnames. Windows/WASI use a blocking connect: Zig 0.16's std.Io has no
 /// timeout connect there, and callers keep a deterministic stop path.
@@ -523,6 +580,9 @@ pub fn writeWithTimeout(stream: Stream, bytes: []const u8, timeout_ms: u32) !voi
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             .INTR, .AGAIN => continue,
+            .TIMEDOUT => return error.Timeout,
+            .PIPE => return error.ServerClosed,
+            .CONNRESET => return error.ConnectionResetByPeer,
             else => |err| return posix.unexpectedErrno(err),
         }
         const n: usize = @intCast(rc);
