@@ -411,7 +411,6 @@ pub const AndroidDeviceTool = struct {
     socket_path: []const u8,
     /// Borrowed from allTools; outlives the tool.
     workspace_dir: []const u8,
-    host_name: []const u8,
     tool_name: []const u8,
     desc: []const u8,
     params_json: []const u8,
@@ -431,7 +430,9 @@ pub const AndroidDeviceTool = struct {
 
     fn executeImpl(ptr: *anyopaque, allocator: Allocator, args: root.JsonObjectMap) anyerror!root.ToolResult {
         const self: *AndroidDeviceTool = @ptrCast(@alignCast(ptr));
-        return invoke(allocator, self.socket_path, self.workspace_dir, self.host_name, self.timeout_ms, args);
+        const host_name = hostName(self.tool_name) orelse
+            return root.ToolResult.fail("android device tool has an invalid name");
+        return invoke(allocator, self.socket_path, self.workspace_dir, host_name, self.timeout_ms, args);
     }
 
     fn nameImpl(ptr: *anyopaque) []const u8 {
@@ -456,7 +457,6 @@ pub const AndroidDeviceTool = struct {
 
     pub fn deinit(self: *AndroidDeviceTool, allocator: Allocator) void {
         allocator.free(self.socket_path);
-        allocator.free(self.host_name);
         allocator.free(self.tool_name);
         allocator.free(self.desc);
         allocator.free(self.params_json);
@@ -475,8 +475,6 @@ pub fn createTool(
 
     const socket_copy = try allocator.dupe(u8, socket_path);
     errdefer allocator.free(socket_copy);
-    const host_copy = try allocator.dupe(u8, descriptor.name);
-    errdefer allocator.free(host_copy);
     const name_copy = try prefixedName(allocator, descriptor.name);
     errdefer allocator.free(name_copy);
     const desc_copy = try allocator.dupe(u8, descriptor.description);
@@ -487,7 +485,6 @@ pub fn createTool(
     self.* = .{
         .socket_path = socket_copy,
         .workspace_dir = workspace_dir,
-        .host_name = host_copy,
         .tool_name = name_copy,
         .desc = desc_copy,
         .params_json = params_copy,
@@ -943,6 +940,45 @@ test "request times out and closes when the host never responds" {
 
     try server.join();
     try testing.expect(server.eof_seen);
+}
+
+test "createTool exposes android_ names and invokes with the host name" {
+    try skipWithoutUnixSockets();
+    const allocator = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try serverSocketPath(allocator, tmp.dir);
+    defer allocator.free(path);
+
+    var server = TestServer{ .allocator = allocator, .path = path, .handler = invokeHandler };
+    defer server.deinit();
+    try server.start();
+
+    const descriptor = ToolDescriptor{
+        .name = "screen_tap",
+        .group = "screen",
+        .description = "Tap the screen",
+        .input_schema_json = "{\"type\":\"object\"}",
+        .risk = .dangerous,
+        .needs_unlock = false,
+        .timeout_ms = 500,
+    };
+    const device = try createTool(allocator, path, ".", descriptor);
+    const tool = device.tool();
+    defer tool.deinit(allocator);
+
+    try testing.expectEqualStrings("android_screen_tap", tool.name());
+    try testing.expectEqualStrings("Tap the screen", tool.description());
+    try testing.expectEqualStrings("{\"type\":\"object\"}", tool.parametersJson());
+
+    var args = try std.json.parseFromSlice(std.json.Value, allocator, "{\"path\":\"/sdcard/a.txt\"}", .{});
+    defer args.deinit();
+    const result = try tool.execute(allocator, args.value.object);
+    defer allocator.free(result.output);
+    try testing.expect(result.success);
+    try testing.expectEqualStrings("tapped", result.output);
+
+    try server.join();
 }
 
 // ── Registration gating ─────────────────────────────────────────────
