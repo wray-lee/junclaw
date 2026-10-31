@@ -18,6 +18,7 @@
 const builtin = @import("builtin");
 const std = @import("std");
 const std_compat = @import("compat");
+const platform = @import("../platform.zig");
 const streaming = @import("../streaming.zig");
 const outbound = @import("../outbound.zig");
 const log = std.log.scoped(.channels);
@@ -80,6 +81,9 @@ pub const ChannelMessage = struct {
     sender_uuid: ?[]const u8 = null,
     /// Group ID (Signal-specific: for group chats).
     group_id: ?[]const u8 = null,
+    /// Owned temp attachment paths to delete once this message has been
+    /// processed (deinit), whether the turn succeeded or failed.
+    spool_paths: []const []const u8 = &.{},
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -90,6 +94,11 @@ pub const ChannelMessage = struct {
         if (self.first_name) |fn_| allocator.free(fn_);
         if (self.sender_uuid) |uuid| allocator.free(uuid);
         if (self.group_id) |gid| allocator.free(gid);
+        for (self.spool_paths) |path| {
+            platform.deleteSpoolFile(path);
+            allocator.free(path);
+        }
+        if (self.spool_paths.len > 0) allocator.free(self.spool_paths);
     }
 };
 

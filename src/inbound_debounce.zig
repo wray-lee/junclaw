@@ -121,6 +121,9 @@ pub fn nowMs() i64 {
 
 fn isDebounceEligible(msg: bus.InboundMessage) bool {
     if (msg.media.len > 0) return false;
+    // Spool files are deleted when their message is deinited, so they cannot
+    // be merged into another message's content.
+    if (msg.spool_paths.len > 0) return false;
     const trimmed = std.mem.trim(u8, msg.content, " \t\r\n");
     if (trimmed.len == 0) return false;
     if (trimmed[0] == '/') return false;

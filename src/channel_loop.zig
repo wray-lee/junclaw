@@ -29,6 +29,7 @@ const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
+const platform = @import("platform.zig");
 const inbound_router = @import("inbound_router.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
@@ -2691,8 +2692,10 @@ pub fn runSignalLoop(
     defer loop_state.exited.store(true, .release);
     // Update activity timestamp at start
     loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+    platform.sweepSpoolTempDir(allocator, std_compat.time.timestamp(), platform.spool_ttl_secs);
 
     var evict_counter: u32 = 0;
+    var polls_since_spool_sweep: u32 = 0;
     var poll_backoff_ns: u64 = POLL_BACKOFF_INITIAL_NS;
 
     while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
@@ -2707,6 +2710,11 @@ pub fn runSignalLoop(
         // Update activity after each poll (even if no messages)
         poll_backoff_ns = POLL_BACKOFF_INITIAL_NS;
         loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+        polls_since_spool_sweep += 1;
+        if (polls_since_spool_sweep >= 20) {
+            polls_since_spool_sweep = 0;
+            platform.sweepSpoolTempDir(allocator, std_compat.time.timestamp(), platform.spool_ttl_secs);
+        }
 
         markPollStep(&loop_state.step, .dispatching);
         bumpProgress(&loop_state.progress);

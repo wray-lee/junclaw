@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
+const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
 
@@ -1020,4 +1021,25 @@ test "WhatsAppChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+test "whatsapp inbound spool attachment is deleted after message deinit" {
+    // Regression: WhatsApp media spool files were left in the temp dir after
+    // the inbound message was handled (success or failure).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/whatsapp_test.dat", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/whatsapp_test.dat");
+    defer allocator.free(path);
+
+    var msg = try bus_mod.makeInboundFull(allocator, "whatsapp", "sender", "chat", "[IMAGE:x]", "whatsapp:chat", &.{}, null);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+    msg.spool_paths = paths;
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/whatsapp_test.dat"));
 }

@@ -366,6 +366,23 @@ fn curlPostFromFile(
     file_path: [:0]const u8,
     headers: []const []const u8,
 ) ![]u8 {
+    if (builtin.abi == .android) {
+        // shortcut: 64 MiB in-memory multipart cap; stream from disk if larger
+        // transcription uploads are needed.
+        const body = std_compat.fs.cwd().readFileAlloc(allocator, file_path, 64 * 1024 * 1024) catch
+            return error.CurlFailed;
+        defer allocator.free(body);
+        const response = try http_util.curlRequestWithStatusAndHeaders(allocator, .{
+            .method = .POST,
+            .url = url,
+            .body = body,
+            .headers = headers,
+            .max_time = TRANSCRIBE_CURL_MAX_TIME_SECS,
+        });
+        allocator.free(response.headers);
+        return response.body;
+    }
+
     const data_arg = try std.fmt.allocPrint(allocator, "@{s}", .{file_path});
     defer allocator.free(data_arg);
     var curl_config = try http_util.prepareProtectedCurlConfig(allocator, url, null);
