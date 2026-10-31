@@ -738,6 +738,7 @@ Notes:
 
 - Channel config lives under `channels.<name>`.
 - Multi-account channels typically use an `accounts` wrapper.
+- Inbound attachments downloaded by the Signal, WhatsApp, Mattermost, and Discord channels are written to the platform temp directory under `nullclaw-spool/`. Each file is deleted once its inbound message has been processed, whether the turn succeeded or failed; leftovers older than 24 hours are swept when the channel starts and on its existing poll/heartbeat (no extra thread is started). Sweeps only touch that subdirectory.
 
 External channel plugin example:
 

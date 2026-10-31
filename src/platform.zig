@@ -159,13 +159,70 @@ pub fn androidTempDir(
     return dir;
 }
 
+/// Name of the junclaw-owned subdirectory under the system temp dir. All
+/// channel attachment spool files live here so sweeps never touch unrelated
+/// temp files.
+pub const spool_dir_name = "nullclaw-spool";
+
+/// Default lifetime for spool files that were not released with their message
+/// (for example after a crash). 24 hours.
+pub const spool_ttl_secs: i64 = 24 * 60 * 60;
+
 /// Temp dir for spooled payloads (attachment downloads, spilled output).
 /// Android has no writable /tmp, so use the Android fallback chain; other
-/// platforms keep the historical hardcoded "/tmp".
+/// platforms keep the historical hardcoded "/tmp". The returned directory is
+/// the junclaw-owned subdirectory and is created (0700) if needed, so sweeps
+/// never have to touch unrelated temp files.
 /// Caller owns the returned slice.
 pub fn getSpoolTempDir(allocator: std.mem.Allocator) ![]const u8 {
-    if (comptime builtin.abi == .android) return getTempDir(allocator);
-    return allocator.dupe(u8, "/tmp");
+    const base = if (comptime builtin.abi == .android)
+        try getTempDir(allocator)
+    else
+        try allocator.dupe(u8, "/tmp");
+    defer allocator.free(base);
+    const dir = try std.fs.path.join(allocator, &.{ base, spool_dir_name });
+    errdefer allocator.free(dir);
+    std.Io.Dir.createDirAbsolute(std_compat.io(), dir, std_compat.fs.permissionsFromMode(0o700)) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+    return dir;
+}
+
+/// Remove a single spool file. Refuses paths outside a junclaw spool directory
+/// so a bad caller cannot delete arbitrary files.
+pub fn deleteSpoolFile(path: []const u8) void {
+    const parent = std.fs.path.dirname(path) orelse return;
+    if (!std.mem.eql(u8, std.fs.path.basename(parent), spool_dir_name)) return;
+    std_compat.fs.deleteFileAbsolute(path) catch {};
+}
+
+/// Delete files in `dir_path` whose age is at or past `ttl_secs`. `now_secs`
+/// is injected so callers (and tests) control the clock. Only directories
+/// named like the junclaw spool dir are touched.
+pub fn sweepSpoolFilesInDir(dir_path: []const u8, now_secs: i64, ttl_secs: i64) void {
+    if (!std.mem.eql(u8, std.fs.path.basename(dir_path), spool_dir_name)) return;
+
+    var dir = std_compat.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+
+        const stat = dir.statFile(entry.name) catch continue;
+        const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+        if ((now_secs - mtime_secs) < ttl_secs) continue;
+
+        dir.deleteFile(entry.name) catch continue;
+    }
+}
+
+/// Sweep the platform spool directory.
+pub fn sweepSpoolTempDir(allocator: std.mem.Allocator, now_secs: i64, ttl_secs: i64) void {
+    const dir = getSpoolTempDir(allocator) catch return;
+    defer allocator.free(dir);
+    sweepSpoolFilesInDir(dir, now_secs, ttl_secs);
 }
 
 /// Returns the system temp directory. Tries:
@@ -318,6 +375,91 @@ test "androidTempDir does not create the home base" {
     defer allocator.free(missing);
     try std.testing.expectError(error.FileNotFound, androidTempDir(allocator, null, missing, null));
     try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(missing, .{}));
+}
+
+test "deleteSpoolFile removes a file inside the spool dir" {
+    // Regression: Signal/WhatsApp/Mattermost/Discord attachment spool files
+    // were never deleted after their message was handled.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(spool_dir_name);
+    try dir.writeFile(.{ .sub_path = spool_dir_name ++ "/signal_test.dat", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, spool_dir_name ++ "/signal_test.dat");
+    defer allocator.free(path);
+
+    deleteSpoolFile(path);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(spool_dir_name ++ "/signal_test.dat"));
+}
+
+test "deleteSpoolFile refuses paths outside the spool dir" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.writeFile(.{ .sub_path = "outside.txt", .data = "keep" });
+    const path = try dir.realpathAlloc(allocator, "outside.txt");
+    defer allocator.free(path);
+
+    deleteSpoolFile(path);
+
+    const stat = try dir.statFile("outside.txt");
+    try std.testing.expect(stat.size > 0);
+}
+
+test "sweepSpoolFilesInDir deletes files at or past ttl using injected now" {
+    // Regression: no TTL sweep existed for the channel spool dir, so files
+    // left behind by a crash or a failed handoff stayed forever.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(spool_dir_name);
+    try dir.writeFile(.{ .sub_path = spool_dir_name ++ "/whatsapp_old.dat", .data = "x" });
+    const spool = try dir.realpathAlloc(allocator, spool_dir_name);
+    defer allocator.free(spool);
+    const stat = try dir.statFile(spool_dir_name ++ "/whatsapp_old.dat");
+    const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+
+    sweepSpoolFilesInDir(spool, mtime_secs + spool_ttl_secs, spool_ttl_secs);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(spool_dir_name ++ "/whatsapp_old.dat"));
+}
+
+test "sweepSpoolFilesInDir keeps files younger than ttl" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(spool_dir_name);
+    try dir.writeFile(.{ .sub_path = spool_dir_name ++ "/discord_fresh.dat", .data = "x" });
+    const spool = try dir.realpathAlloc(allocator, spool_dir_name);
+    defer allocator.free(spool);
+    const stat = try dir.statFile(spool_dir_name ++ "/discord_fresh.dat");
+    const mtime_secs: i64 = @intCast(@divFloor(stat.mtime, std.time.ns_per_s));
+
+    sweepSpoolFilesInDir(spool, mtime_secs + spool_ttl_secs - 1, spool_ttl_secs);
+
+    const kept = try dir.statFile(spool_dir_name ++ "/discord_fresh.dat");
+    try std.testing.expect(kept.size > 0);
+}
+
+test "sweepSpoolFilesInDir ignores directories that are not the spool dir" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir("not-spool");
+    try dir.writeFile(.{ .sub_path = "not-spool/mattermost_old.bin", .data = "x" });
+    const other = try dir.realpathAlloc(allocator, "not-spool");
+    defer allocator.free(other);
+
+    sweepSpoolFilesInDir(other, std.math.maxInt(i64), -1);
+
+    const kept = try dir.statFile("not-spool/mattermost_old.bin");
+    try std.testing.expect(kept.size > 0);
 }
 
 test "androidTempDir creates the tmp directory 0700" {
