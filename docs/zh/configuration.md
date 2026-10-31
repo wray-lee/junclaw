@@ -741,6 +741,7 @@ Telegram 示例：
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "api_base": "https://api.telegram.org",
           "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"]
         }
@@ -838,6 +839,7 @@ Weixin channel 字段：
 - 对基于 allowlist 的渠道，空 `allow_from` 会拒绝入站消息；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
 - Telegram webhook 必须配置 `channels.telegram.accounts.<id>.webhook_secret`，并要求 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` header 匹配。
+- 可选 `api_base`（默认为 `"https://api.telegram.org"`）可覆盖 Telegram Bot API 端点，用于本地 mock 或自建 Bot API 服务。
 - Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams.accounts.<id>.webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：

@@ -41,7 +41,7 @@ pub const Client = struct {
 
     pub fn apiUrl(self: Client, buf: []u8, method: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.print("{s}/bot{s}/{s}", .{ self.api_base, self.bot_token, method });
+        try w.print("{s}/bot{s}/{s}", .{ std_compat.mem.trimRight(u8, self.api_base, "/"), self.bot_token, method });
         return w.buffered();
     }
 
@@ -370,7 +370,7 @@ pub const Client = struct {
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.print("{s}/file/bot{s}/{s}", .{ self.api_base, self.bot_token, file_path });
+        try w.print("{s}/file/bot{s}/{s}", .{ std_compat.mem.trimRight(u8, self.api_base, "/"), self.bot_token, file_path });
         return w.buffered();
     }
 };
