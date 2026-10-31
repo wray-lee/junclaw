@@ -168,22 +168,74 @@ pub const spool_dir_name = "nullclaw-spool";
 /// (for example after a crash). 24 hours.
 pub const spool_ttl_secs: i64 = 24 * 60 * 60;
 
+/// True when an existing spool directory is safe to reuse. In a shared temp
+/// dir another local user can pre-create (or symlink) the name, so on POSIX
+/// require a real directory owned by us with no group/other access. Windows
+/// has no POSIX ownership model and WASI has no temp dir to share.
+/// A reusable spool dir must be a directory (not a symlink, which shows up as
+/// 0o120000), owned by the effective user, with no group/other access.
+fn spoolDirStatIsTrusted(mode: u32, uid: u32, euid: u32) bool {
+    return uid == euid and
+        (mode & 0o170000) == 0o040000 and
+        (mode & 0o077) == 0;
+}
+
+fn existingSpoolDirIsOwned(path: []const u8) bool {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return true;
+    // Android's spool dir lives in app-private storage, and its seccomp filter
+    // may reject statx on older kernels.
+    if (comptime builtin.abi == .android) return true;
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const z = std.fmt.bufPrintZ(&buf, "{s}", .{path}) catch return false;
+
+    var mode: u32 = undefined;
+    var uid: u32 = undefined;
+    var euid: u32 = undefined;
+    if (comptime builtin.os.tag == .linux) {
+        var stx: std.os.linux.Statx = undefined;
+        switch (std.os.linux.errno(std.os.linux.statx(
+            std.os.linux.AT.FDCWD,
+            z.ptr,
+            std.os.linux.AT.SYMLINK_NOFOLLOW,
+            .{ .TYPE = true, .MODE = true, .UID = true },
+            &stx,
+        ))) {
+            .SUCCESS => {},
+            // Kernels older than 4.11 lack statx; nothing to verify against.
+            .NOSYS => return true,
+            else => return false,
+        }
+        mode = stx.mode;
+        uid = stx.uid;
+        euid = std.os.linux.geteuid();
+    } else if (comptime builtin.link_libc) {
+        var st: std.c.Stat = undefined;
+        if (std.c.fstatat(std.c.AT.FDCWD, z.ptr, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return false;
+        mode = @intCast(st.mode);
+        uid = @intCast(st.uid);
+        euid = std.c.geteuid();
+    } else {
+        return true;
+    }
+    return uid == euid and
+        (mode & 0o170000) == 0o040000 and
+        (mode & 0o077) == 0;
+}
+
 /// Temp dir for spooled payloads (attachment downloads, spilled output).
-/// Android has no writable /tmp, so use the Android fallback chain; other
-/// platforms keep the historical hardcoded "/tmp". The returned directory is
-/// the junclaw-owned subdirectory and is created (0700) if needed, so sweeps
-/// never have to touch unrelated temp files.
+/// Uses the platform temp dir: a hardcoded "/tmp" does not exist on Windows,
+/// where the failed mkdir silently dropped every attachment download. The
+/// returned directory is the junclaw-owned subdirectory and is created (0700)
+/// if needed, so sweeps never have to touch unrelated temp files.
 /// Caller owns the returned slice.
 pub fn getSpoolTempDir(allocator: std.mem.Allocator) ![]const u8 {
-    const base = if (comptime builtin.abi == .android)
-        try getTempDir(allocator)
-    else
-        try allocator.dupe(u8, "/tmp");
+    const base = try getTempDir(allocator);
     defer allocator.free(base);
     const dir = try std.fs.path.join(allocator, &.{ base, spool_dir_name });
     errdefer allocator.free(dir);
     std.Io.Dir.createDirAbsolute(std_compat.io(), dir, std_compat.fs.permissionsFromMode(0o700)) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
+        error.PathAlreadyExists => if (!existingSpoolDirIsOwned(dir)) return error.SpoolDirNotOwned,
         else => return err,
     };
     return dir;
@@ -375,6 +427,50 @@ test "androidTempDir does not create the home base" {
     defer allocator.free(missing);
     try std.testing.expectError(error.FileNotFound, androidTempDir(allocator, null, missing, null));
     try std.testing.expectError(error.FileNotFound, std_compat.fs.accessAbsolute(missing, .{}));
+}
+
+test "spoolDirStatIsTrusted rejects symlinks and foreign or group-writable dirs" {
+    // Regression: getSpoolTempDir trusted any pre-existing /tmp/nullclaw-spool,
+    // so another local user could own (or symlink) the dir and read attachments.
+    const me: u32 = 1000;
+    try std.testing.expect(spoolDirStatIsTrusted(0o040700, me, me));
+    // Symlink planted under the same name.
+    try std.testing.expect(!spoolDirStatIsTrusted(0o120777, me, me));
+    // Owned by someone else.
+    try std.testing.expect(!spoolDirStatIsTrusted(0o040700, 1001, me));
+    // Group/other accessible.
+    try std.testing.expect(!spoolDirStatIsTrusted(0o040755, me, me));
+    try std.testing.expect(!spoolDirStatIsTrusted(0o040770, me, me));
+    // Not a directory.
+    try std.testing.expect(!spoolDirStatIsTrusted(0o100700, me, me));
+}
+
+test "getSpoolTempDir reuses its own 0700 dir and rejects a planted one" {
+    if (comptime builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std_compat.fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(root);
+
+    const spool = try std_compat.fs.path.join(allocator, &.{ root, spool_dir_name });
+    defer allocator.free(spool);
+
+    // A world-writable dir planted at the spool name must be refused, not reused.
+    try std_compat.fs.makeDirAbsolute(spool);
+    try std_compat.fs.chmodAbsolute(spool, 0o777);
+    try std.testing.expect(!existingSpoolDirIsOwned(spool));
+
+    // The dir junclaw creates itself is 0700 and is reused.
+    try std_compat.fs.chmodAbsolute(spool, 0o700);
+    try std.testing.expect(existingSpoolDirIsOwned(spool));
+
+    // A symlink at the spool name is never trusted.
+    const link = try std_compat.fs.path.join(allocator, &.{ root, "planted-link" });
+    defer allocator.free(link);
+    std_compat.fs.Dir.wrap(tmp.dir).symLink(root, "planted-link", .{}) catch return error.SkipZigTest;
+    try std.testing.expect(!existingSpoolDirIsOwned(link));
 }
 
 test "deleteSpoolFile removes a file inside the spool dir" {

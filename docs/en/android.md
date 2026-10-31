@@ -99,6 +99,10 @@ The host uses the original DSH tool names (`file_read`, `screen_tap`, `device_st
 - `ok: false`: the tool call fails with `<code>: <message>` (`failed: ` when the host omits both fields).
 - Malformed host responses or a closed connection fail only that tool call.
 
+## Updates
+
+Android builds are packaged into the host application and are updated along with the APK; `junclaw update` is disabled on Android to prevent overwriting the bionic binary with a glibc Linux release asset.
+
 ## Security
 
 Device-specific approval is the host's responsibility; junclaw does not duplicate it. However, device tools are ordinary junclaw tools: the agent's `SecurityPolicy` (read-only autonomy, action rate limits, and any per-agent tool withholding) still applies before execution, and nothing in the bridge bypasses it.
