@@ -6,7 +6,6 @@
 const std = @import("std");
 const std_compat = @import("compat");
 const builtin = @import("builtin");
-const http_util = @import("http_util.zig");
 
 const log = std.log.scoped(.update);
 
@@ -21,6 +20,13 @@ pub const Options = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
+    // Android has no compatible release asset (all are glibc/musl ELF); the
+    // host app owns updates, and downloading one would brick the install.
+    if (comptime builtin.abi == .android) {
+        std.debug.print("Android builds are updated by the host app; self-update is not supported.\n", .{});
+        return error.UnsupportedPlatform;
+    }
+
     // Get current version
     const current_version = @import("version.zig").string;
 
@@ -203,20 +209,7 @@ pub const ReleaseInfo = struct {
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const url = "https://api.github.com/repos/" ++ release_repo ++ "/releases/latest";
 
-    const stdout: []u8 = if (builtin.abi == .android) blk: {
-        const response = http_util.curlRequestWithStatusAndHeaders(allocator, .{
-            .method = .GET,
-            .url = url,
-            .max_time = "30",
-            .max_response_bytes = 10 * 1024 * 1024,
-            .fail_on_http_error = true,
-        }) catch |err| {
-            log.err("release request failed: {}", .{err});
-            return error.CurlFailed;
-        };
-        allocator.free(response.headers);
-        break :blk response.body;
-    } else blk: {
+    const stdout: []u8 = blk: {
         const result = std_compat.process.Child.run(.{
             .allocator = allocator,
             .argv = &.{ "curl", "-q", "-sf", "--proto", "=https", "--max-time", "30", url },
@@ -288,7 +281,10 @@ pub const PlatformTarget = enum {
     }
 };
 
-fn platformFromParts(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ?PlatformTarget {
+fn platformFromParts(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch, abi: std.Target.Abi) ?PlatformTarget {
+    // Android reports os == .linux but runs bionic, so every release asset
+    // (glibc/musl ELF) is unrunnable there; refuse instead of bricking the app.
+    if (abi == .android) return null;
     if (os == .linux) {
         if (arch == .x86_64) return .linux_x86_64;
         if (arch == .aarch64) return .linux_aarch64;
@@ -302,7 +298,7 @@ fn platformFromParts(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ?Platform
 }
 
 pub fn getCurrentPlatform() ?PlatformTarget {
-    return platformFromParts(builtin.os.tag, builtin.cpu.arch);
+    return platformFromParts(builtin.os.tag, builtin.cpu.arch, builtin.abi);
 }
 
 // ── Asset URL Finding ─────────────────────────────────────────────────
@@ -380,28 +376,6 @@ inline fn logDownloadToFileError(comptime fmt: []const u8, args: anytype) void {
 }
 
 fn downloadToFile(allocator: std.mem.Allocator, url: []const u8, file: *std_compat.fs.File) !usize {
-    if (builtin.abi == .android) {
-        var buffer: [64 * 1024]u8 = undefined;
-        var writer = file.writer(&buffer);
-        const response = http_util.curlRequestWithStatusAndHeaders(allocator, .{
-            .method = .GET,
-            .url = url,
-            .max_time = "60",
-            .response_writer = &writer.interface,
-            .fail_on_http_error = true,
-        }) catch |err| {
-            logDownloadToFileError("http download failed: {}", .{err});
-            return error.CurlFailed;
-        };
-        allocator.free(response.headers);
-        allocator.free(response.body);
-        writer.flush() catch |err| {
-            logDownloadToFileError("download write failed: {}", .{err});
-            return error.CurlFailed;
-        };
-        return @intCast(writer.pos);
-    }
-
     // Production updates are HTTPS-only. Tests use a local file URL so they can
     // exercise streaming deterministically without a network dependency.
     const allowed_protocols = if (builtin.is_test) "=file,https" else "=https";
@@ -534,14 +508,21 @@ test "PlatformTarget.assetName covers all release assets" {
 }
 
 test "platformFromParts maps supported and unsupported targets" {
-    try std.testing.expectEqual(PlatformTarget.linux_x86_64, platformFromParts(.linux, .x86_64).?);
-    try std.testing.expectEqual(PlatformTarget.linux_aarch64, platformFromParts(.linux, .aarch64).?);
-    try std.testing.expectEqual(PlatformTarget.macos_aarch64, platformFromParts(.macos, .aarch64).?);
-    try std.testing.expectEqual(PlatformTarget.macos_x86_64, platformFromParts(.macos, .x86_64).?);
-    try std.testing.expectEqual(PlatformTarget.windows_x86_64, platformFromParts(.windows, .x86_64).?);
+    try std.testing.expectEqual(PlatformTarget.linux_x86_64, platformFromParts(.linux, .x86_64, .gnu).?);
+    try std.testing.expectEqual(PlatformTarget.linux_aarch64, platformFromParts(.linux, .aarch64, .musl).?);
+    try std.testing.expectEqual(PlatformTarget.macos_aarch64, platformFromParts(.macos, .aarch64, .none).?);
+    try std.testing.expectEqual(PlatformTarget.macos_x86_64, platformFromParts(.macos, .x86_64, .none).?);
+    try std.testing.expectEqual(PlatformTarget.windows_x86_64, platformFromParts(.windows, .x86_64, .gnu).?);
 
-    try std.testing.expect(platformFromParts(.windows, .aarch64) == null);
-    try std.testing.expect(platformFromParts(.freebsd, .x86_64) == null);
+    try std.testing.expect(platformFromParts(.windows, .aarch64, .gnu) == null);
+    try std.testing.expect(platformFromParts(.freebsd, .x86_64, .none) == null);
+}
+
+// Regression: Android reported .linux/.aarch64, so `update` downloaded the
+// glibc junclaw-linux-aarch64.bin and replaced the bionic app with it.
+test "platformFromParts refuses Android so self-update cannot brick the app" {
+    try std.testing.expect(platformFromParts(.linux, .aarch64, .android) == null);
+    try std.testing.expect(platformFromParts(.linux, .x86_64, .android) == null);
 }
 
 test "downloadToFile streams from local file URL" {

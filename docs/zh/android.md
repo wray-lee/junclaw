@@ -99,6 +99,10 @@ JSON-RPC 错误沿用标准错误码：未知方法 `-32601`，参数错误 `-32
 - `ok: false`：该工具调用失败，文本为 `<code>: <message>`（宿主两个字段都缺省时为 `failed: `）。
 - 宿主响应格式错误或连接被关闭，只让当前这次工具调用失败。
 
+## 更新
+
+Android 构建打包在宿主 App 内，随 APK 一同更新；`junclaw update` 在 Android 上被显式禁用，避免将 bionic 二进制覆盖为通用 glibc Linux 发行包。
+
 ## 安全
 
 设备能力的审批由宿主负责，junclaw 不重复审批。但设备工具仍是普通的 junclaw 工具：执行前照常经过 agent 的 `SecurityPolicy`（只读 autonomy、动作限流、按 agent 收窄工具等），桥接不会绕过这些通用限制。
