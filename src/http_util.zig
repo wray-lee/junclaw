@@ -826,8 +826,9 @@ fn waitBodyReadable(
     if (bodyBuffered(req, reader)) return true;
     const conn = req.connection orelse return error.ConnectionClosed;
     if (comptime builtin.os.tag == .windows) {
-        if (timeout_ms > 0) std_compat.thread.sleep(@as(u64, @intCast(timeout_ms)) * std.time.ns_per_ms);
-        return bodyBuffered(req, reader);
+        // Windows: std.posix.poll is unavailable; yield to the reader so it
+        // performs the blocking read on the socket directly.
+        return true;
     }
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = conn.stream_reader.stream.socket.handle,
