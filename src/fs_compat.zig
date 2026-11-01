@@ -377,6 +377,8 @@ test "writeFileAtomicSecureNoReplace preserves existing file and removes candida
 }
 
 test "secure no-replace publication supports hard-link fallback" {
+    // Android: SELinux on /data/local/tmp disallows hard links
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return error.SkipZigTest;
 
     var tmp_dir = std.testing.tmpDir(.{});

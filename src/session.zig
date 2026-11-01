@@ -4179,6 +4179,12 @@ pub const SessionManager = struct {
         // like any other message instead of stalling behind the turn lock.
         if (agent_mod.commands.isKnownSlashCommand(content)) return .process;
 
+        // Messages with a channel spool attachment are read lazily by the
+        // turn, and the file is deleted when the InboundMessage is destroyed.
+        // Injecting one into a running turn would outlive the file, so run it
+        // as a normal follow-up after the active turn instead.
+        if (std.mem.indexOf(u8, content, platform.spool_dir_name) != null) return .process;
+
         return switch (inbound_router.route(self.routeInput(session_key))) {
             .inject, .replace_injection => blk: {
                 const injected = self.injectMidTurnIfRunning(session_key, content, ref, sink) catch |err| {

@@ -550,6 +550,8 @@ test "FileAppendTool blocks symlink parent escape outside workspace" {
 }
 
 test "FileAppendTool does not mutate outside inode through hard link" {
+    // Android: SELinux on /data/local/tmp disallows hard links
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
 
     var ws_tmp = testing.tmpDir(.{});

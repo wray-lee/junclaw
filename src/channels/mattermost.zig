@@ -153,6 +153,7 @@ pub const MattermostChannel = struct {
     connected: Atomic(bool) = Atomic(bool).init(false),
     ws_seq: Atomic(u64) = Atomic(u64).init(0),
     tmp_counter: Atomic(u64) = Atomic(u64).init(0),
+    spool_sweep_events: u32 = 0,
     lifecycle_mu: std_compat.sync.Mutex = .{},
     gateway_socket_mu: std_compat.sync.Mutex = .{},
     ws_fd: Atomic(SocketFd) = Atomic(SocketFd).init(invalid_socket),
@@ -480,7 +481,12 @@ pub const MattermostChannel = struct {
         return .{ .ptr = @ptrCast(self), .vtable = &vtable };
     }
 
+    fn sweepSpoolFiles(self: *MattermostChannel) void {
+        platform.sweepSpoolTempDir(self.allocator, std_compat.time.timestamp(), platform.spool_ttl_secs);
+    }
+
     fn gatewayLoop(self: *MattermostChannel) void {
+        self.sweepSpoolFiles();
         while (self.running.load(.acquire)) {
             self.runGatewayOnce() catch |err| {
                 log.warn("mattermost websocket cycle failed: {}", .{err});
@@ -592,6 +598,12 @@ pub const MattermostChannel = struct {
     }
 
     fn handleGatewayMessage(self: *MattermostChannel, payload: []const u8) !void {
+        self.spool_sweep_events += 1;
+        if (self.spool_sweep_events >= 20) {
+            self.spool_sweep_events = 0;
+            self.sweepSpoolFiles();
+        }
+
         const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, payload, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
@@ -681,6 +693,14 @@ pub const MattermostChannel = struct {
 
         var content: std.ArrayListUnmanaged(u8) = .empty;
         defer content.deinit(self.allocator);
+        var spool_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer {
+            for (spool_paths.items) |path| {
+                platform.deleteSpoolFile(path);
+                self.allocator.free(path);
+            }
+            spool_paths.deinit(self.allocator);
+        }
         if (message_body.len > 0) {
             try content.appendSlice(self.allocator, message_body);
         }
@@ -692,10 +712,18 @@ pub const MattermostChannel = struct {
                     const maybe_path = self.downloadAttachmentToTemp(fid.string);
                     if (maybe_path) |path| {
                         defer self.allocator.free(path);
+                        var keep = false;
+                        defer if (!keep) platform.deleteSpoolFile(path);
                         if (content.items.len > 0) try content.appendSlice(self.allocator, "\n");
                         try content.appendSlice(self.allocator, "[IMAGE:");
                         try content.appendSlice(self.allocator, path);
                         try content.appendSlice(self.allocator, "]");
+                        const owned_path = try self.allocator.dupe(u8, path);
+                        spool_paths.append(self.allocator, owned_path) catch |err| {
+                            self.allocator.free(owned_path);
+                            return err;
+                        };
+                        keep = true;
                     }
                 }
             }
@@ -756,7 +784,7 @@ pub const MattermostChannel = struct {
         const content_owned = try content.toOwnedSlice(self.allocator);
         defer self.allocator.free(content_owned);
 
-        const inbound = try bus_mod.makeInboundFull(
+        var inbound = try bus_mod.makeInboundFull(
             self.allocator,
             "mattermost",
             sender_id,
@@ -766,6 +794,13 @@ pub const MattermostChannel = struct {
             &.{},
             meta.items,
         );
+        if (spool_paths.items.len > 0) {
+            inbound.spool_paths = spool_paths.toOwnedSlice(self.allocator) catch |err| {
+                inbound.deinit(self.allocator);
+                return err;
+            };
+            spool_paths = .empty;
+        }
 
         if (self.bus) |b| {
             b.publishInbound(inbound) catch |err| {
@@ -789,28 +824,11 @@ pub const MattermostChannel = struct {
         defer self.allocator.free(data);
         if (data.len == 0) return null;
 
-        const tmp_env = std_compat.process.getEnvVarOwned(self.allocator, "TMPDIR") catch null;
-        defer if (tmp_env) |v| self.allocator.free(v);
-        const trimmed_env: []const u8 = if (tmp_env) |v| std_compat.mem.trimRight(u8, v, "/") else "";
-        const fallback_dir: ?[]const u8 = if (trimmed_env.len == 0)
-            platform.getSpoolTempDir(self.allocator) catch return null
-        else
-            null;
-        defer if (fallback_dir) |v| self.allocator.free(v);
-        const tmp_dir = if (trimmed_env.len > 0) trimmed_env else fallback_dir.?;
+        const tmp_dir = platform.getSpoolTempDir(self.allocator) catch return null;
+        defer self.allocator.free(tmp_dir);
 
         const counter = self.tmp_counter.fetchAdd(1, .monotonic) + 1;
-        const path = std.fmt.allocPrint(
-            self.allocator,
-            "{s}/nullclaw_mattermost_{d}_{d}.bin",
-            .{ tmp_dir, std_compat.time.timestamp(), counter },
-        ) catch return null;
-        errdefer self.allocator.free(path);
-
-        const file = std_compat.fs.createFileAbsolute(path, .{ .read = false }) catch return null;
-        defer file.close();
-        file.writeAll(data) catch return null;
-        return path;
+        return writeSpoolFile(self.allocator, tmp_dir, counter, data);
     }
 
     fn isDirectSenderAllowed(self: *const MattermostChannel, sender_id: []const u8, sender_name: ?[]const u8) bool {
@@ -1336,4 +1354,53 @@ test "MattermostChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+test "mattermost inbound spool attachment is deleted after message deinit" {
+    // Regression: Mattermost attachment spool files were left in TMPDIR after
+    // the inbound message was handled (success or failure).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/mattermost_test.bin", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/mattermost_test.bin");
+    defer allocator.free(path);
+
+    var msg = try bus_mod.makeInboundFull(allocator, "mattermost", "sender", "chat", "[IMAGE:x]", "mattermost:chat", &.{}, null);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+    msg.spool_paths = paths;
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/mattermost_test.bin"));
+}
+
+pub fn writeSpoolFile(allocator: std.mem.Allocator, tmp_dir: []const u8, counter: u64, data: []const u8) ?[]u8 {
+    const path = std.fmt.allocPrint(
+        allocator,
+        "{s}/nullclaw_mattermost_{d}_{d}.bin",
+        .{ tmp_dir, std_compat.time.timestamp(), counter },
+    ) catch return null;
+
+    const file = std_compat.fs.createFileAbsolute(path, .{ .read = false }) catch {
+        allocator.free(path);
+        return null;
+    };
+    defer file.close();
+    file.writeAll(data) catch {
+        platform.deleteSpoolFile(path);
+        allocator.free(path);
+        return null;
+    };
+    return path;
+}
+
+test "mattermost writeSpoolFile frees path on create failure" {
+    // Regression: errdefer self.allocator.free(path) was never executed because function returned ?[]u8
+    const allocator = std.testing.allocator;
+    const non_existent_dir = "/non_existent_directory_for_test/nullclaw-spool";
+    const res = writeSpoolFile(allocator, non_existent_dir, 1, "test-data");
+    try std.testing.expect(res == null);
 }

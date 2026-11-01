@@ -364,6 +364,14 @@ pub const SignalChannel = struct {
         // Determine message text and fetch attachments.
         var text_buf: std.ArrayListUnmanaged(u8) = .empty;
         errdefer text_buf.deinit(allocator);
+        var spool_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        errdefer {
+            for (spool_paths.items) |path| {
+                platform.deleteSpoolFile(path);
+                allocator.free(path);
+            }
+            spool_paths.deinit(allocator);
+        }
 
         if (has_message_text) {
             try text_buf.appendSlice(allocator, dm_message.?);
@@ -374,10 +382,17 @@ pub const SignalChannel = struct {
             const target_id = dm_group_id orelse sender_raw;
             for (dm_attachment_ids) |att_id| {
                 if (try self.fetchAttachmentLocally(allocator, att_id, is_group, target_id)) |local_path| {
+                    var keep = false;
+                    defer if (!keep) {
+                        platform.deleteSpoolFile(local_path);
+                        allocator.free(local_path);
+                    };
                     if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "\n");
                     try text_buf.appendSlice(allocator, "[IMAGE:");
                     try text_buf.appendSlice(allocator, local_path);
                     try text_buf.appendSlice(allocator, "]");
+                    try spool_paths.append(allocator, local_path);
+                    keep = true;
                 } else {
                     if (text_buf.items.len > 0) try text_buf.appendSlice(allocator, "\n");
                     try text_buf.appendSlice(allocator, "[Attachment]");
@@ -418,6 +433,7 @@ pub const SignalChannel = struct {
             .is_group = dm_group_id != null,
             .sender_uuid = if (source) |src| if (src.len > 0 and isUuid(src)) try allocator.dupe(u8, src) else null else null,
             .group_id = if (dm_group_id) |gid| try allocator.dupe(u8, gid) else null,
+            .spool_paths = try spool_paths.toOwnedSlice(allocator),
         };
 
         return msg;
@@ -487,11 +503,7 @@ pub const SignalChannel = struct {
         const local_path = try std.fmt.allocPrint(allocator, "{s}/signal_{x}.dat", .{ tmp_dir, rand_id });
         defer allocator.free(local_path);
 
-        var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
-        defer file.close();
-        try file.writeAll(decoded);
-
-        return try allocator.dupe(u8, local_path);
+        return writeSpoolAttachment(allocator, local_path, decoded);
     }
 
     // ── JSON-RPC Send ───────────────────────────────────────────────
@@ -3695,4 +3707,58 @@ test "SignalChannel start + stop under is_test leaks zero bytes" {
     ch.stop();
     // Double stop — must not double-free or crash.
     ch.stop();
+}
+
+test "signal channel spool attachment is deleted after message deinit" {
+    // Regression: Signal attachment spool files were never deleted after the
+    // inbound message was processed, so /tmp accumulated signal_*.dat files.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/signal_test.dat", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/signal_test.dat");
+    defer allocator.free(path);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+
+    var msg = root.ChannelMessage{
+        .id = try allocator.dupe(u8, "id"),
+        .sender = try allocator.dupe(u8, "sender"),
+        .content = try allocator.dupe(u8, "[IMAGE:x]"),
+        .channel = "signal",
+        .timestamp = 0,
+        .spool_paths = paths,
+    };
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/signal_test.dat"));
+}
+
+pub fn writeSpoolAttachment(allocator: std.mem.Allocator, local_path: []const u8, decoded: []const u8) !?[]u8 {
+    var file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
+    errdefer platform.deleteSpoolFile(local_path);
+    defer file.close();
+    try file.writeAll(decoded);
+
+    return try allocator.dupe(u8, local_path);
+}
+
+test "signal writeSpoolAttachment cleans up file on dupe OOM" {
+    // Regression: file handle must close before deleting spool file, and OOM cleans up spool
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    const sub_path = platform.spool_dir_name ++ "/signal_test.dat";
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name);
+    defer allocator.free(path);
+    const local_path = try std.fs.path.join(allocator, &.{ path, "signal_test.dat" });
+    defer allocator.free(local_path);
+
+    var failing_alloc = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, writeSpoolAttachment(failing_alloc.allocator(), local_path, "signal-payload"));
+    try std.testing.expectError(error.FileNotFound, dir.statFile(sub_path));
 }

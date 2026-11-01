@@ -147,6 +147,9 @@ pub const SseConnection = struct {
         // long-lived transport.
         // URL already includes account query param from Signal channel config.
         const uri = try std.Uri.parse(self.url);
+        if (comptime http_util.stdHttpTransport(builtin.abi)) {
+            try http_util.validateStdProxyForUrl(self.allocator, self.url, null);
+        }
         self.body_reader = null;
 
         // Build request options with SSE headers.

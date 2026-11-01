@@ -41,7 +41,7 @@ pub const Client = struct {
 
     pub fn apiUrl(self: Client, buf: []u8, method: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.print("{s}/bot{s}/{s}", .{ self.api_base, self.bot_token, method });
+        try w.print("{s}/bot{s}/{s}", .{ std_compat.mem.trimRight(u8, self.api_base, "/"), self.bot_token, method });
         return w.buffered();
     }
 
@@ -370,7 +370,7 @@ pub const Client = struct {
 
     fn fileUrl(self: Client, buf: []u8, file_path: []const u8) ![]const u8 {
         var w: std.Io.Writer = .fixed(buf);
-        try w.print("{s}/file/bot{s}/{s}", .{ self.api_base, self.bot_token, file_path });
+        try w.print("{s}/file/bot{s}/{s}", .{ std_compat.mem.trimRight(u8, self.api_base, "/"), self.bot_token, file_path });
         return w.buffered();
     }
 };
@@ -656,6 +656,8 @@ fn serveStalledApi(ctx: *StalledApiCtx) void {
 // call site (`getUpdates` -> `post`), not just the bounded transport helper, so
 // reverting `post` to the untimed std.http client makes it fail.
 test "telegram getUpdates returns a bounded error on a stalled socket" {
+    // Android: production uses std.http, test assumes curl --max-time
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;

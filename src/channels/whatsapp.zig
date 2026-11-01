@@ -2,6 +2,7 @@ const std = @import("std");
 const std_compat = @import("compat");
 const root = @import("root.zig");
 const platform = @import("../platform.zig");
+const bus_mod = @import("../bus.zig");
 const config_types = @import("../config_types.zig");
 const http_util = @import("../http_util.zig");
 
@@ -250,22 +251,7 @@ pub const WhatsAppChannel = struct {
         const local_path = std.fmt.allocPrint(allocator, "{s}/whatsapp_{x}.dat", .{ tmp_dir, std_compat.crypto.random.int(u64) }) catch return null;
         defer allocator.free(local_path);
 
-        if (std_compat.fs.createFileAbsolute(local_path, .{ .read = false })) |file| {
-            file.writeAll(media_resp) catch {
-                file.close();
-                return null;
-            };
-            file.close();
-
-            // Format as [IMAGE:path]
-            var out_buf: std.ArrayListUnmanaged(u8) = .empty;
-            out_buf.appendSlice(allocator, "[IMAGE:") catch return null;
-            out_buf.appendSlice(allocator, local_path) catch return null;
-            out_buf.appendSlice(allocator, "]") catch return null;
-            return out_buf.toOwnedSlice(allocator) catch null;
-        } else |_| {
-            return null;
-        }
+        return writeMediaMarker(allocator, local_path, media_resp);
     }
 
     pub fn healthCheck(_: *WhatsAppChannel) bool {
@@ -1020,4 +1006,59 @@ test "WhatsAppChannel create + healthCheck + stop leaks zero bytes" {
     const ch = ch_struct.channel();
     _ = ch.healthCheck();
     ch.stop();
+}
+
+test "whatsapp inbound spool attachment is deleted after message deinit" {
+    // Regression: WhatsApp media spool files were left in the temp dir after
+    // the inbound message was handled (success or failure).
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    try dir.writeFile(.{ .sub_path = platform.spool_dir_name ++ "/whatsapp_test.dat", .data = "x" });
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name ++ "/whatsapp_test.dat");
+    defer allocator.free(path);
+
+    var msg = try bus_mod.makeInboundFull(allocator, "whatsapp", "sender", "chat", "[IMAGE:x]", "whatsapp:chat", &.{}, null);
+    const paths = try allocator.alloc([]const u8, 1);
+    paths[0] = try allocator.dupe(u8, path);
+    msg.spool_paths = paths;
+    msg.deinit(allocator);
+
+    try std.testing.expectError(error.FileNotFound, dir.statFile(platform.spool_dir_name ++ "/whatsapp_test.dat"));
+}
+
+pub fn writeMediaMarker(allocator: std.mem.Allocator, local_path: []const u8, media_resp: []const u8) ?[]const u8 {
+    const file = std_compat.fs.createFileAbsolute(local_path, .{ .read = false }) catch return null;
+    file.writeAll(media_resp) catch {
+        file.close();
+        platform.deleteSpoolFile(local_path);
+        return null;
+    };
+    file.close();
+
+    return std.fmt.allocPrint(allocator, "[IMAGE:{s}]", .{local_path}) catch {
+        platform.deleteSpoolFile(local_path);
+        return null;
+    };
+}
+
+test "whatsapp writeMediaMarker cleans up file on marker OOM" {
+    // Regression: writeAll succeeded but marker assembly OOM returned null leaving orphan file
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = std_compat.fs.Dir.wrap(tmp.dir);
+    try dir.makeDir(platform.spool_dir_name);
+    const sub_path = platform.spool_dir_name ++ "/whatsapp_test.dat";
+    const path = try dir.realpathAlloc(allocator, platform.spool_dir_name);
+    defer allocator.free(path);
+    const local_path = try std.fs.path.join(allocator, &.{ path, "whatsapp_test.dat" });
+    defer allocator.free(local_path);
+
+    var failing_alloc = std.testing.FailingAllocator.init(allocator, .{ .fail_index = 0 });
+    const res = writeMediaMarker(failing_alloc.allocator(), local_path, "media-payload");
+    try std.testing.expect(res == null);
+    try std.testing.expectError(error.FileNotFound, dir.statFile(sub_path));
 }

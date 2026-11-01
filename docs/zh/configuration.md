@@ -673,6 +673,7 @@ P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `d
 
 - 渠道配置统一在 `channels.<name>` 下。
 - 多账号渠道通常用 `accounts` 包裹。
+- Signal、WhatsApp、Mattermost、Discord 下载的入站附件写入平台临时目录下的 `nullclaw-spool/` 子目录（spool 位置是 `TMPDIR/nullclaw-spool`，没有 `TMPDIR` 时用 `/tmp/nullclaw-spool`；macOS 上是每用户目录）。对应入站消息处理完成后（无论回合成功还是失败）立即删除该文件；超过 24 小时的残留文件在渠道启动时以及渠道现有的轮询/心跳周期中清理（不新开线程）。清理只作用于该子目录。旧的 `/tmp/nullclaw-spool` 残留不再自动清理，可以手动删除。
 
 外部渠道插件示例：
 
@@ -740,6 +741,7 @@ Telegram 示例：
       "accounts": {
         "main": {
           "bot_token": "123456:ABCDEF",
+          "api_base": "https://api.telegram.org",
           "webhook_secret": "replace-with-random-telegram-webhook-secret",
           "allow_from": ["YOUR_TELEGRAM_USER_ID"]
         }
@@ -748,6 +750,8 @@ Telegram 示例：
   }
 }
 ```
+
+> **警告**：bot token 会出现在发往 `api_base` 主机的每个请求 URL 里，只能配置可信主机。
 
 WeChat 示例：
 
@@ -837,6 +841,7 @@ Weixin channel 字段：
 - 对基于 allowlist 的渠道，空 `allow_from` 会拒绝入站消息；如果要做私有机器人，请显式填写 ID/OpenID。
 - `allow_from: ["*"]` 会在基于 allowlist 的渠道上允许所有来源，仅在你明确接受风险时使用。
 - Telegram webhook 必须配置 `channels.telegram.accounts.<id>.webhook_secret`，并要求 Telegram 的 `X-Telegram-Bot-Api-Secret-Token` header 匹配。
+- 可选 `api_base`（默认为 `"https://api.telegram.org"`）可覆盖 Telegram Bot API 端点，用于本地 mock 或自建 Bot API 服务。**警告**：bot token 会出现在发往 `api_base` 主机的每个请求 URL 里，只能配置可信主机。
 - Teams 入站 webhook 现在会使用 Bot Framework JWT bearer token 并对照 Microsoft OpenID metadata 做认证。`channels.teams.accounts.<id>.webhook_secret` 变为可选项；如果配置，会额外要求 `X-Webhook-Secret` 匹配。
 
 Telegram forum topics：

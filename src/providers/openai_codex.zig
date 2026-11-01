@@ -375,6 +375,10 @@ fn codexStreamRequest(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !StreamChatResult {
+    if (comptime http_util.stdHttpTransport(@import("builtin").abi)) {
+        return stdCodexStream(allocator, url, body, auth_header, extra_headers, timeout_secs, callback, ctx);
+    }
+
     // Build argv on stack
     var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
@@ -458,29 +462,64 @@ fn codexStreamRequest(
 
     try child.spawn();
 
-    // Abort the in-flight stream when the agent /stop raises the interrupt
-    // flag: the watcher kills curl and the read loop below returns
-    // error.Interrupted instead of running the request to completion.
-    var cancel_done = std.atomic.Value(bool).init(false);
-    var cancel_watcher: ?std.Thread = null;
-    var cancel_ctx: http_util.CancelWatcherCtx = undefined;
-    http_util.spawnCancelWatcher(&child, &cancel_done, &cancel_watcher, &cancel_ctx);
-    defer http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
+    var source: http_util.CurlByteStream = undefined;
+    source.init(&child);
+    defer source.deinit();
 
     if (child.stdin) |stdin_file| {
         stdin_file.writeAll(body) catch {
             stdin_file.close();
             child.stdin = null;
-            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            source.abort();
             return error.CurlWriteError;
         };
         stdin_file.close();
         child.stdin = null;
     } else {
-        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+        source.abort();
         return error.CurlWriteError;
     }
 
+    return consumeCodexStream(allocator, source.stream(), callback, ctx);
+}
+
+/// std.http stream for Android: same parser and callbacks, no curl process.
+fn stdCodexStream(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    body: []const u8,
+    auth_header: []const u8,
+    extra_headers: []const []const u8,
+    timeout_secs: u64,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !StreamChatResult {
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+
+    var header_buf: [16][]const u8 = undefined;
+    var header_count: usize = 0;
+    header_buf[header_count] = "Content-Type: application/json";
+    header_count += 1;
+    header_buf[header_count] = auth_header;
+    header_count += 1;
+    for (extra_headers) |hdr| {
+        if (header_count >= header_buf.len) return error.TooManyHeaders;
+        header_buf[header_count] = hdr;
+        header_count += 1;
+    }
+
+    const stream = try http_util.HttpStream.open(allocator, url, header_buf[0..header_count], body, timeout_secs);
+    defer stream.deinit();
+    return consumeCodexStream(allocator, stream.stream(), callback, ctx);
+}
+
+fn consumeCodexStream(
+    allocator: std.mem.Allocator,
+    source: http_util.ByteStream,
+    callback: root.StreamCallback,
+    ctx: *anyopaque,
+) !StreamChatResult {
     // Read stdout line by line, parse Codex SSE events
     var accumulated: std.ArrayListUnmanaged(u8) = .empty;
     defer accumulated.deinit(allocator);
@@ -488,7 +527,6 @@ fn codexStreamRequest(
     var line_buf: std.ArrayListUnmanaged(u8) = .empty;
     defer line_buf.deinit(allocator);
 
-    const file = child.stdout.?;
     var read_buf: [4096]u8 = undefined;
     var saw_text_delta = false;
     var emitted_text_fallback = false;
@@ -499,10 +537,10 @@ fn codexStreamRequest(
         // /stop: stop reading at the next delta boundary instead of draining
         // every delta the provider already buffered.
         if (http_util.interruptRequested()) {
-            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+            source.abort();
             return error.Interrupted;
         }
-        const n = file.read(&read_buf) catch break;
+        const n = source.read(&read_buf) catch break;
         if (n == 0) break;
 
         for (read_buf[0..n]) |byte| {
@@ -516,7 +554,7 @@ fn codexStreamRequest(
                     .delta => |delta_evt| {
                         defer allocator.free(delta_evt.text);
                         if (http_util.interruptRequested()) {
-                            http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+                            source.abort();
                             return error.Interrupted;
                         }
                         const is_tool_payload = std.mem.indexOf(u8, delta_evt.text, "<tool_call>") != null;
@@ -587,7 +625,7 @@ fn codexStreamRequest(
     // A /stop killed curl before the stream finished: report the interrupt
     // instead of salvaging the partial text as a completed response.
     if (!saw_terminal and http_util.interruptRequested()) {
-        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+        source.abort();
         return error.Interrupted;
     }
 
@@ -597,7 +635,7 @@ fn codexStreamRequest(
         // NOTE: No direct unit test covers the child-kill path here. Under the
         // current Zig/macOS test runner, PATH-based curl interception is not
         // reliable enough for a deterministic subprocess regression test.
-        http_util.stopCancelWatcherAndReap(&child, &cancel_done, &cancel_watcher);
+        source.abort();
         if (accumulated.items.len == 0) return error.NoResponseContent;
         callback(ctx, root.StreamChunk.finalChunk());
         return finalizeCodexStreamResult(allocator, accumulated.items);
@@ -605,37 +643,18 @@ fn codexStreamRequest(
 
     // Drain remaining stdout
     while (true) {
-        const n = file.read(&read_buf) catch break;
+        const n = source.read(&read_buf) catch break;
         if (n == 0) break;
     }
 
-    // Join the watcher before reaping curl (PID-reuse window; see
-    // stopCancelWatcherAndReap). The stdout stream is already at EOF.
-    http_util.stopCancelWatcher(&cancel_done, &cancel_watcher);
-    const term = child.wait() catch {
+    source.finish() catch |err| {
         if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
             callback(ctx, root.StreamChunk.finalChunk());
             return finalizeCodexStreamResult(allocator, accumulated.items);
         }
-        return error.CurlWaitError;
+        if (source.exit_code) |code| if (code.*) |c| return http_util.mapCurlExitCodeToError(c);
+        return err;
     };
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeCodexStreamResult(allocator, accumulated.items);
-            }
-            return http_util.mapCurlExitCodeToError(code);
-        },
-        else => {
-            if (root.shouldRecoverPartialStream(accumulated.items.len, saw_terminal)) {
-                callback(ctx, root.StreamChunk.finalChunk());
-                return finalizeCodexStreamResult(allocator, accumulated.items);
-            }
-            return error.CurlFailed;
-        },
-    }
-
     callback(ctx, root.StreamChunk.finalChunk());
     return finalizeCodexStreamResult(allocator, accumulated.items);
 }

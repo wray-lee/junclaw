@@ -13,6 +13,52 @@ pub fn initProcess(init: std.process.Init) void {
     process_io = init.io;
     process_args = init.minimal.args;
     process_environ = init.minimal.environ;
+    if (comptime builtin.abi == .android) installAndroidSignalHandlers();
+}
+
+/// Regression: once Android DNS resolved, the first std.http connect killed
+/// the process with SIGIO (exit 157). Bionic LP64 puts `sa_flags` before the
+/// handler while Zig's `std.c.Sigaction` uses the kernel-ish order, so
+/// `std.Io.Threaded` installs its SIGIO/SIGPIPE handlers into the wrong
+/// offsets. Reinstall them with bionic's layout before any Io operation can
+/// cancel.
+const AndroidSigaction = if (@sizeOf(usize) == 8) extern struct {
+    flags: c_int,
+    handler: extern union {
+        handler: ?*const fn (c_int) callconv(.c) void,
+        sigaction: ?*const fn (c_int, ?*anyopaque, ?*anyopaque) callconv(.c) void,
+    },
+    mask: [1]c_ulong,
+    restorer: ?*const fn () callconv(.c) void = null,
+} else extern struct {
+    handler: extern union {
+        handler: ?*const fn (c_int) callconv(.c) void,
+        sigaction: ?*const fn (c_int, ?*anyopaque, ?*anyopaque) callconv(.c) void,
+    },
+    mask: c_ulong,
+    flags: c_int,
+    restorer: ?*const fn () callconv(.c) void = null,
+};
+
+extern "c" fn sigaction(sig: c_int, act: ?*const AndroidSigaction, old: ?*AndroidSigaction) c_int;
+
+comptime {
+    if (builtin.abi == .android and @sizeOf(usize) == 8) {
+        std.debug.assert(@offsetOf(AndroidSigaction, "flags") == 0);
+        std.debug.assert(@offsetOf(AndroidSigaction, "handler") == 8);
+        std.debug.assert(@offsetOf(AndroidSigaction, "mask") == 16);
+        std.debug.assert(@offsetOf(AndroidSigaction, "restorer") == 24);
+        std.debug.assert(@sizeOf(AndroidSigaction) == 32);
+    }
+}
+
+fn ignoreSignal(_: c_int) callconv(.c) void {}
+
+fn installAndroidSignalHandlers() void {
+    var act: AndroidSigaction = std.mem.zeroes(AndroidSigaction);
+    act.handler = .{ .handler = ignoreSignal };
+    _ = sigaction(@intFromEnum(std.posix.SIG.IO), &act, null);
+    _ = sigaction(@intFromEnum(std.posix.SIG.PIPE), &act, null);
 }
 
 pub fn initProcessMinimal(init: std.process.Init.Minimal) void {

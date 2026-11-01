@@ -20,6 +20,13 @@ pub const Options = struct {
 };
 
 pub fn run(allocator: std.mem.Allocator, opts: Options) !void {
+    // Android has no compatible release asset (all are glibc/musl ELF); the
+    // host app owns updates, and downloading one would brick the install.
+    if (comptime builtin.abi == .android) {
+        std.debug.print("Android builds are updated by the host app; self-update is not supported.\n", .{});
+        return error.UnsupportedPlatform;
+    }
+
     // Get current version
     const current_version = @import("version.zig").string;
 
@@ -202,26 +209,26 @@ pub const ReleaseInfo = struct {
 pub fn getLatestRelease(allocator: std.mem.Allocator) !ReleaseInfo {
     const url = "https://api.github.com/repos/" ++ release_repo ++ "/releases/latest";
 
-    // Use curl subprocess approach (from http_util pattern)
-    const result = std_compat.process.Child.run(.{
-        .allocator = allocator,
-        .argv = &.{ "curl", "-q", "-sf", "--proto", "=https", "--max-time", "30", url },
-        .max_output_bytes = 10 * 1024 * 1024,
-    }) catch |err| {
-        log.err("curl failed: {}", .{err});
-        return error.CurlFailed;
-    };
-    defer {
-        allocator.free(result.stdout);
+    const stdout: []u8 = blk: {
+        const result = std_compat.process.Child.run(.{
+            .allocator = allocator,
+            .argv = &.{ "curl", "-q", "-sf", "--proto", "=https", "--max-time", "30", url },
+            .max_output_bytes = 10 * 1024 * 1024,
+        }) catch |err| {
+            log.err("curl failed: {}", .{err});
+            return error.CurlFailed;
+        };
         allocator.free(result.stderr);
-    }
+        break :blk result.stdout;
+    };
+    defer allocator.free(stdout);
 
-    if (result.stdout.len == 0) {
+    if (stdout.len == 0) {
         return error.EmptyResponse;
     }
 
     // Parse JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, result.stdout, .{}) catch |err| {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, stdout, .{}) catch |err| {
         log.err("JSON parse failed: {}", .{err});
         return error.InvalidJson;
     };
@@ -274,7 +281,10 @@ pub const PlatformTarget = enum {
     }
 };
 
-fn platformFromParts(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ?PlatformTarget {
+fn platformFromParts(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch, abi: std.Target.Abi) ?PlatformTarget {
+    // Android reports os == .linux but runs bionic, so every release asset
+    // (glibc/musl ELF) is unrunnable there; refuse instead of bricking the app.
+    if (abi == .android) return null;
     if (os == .linux) {
         if (arch == .x86_64) return .linux_x86_64;
         if (arch == .aarch64) return .linux_aarch64;
@@ -288,7 +298,7 @@ fn platformFromParts(os: std.Target.Os.Tag, arch: std.Target.Cpu.Arch) ?Platform
 }
 
 pub fn getCurrentPlatform() ?PlatformTarget {
-    return platformFromParts(builtin.os.tag, builtin.cpu.arch);
+    return platformFromParts(builtin.os.tag, builtin.cpu.arch, builtin.abi);
 }
 
 // ── Asset URL Finding ─────────────────────────────────────────────────
@@ -498,14 +508,21 @@ test "PlatformTarget.assetName covers all release assets" {
 }
 
 test "platformFromParts maps supported and unsupported targets" {
-    try std.testing.expectEqual(PlatformTarget.linux_x86_64, platformFromParts(.linux, .x86_64).?);
-    try std.testing.expectEqual(PlatformTarget.linux_aarch64, platformFromParts(.linux, .aarch64).?);
-    try std.testing.expectEqual(PlatformTarget.macos_aarch64, platformFromParts(.macos, .aarch64).?);
-    try std.testing.expectEqual(PlatformTarget.macos_x86_64, platformFromParts(.macos, .x86_64).?);
-    try std.testing.expectEqual(PlatformTarget.windows_x86_64, platformFromParts(.windows, .x86_64).?);
+    try std.testing.expectEqual(PlatformTarget.linux_x86_64, platformFromParts(.linux, .x86_64, .gnu).?);
+    try std.testing.expectEqual(PlatformTarget.linux_aarch64, platformFromParts(.linux, .aarch64, .musl).?);
+    try std.testing.expectEqual(PlatformTarget.macos_aarch64, platformFromParts(.macos, .aarch64, .none).?);
+    try std.testing.expectEqual(PlatformTarget.macos_x86_64, platformFromParts(.macos, .x86_64, .none).?);
+    try std.testing.expectEqual(PlatformTarget.windows_x86_64, platformFromParts(.windows, .x86_64, .gnu).?);
 
-    try std.testing.expect(platformFromParts(.windows, .aarch64) == null);
-    try std.testing.expect(platformFromParts(.freebsd, .x86_64) == null);
+    try std.testing.expect(platformFromParts(.windows, .aarch64, .gnu) == null);
+    try std.testing.expect(platformFromParts(.freebsd, .x86_64, .none) == null);
+}
+
+// Regression: Android reported .linux/.aarch64, so `update` downloaded the
+// glibc junclaw-linux-aarch64.bin and replaced the bionic app with it.
+test "platformFromParts refuses Android so self-update cannot brick the app" {
+    try std.testing.expect(platformFromParts(.linux, .aarch64, .android) == null);
+    try std.testing.expect(platformFromParts(.linux, .x86_64, .android) == null);
 }
 
 test "downloadToFile streams from local file URL" {

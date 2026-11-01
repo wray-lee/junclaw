@@ -123,6 +123,7 @@ pub const webdriver_security = @import("webdriver_security.zig");
 pub const image = @import("image.zig");
 pub const composio = @import("composio.zig");
 pub const screenshot = @import("screenshot.zig");
+pub const android_device = @import("android_device.zig");
 pub const browser_open = @import("browser_open.zig");
 pub const hardware_info = @import("hardware_info.zig");
 pub const hardware_memory = @import("hardware_memory.zig");
@@ -668,6 +669,11 @@ pub fn allTools(
             try list.append(allocator, t);
         }
     }
+
+    // Android device capabilities: the host advertises its tools over the
+    // per-request unix socket. Off Android (or without the env var) this is a
+    // no-op, so the tool list is unchanged.
+    android_device.registerTools(allocator, &list, workspace_dir);
 
     applyToolCustomizations(allocator, &list, opts.tools_config.tool_customizations);
 
@@ -1608,4 +1614,19 @@ test "all tools wires anonymize_text and end-to-end redacts an email" {
 
 test {
     @import("std").testing.refAllDecls(@This());
+}
+
+test "allTools registers no android device tools outside Android builds" {
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const tools = try allTools(allocator, workspace, .{});
+    defer deinitTools(allocator, tools);
+    for (tools) |t| {
+        try std.testing.expect(!std.mem.startsWith(u8, t.name(), android_device.name_prefix));
+    }
 }

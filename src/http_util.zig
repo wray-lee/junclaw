@@ -457,15 +457,19 @@ fn createSecureCurlTempFile(
     return error.TempFileCreateFailed;
 }
 
+fn validateParsedHttpUri(uri: std.Uri) !void {
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
+        return error.UnsupportedUriScheme;
+    }
+    if (uri.host == null) return error.InvalidUrl;
+}
+
 fn validateHttpUrl(url: []const u8) !std.Uri {
     if (std.mem.indexOfScalar(u8, url, 0) != null or std.mem.indexOfAny(u8, url, "\r\n") != null) {
         return error.InvalidUrl;
     }
     const uri = std.Uri.parse(url) catch return error.InvalidUrl;
-    if (!std.ascii.eqlIgnoreCase(uri.scheme, "http") and !std.ascii.eqlIgnoreCase(uri.scheme, "https")) {
-        return error.UnsupportedUriScheme;
-    }
-    if (uri.host == null) return error.InvalidUrl;
+    try validateParsedHttpUri(uri);
     return uri;
 }
 
@@ -747,10 +751,705 @@ fn streamCurlStdout(file: std_compat.fs.File, writer: ?*std.Io.Writer, max_bytes
     }
 }
 
+/// curl `--max-time` takes fractional seconds and treats `0` as "no limit";
+/// a value curl would reject must not silently disable the bound here.
+fn maxTimeMs(max_time: ?[]const u8) !?u64 {
+    const text = max_time orelse return null;
+    const secs = std.fmt.parseFloat(f64, text) catch return error.InvalidCurlConfigValue;
+    if (!std.math.isFinite(secs) or secs < 0) return error.InvalidCurlConfigValue;
+    if (secs == 0) return null;
+    const scaled = secs * @as(f64, @floatFromInt(std.time.ms_per_s));
+    return if (scaled >= @as(f64, @floatFromInt(std.math.maxInt(u64))))
+        std.math.maxInt(u64)
+    else
+        @intFromFloat(scaled);
+}
+
+fn maxTimeDeadlineMs(max_time: ?[]const u8) !?i64 {
+    const ms = (try maxTimeMs(max_time)) orelse return null;
+    return std_compat.time.milliTimestamp() +| @as(i64, @intCast(@min(ms, @as(u64, std.math.maxInt(i64)))));
+}
+
+fn responseBodyReader(
+    allocator: Allocator,
+    req: *std.http.Client.Request,
+    response: *std.http.Client.Response,
+    transfer_buffer: []u8,
+    decompress: *std.http.Decompress,
+    decompress_buffer: *[]u8,
+) !*std.Io.Reader {
+    switch (response.head.content_encoding) {
+        .identity => return req.reader.bodyReader(transfer_buffer, response.head.transfer_encoding, response.head.content_length),
+        .zstd => {
+            decompress_buffer.* = try allocator.alloc(u8, std.compress.zstd.default_window_len);
+            return response.readerDecompressing(transfer_buffer, decompress, decompress_buffer.*);
+        },
+        .deflate, .gzip => {
+            decompress_buffer.* = try allocator.alloc(u8, std.compress.flate.max_window_len);
+            return response.readerDecompressing(transfer_buffer, decompress, decompress_buffer.*);
+        },
+        .compress => return error.UnsupportedCompressionMethod,
+    }
+}
+
+/// True when the body reader can make progress without touching the socket.
+/// HTTP framing (chunk sizes) or TLS records may sit in the connection reader
+/// while the body reader reports no decoded bytes yet.
+fn bodyBuffered(req: *std.http.Client.Request, reader: *std.Io.Reader) bool {
+    if (reader.bufferedLen() > 0) return true;
+    const conn = req.connection orelse return false;
+    return conn.reader().bufferedLen() > 0;
+}
+
+/// HTTP bodies that are known empty before reading: HEAD/TRACE responses and
+/// 204/304 statuses end at the head, and `Content-Length: 0` frames no bytes.
+/// Reading them would otherwise poll a socket that never becomes readable.
+fn hasResponseBody(
+    method: std.http.Method,
+    status: std.http.Status,
+    transfer_encoding: std.http.TransferEncoding,
+    content_length: ?u64,
+) bool {
+    if (!method.responseHasBody()) return false;
+    if (status == .no_content or status == .not_modified) return false;
+    if (transfer_encoding == .none) {
+        if (content_length) |len| return len != 0;
+    }
+    return true;
+}
+
+fn waitBodyReadable(
+    req: *std.http.Client.Request,
+    reader: *std.Io.Reader,
+    timeout_ms: i32,
+) anyerror!bool {
+    if (bodyBuffered(req, reader)) return true;
+    const conn = req.connection orelse return error.ConnectionClosed;
+    if (comptime builtin.os.tag == .windows) {
+        // Windows: std.posix.poll is unavailable; yield to the reader so it
+        // performs the blocking read on the socket directly.
+        return true;
+    }
+    var poll_fds = [_]std.posix.pollfd{.{
+        .fd = conn.stream_reader.stream.socket.handle,
+        .events = std.posix.POLL.IN,
+        .revents = undefined,
+    }};
+    const events = std.posix.poll(&poll_fds, timeout_ms) catch return error.CurlReadError;
+    if (events == 0) return false;
+    const revents = poll_fds[0].revents;
+    if (revents & std.posix.POLL.IN != 0) return true;
+    if (revents & (std.posix.POLL.ERR | std.posix.POLL.HUP | std.posix.POLL.NVAL) != 0) {
+        return error.CurlReadError;
+    }
+    return false;
+}
+
+pub fn mapStdHttpError(err: anyerror) anyerror {
+    if (interruptRequested()) return error.CurlInterrupted;
+    const name = @errorName(err);
+    if (std.mem.startsWith(u8, name, "Tls") or std.mem.startsWith(u8, name, "Certificate")) {
+        return error.CurlTlsError;
+    }
+    return switch (err) {
+        error.Canceled, error.Interrupted, error.CurlInterrupted => error.CurlInterrupted,
+        error.Timeout, error.ConnectionTimedOut, error.CurlTimeout => error.CurlTimeout,
+        error.UnknownHostName,
+        error.ResolvConfParseFailed,
+        error.InvalidDnsARecord,
+        error.InvalidDnsAAAARecord,
+        error.InvalidDnsCnameRecord,
+        error.NameServerFailure,
+        error.NoAddressReturned,
+        error.DetectingNetworkConfigurationFailed,
+        error.CurlDnsError,
+        => error.CurlDnsError,
+        error.ConnectionRefused,
+        error.ConnectionResetByPeer,
+        error.HostUnreachable,
+        error.NetworkUnreachable,
+        error.NetworkDown,
+        error.AddressUnavailable,
+        error.AddressFamilyUnsupported,
+        error.ConnectionPending,
+        error.SocketModeUnsupported,
+        error.CurlConnectError,
+        => error.CurlConnectError,
+        error.TooManyHttpRedirects,
+        error.HttpRedirectLocationMissing,
+        error.HttpRedirectLocationOversize,
+        error.HttpRedirectLocationInvalid,
+        error.RedirectRequiresResend,
+        error.HttpContentEncodingUnsupported,
+        error.HttpHeadersInvalid,
+        error.HttpHeadersOversize,
+        error.HttpChunkInvalid,
+        error.HttpChunkTruncated,
+        error.TunnelNotSupported,
+        error.CurlFailed,
+        => error.CurlFailed,
+        error.WriteFailed, error.CurlWriteError => error.CurlWriteError,
+        error.EndOfStream, error.CurlReadError => error.CurlReadError,
+        error.OutOfMemory,
+        error.InvalidHeader,
+        error.InvalidUrl,
+        error.UnsupportedUriScheme,
+        error.UnsupportedProxyScheme,
+        error.TooManyHeaders,
+        error.TempFileCreateFailed,
+        error.CurlPreSendError,
+        error.CurlWaitError,
+        error.HttpStatusError,
+        error.HttpStatusIndeterminate,
+        => err,
+        else => error.CurlFailed,
+    };
+}
+
+fn bodyReadError(response: *std.http.Client.Response, err: anyerror) anyerror {
+    if (interruptRequested()) return error.CurlInterrupted;
+    if (response.bodyErr()) |body_err| {
+        if (body_err == error.Timeout) return error.CurlTimeout;
+    }
+    return switch (err) {
+        error.Canceled => error.CurlInterrupted,
+        else => error.CurlReadError,
+    };
+}
+
+const StdHttpBodyResult = struct {
+    body: []u8,
+    truncated: bool,
+};
+
+/// Read a std.http body with the curl executor's limits: `max_response_bytes`
+/// is a hard cap unless `truncate_response`, `max_time` bounds the whole read,
+/// `/stop` aborts between chunks, and `response_writer` streams instead of
+/// buffering.
+fn readStdHttpBody(
+    allocator: Allocator,
+    req: *std.http.Client.Request,
+    response: *std.http.Client.Response,
+    spec: CurlRequestSpec,
+    deadline_ms: ?i64,
+) !StdHttpBodyResult {
+    if (!hasResponseBody(
+        spec.method,
+        response.head.status,
+        response.head.transfer_encoding,
+        response.head.content_length,
+    )) {
+        return .{ .body = try allocator.dupe(u8, ""), .truncated = false };
+    }
+    var transfer_buffer: [4096]u8 = undefined;
+    var decompress: std.http.Decompress = undefined;
+    var decompress_buffer: []u8 = &.{};
+    defer if (decompress_buffer.len != 0) allocator.free(decompress_buffer);
+    const reader = try responseBodyReader(allocator, req, response, &transfer_buffer, &decompress, &decompress_buffer);
+
+    const discard = spec.discard_response_body or spec.method == .HEAD;
+    const cap = spec.max_response_bytes;
+    var output: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer output.deinit(allocator);
+    var total: usize = 0;
+    var truncated = false;
+
+    while (true) {
+        if (interruptRequested()) return error.CurlInterrupted;
+        // A fast server keeps the buffer non-empty, so the deadline has to be
+        // checked here and not only on the poll path.
+        var poll_ms: i32 = 1000;
+        if (deadline_ms) |deadline| {
+            const remaining = deadline - std_compat.time.milliTimestamp();
+            if (remaining <= 0) return error.CurlTimeout;
+            poll_ms = @intCast(@min(remaining, 1000));
+        }
+        if (reader.bufferedLen() > 0) {
+            const chunk = reader.take(@min(reader.bufferedLen(), 8192)) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return bodyReadError(response, err),
+            };
+            if (chunk.len == 0) break;
+            if (chunk.len > cap - total) {
+                if (!spec.truncate_response) return error.CurlReadError;
+                truncated = true;
+                if (!discard) try emitStdHttpChunk(allocator, spec, &output, chunk[0 .. cap - total]);
+                total = cap;
+                break;
+            }
+            if (!discard) try emitStdHttpChunk(allocator, spec, &output, chunk);
+            total += chunk.len;
+            continue;
+        }
+
+        const readable = try waitBodyReadable(req, reader, poll_ms);
+        if (!readable) {
+            if (deadline_ms) |deadline| {
+                if (std_compat.time.milliTimestamp() >= deadline) return error.CurlTimeout;
+            }
+            continue;
+        }
+        const first = reader.take(1) catch |err| switch (err) {
+            error.EndOfStream => break,
+            else => return bodyReadError(response, err),
+        };
+        if (first.len == 0) break;
+        if (total == cap) {
+            if (!spec.truncate_response) return error.CurlReadError;
+            truncated = true;
+            break;
+        }
+        if (!discard) try emitStdHttpChunk(allocator, spec, &output, first);
+        total += first.len;
+    }
+
+    return .{
+        .body = if (spec.response_writer != null or discard)
+            try allocator.dupe(u8, "")
+        else
+            try output.toOwnedSlice(allocator),
+        .truncated = truncated,
+    };
+}
+
+fn emitStdHttpChunk(
+    allocator: Allocator,
+    spec: CurlRequestSpec,
+    output: *std.ArrayListUnmanaged(u8),
+    chunk: []const u8,
+) !void {
+    if (spec.response_writer) |writer| {
+        try writer.writeAll(chunk);
+    } else {
+        try output.appendSlice(allocator, chunk);
+    }
+}
+
+/// Common byte source for provider SSE loops: curl stdout off Android, an
+/// std.http response body on Android. `finish` implements the post-EOF status
+/// mapping each transport needs; `abort` stops an in-flight transfer.
+pub const ByteStream = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+    /// Set by curl sources; Codex maps specific exit codes to transport errors.
+    exit_code: ?*const ?u8 = null,
+
+    pub const VTable = struct {
+        read: *const fn (ptr: *anyopaque, buf: []u8) anyerror!usize,
+        abort: *const fn (ptr: *anyopaque) void,
+        finish: *const fn (ptr: *anyopaque) anyerror!void,
+    };
+
+    pub fn read(self: ByteStream, buf: []u8) anyerror!usize {
+        return self.vtable.read(self.ptr, buf);
+    }
+
+    pub fn abort(self: ByteStream) void {
+        self.vtable.abort(self.ptr);
+    }
+
+    pub fn finish(self: ByteStream) anyerror!void {
+        return self.vtable.finish(self.ptr);
+    }
+};
+
+/// ByteStream over a spawned curl child's stdout. Keeps the interrupt watcher
+/// semantics of the existing provider loops.
+pub const CurlByteStream = struct {
+    child: *std_compat.process.Child,
+    cancel_done: AtomicBool = .init(false),
+    cancel_watcher: ?std.Thread = null,
+    cancel_ctx: CancelWatcherCtx = undefined,
+    exit_code: ?u8 = null,
+
+    pub fn init(self: *CurlByteStream, child: *std_compat.process.Child) void {
+        self.* = .{ .child = child };
+        spawnCancelWatcher(child, &self.cancel_done, &self.cancel_watcher, &self.cancel_ctx);
+    }
+
+    pub fn deinit(self: *CurlByteStream) void {
+        stopCancelWatcher(&self.cancel_done, &self.cancel_watcher);
+    }
+
+    pub fn stream(self: *CurlByteStream) ByteStream {
+        return .{ .ptr = self, .vtable = &vtable, .exit_code = &self.exit_code };
+    }
+
+    const vtable: ByteStream.VTable = .{
+        .read = read,
+        .abort = abortPtr,
+        .finish = finish,
+    };
+
+    fn read(ptr: *anyopaque, buf: []u8) anyerror!usize {
+        const self: *CurlByteStream = @ptrCast(@alignCast(ptr));
+        return self.child.stdout.?.read(buf);
+    }
+
+    pub fn abort(self: *CurlByteStream) void {
+        abortPtr(self);
+    }
+
+    fn abortPtr(ptr: *anyopaque) void {
+        const self: *CurlByteStream = @ptrCast(@alignCast(ptr));
+        stopCancelWatcherAndReap(self.child, &self.cancel_done, &self.cancel_watcher);
+    }
+
+    fn finish(ptr: *anyopaque) anyerror!void {
+        const self: *CurlByteStream = @ptrCast(@alignCast(ptr));
+        stopCancelWatcher(&self.cancel_done, &self.cancel_watcher);
+        const term = self.child.wait() catch return error.CurlWaitError;
+        switch (term) {
+            .exited => |code| {
+                self.exit_code = code;
+                if (code == 0) return;
+            },
+            else => {},
+        }
+        return error.CurlFailed;
+    }
+};
+
+const STREAM_IDLE_TIMEOUT_MS: i64 = 60_000;
+
+/// std.http streaming POST used by provider SSE loops on Android. Buffered
+/// variants use `stdHttpRequest`; this keeps the body unread so callers parse
+/// deltas as they arrive. Poll-based reads preserve `timeout_secs` and the
+/// 60-second stall bound curl had, and check the agent interrupt flag.
+pub const HttpStream = struct {
+    allocator: Allocator,
+    http: ProxyHttpClient,
+    request: std.http.Client.Request,
+    reader: *std.Io.Reader,
+    transfer_buffer: [4096]u8,
+    decompress: std.http.Decompress,
+    decompress_buffer: []u8,
+    headers: std.ArrayListUnmanaged(std.http.Header) = .empty,
+    status_code: u16,
+    body_available: bool = true,
+    deadline_ms: ?i64,
+    idle_deadline_ms: i64,
+    failed: ?anyerror = null,
+
+    pub fn open(
+        allocator: Allocator,
+        url: []const u8,
+        headers: []const []const u8,
+        body: []const u8,
+        timeout_secs: u64,
+    ) !*HttpStream {
+        _ = try validateHttpUrl(url);
+
+        var header_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+        errdefer header_list.deinit(allocator);
+        for (headers) |header| {
+            try validateCurlHeaderLine(header);
+            try header_list.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
+        }
+
+        try validateStdProxyForUrl(allocator, url, null);
+
+        return openInner(allocator, url, &header_list, body, timeout_secs) catch |err| {
+            return mapStdHttpError(err);
+        };
+    }
+
+    fn openInner(
+        allocator: Allocator,
+        url: []const u8,
+        headers: *std.ArrayListUnmanaged(std.http.Header),
+        body: []const u8,
+        timeout_secs: u64,
+    ) !*HttpStream {
+        const self = try allocator.create(HttpStream);
+        errdefer allocator.destroy(self);
+        const now = std_compat.time.milliTimestamp();
+        self.* = .{
+            .allocator = allocator,
+            .http = try ProxyHttpClient.init(allocator),
+            .request = undefined,
+            .reader = undefined,
+            .transfer_buffer = undefined,
+            .decompress = undefined,
+            .decompress_buffer = &.{},
+            .headers = .empty,
+            .status_code = 0,
+            .deadline_ms = if (timeout_secs == 0) null else now +| @as(i64, @intCast(@min(
+                std.math.mul(u64, timeout_secs, std.time.ms_per_s) catch std.math.maxInt(u64),
+                @as(u64, std.math.maxInt(i64)),
+            ))),
+            .idle_deadline_ms = now +| STREAM_IDLE_TIMEOUT_MS,
+        };
+        errdefer self.http.deinit();
+
+        const uri = try std.Uri.parse(url);
+        self.request = try self.http.client.request(.POST, uri, .{
+            .redirect_behavior = .unhandled,
+            // curl's SSE calls did not request compression; keep the body
+            // unframed by a decompressor.
+            .headers = .{ .accept_encoding = .omit },
+            .extra_headers = headers.items,
+        });
+        errdefer self.request.deinit();
+
+        self.request.transfer_encoding = .{ .content_length = body.len };
+        var request_body = try self.request.sendBodyUnflushed(&.{});
+        try request_body.writer.writeAll(body);
+        try request_body.end();
+        try self.request.connection.?.flush();
+
+        var redirect_buffer: [8 * 1024]u8 = undefined;
+        var response = try self.request.receiveHead(&redirect_buffer);
+        self.status_code = @intFromEnum(response.head.status);
+
+        self.body_available = hasResponseBody(
+            .POST,
+            response.head.status,
+            response.head.transfer_encoding,
+            response.head.content_length,
+        );
+        errdefer if (self.decompress_buffer.len != 0) allocator.free(self.decompress_buffer);
+        self.reader = try responseBodyReader(
+            allocator,
+            &self.request,
+            &response,
+            &self.transfer_buffer,
+            &self.decompress,
+            &self.decompress_buffer,
+        );
+        self.headers = headers.*;
+        headers.* = .empty;
+        return self;
+    }
+
+    pub fn deinit(self: *HttpStream) void {
+        self.request.deinit();
+        self.http.deinit();
+        self.headers.deinit(self.allocator);
+        if (self.decompress_buffer.len != 0) self.allocator.free(self.decompress_buffer);
+        self.allocator.destroy(self);
+    }
+
+    pub fn stream(self: *HttpStream) ByteStream {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    const vtable: ByteStream.VTable = .{
+        .read = read,
+        .abort = abort,
+        .finish = finish,
+    };
+
+    fn read(ptr: *anyopaque, buf: []u8) anyerror!usize {
+        const self: *HttpStream = @ptrCast(@alignCast(ptr));
+        if (buf.len == 0) return 0;
+        if (self.failed) |err| return err;
+        if (!self.body_available) return 0;
+        while (true) {
+            if (interruptRequested()) return self.fail(error.Interrupted);
+            if (self.deadline_ms) |deadline| {
+                if (std_compat.time.milliTimestamp() >= deadline) return self.fail(error.CurlTimeout);
+            }
+            if (self.reader.bufferedLen() > 0) {
+                const n = @min(buf.len, self.reader.bufferedLen());
+                const chunk = self.reader.take(n) catch |err| return self.fail(err);
+                if (chunk.len == 0) return 0;
+                @memcpy(buf[0..chunk.len], chunk);
+                self.touch();
+                return chunk.len;
+            }
+
+            var poll_ms: i32 = 1000;
+            if (self.deadline_ms) |deadline| {
+                const remaining = deadline - std_compat.time.milliTimestamp();
+                if (remaining <= 0) return self.fail(error.CurlTimeout);
+                poll_ms = @intCast(@min(remaining, 1000));
+            }
+            const idle_remaining = self.idle_deadline_ms - std_compat.time.milliTimestamp();
+            if (idle_remaining <= 0) return self.fail(error.CurlTimeout);
+            poll_ms = @min(poll_ms, @as(i32, @intCast(@max(idle_remaining, 1))));
+
+            const readable = waitBodyReadable(&self.request, self.reader, poll_ms) catch |err| return self.fail(err);
+            if (!readable) continue;
+
+            const first = self.reader.take(1) catch |err| switch (err) {
+                error.EndOfStream => return 0,
+                else => return self.fail(err),
+            };
+            if (first.len == 0) return 0;
+            buf[0] = first[0];
+            var n: usize = 1;
+            while (n < buf.len and self.reader.bufferedLen() > 0) {
+                const chunk = self.reader.take(@min(buf.len - n, self.reader.bufferedLen())) catch break;
+                if (chunk.len == 0) break;
+                @memcpy(buf[n..][0..chunk.len], chunk);
+                n += chunk.len;
+            }
+            self.touch();
+            return n;
+        }
+    }
+
+    /// /stop: mark the stream failed and drop the socket so a blocked read
+    /// cannot keep draining what the server already sent.
+    fn abort(ptr: *anyopaque) void {
+        const self: *HttpStream = @ptrCast(@alignCast(ptr));
+        if (self.failed == null) self.failed = error.Interrupted;
+        if (self.request.connection) |connection| {
+            connection.closing = true;
+            self.http.client.connection_pool.release(connection, self.http.client.io);
+            self.request.connection = null;
+        }
+    }
+
+    fn finish(ptr: *anyopaque) anyerror!void {
+        const self: *HttpStream = @ptrCast(@alignCast(ptr));
+        if (self.failed) |err| return switch (err) {
+            error.CurlTimeout => error.CurlTimeout,
+            error.Interrupted => error.Interrupted,
+            else => error.CurlFailed,
+        };
+        if (self.status_code >= 400) return error.CurlFailed;
+    }
+
+    fn touch(self: *HttpStream) void {
+        self.idle_deadline_ms = std_compat.time.milliTimestamp() +| STREAM_IDLE_TIMEOUT_MS;
+    }
+
+    fn fail(self: *HttpStream, err: anyerror) anyerror {
+        const mapped = switch (err) {
+            error.Canceled, error.Interrupted => error.Interrupted,
+            error.Timeout, error.CurlTimeout => error.CurlTimeout,
+            else => error.CurlReadError,
+        };
+        self.failed = mapped;
+        return mapped;
+    }
+};
+
+/// std.http replacement for the curl executor on Android. The curl-specific
+/// fields (resolve pinning, generated redirect headers) do not apply: Android
+/// has no curl binary, and `compat.net.httpIo` resolves every hop through
+/// bionic. The URL was already validated by net_security at the call site.
+fn stdHttpRequest(allocator: Allocator, spec: CurlRequestSpec) !HttpResponseWithHeaders {
+    _ = try validateHttpUrl(spec.url);
+
+    var header_list: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    defer header_list.deinit(allocator);
+    if (spec.content_type) |content_type| {
+        if (content_type.len == 0 or std.mem.indexOfAny(u8, content_type, "\r\n\x00") != null) return error.InvalidHeader;
+        try header_list.append(allocator, .{ .name = "Content-Type", .value = content_type });
+    }
+    for (spec.headers) |header| {
+        try validateCurlHeaderLine(header);
+        try header_list.append(allocator, parseHeader(header) orelse return error.InvalidHeader);
+    }
+
+    try validateStdProxyForUrl(allocator, spec.url, spec.proxy);
+    const uri = try std.Uri.parse(spec.url);
+
+    return stdHttpRequestInner(allocator, spec, uri, header_list.items) catch |err| {
+        return mapStdHttpError(err);
+    };
+}
+
+fn stdHttpRequestInner(
+    allocator: Allocator,
+    spec: CurlRequestSpec,
+    uri: std.Uri,
+    headers: []const std.http.Header,
+) !HttpResponseWithHeaders {
+    var client = try initProxyClientWithOptionalProxy(allocator, spec.proxy);
+    defer client.deinit();
+    var scratch = std.heap.ArenaAllocator.init(allocator);
+    defer scratch.deinit();
+
+    // std.http replays extra_headers to every redirect target and has no
+    // per-hop hook, so follow redirects here: curl's budget, each Location
+    // validated like the first hop, and caller headers dropped on a new origin.
+    var remaining = redirectBudget(spec);
+    var request_uri = uri;
+    var request_method = spec.method;
+    var request_body = spec.body;
+    var request_headers = headers;
+
+    while (true) {
+        var req = try client.client.request(request_method, request_uri, .{
+            .redirect_behavior = .unhandled,
+            .headers = .{ .accept_encoding = if (spec.accept_compression) .default else .omit },
+            .extra_headers = request_headers,
+        });
+        defer req.deinit();
+
+        if (request_body) |payload| {
+            req.transfer_encoding = .{ .content_length = payload.len };
+            var body_writer = try req.sendBodyUnflushed(&.{});
+            try body_writer.writer.writeAll(payload);
+            try body_writer.end();
+            try req.connection.?.flush();
+        } else {
+            try req.sendBodiless();
+        }
+
+        var response = try req.receiveHead(&.{});
+
+        if (remaining != 0) {
+            if (response.head.location) |location| {
+                var aux_buf: []u8 = try scratch.allocator().alloc(u8, 8 * 1024);
+                switch (try redirectDecision(
+                    request_uri,
+                    location,
+                    &aux_buf,
+                    @intFromEnum(response.head.status),
+                    request_method,
+                    remaining,
+                )) {
+                    .stop => {},
+                    .follow => |hop| {
+                        remaining -= 1;
+                        request_uri = hop.uri;
+                        request_method = hop.method;
+                        if (hop.drop_body) request_body = null;
+                        request_headers = try redirectHopHeaders(
+                            scratch.allocator(),
+                            headers,
+                            hop.drop_body,
+                            // Generated headers are ours to replay; only caller
+                            // headers are origin-bound.
+                            hop.strip_caller_headers and !spec.generated_redirect_headers_only,
+                        );
+                        continue;
+                    },
+                }
+            }
+        }
+
+        const status_code: u16 = @intFromEnum(response.head.status);
+        if (spec.fail_on_http_error and status_code >= 400) return error.CurlFailed;
+        const response_headers = try allocator.dupe(u8, response.head.bytes);
+        errdefer allocator.free(response_headers);
+
+        var body_spec = spec;
+        body_spec.method = request_method;
+        const result = try readStdHttpBody(allocator, &req, &response, body_spec, try maxTimeDeadlineMs(spec.max_time));
+        errdefer allocator.free(result.body);
+        if (spec.response_writer) |writer| try writer.flush();
+
+        return .{
+            .status_code = status_code,
+            .headers = response_headers,
+            .body = result.body,
+            .truncated = result.truncated,
+        };
+    }
+}
+
 fn secureCurlRequestWithStatusAndHeaders(
     allocator: Allocator,
     spec: CurlRequestSpec,
 ) !HttpResponseWithHeaders {
+    if (comptime stdHttpTransport(builtin.abi)) return stdHttpRequest(allocator, spec);
+
     _ = try validateHttpUrl(spec.url);
 
     var all_headers: std.ArrayListUnmanaged([]const u8) = .empty;
@@ -940,13 +1639,35 @@ pub fn curlRequestWithStatusAndHeaders(
     return secureCurlRequestWithStatusAndHeaders(allocator, options);
 }
 
-fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
-    // Regression: aarch64-linux-android.24 (Termux) — std.http.Client cannot
-    // complete credentialed HTTPS requests to remote service endpoints.
-    // Force the curl subprocess path on Android; credentials still flow via
-    // `-H @<tempfile>` (see prepareCurlHeaderArg), so argv stays clean.
-    if (comptime builtin.abi == .android) return false;
+/// Whether HTTP transport on `abi` uses std.http instead of the curl
+/// subprocess. Android embeds no curl binary: phase 1 supplied a libc DNS hook
+/// (compat.net) and embedded Mozilla CAs, so provider, OAuth, embedding, and
+/// tool requests all go through std.http there. Other ABIs keep curl.
+pub fn stdHttpTransport(comptime abi: std.Target.Abi) bool {
+    return abi == .android;
+}
+
+/// True when curl subprocesses remain the transport for `abi`. On Android the
+/// secure executor swaps its body for `stdHttpRequest`, so every caller keeps
+/// its timeout, size cap, and credential handling without a curl binary.
+pub fn usesCurlTransport(comptime abi: std.Target.Abi) bool {
+    return !stdHttpTransport(abi);
+}
+
+fn credentialedCurlUsesHttpFallbackFor(
+    comptime abi: std.Target.Abi,
+    url: []const u8,
+    headers: []const []const u8,
+    resolve_entry: ?[]const u8,
+) bool {
+    // Android's Android-branch in secureCurlRequestWithStatusAndHeaders keeps
+    // the full spec (timeouts, caps); do not divert to the lossier wrapper.
+    if (!usesCurlTransport(abi)) return false;
     return hasCredentialedCurlArgs(url, headers) and resolve_entry == null;
+}
+
+fn credentialedCurlUsesHttpFallback(url: []const u8, headers: []const []const u8, resolve_entry: ?[]const u8) bool {
+    return credentialedCurlUsesHttpFallbackFor(builtin.abi, url, headers, resolve_entry);
 }
 
 fn parseHeader(header: []const u8) ?std.http.Header {
@@ -963,14 +1684,39 @@ fn contentTypeHeaderValue(header: []const u8) ?[]const u8 {
     return parsed.value;
 }
 
-fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !ProxyHttpClient {
-    var proxy_client = try ProxyHttpClient.init(allocator);
-    if (proxy == null) return proxy_client;
+/// std.http understands HTTP(S) proxies only. Android has no curl fallback, so
+/// fail instead of silently connecting direct when the configured proxy (flag,
+/// config override, or environment) uses another scheme such as socks5.
+pub fn validateStdProxyForUrl(allocator: Allocator, url: []const u8, explicit: ?[]const u8) !void {
+    if (explicit) |proxy| return validateStdProxyScheme(proxy);
+    var selected = try getProxyForUrl(allocator, url);
+    defer selected.deinit(allocator);
+    if (selected.value) |proxy| try validateStdProxyScheme(proxy);
+}
 
-    proxy_client.deinit();
+fn validateStdProxyScheme(proxy: []const u8) !void {
+    const uri = std.Uri.parse(proxy) catch return error.UnsupportedProxyScheme;
+    if (std.http.Client.Protocol.fromScheme(uri.scheme) == null) return error.UnsupportedProxyScheme;
+}
+
+fn validateFetchProxy(allocator: Allocator, location: std.http.Client.FetchOptions.Location) !void {
+    switch (location) {
+        .url => |url| try validateStdProxyForUrl(allocator, url, null),
+        .uri => |uri| {
+            var writer: std.Io.Writer.Allocating = .init(allocator);
+            defer writer.deinit();
+            try uri.format(&writer.writer);
+            try validateStdProxyForUrl(allocator, writer.writer.buffer[0..writer.writer.end], null);
+        },
+    }
+}
+
+fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !ProxyHttpClient {
+    if (proxy == null) return ProxyHttpClient.init(allocator);
+
     var proxy_arena = std.heap.ArenaAllocator.init(allocator);
     errdefer proxy_arena.deinit();
-    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+    var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.net.httpIo() };
     errdefer client.deinit();
     try tls_ca.configureHttpClient(&client, allocator);
     var env_map = std_compat.process.EnvMap.init(proxy_arena.allocator());
@@ -978,11 +1724,33 @@ fn initProxyClientWithOptionalProxy(allocator: Allocator, proxy: ?[]const u8) !P
     try env_map.put("https_proxy", proxy.?);
     try env_map.put("HTTP_PROXY", proxy.?);
     try env_map.put("http_proxy", proxy.?);
-    try client.initDefaultProxies(proxy_arena.allocator(), &env_map);
+    try initClientDefaultProxiesFromEnvMap(&client, proxy_arena.allocator(), &env_map);
     return .{ .proxy_arena = proxy_arena, .client = client };
 }
 
 pub fn httpRequestWithStatusAndHeaders(
+    allocator: Allocator,
+    method: std.http.Method,
+    url: []const u8,
+    body: ?[]const u8,
+    headers: []const []const u8,
+    content_type: ?[]const u8,
+    proxy: ?[]const u8,
+) !HttpResponseWithHeaders {
+    return httpRequestWithStatusAndHeadersInner(
+        allocator,
+        method,
+        url,
+        body,
+        headers,
+        content_type,
+        proxy,
+    ) catch |err| {
+        return mapStdHttpError(err);
+    };
+}
+
+fn httpRequestWithStatusAndHeadersInner(
     allocator: Allocator,
     method: std.http.Method,
     url: []const u8,
@@ -1010,77 +1778,23 @@ pub fn httpRequestWithStatusAndHeaders(
         return error.UnsupportedUriScheme;
     }
 
-    // Regression: Termux has no resolver configuration where Zig expects it,
-    // so std.http reports NameServerFailure. Keep the public wrapper semantics
-    // while using a secure curl subprocess on Android.
-    if (comptime builtin.abi == .android) {
-        return secureCurlRequestWithStatusAndHeaders(allocator, .{
-            .method = method,
-            .url = url,
-            .body = body,
-            .headers = headers,
-            .content_type = content_type,
-            .proxy = proxy,
-            // curl forwards arbitrary custom headers across origins. Only
-            // follow automatically when there are no caller headers to leak.
-            .max_redirects = if (method == .GET and body == null and headers.len == 0 and content_type == null) 3 else null,
-            .accept_compression = true,
-            .std_http_defaults = true,
-        });
+    if (comptime stdHttpTransport(builtin.abi)) {
+        try validateStdProxyForUrl(allocator, url, proxy);
     }
 
-    var client = try initProxyClientWithOptionalProxy(allocator, proxy);
-    defer client.deinit();
-
-    const redirect_behavior: std.http.Client.Request.RedirectBehavior =
-        if (body == null) @enumFromInt(3) else .unhandled;
-    var req = try client.client.request(method, uri, .{
-        .redirect_behavior = redirect_behavior,
-        .headers = .{ .accept_encoding = .default },
-        .extra_headers = header_buf[0..header_count],
-    });
-    defer req.deinit();
-
-    if (body) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var request_body = try req.sendBodyUnflushed(&.{});
-        try request_body.writer.writeAll(payload);
-        try request_body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
-    }
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    const response_headers = try allocator.dupe(u8, response.head.bytes);
-    errdefer allocator.free(response_headers);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-        .identity => &.{},
-        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
-        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
-        .compress => return error.UnsupportedCompressionMethod,
+    // std.http replays extra_headers on every redirect hop, so reuse the same
+    // policy as stdHttpRequest: a caller-header request returns the 3xx instead.
+    const spec: CurlRequestSpec = .{
+        .method = method,
+        .url = url,
+        .body = body,
+        .headers = headers,
+        .content_type = content_type,
+        .proxy = proxy,
+        .max_redirects = if (body == null) 3 else null,
+        .accept_compression = true,
     };
-    defer if (response.head.content_encoding != .identity) allocator.free(decompress_buffer);
-
-    var transfer_buffer: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr().?,
-        else => |e| return e,
-    };
-
-    const response_body = aw.writer.buffer[0..aw.writer.end];
-    return .{
-        .status_code = @as(u16, @intFromEnum(response.head.status)),
-        .headers = response_headers,
-        .body = try allocator.dupe(u8, response_body),
-    };
+    return stdHttpRequestInner(allocator, spec, uri, header_buf[0..header_count]);
 }
 
 pub fn httpRequestWithStatus(
@@ -1298,6 +2012,14 @@ fn appendFetchHeaderValue(
     }
 }
 
+/// Which redirect policy `ProxyHttpClient.fetch` applies on `abi`. Android has
+/// no curl binary, but it must still refuse the redirects curl refuses.
+const FetchRedirectPolicy = enum { curl, std };
+
+fn fetchRedirectPolicy(comptime abi: std.Target.Abi) FetchRedirectPolicy {
+    return if (stdHttpTransport(abi)) .curl else .std;
+}
+
 fn fetchHasCallerHeaders(options: std.http.Client.FetchOptions) bool {
     return options.extra_headers.len > 0 or
         options.privileged_headers.len > 0 or
@@ -1325,14 +2047,26 @@ pub const ProxyHttpClient = struct {
     client: std.http.Client,
 
     pub fn init(allocator: Allocator) !ProxyHttpClient {
+        return initForAbi(builtin.abi, allocator, null);
+    }
+
+    pub fn initWithEnvMap(allocator: Allocator, env_map: *const std_compat.process.EnvMap) !ProxyHttpClient {
+        return initForAbi(builtin.abi, allocator, env_map);
+    }
+
+    pub fn initForAbi(
+        comptime abi: std.Target.Abi,
+        allocator: Allocator,
+        env_map: ?*const std_compat.process.EnvMap,
+    ) !ProxyHttpClient {
         var proxy_arena = std.heap.ArenaAllocator.init(allocator);
         errdefer proxy_arena.deinit();
 
-        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.io() };
+        var client: std.http.Client = .{ .allocator = allocator, .io = std_compat.net.httpIo() };
         errdefer client.deinit();
         try tls_ca.configureHttpClient(&client, allocator);
 
-        try initClientDefaultProxies(&client, proxy_arena.allocator());
+        try initClientDefaultProxiesForAbi(abi, &client, proxy_arena.allocator(), env_map);
 
         return .{
             .proxy_arena = proxy_arena,
@@ -1346,13 +2080,14 @@ pub const ProxyHttpClient = struct {
         self.* = undefined;
     }
 
-    /// Use std.http everywhere except Android, where Termux lacks the resolver
-    /// configuration Zig expects. The curl adapter preserves request/response
-    /// semantics but returns non-GET and caller-header redirects unhandled:
-    /// curl cannot both reproduce std.http method rewriting and safely scope
-    /// opaque headers to the original origin.
     pub fn fetch(self: *ProxyHttpClient, options: std.http.Client.FetchOptions) !std.http.Client.FetchResult {
-        if (comptime builtin.abi == .android) return self.fetchWithCurl(options);
+        if (comptime fetchRedirectPolicy(builtin.abi) == .curl) {
+            // std.http follows up to 3 redirects and replays extra_headers to
+            // any target; fetchWithCurl reduces to stdHttpRequest here but
+            // keeps fetchCurlMaxRedirects, so caller headers never follow.
+            try validateFetchProxy(self.client.allocator, options.location);
+            return self.fetchWithCurl(options);
+        }
         return self.client.fetch(options);
     }
 
@@ -1991,18 +2726,48 @@ fn getProxyOverrideOwned(allocator: Allocator) !?[]u8 {
     return try allocator.dupe(u8, value);
 }
 
-fn initClientDefaultProxiesFromEnvMap(
+fn validateStdProxyEnvMap(env_map: *const std_compat.process.EnvMap) !void {
+    for (proxy_env_var_names) |key| {
+        if (env_map.get(key)) |raw_val| {
+            const trimmed = std.mem.trim(u8, raw_val, " \t\r\n");
+            if (trimmed.len > 0) {
+                try validateStdProxyScheme(trimmed);
+            }
+        }
+    }
+}
+
+pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !void {
+    return initClientDefaultProxiesForAbi(builtin.abi, client, arena, null);
+}
+
+pub fn initClientDefaultProxiesFromEnvMap(
     client: *std.http.Client,
     arena: Allocator,
     env_map: *const std_compat.process.EnvMap,
 ) !void {
-    var merged_env_map = try env_map.clone(arena);
-    _ = try applyProxyOverrideToEnvMap(&merged_env_map);
-    try client.initDefaultProxies(arena, &merged_env_map);
+    return initClientDefaultProxiesForAbi(builtin.abi, client, arena, env_map);
 }
 
-pub fn initClientDefaultProxies(client: *std.http.Client, arena: Allocator) !void {
-    var env_map = try buildProxyEnvMapFromProcess(arena);
+pub fn initClientDefaultProxiesForAbi(
+    comptime abi: std.Target.Abi,
+    client: *std.http.Client,
+    arena: Allocator,
+    explicit_env_map: ?*const std_compat.process.EnvMap,
+) !void {
+    var env_map = if (explicit_env_map) |em|
+        try em.clone(arena)
+    else
+        try buildProxyEnvMapFromProcess(arena);
+
+    if (explicit_env_map != null) {
+        _ = try applyProxyOverrideToEnvMap(&env_map);
+    }
+
+    if (comptime stdHttpTransport(abi)) {
+        try validateStdProxyEnvMap(&env_map);
+    }
+
     try client.initDefaultProxies(arena, &env_map);
 }
 
@@ -2042,6 +2807,18 @@ pub fn curlGetSSE(
     url: []const u8,
     timeout_secs: []const u8,
 ) ![]u8 {
+    if (comptime stdHttpTransport(builtin.abi)) {
+        const response = try stdHttpRequest(allocator, .{
+            .method = .GET,
+            .url = url,
+            .headers = &.{"Accept: text/event-stream"},
+            .max_time = timeout_secs,
+            .max_response_bytes = DEFAULT_CURL_GET_MAX_BYTES,
+            .fail_on_http_error = true,
+        });
+        allocator.free(response.headers);
+        return response.body;
+    }
     var config = try prepareProtectedCurlConfig(allocator, url, null);
     defer config.deinit();
     var argv_buf: [40][]const u8 = undefined;
@@ -2178,27 +2955,25 @@ test "credentialed curl args route to std http fallback" {
     try std.testing.expect(!hasCredentialedCurlArgs("https://example.com/v1", &.{"User-Agent: nullclaw-test"}));
 }
 
-// Regression: aarch64-linux-android (Termux) — std.http.Client cannot complete
-// credentialed HTTPS requests, so the curl subprocess path must be used on
-// Android. Verified at comptime; the curl subprocess itself is exercised by
-// the existing curlGet/curlPost test suite on every host platform.
-test "credentialed curl falls through to curl on android" {
+// Regression: aarch64-linux-android (Termux) — std.http.Client could not
+// resolve names, so every request was forced through a curl subprocess that
+// the APK does not ship. compat.net's libc lookup now backs std.http on
+// Android, so both credentialed and plain requests must select it.
+test "android routes all curl helpers to std http" {
     const cred_headers = [_][]const u8{"Authorization: Bearer test-token"};
-    if (comptime builtin.abi == .android) {
-        try std.testing.expect(!credentialedCurlUsesHttpFallback(
-            "https://example.com/v1",
-            &cred_headers,
-            null,
-        ));
-    } else {
-        // On non-Android platforms the existing std.http fallback path is
-        // preserved. Behavior is unchanged from before this fix.
-        try std.testing.expect(credentialedCurlUsesHttpFallback(
-            "https://example.com/v1",
-            &cred_headers,
-            null,
-        ));
-    }
+    const plain_headers = [_][]const u8{"User-Agent: nullclaw-test"};
+    try std.testing.expect(stdHttpTransport(.android));
+    try std.testing.expect(!usesCurlTransport(.android));
+    // Android never diverts to the lossy wrapper: the secure executor keeps
+    // the spec and swaps its transport internally.
+    try std.testing.expect(!credentialedCurlUsesHttpFallbackFor(.android, "https://example.com/v1", &cred_headers, null));
+    try std.testing.expect(!credentialedCurlUsesHttpFallbackFor(.android, "https://example.com/v1", &plain_headers, null));
+    // Non-Android keeps the existing split: credentialed args use std.http to
+    // stay out of argv, everything else stays on curl.
+    try std.testing.expect(!stdHttpTransport(.gnu));
+    try std.testing.expect(usesCurlTransport(.gnu));
+    try std.testing.expect(credentialedCurlUsesHttpFallbackFor(.gnu, "https://example.com/v1", &cred_headers, null));
+    try std.testing.expect(!credentialedCurlUsesHttpFallbackFor(.gnu, "https://example.com/v1", &plain_headers, null));
 }
 
 test "secure curl command preserves methods and keeps secrets out of argv" {
@@ -2359,6 +3134,271 @@ test "android fetch adapter never auto-redirects caller headers" {
         .headers = &.{"Authorization: Bearer test-token"},
         .max_redirects = 3,
     }));
+}
+
+const RedirectDecision = union(enum) {
+    stop,
+    follow: struct {
+        uri: std.Uri,
+        method: std.http.Method,
+        drop_body: bool,
+        strip_caller_headers: bool,
+    },
+};
+
+/// Curl `-L` budget for this request; 0 means the 3xx goes back to the caller.
+fn redirectBudget(spec: CurlRequestSpec) u16 {
+    return safeCurlMaxRedirects(spec) orelse 0;
+}
+
+/// Same origin means same scheme, host, and effective port. Anything else is
+/// treated as a new source, so the hop loses its caller headers.
+fn sameOrigin(a: std.Uri, b: std.Uri) bool {
+    const host_a = a.host orelse return false;
+    const host_b = b.host orelse return false;
+    var buf_a: [std.Io.net.HostName.max_len]u8 = undefined;
+    var buf_b: [std.Io.net.HostName.max_len]u8 = undefined;
+    const raw_a = host_a.toRaw(&buf_a) catch return false;
+    const raw_b = host_b.toRaw(&buf_b) catch return false;
+    return std.ascii.eqlIgnoreCase(a.scheme, b.scheme) and
+        std.ascii.eqlIgnoreCase(raw_a, raw_b) and
+        defaultPortForScheme(a) == defaultPortForScheme(b);
+}
+
+/// One redirect hop, decided without I/O so the policy is host-testable.
+/// `location` bytes are copied into `aux_buf` for RFC 3986 merging and the
+/// returned URI points into it. Validation matches the first hop
+/// (`validateHttpUrl`): no control bytes, http(s) only, host present. It is
+/// deliberately not stricter, or intentional private api_base targets break.
+fn redirectDecision(
+    current: std.Uri,
+    location: []const u8,
+    aux_buf: *[]u8,
+    status: u16,
+    method: std.http.Method,
+    remaining: u16,
+) !RedirectDecision {
+    const redirecting = switch (status) {
+        301, 302, 303, 307, 308 => true,
+        else => false,
+    };
+    if (!redirecting) return .stop;
+    if (remaining == 0) return .stop;
+    if (std.mem.indexOfScalar(u8, location, 0) != null or
+        std.mem.indexOfAny(u8, location, "\r\n") != null) return error.HttpRedirectLocationInvalid;
+    if (location.len > aux_buf.*.len) return error.HttpRedirectLocationOversize;
+    @memcpy(aux_buf.*[0..location.len], location);
+    const uri = current.resolveInPlace(location.len, aux_buf) catch
+        return error.HttpRedirectLocationInvalid;
+    try validateParsedHttpUri(uri);
+
+    const drop_body = switch (status) {
+        303 => true,
+        301, 302 => method == .POST,
+        else => false,
+    };
+    return .{ .follow = .{
+        .uri = uri,
+        .method = if (drop_body) .GET else method,
+        .drop_body = drop_body,
+        .strip_caller_headers = !sameOrigin(current, uri),
+    } };
+}
+
+/// Headers for a redirect hop: caller headers never cross origins, and a
+/// method rewrite to GET drops the body's Content-Type.
+fn redirectHopHeaders(
+    arena: Allocator,
+    headers: []const std.http.Header,
+    drop_body: bool,
+    strip_caller_headers: bool,
+) ![]const std.http.Header {
+    if (strip_caller_headers) return &.{};
+    if (!drop_body) return headers;
+    var kept: std.ArrayListUnmanaged(std.http.Header) = .empty;
+    for (headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Content-Type") or
+            std.ascii.eqlIgnoreCase(header.name, "Content-Length") or
+            std.ascii.eqlIgnoreCase(header.name, "Transfer-Encoding")) continue;
+        try kept.append(arena, header);
+    }
+    return kept.items;
+}
+
+test "android std redirect hop drops body framing with the body" {
+    // Regression: a 303 rewrite kept Content-Length, so the bodiless hop
+    // declared a payload the server kept waiting for.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Content-Length", .value = "42" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Authorization", .value = "Bearer test-key" },
+    };
+    const kept = try redirectHopHeaders(arena.allocator(), &headers, true, false);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("Authorization", kept[0].name);
+}
+
+fn expectFormattedUri(expected: []const u8, uri: std.Uri) !void {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try uri.format(&out.writer);
+    try std.testing.expectEqualStrings(expected, out.writer.buffer[0..out.writer.end]);
+}
+
+test "android std redirect budget disables caller-header redirects" {
+    // Regression: stdHttpRequest honored spec.max_redirects directly, so an
+    // Android request carrying caller headers followed redirects that the curl
+    // policy (safeCurlMaxRedirects) refuses, leaking the headers across origins.
+    try std.testing.expectEqual(@as(u16, 0), redirectBudget(.{
+        .method = .GET,
+        .url = "https://example.com/start",
+        .headers = &.{"Authorization: Bearer test-key"},
+        .max_redirects = 3,
+    }));
+    try std.testing.expectEqual(@as(u16, 0), redirectBudget(.{
+        .method = .POST,
+        .url = "https://example.com/start",
+        .body = "{}",
+        .max_redirects = 3,
+        .generated_redirect_headers_only = true,
+    }));
+    try std.testing.expectEqual(@as(u16, 3), redirectBudget(.{
+        .method = .GET,
+        .url = "https://example.com/start",
+        .headers = &.{STD_HTTP_USER_AGENT_HEADER},
+        .max_redirects = 3,
+        .generated_redirect_headers_only = true,
+    }));
+}
+
+test "android std redirect decision keeps caller headers for the same origin" {
+    var aux_buf: [4096]u8 = undefined;
+    var aux: []u8 = &aux_buf;
+    const current = try std.Uri.parse("https://example.com/start");
+    switch (try redirectDecision(current, "/next", &aux, 302, .GET, 3)) {
+        .stop => return error.TestUnexpectedResult,
+        .follow => |hop| {
+            try std.testing.expect(!hop.strip_caller_headers);
+            try std.testing.expect(!hop.drop_body);
+            try std.testing.expectEqual(std.http.Method.GET, hop.method);
+            try expectFormattedUri("https://example.com/next", hop.uri);
+        },
+    }
+    // A relative Location resolves against the current path, not the root.
+    var aux2_buf: [4096]u8 = undefined;
+    var aux2: []u8 = &aux2_buf;
+    switch (try redirectDecision(current, "sub/page", &aux2, 302, .GET, 3)) {
+        .stop => return error.TestUnexpectedResult,
+        .follow => |hop| try expectFormattedUri("https://example.com/sub/page", hop.uri),
+    }
+}
+
+test "android std redirect decision strips caller headers when the origin changes" {
+    const current = try std.Uri.parse("https://example.com/start");
+    const cases = [_][]const u8{
+        "https://api.example.net/v1", // different host
+        "//api.example.net/v1", // protocol-relative
+        "http://example.com/v1", // scheme downgrade
+        "https://example.com:8443/v1", // different port
+    };
+    for (cases) |location| {
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        switch (try redirectDecision(current, location, &aux, 302, .GET, 3)) {
+            .stop => return error.TestUnexpectedResult,
+            .follow => |hop| try std.testing.expect(hop.strip_caller_headers),
+        }
+    }
+}
+
+test "android std redirect decision rewrites methods like std.http" {
+    const current = try std.Uri.parse("https://example.com/start");
+    const Case = struct { status: u16, method: std.http.Method, want_method: std.http.Method, drop: bool };
+    const cases = [_]Case{
+        .{ .status = 303, .method = .POST, .want_method = .GET, .drop = true },
+        .{ .status = 303, .method = .GET, .want_method = .GET, .drop = true },
+        .{ .status = 302, .method = .POST, .want_method = .GET, .drop = true },
+        .{ .status = 301, .method = .POST, .want_method = .GET, .drop = true },
+        .{ .status = 301, .method = .PUT, .want_method = .PUT, .drop = false },
+        .{ .status = 307, .method = .POST, .want_method = .POST, .drop = false },
+        .{ .status = 308, .method = .POST, .want_method = .POST, .drop = false },
+    };
+    for (cases) |case| {
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        switch (try redirectDecision(current, "/next", &aux, case.status, case.method, 3)) {
+            .stop => return error.TestUnexpectedResult,
+            .follow => |hop| {
+                try std.testing.expectEqual(case.want_method, hop.method);
+                try std.testing.expectEqual(case.drop, hop.drop_body);
+            },
+        }
+    }
+}
+
+test "android std redirect decision stops at the hop budget" {
+    var aux_buf: [4096]u8 = undefined;
+    var aux: []u8 = &aux_buf;
+    const current = try std.Uri.parse("https://example.com/start");
+    switch (try redirectDecision(current, "/next", &aux, 302, .GET, 0)) {
+        .stop => {},
+        .follow => return error.TestUnexpectedResult,
+    }
+}
+
+test "android std redirect decision rejects non-http targets" {
+    const current = try std.Uri.parse("https://example.com/start");
+    const bad = [_]struct { location: []const u8, err: anyerror }{
+        .{ .location = "ftp://example.com/x", .err = error.UnsupportedUriScheme },
+        .{ .location = "javascript:alert(1)", .err = error.UnsupportedUriScheme },
+        .{ .location = "https:///nohost", .err = error.InvalidUrl },
+        .{ .location = "https://example.com/\r\nX-Injected: 1", .err = error.HttpRedirectLocationInvalid },
+    };
+    for (bad) |case| {
+        var aux_buf: [4096]u8 = undefined;
+        var aux: []u8 = &aux_buf;
+        try std.testing.expectError(case.err, redirectDecision(current, case.location, &aux, 302, .GET, 3));
+    }
+}
+
+test "android std redirect decision does not tighten first-hop validation" {
+    // The first hop only runs validateHttpUrl, so a private api_base is legal.
+    // Hops must not be stricter or intentional local providers break.
+    const current = try std.Uri.parse("http://127.0.0.1:8080/start");
+    var aux_buf: [4096]u8 = undefined;
+    var aux: []u8 = &aux_buf;
+    switch (try redirectDecision(current, "http://127.0.0.1:9090/next", &aux, 302, .GET, 3)) {
+        .stop => return error.TestUnexpectedResult,
+        .follow => |hop| try std.testing.expect(hop.strip_caller_headers),
+    }
+}
+
+test "android std redirect hop headers drop caller headers and body content type" {
+    const headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer test-key" },
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "User-Agent", .value = "test-agent" },
+    };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        (try redirectHopHeaders(arena.allocator(), &headers, false, true)).len,
+    );
+    const kept = try redirectHopHeaders(arena.allocator(), &headers, true, false);
+    try std.testing.expectEqual(@as(usize, 2), kept.len);
+    try std.testing.expectEqualStrings("Authorization", kept[0].name);
+    try std.testing.expectEqualStrings("User-Agent", kept[1].name);
+}
+
+test "android fetch keeps the curl redirect policy" {
+    // Regression: Android fetch called std.http.Client.fetch, which followed
+    // three redirects and replayed extra_headers to every target.
+    try std.testing.expectEqual(FetchRedirectPolicy.curl, fetchRedirectPolicy(.android));
+    try std.testing.expectEqual(FetchRedirectPolicy.std, fetchRedirectPolicy(.gnu));
 }
 
 const LegacyCredentialedCurlHelper = enum {
@@ -2557,6 +3597,8 @@ fn expectSecureCurlTransport(
 }
 
 test "secure curl transport preserves method body content type status and headers" {
+    // Android: production uses std.http, test assumes curl/mock CONNECT
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: these are the exact method classes broken by the original
     // Android GET/POST dispatcher.
     try expectSecureCurlTransport(.PATCH, "patch-body", "multipart/form-data; boundary=test-boundary", true, false);
@@ -2733,6 +3775,8 @@ fn expectCurlIntegrity(
 }
 
 test "curl transport round-trips payloads byte-exactly across the 8 KiB boundary" {
+    // Android: production uses std.http, test assumes curl transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: nullclaw#1018 — silent corruption. Short fixtures (12 B) never
     // crossed the read boundary, so a truncating reader still passed.
     const allocator = std.testing.allocator;
@@ -2746,6 +3790,8 @@ test "curl transport round-trips payloads byte-exactly across the 8 KiB boundary
 }
 
 test "curl transport preserves a large request body byte-exactly" {
+    // Android: production uses std.http, test assumes curl transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: nullclaw#1018 — why a mangled request reads as scrambled output:
     // the model answers a prompt it never received.
     const allocator = std.testing.allocator;
@@ -2762,6 +3808,8 @@ test "curl transport preserves a large request body byte-exactly" {
 }
 
 test "android curl adapter returns the response body byte-exactly" {
+    // Android: production uses std.http, test assumes curl transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // The adapter is what `ProxyHttpClient.fetch` selects on Android
     // (http_util.zig); until now nothing round-tripped a body through it.
     const allocator = std.testing.allocator;
@@ -2774,6 +3822,8 @@ test "android curl adapter returns the response body byte-exactly" {
 }
 
 test "curl transport stays byte-exact across repeated calls" {
+    // Android: production uses std.http, test assumes curl transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: nullclaw#1018 — corruption was intermittent, the signature of
     // state leaking between transfers rather than a constant misparse.
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
@@ -2981,6 +4031,8 @@ fn expectCredentialedCurlResolveEntry(helper: LegacyCredentialedCurlHelper, expe
 }
 
 test "credentialed legacy curl body helpers do not reject authorization headers" {
+    // Android: production uses std.http, test assumes curl argv transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: legacy channel code still passes Authorization to curl* helper
     // APIs. These helpers must route through std.http fallback instead of
     // returning CredentialedCurlArgRejected and breaking old channels.
@@ -2990,6 +4042,8 @@ test "credentialed legacy curl body helpers do not reject authorization headers"
 }
 
 test "credentialed legacy curl status helpers do not reject authorization headers" {
+    // Android: production uses std.http, test assumes curl argv transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: status-returning helpers used by Lark/QQ/OneBot must preserve
     // behavior while keeping Authorization out of curl argv.
     try expectLegacyCredentialedCurlFallback(.get_status, "GET");
@@ -2998,6 +4052,8 @@ test "credentialed legacy curl status helpers do not reject authorization header
 }
 
 test "credentialed curl helpers preserve resolve pinning" {
+    // Android: production uses std.http, test assumes curl argv transport
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     // Regression: credentialed fallback must not bypass curl --resolve pinning,
     // otherwise provider SSRF/DNS-rebinding protection is weakened.
     try expectCredentialedCurlResolveEntry(.get_body, "GET");
@@ -3272,6 +4328,8 @@ fn serveStalledSocket(ctx: *StalledSocketCtx) void {
 // untimed `std.http` client has no read timeout in Zig 0.16. The bounded helper
 // must enforce curl's `--max-time`.
 test "bounded http post times out instead of hanging on a stalled socket" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3343,6 +4401,8 @@ fn stopFixedHttpServer(ctx: *FixedHttpResponseCtx, thread: std.Thread) void {
 // Regression: the bounded GET must keep `httpRequest`'s error identity - a
 // non-2xx is `error.HttpStatusError`, not curl `--fail`'s `error.CurlFailed`.
 test "bounded http get maps a non-2xx to HttpStatusError" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3395,11 +4455,15 @@ fn expectBoundedPostError(status_line: []const u8, expected: anyerror) !void {
 }
 
 test "bounded POST maps gateway 502/504 to an indeterminate send error" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     try expectBoundedPostError("HTTP/1.1 502 Bad Gateway", error.HttpStatusIndeterminate);
     try expectBoundedPostError("HTTP/1.1 504 Gateway Timeout", error.HttpStatusIndeterminate);
 }
 
 test "bounded POST keeps definite 4xx/429/503 as HttpStatusError" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     try expectBoundedPostError("HTTP/1.1 400 Bad Request", error.HttpStatusError);
     try expectBoundedPostError("HTTP/1.1 429 Too Many Requests", error.HttpStatusError);
     try expectBoundedPostError("HTTP/1.1 503 Service Unavailable", error.HttpStatusError);
@@ -3408,6 +4472,8 @@ test "bounded POST keeps definite 4xx/429/503 as HttpStatusError" {
 // Slack's chat.postMessage goes through curlPost, whose credentialed (std)
 // backend previously discarded the status before the channel could classify it.
 test "curlPost maps gateway 502 to an indeterminate send error" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3437,6 +4503,8 @@ test "curlPost maps gateway 502 to an indeterminate send error" {
 // contract - a non-2xx is returned with its body (not turned into an error) - so
 // Weixin can still read the error payload, unlike httpRequestWithTimeout.
 test "bounded http request with status preserves a non-2xx body" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3463,6 +4531,8 @@ test "bounded http request with status preserves a non-2xx body" {
 // a larger body (a media download) has to opt into a bigger cap explicitly
 // rather than silently truncating.
 test "bounded http get enforces the response size cap" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3495,6 +4565,8 @@ test "bounded http get enforces the response size cap" {
 // Regression: readToEndAlloc(.limited(n)) returned StreamTooLong for a body
 // exactly n bytes long, so a response at the cap surfaced as CurlReadError.
 test "bounded http get accepts a body exactly at the size cap" {
+    // Android: production uses std.http, test assumes curl subprocess and exit codes
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3524,6 +4596,8 @@ test "bounded http get accepts a body exactly at the size cap" {
 // Regression: web_fetch turned a 4 MiB+ page into "Fetch failed:
 // error.CurlReadError" instead of returning the content it could read.
 test "web fetch get truncates an oversized body at a utf-8 boundary" {
+    // Android: production uses std.http, test assumes curl fetch adapter
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3591,6 +4665,8 @@ test "trimToUtf8Prefix keeps the valid prefix when trailing continuations run lo
 
 // Regression: trimToUtf8Prefix 在完整码点边界截断时留下裸 lead byte，工具结果非法 UTF-8
 test "web fetch get keeps a complete code point at the truncation cap" {
+    // Android: production uses std.http, test assumes curl fetch adapter
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3627,6 +4703,8 @@ test "web fetch get keeps a complete code point at the truncation cap" {
 // Regression: web_fetch only received error.CurlFailed for any 4xx; the status
 // and body must survive so the tool can explain the failure.
 test "web fetch get keeps a non-2xx status and body" {
+    // Android: production uses std.http, test assumes curl fetch adapter
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3654,6 +4732,8 @@ test "web fetch get keeps a non-2xx status and body" {
 // Regression: a stalled web_fetch connection used to end as a generic fetch
 // failure; it must stay distinguishable as a timeout.
 test "web fetch get reports a timeout" {
+    // Android: production uses std.http, test assumes curl fetch adapter
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3698,6 +4778,8 @@ fn serveStalledCredential(ctx: *StalledCredentialCtx) void {
 // std.http client (`curlRequestWithProxy` does exactly that, dropping the bound).
 // A stalled socket with an Authorization header must still return error.CurlTimeout.
 test "bounded http request keeps the timeout for a credentialed request" {
+    // Android: production uses std.http, test assumes curl subprocess and timeout
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3732,6 +4814,8 @@ test "bounded http request keeps the timeout for a credentialed request" {
 // /sync long poll routes through it) must keep the timeout for a credentialed
 // GET instead of falling back to the untimed std.http client.
 test "bounded status request keeps the timeout for a credentialed get" {
+    // Android: production uses std.http, test assumes curl subprocess and timeout
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
@@ -3780,4 +4864,508 @@ test "curlPostRawWithContentType rejects header injection before any request" {
             null,
         ),
     );
+}
+
+const StdHttpTestServerCtx = struct {
+    server: *std_compat.net.Server,
+    body: []const u8,
+    saw_post_body: AtomicBool = AtomicBool.init(false),
+};
+
+fn serveStdHttpTest(ctx: *StdHttpTestServerCtx) void {
+    var conn = ctx.server.accept() catch return;
+    defer conn.stream.close();
+
+    var buf: [8192]u8 = undefined;
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = conn.stream.read(buf[filled..]) catch return;
+        if (n == 0) break;
+        filled += n;
+        if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+    }
+    if (std.mem.indexOf(u8, buf[0..filled], "{\"ping\":true}") != null) {
+        ctx.saw_post_body.store(true, .release);
+    }
+
+    var head_buf: [256]u8 = undefined;
+    const response = std.fmt.bufPrint(
+        &head_buf,
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n",
+        .{ctx.body.len},
+    ) catch return;
+    conn.stream.writeAll(response) catch {};
+    conn.stream.writeAll(ctx.body) catch {};
+}
+
+test "android std http keeps status body headers and post payload" {
+    // Windows: the loopback mock server thread does not complete there. The std
+    // transport is Android-only; Windows goes through curl (tested elsewhere).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "{\"ok\":true}" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/v1/test",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const response = try stdHttpRequest(std.testing.allocator, .{
+        .method = .POST,
+        .url = url,
+        .body = "{\"ping\":true}",
+        .headers = &.{"X-Test: yes"},
+        .content_type = "application/json",
+    });
+    defer std.testing.allocator.free(response.headers);
+    defer std.testing.allocator.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("{\"ok\":true}", response.body);
+    try std.testing.expect(std.mem.indexOf(u8, response.headers, "application/json") != null);
+    try std.testing.expect(ctx.saw_post_body.load(.acquire));
+}
+
+test "android std http response cap rejects and truncates" {
+    // Windows: the loopback mock server thread does not complete there. The std
+    // transport is Android-only; Windows goes through curl (tested elsewhere).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/cap",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectError(error.CurlReadError, stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url,
+        .max_response_bytes = 4,
+    }));
+
+    var server2 = try addr.listen(.{});
+    var ctx2: StdHttpTestServerCtx = .{ .server = &server2, .body = "0123456789" };
+    var thread2 = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx2});
+    defer thread2.join();
+    defer server2.deinit();
+
+    const url2 = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/truncate",
+        .{server2.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url2);
+
+    const response = try stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url2,
+        .max_response_bytes = 4,
+        .truncate_response = true,
+    });
+    defer std.testing.allocator.free(response.headers);
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("0123", response.body);
+    try std.testing.expect(response.truncated);
+}
+
+test "android proxy http client init rejects unsupported proxy schemes in env" {
+    // Regression: on Android, ProxyHttpClient.init silently discarded unsupported proxy
+    // schemes (like socks5) via std.http.Client.initDefaultProxies and connected direct
+    // (fail-open), bypassing configured proxies.
+    const unsupported_schemes = [_][]const u8{
+        "socks5://proxy.example.com:1080",
+        "socks5h://proxy.example.com:1080",
+        "ftp://proxy.example.com:21",
+    };
+
+    for (unsupported_schemes) |bad_proxy| {
+        for (proxy_env_var_names) |var_name| {
+            var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+            defer env_map.deinit();
+            try env_map.put(var_name, bad_proxy);
+
+            try std.testing.expectError(
+                error.UnsupportedProxyScheme,
+                ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map),
+            );
+        }
+    }
+
+    // Non-Android ABI keeps std.http silent discard (does not return UnsupportedProxyScheme at init):
+    {
+        var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+        defer env_map.deinit();
+        try env_map.put("all_proxy", "socks5://proxy.example.com:1080");
+        var client = try ProxyHttpClient.initForAbi(.gnu, std.testing.allocator, &env_map);
+        defer client.deinit();
+    }
+
+    // Android ABI succeeds when proxy scheme is supported:
+    {
+        var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+        defer env_map.deinit();
+        try env_map.put("http_proxy", "http://proxy-http.example.com:8080");
+        try env_map.put("https_proxy", "https://proxy-https.example.com:8443");
+        var client = try ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map);
+        defer client.deinit();
+        try std.testing.expect(client.client.http_proxy != null);
+        try std.testing.expect(client.client.https_proxy != null);
+    }
+
+    // Empty proxy env value is ignored and does not error:
+    {
+        var env_map = std_compat.process.EnvMap.init(std.testing.allocator);
+        defer env_map.deinit();
+        try env_map.put("all_proxy", "");
+        var client = try ProxyHttpClient.initForAbi(.android, std.testing.allocator, &env_map);
+        defer client.deinit();
+    }
+}
+
+test "android std http rejects proxies it cannot honor" {
+    try std.testing.expectError(error.UnsupportedProxyScheme, validateStdProxyScheme("socks5://127.0.0.1:1080"));
+    try std.testing.expectError(error.UnsupportedProxyScheme, validateStdProxyForUrl(
+        std.testing.allocator,
+        "https://example.com",
+        "socks5://127.0.0.1:1080",
+    ));
+    try validateStdProxyScheme("http://proxy.example:8080");
+    try validateStdProxyScheme("https://proxy.example:8443");
+}
+
+test "android std http treats head and empty frames as bodyless" {
+    try std.testing.expect(!hasResponseBody(.HEAD, .ok, .none, 12));
+    try std.testing.expect(!hasResponseBody(.GET, .no_content, .none, null));
+    try std.testing.expect(!hasResponseBody(.DELETE, .not_modified, .none, 4));
+    try std.testing.expect(!hasResponseBody(.POST, .ok, .none, 0));
+    try std.testing.expect(hasResponseBody(.GET, .ok, .none, 12));
+    try std.testing.expect(hasResponseBody(.GET, .ok, .chunked, null));
+    try std.testing.expect(hasResponseBody(.GET, .ok, .none, null));
+}
+
+// Regression: readStdHttpBody skipped the max_response_bytes check when the
+// body was discarded, so a discard request read an unbounded body while curl
+// rejects it at the cap.
+test "android std http discard path enforces the response cap" {
+    // Windows: the loopback mock server thread does not complete there. The std
+    // transport is Android-only; Windows goes through curl (tested elsewhere).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/discard-cap",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectError(error.CurlReadError, stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url,
+        .discard_response_body = true,
+        .max_response_bytes = 4,
+    }));
+}
+
+test "android std http discard path truncates at the response cap" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/discard-truncate",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const response = try stdHttpRequest(std.testing.allocator, .{
+        .method = .GET,
+        .url = url,
+        .discard_response_body = true,
+        .max_response_bytes = 4,
+        .truncate_response = true,
+    });
+    defer std.testing.allocator.free(response.headers);
+    defer std.testing.allocator.free(response.body);
+    try std.testing.expectEqualStrings("", response.body);
+    try std.testing.expect(response.truncated);
+}
+
+// Regression: HttpStream.abort was a no-op, so /stop kept draining the buffered
+// body and finish() reported success instead of an interrupt.
+test "android std http stream abort fails the stream" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/abort",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const stream = try HttpStream.open(std.testing.allocator, url, &.{}, "{}", 0);
+    defer stream.deinit();
+    stream.stream().abort();
+
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.Interrupted, stream.stream().read(&buf));
+    try std.testing.expectError(error.Interrupted, stream.stream().finish());
+}
+
+// Regression: only integer seconds parsed, so "1.5" silently became "no
+// timeout" while curl enforced 1.5s.
+test "max time accepts fractional seconds and rejects garbage" {
+    try std.testing.expectEqual(@as(?u64, 2000), try maxTimeMs("2"));
+    try std.testing.expectEqual(@as(?u64, 1500), try maxTimeMs("1.5"));
+    try std.testing.expectEqual(@as(?u64, 250), try maxTimeMs("0.25"));
+    try std.testing.expect(try maxTimeMs("0") == null);
+    try std.testing.expect(try maxTimeMs(null) == null);
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("1.5s"));
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("abc"));
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("-1"));
+    try std.testing.expectError(error.InvalidCurlConfigValue, maxTimeMs("inf"));
+}
+
+// Regression: the std http stream only compared max_time when the body reader
+// had nothing buffered, so a fast server could extend the transfer forever.
+test "android std http stream deadline applies while data is buffered" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "0123456789" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer thread.join();
+    defer server.deinit();
+
+    const url = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "http://127.0.0.1:{d}/deadline",
+        .{server.listen_address.in.getPort()},
+    );
+    defer std.testing.allocator.free(url);
+
+    const stream = try HttpStream.open(std.testing.allocator, url, &.{}, "{}", 0);
+    defer stream.deinit();
+    var first: [1]u8 = undefined;
+    _ = try stream.stream().read(&first);
+    try std.testing.expect(stream.reader.bufferedLen() > 0);
+    stream.deadline_ms = std_compat.time.milliTimestamp() - 1;
+    var buf: [16]u8 = undefined;
+    try std.testing.expectError(error.CurlTimeout, stream.stream().read(&buf));
+}
+
+test "android std http maps connection refused to CurlConnectError" {
+    // Regression: stdHttpRequest and HttpStream on Android must map ConnectionRefused to CurlConnectError
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectError(
+        error.CurlConnectError,
+        stdHttpRequest(std.testing.allocator, .{
+            .method = .GET,
+            .url = "http://127.0.0.1:1/",
+        }),
+    );
+    try std.testing.expectError(
+        error.CurlConnectError,
+        HttpStream.open(std.testing.allocator, "http://127.0.0.1:1/", &.{}, "{}", 0),
+    );
+    // Regression: HttpStream.open with non-empty headers double freed header_list on failure
+    try std.testing.expectError(
+        error.CurlConnectError,
+        HttpStream.open(
+            std.testing.allocator,
+            "http://127.0.0.1:1/",
+            &.{"Authorization: Bearer test-key"},
+            "{}",
+            0,
+        ),
+    );
+    // Regression: httpRequestWithStatusAndHeaders must map std http transport errors to CurlConnectError
+    try std.testing.expectError(
+        error.CurlConnectError,
+        httpRequestWithStatusAndHeaders(
+            std.testing.allocator,
+            .GET,
+            "http://127.0.0.1:1/",
+            null,
+            &.{"Authorization: Bearer test-key"},
+            null,
+            null,
+        ),
+    );
+}
+
+const RedirectHeaderLeakCtx = struct {
+    server: *std_compat.net.Server,
+    location: []const u8,
+    accepts: u8,
+};
+
+fn serveRedirectHeaderLeak(ctx: *RedirectHeaderLeakCtx) void {
+    var accepted: u8 = 0;
+    while (accepted < ctx.accepts) : (accepted += 1) {
+        var conn = ctx.server.accept() catch return;
+        defer conn.stream.close();
+        var buf: [4096]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const n = conn.stream.read(buf[filled..]) catch return;
+            if (n == 0) break;
+            filled += n;
+            if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+        }
+        const request = buf[0..filled];
+        var head_buf: [512]u8 = undefined;
+        const response = if (std.mem.indexOf(u8, request, " /next ") != null)
+            std.fmt.bufPrint(&head_buf, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", .{}) catch return
+        else
+            std.fmt.bufPrint(&head_buf, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ctx.location}) catch return;
+        conn.stream.writeAll(response) catch {};
+    }
+}
+
+test "android std status request never replays caller headers across redirects" {
+    // Regression: httpRequestWithStatusAndHeadersInner used std's built-in
+    // redirect follow, which replayed extra_headers (Authorization) to the
+    // redirect target; a caller-header request must return the 3xx instead.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: RedirectHeaderLeakCtx = .{
+        .server = &server,
+        .location = "http://127.0.0.1:1/next",
+        .accepts = 1,
+    };
+    const thread = try std.Thread.spawn(.{}, serveRedirectHeaderLeak, .{&ctx});
+    defer {
+        server.deinit();
+        thread.join();
+    }
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/start", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const headers = [_][]const u8{"Authorization: Bearer test-key"};
+    const response = try httpRequestWithStatusAndHeaders(allocator, .GET, url, null, &headers, null, null);
+    defer allocator.free(response.headers);
+    defer allocator.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 302), response.status_code);
+}
+
+test "android std status request honors explicit proxy parameter" {
+    // Regression: httpRequestWithStatusAndHeadersInner omitted .proxy = proxy
+    // when building CurlRequestSpec, silently discarding the explicit proxy
+    // and connecting directly to the target server (fail-open).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "direct" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer {
+        if (std_compat.net.tcpConnectToAddress(server.listen_address)) |stream| {
+            stream.close();
+        } else |_| {}
+        thread.join();
+        server.deinit();
+    }
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/direct",
+        .{server.listen_address.in.getPort()},
+    );
+    defer allocator.free(url);
+
+    // Explicit unreachable proxy: if honored, connection to proxy fails with
+    // CurlConnectError. If discarded (bug), it connects direct to target server
+    // and returns 200 OK.
+    const result = httpRequestWithStatusAndHeaders(
+        allocator,
+        .GET,
+        url,
+        null,
+        &.{},
+        null,
+        "http://127.0.0.1:1",
+    );
+    if (result) |res| {
+        allocator.free(res.headers);
+        allocator.free(res.body);
+    } else |_| {}
+    try std.testing.expectError(error.CurlConnectError, result);
+}
+
+test "android std http rejects header injection before validating proxy" {
+    // Regression: stdHttpRequest on Android must validate headers before proxy scheme
+    try std.testing.expectError(
+        error.InvalidHeader,
+        stdHttpRequest(std.testing.allocator, .{
+            .method = .GET,
+            .url = "https://example.com/",
+            .headers = &.{"X-Test: ok\r\nX-Injected: bad"},
+            .proxy = "unsupported://proxy",
+        }),
+    );
+}
+
+test "mapStdHttpError aligns std http transport errors with curl identities" {
+    // Regression: E1/E2 std error mapping for DNS, TLS, timeout, redirect limits, and connection
+    try std.testing.expectEqual(error.CurlConnectError, mapStdHttpError(error.ConnectionRefused));
+    try std.testing.expectEqual(error.CurlConnectError, mapStdHttpError(error.NetworkUnreachable));
+    try std.testing.expectEqual(error.CurlDnsError, mapStdHttpError(error.UnknownHostName));
+    try std.testing.expectEqual(error.CurlTlsError, mapStdHttpError(error.TlsInitializationFailed));
+    try std.testing.expectEqual(error.CurlTlsError, mapStdHttpError(error.TlsAlert));
+    try std.testing.expectEqual(error.CurlTlsError, mapStdHttpError(error.CertificateBundleLoadFailure));
+    try std.testing.expectEqual(error.CurlTimeout, mapStdHttpError(error.ConnectionTimedOut));
+    try std.testing.expectEqual(error.CurlTimeout, mapStdHttpError(error.Timeout));
+    try std.testing.expectEqual(error.CurlFailed, mapStdHttpError(error.TooManyHttpRedirects));
+    try std.testing.expectEqual(error.CurlInterrupted, mapStdHttpError(error.Canceled));
+    try std.testing.expectEqual(error.OutOfMemory, mapStdHttpError(error.OutOfMemory));
+    try std.testing.expectEqual(error.InvalidHeader, mapStdHttpError(error.InvalidHeader));
+
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.ConnectionRefused)));
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.UnknownHostName)));
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.TlsAlert)));
+    try std.testing.expect(isCurlTransportError(mapStdHttpError(error.TooManyHttpRedirects)));
+    try std.testing.expect(!isCurlTransportError(mapStdHttpError(error.OutOfMemory)));
+    try std.testing.expect(!isCurlTransportError(mapStdHttpError(error.InvalidHeader)));
 }

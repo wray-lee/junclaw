@@ -411,6 +411,8 @@ test "file_write blocks symlink target escape outside workspace" {
 }
 
 test "file_write does not mutate outside inode through hard link" {
+    // Android: SELinux on /data/local/tmp disallows hard links
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
 
     var ws_tmp = std.testing.tmpDir(.{});
