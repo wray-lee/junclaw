@@ -1781,58 +1781,18 @@ fn httpRequestWithStatusAndHeadersInner(
         try validateStdProxyForUrl(allocator, url, proxy);
     }
 
-    var client = try initProxyClientWithOptionalProxy(allocator, proxy);
-    defer client.deinit();
-
-    const redirect_behavior: std.http.Client.Request.RedirectBehavior =
-        if (body == null) @enumFromInt(3) else .unhandled;
-    var req = try client.client.request(method, uri, .{
-        .redirect_behavior = redirect_behavior,
-        .headers = .{ .accept_encoding = .default },
-        .extra_headers = header_buf[0..header_count],
-    });
-    defer req.deinit();
-
-    if (body) |payload| {
-        req.transfer_encoding = .{ .content_length = payload.len };
-        var request_body = try req.sendBodyUnflushed(&.{});
-        try request_body.writer.writeAll(payload);
-        try request_body.end();
-        try req.connection.?.flush();
-    } else {
-        try req.sendBodiless();
-    }
-
-    var redirect_buffer: [8 * 1024]u8 = undefined;
-    var response = try req.receiveHead(&redirect_buffer);
-    const response_headers = try allocator.dupe(u8, response.head.bytes);
-    errdefer allocator.free(response_headers);
-
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    const decompress_buffer: []u8 = switch (response.head.content_encoding) {
-        .identity => &.{},
-        .zstd => try allocator.alloc(u8, std.compress.zstd.default_window_len),
-        .deflate, .gzip => try allocator.alloc(u8, std.compress.flate.max_window_len),
-        .compress => return error.UnsupportedCompressionMethod,
+    // std.http replays extra_headers on every redirect hop, so reuse the same
+    // policy as stdHttpRequest: a caller-header request returns the 3xx instead.
+    const spec: CurlRequestSpec = .{
+        .method = method,
+        .url = url,
+        .body = body,
+        .headers = headers,
+        .content_type = content_type,
+        .max_redirects = if (body == null) 3 else null,
+        .accept_compression = true,
     };
-    defer if (response.head.content_encoding != .identity) allocator.free(decompress_buffer);
-
-    var transfer_buffer: [64]u8 = undefined;
-    var decompress: std.http.Decompress = undefined;
-    const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
-    _ = reader.streamRemaining(&aw.writer) catch |err| switch (err) {
-        error.ReadFailed => return response.bodyErr() orelse error.CurlReadError,
-        else => |e| return e,
-    };
-
-    const response_body = aw.writer.buffer[0..aw.writer.end];
-    return .{
-        .status_code = @as(u16, @intFromEnum(response.head.status)),
-        .headers = response_headers,
-        .body = try allocator.dupe(u8, response_body),
-    };
+    return stdHttpRequestInner(allocator, spec, uri, header_buf[0..header_count]);
 }
 
 pub fn httpRequestWithStatus(
@@ -3255,10 +3215,28 @@ fn redirectHopHeaders(
     if (!drop_body) return headers;
     var kept: std.ArrayListUnmanaged(std.http.Header) = .empty;
     for (headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "Content-Type")) continue;
+        if (std.ascii.eqlIgnoreCase(header.name, "Content-Type") or
+            std.ascii.eqlIgnoreCase(header.name, "Content-Length") or
+            std.ascii.eqlIgnoreCase(header.name, "Transfer-Encoding")) continue;
         try kept.append(arena, header);
     }
     return kept.items;
+}
+
+test "android std redirect hop drops body framing with the body" {
+    // Regression: a 303 rewrite kept Content-Length, so the bodiless hop
+    // declared a payload the server kept waiting for.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const headers = [_]std.http.Header{
+        .{ .name = "Content-Type", .value = "application/json" },
+        .{ .name = "Content-Length", .value = "42" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+        .{ .name = "Authorization", .value = "Bearer test-key" },
+    };
+    const kept = try redirectHopHeaders(arena.allocator(), &headers, true, false);
+    try std.testing.expectEqual(@as(usize, 1), kept.len);
+    try std.testing.expectEqualStrings("Authorization", kept[0].name);
 }
 
 fn expectFormattedUri(expected: []const u8, uri: std.Uri) !void {

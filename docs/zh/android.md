@@ -109,7 +109,7 @@ Android 构建打包在宿主 App 内，随 APK 一同更新；`junclaw update` 
 
 ### 出站 HTTP 与代理安全
 
-Android 构建通过 `std.http` 发起出站 HTTP 请求（不附带 curl 二进制）。当代理配置（标准环境变量 `http_proxy`、`https_proxy`、`all_proxy` 及其大写变体，或运行时代理覆盖）指定了 `std.http` 不支持的 scheme（如 `socks5://`）时，客户端初始化会立即报错失败（`error.UnsupportedProxyScheme`），请求被阻断，绝不静默绕过代理回退为直连（fail-closed）。非 Android 平台行为保持不变。
+Android 构建通过 `std.http` 发起出站 HTTP 请求（不附带 curl 二进制）。当代理配置（标准环境变量 `http_proxy`、`https_proxy`、`all_proxy` 及其大写变体，或运行时代理覆盖）指定了 `std.http` 不支持的 scheme（如 `socks5://`）时，客户端初始化会立即报错失败（`error.UnsupportedProxyScheme`），请求被阻断，绝不静默绕过代理回退为直连（fail-closed）。非 Android 平台行为保持不变。重定向沿用 curl 策略：只有不带调用方 header 的 GET 请求最多跟随三跳，每一跳都会校验；携带调用方 header 的请求会把 3xx 原样返回给调用方，而不是把这些 header 重放到其他源。
 
 ## 测试
 
