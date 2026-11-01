@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const appendJsonEscaped = @import("../util.zig").appendJsonEscaped;
 const http_util = @import("../http_util.zig");
@@ -413,6 +414,8 @@ test "composio no api key returns error" {
 }
 
 test "composio list action invokes curl" {
+    // Android: environment lacks public internet / test assumes curl
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default" };
     const t = ct.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"list\"}");
@@ -426,6 +429,8 @@ test "composio list action invokes curl" {
 }
 
 test "composio list with app filter invokes curl" {
+    // Android: environment lacks public internet / test assumes curl
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default" };
     const t = ct.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"list\", \"app\": \"gmail\"}");
@@ -447,6 +452,8 @@ test "composio execute missing action_name" {
 }
 
 test "composio execute with action_name invokes curl" {
+    // Android: environment lacks public internet / test assumes curl
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default" };
     const t = ct.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"execute\", \"action_name\": \"GMAIL_SEND\"}");
@@ -469,6 +476,8 @@ test "composio connect missing app" {
 }
 
 test "composio connect with app invokes curl" {
+    // Android: environment lacks public internet / test assumes curl
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     var ct = ComposioTool{ .api_key = "test-key", .entity_id = "default" };
     const t = ct.tool();
     const parsed = try root.parseTestArgs("{\"action\": \"connect\", \"app\": \"gmail\"}");

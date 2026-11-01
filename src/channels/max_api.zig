@@ -677,6 +677,8 @@ fn serveMaxStalledApi(ctx: *MaxStalledApiCtx) void {
 // a bounded error. Drives the real call site (editMessage -> bounded transport):
 // reverting it to the untimed, unbounded curlPut makes it hang/ReadFailed.
 test "max editMessage returns a bounded error on a stalled socket" {
+    // Android: production uses std.http, test assumes curl --max-time
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;

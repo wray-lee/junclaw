@@ -2338,6 +2338,8 @@ fn serveStalledSync(ctx: *StalledSyncServer) void {
 // time-bounded (curl --max-time) rather than falling back to the untimed
 // std.http client, which would park the poller until TCP keepalive (default 2h).
 test "MatrixChannel sync GET is time-bounded on a stalled socket" {
+    // Android: production uses std.http, test assumes curl --max-time
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
