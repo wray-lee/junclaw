@@ -562,7 +562,7 @@ pub fn registerTools(allocator: Allocator, list: *std.ArrayList(root.Tool), work
 }
 // ── Test helpers ────────────────────────────────────────────────────
 
-fn skipWithoutUnixSockets() !void {
+inline fn skipWithoutUnixSockets() !void {
     // Windows CI: this repo does not run AF_UNIX socket tests there (the
     // platform support varies by Windows build), so skip rather than flake.
     if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
