@@ -30,6 +30,13 @@ const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
     "/sys",
 };
 
+/// System-critical prefixes (Android) — includes Unix defaults plus Android read-only / system partitions.
+const SYSTEM_BLOCKED_PREFIXES_ANDROID = SYSTEM_BLOCKED_PREFIXES_UNIX ++ [_][]const u8{
+    "/system",
+    "/vendor",
+    "/apex",
+};
+
 /// System-critical prefixes (Windows).
 const SYSTEM_BLOCKED_PREFIXES_WINDOWS = [_][]const u8{
     "C:\\Windows",
@@ -45,11 +52,13 @@ pub fn systemBlockedPrefixesForAbi(
     comptime os_tag: std.Target.Os.Tag,
     comptime abi: std.Target.Abi,
 ) []const []const u8 {
-    _ = abi;
-    return if (os_tag == .windows)
-        &SYSTEM_BLOCKED_PREFIXES_WINDOWS
-    else
-        &SYSTEM_BLOCKED_PREFIXES_UNIX;
+    if (os_tag == .windows) {
+        return &SYSTEM_BLOCKED_PREFIXES_WINDOWS;
+    } else if (abi == .android) {
+        return &SYSTEM_BLOCKED_PREFIXES_ANDROID;
+    } else {
+        return &SYSTEM_BLOCKED_PREFIXES_UNIX;
+    }
 }
 
 /// Platform-selected system blocked prefixes.
