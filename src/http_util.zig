@@ -5205,6 +5205,66 @@ test "android std http maps connection refused to CurlConnectError" {
     );
 }
 
+const RedirectHeaderLeakCtx = struct {
+    server: *std_compat.net.Server,
+    location: []const u8,
+    accepts: u8,
+};
+
+fn serveRedirectHeaderLeak(ctx: *RedirectHeaderLeakCtx) void {
+    var accepted: u8 = 0;
+    while (accepted < ctx.accepts) : (accepted += 1) {
+        var conn = ctx.server.accept() catch return;
+        defer conn.stream.close();
+        var buf: [4096]u8 = undefined;
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const n = conn.stream.read(buf[filled..]) catch return;
+            if (n == 0) break;
+            filled += n;
+            if (std.mem.indexOf(u8, buf[0..filled], "\r\n\r\n") != null) break;
+        }
+        const request = buf[0..filled];
+        var head_buf: [512]u8 = undefined;
+        const response = if (std.mem.indexOf(u8, request, " /next ") != null)
+            std.fmt.bufPrint(&head_buf, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok", .{}) catch return
+        else
+            std.fmt.bufPrint(&head_buf, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{ctx.location}) catch return;
+        conn.stream.writeAll(response) catch {};
+    }
+}
+
+test "android std status request never replays caller headers across redirects" {
+    // Regression: httpRequestWithStatusAndHeadersInner used std's built-in
+    // redirect follow, which replayed extra_headers (Authorization) to the
+    // redirect target; a caller-header request must return the 3xx instead.
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: RedirectHeaderLeakCtx = .{
+        .server = &server,
+        .location = "http://127.0.0.1:1/next",
+        .accepts = 1,
+    };
+    const thread = try std.Thread.spawn(.{}, serveRedirectHeaderLeak, .{&ctx});
+    defer {
+        server.deinit();
+        thread.join();
+    }
+
+    const url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/start", .{server.listen_address.in.getPort()});
+    defer allocator.free(url);
+
+    const headers = [_][]const u8{"Authorization: Bearer test-key"};
+    const response = try httpRequestWithStatusAndHeaders(allocator, .GET, url, null, &headers, null, null);
+    defer allocator.free(response.headers);
+    defer allocator.free(response.body);
+
+    try std.testing.expectEqual(@as(u16, 302), response.status_code);
+}
+
 test "android std http rejects header injection before validating proxy" {
     // Regression: stdHttpRequest on Android must validate headers before proxy scheme
     try std.testing.expectError(
