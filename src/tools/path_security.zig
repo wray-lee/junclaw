@@ -4,6 +4,7 @@
 //! Extracted from file_edit.zig to eliminate cross-imports between tool files.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const std_compat = @import("compat");
 const fs_compat = @import("../fs_compat.zig");
 const path_prefix = @import("../path_prefix.zig");
@@ -29,6 +30,13 @@ const SYSTEM_BLOCKED_PREFIXES_UNIX = [_][]const u8{
     "/sys",
 };
 
+/// System-critical prefixes (Android) — includes Unix defaults plus Android read-only / system partitions.
+const SYSTEM_BLOCKED_PREFIXES_ANDROID = SYSTEM_BLOCKED_PREFIXES_UNIX ++ [_][]const u8{
+    "/system",
+    "/vendor",
+    "/apex",
+};
+
 /// System-critical prefixes (Windows).
 const SYSTEM_BLOCKED_PREFIXES_WINDOWS = [_][]const u8{
     "C:\\Windows",
@@ -40,10 +48,24 @@ const SYSTEM_BLOCKED_PREFIXES_WINDOWS = [_][]const u8{
 };
 
 /// Platform-selected system blocked prefixes.
-pub const SYSTEM_BLOCKED_PREFIXES: []const []const u8 = if (@import("builtin").os.tag == .windows)
-    &SYSTEM_BLOCKED_PREFIXES_WINDOWS
-else
-    &SYSTEM_BLOCKED_PREFIXES_UNIX;
+pub fn systemBlockedPrefixesForAbi(
+    comptime os_tag: std.Target.Os.Tag,
+    comptime abi: std.Target.Abi,
+) []const []const u8 {
+    if (os_tag == .windows) {
+        return &SYSTEM_BLOCKED_PREFIXES_WINDOWS;
+    } else if (abi == .android) {
+        return &SYSTEM_BLOCKED_PREFIXES_ANDROID;
+    } else {
+        return &SYSTEM_BLOCKED_PREFIXES_UNIX;
+    }
+}
+
+/// Platform-selected system blocked prefixes.
+pub const SYSTEM_BLOCKED_PREFIXES: []const []const u8 = systemBlockedPrefixesForAbi(
+    builtin.os.tag,
+    builtin.abi,
+);
 
 /// Check whether a directory-style prefix matches (exact or followed by a path separator).
 pub fn pathStartsWith(path: []const u8, prefix: []const u8) bool {
@@ -60,10 +82,28 @@ pub fn isResolvedPathAllowed(
     ws_resolved: []const u8,
     allowed_paths: []const []const u8,
 ) bool {
+    return isResolvedPathAllowedForAbi(
+        builtin.os.tag,
+        builtin.abi,
+        allocator,
+        resolved,
+        ws_resolved,
+        allowed_paths,
+    );
+}
+
+pub fn isResolvedPathAllowedForAbi(
+    comptime os_tag: std.Target.Os.Tag,
+    comptime abi: std.Target.Abi,
+    allocator: std.mem.Allocator,
+    resolved: []const u8,
+    ws_resolved: []const u8,
+    allowed_paths: []const []const u8,
+) bool {
     // macOS tmp dirs canonically live under /private/var/folders. Allow the
     // active workspace (or explicit allowed paths) there before the broader
     // /private/var blocklist check.
-    if (comptime @import("builtin").os.tag == .macos) {
+    if (comptime os_tag == .macos) {
         if (pathStartsWith(ws_resolved, MACOS_PRIVATE_VAR_FOLDERS_PREFIX) and
             pathStartsWith(resolved, ws_resolved))
         {
@@ -85,7 +125,7 @@ pub fn isResolvedPathAllowed(
     }
 
     // 1. System blocklist
-    for (SYSTEM_BLOCKED_PREFIXES) |prefix| {
+    for (systemBlockedPrefixesForAbi(os_tag, abi)) |prefix| {
         if (pathStartsWith(resolved, prefix)) return false;
     }
     // 2. Workspace
@@ -352,4 +392,27 @@ test "pathStartsWith windows accepts mixed separators and verbatim prefix" {
 
 test "pathStartsWith rejects partial" {
     try std.testing.expect(!pathStartsWith("/foo/barbaz", "/foo/bar"));
+}
+
+test "isResolvedPathAllowed blocks Android system partitions (/system, /vendor, /apex)" {
+    // Regression: on Android, /etc symlinks to /system/etc. SYSTEM_BLOCKED_PREFIXES_UNIX
+    // lacked /system, /vendor, and /apex, allowing allowed_paths to bypass the system blocklist.
+    if (comptime builtin.os.tag == .windows) return;
+
+    const partitions = [_][]const u8{
+        "/system/etc/passwd",
+        "/system/bin/sh",
+        "/vendor/etc/hosts",
+        "/apex/com.android.runtime/bin/linker64",
+    };
+    for (partitions) |path| {
+        try std.testing.expect(!isResolvedPathAllowedForAbi(
+            .linux,
+            .android,
+            std.testing.allocator,
+            path,
+            "/data/local/tmp/workspace",
+            &.{"*"},
+        ));
+    }
 }

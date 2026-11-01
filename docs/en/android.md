@@ -107,6 +107,10 @@ Android builds are packaged into the host application and are updated along with
 
 Device-specific approval is the host's responsibility; junclaw does not duplicate it. However, device tools are ordinary junclaw tools: the agent's `SecurityPolicy` (read-only autonomy, action rate limits, and any per-agent tool withholding) still applies before execution, and nothing in the bridge bypasses it.
 
+### Filesystem Sandbox
+
+On Android builds (`builtin.abi == .android`), `/system`, `/vendor`, and `/apex` are included in the system blocklist, preventing symlink targets (such as `/etc` resolving to `/system/etc`) from bypassing the security perimeter.
+
 ### Outbound HTTP and Proxy Safety
 
 Android builds route outbound HTTP requests through `std.http` without embedding a curl binary. When proxy configuration (standard environment variables `http_proxy`, `https_proxy`, `all_proxy`, uppercase variants, or runtime overrides) specifies an unsupported scheme such as `socks5://`, client initialization fails immediately (`error.UnsupportedProxyScheme`). The request is terminated and never silently bypasses the proxy to connect directly (fail-closed). On non-Android platforms, existing behavior is preserved. Redirects follow the same curl policy: only GET requests without caller headers follow up to three hops, each hop is validated, and a request carrying caller headers returns the 3xx response instead of replaying those headers to another origin.

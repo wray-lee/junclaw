@@ -107,6 +107,10 @@ Android 构建打包在宿主 App 内，随 APK 一同更新；`junclaw update` 
 
 设备能力的审批由宿主负责，junclaw 不重复审批。但设备工具仍是普通的 junclaw 工具：执行前照常经过 agent 的 `SecurityPolicy`（只读 autonomy、动作限流、按 agent 收窄工具等），桥接不会绕过这些通用限制。
 
+### 文件系统沙箱
+
+在 Android 构建（`builtin.abi == .android`）下，系统黑名单恒定包含 `/system`、`/vendor` 与 `/apex` 分区，防止符号链接目标（如 `/etc` 解析为 `/system/etc`）绕过安全沙箱门禁。
+
 ### 出站 HTTP 与代理安全
 
 Android 构建通过 `std.http` 发起出站 HTTP 请求（不附带 curl 二进制）。当代理配置（标准环境变量 `http_proxy`、`https_proxy`、`all_proxy` 及其大写变体，或运行时代理覆盖）指定了 `std.http` 不支持的 scheme（如 `socks5://`）时，客户端初始化会立即报错失败（`error.UnsupportedProxyScheme`），请求被阻断，绝不静默绕过代理回退为直连（fail-closed）。非 Android 平台行为保持不变。重定向沿用 curl 策略：只有不带调用方 header 的 GET 请求最多跟随三跳，每一跳都会校验；携带调用方 header 的请求会把 3xx 原样返回给调用方，而不是把这些 header 重放到其他源。
