@@ -1790,6 +1790,7 @@ fn httpRequestWithStatusAndHeadersInner(
         .body = body,
         .headers = headers,
         .content_type = content_type,
+        .proxy = proxy,
         .max_redirects = if (body == null) 3 else null,
         .accept_compression = true,
     };
@@ -5286,6 +5287,51 @@ test "android std status request never replays caller headers across redirects" 
     defer allocator.free(response.body);
 
     try std.testing.expectEqual(@as(u16, 302), response.status_code);
+}
+
+test "android std status request honors explicit proxy parameter" {
+    // Regression: httpRequestWithStatusAndHeadersInner omitted .proxy = proxy
+    // when building CurlRequestSpec, silently discarding the explicit proxy
+    // and connecting directly to the target server (fail-open).
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const addr = try std_compat.net.Address.parseIp4("127.0.0.1", 0);
+    var server = try addr.listen(.{});
+    var ctx: StdHttpTestServerCtx = .{ .server = &server, .body = "direct" };
+    var thread = try std.Thread.spawn(.{}, serveStdHttpTest, .{&ctx});
+    defer {
+        if (std_compat.net.tcpConnectToAddress(server.listen_address)) |stream| {
+            stream.close();
+        } else |_| {}
+        thread.join();
+        server.deinit();
+    }
+
+    const url = try std.fmt.allocPrint(
+        allocator,
+        "http://127.0.0.1:{d}/direct",
+        .{server.listen_address.in.getPort()},
+    );
+    defer allocator.free(url);
+
+    // Explicit unreachable proxy: if honored, connection to proxy fails with
+    // CurlConnectError. If discarded (bug), it connects direct to target server
+    // and returns 200 OK.
+    const result = httpRequestWithStatusAndHeaders(
+        allocator,
+        .GET,
+        url,
+        null,
+        &.{},
+        null,
+        "http://127.0.0.1:1",
+    );
+    if (result) |res| {
+        allocator.free(res.headers);
+        allocator.free(res.body);
+    } else |_| {}
+    try std.testing.expectError(error.CurlConnectError, result);
 }
 
 test "android std http rejects header injection before validating proxy" {
