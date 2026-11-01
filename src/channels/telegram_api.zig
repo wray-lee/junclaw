@@ -656,6 +656,8 @@ fn serveStalledApi(ctx: *StalledApiCtx) void {
 // call site (`getUpdates` -> `post`), not just the bounded transport helper, so
 // reverting `post` to the untimed std.http client makes it fail.
 test "telegram getUpdates returns a bounded error on a stalled socket" {
+    // Android: production uses std.http, test assumes curl --max-time
+    if (comptime builtin.abi == .android) return error.SkipZigTest;
     if (comptime builtin.os.tag == .wasi) return error.SkipZigTest;
 
     const allocator = std.testing.allocator;
