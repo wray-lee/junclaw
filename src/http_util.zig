@@ -1790,6 +1790,7 @@ fn httpRequestWithStatusAndHeadersInner(
         .body = body,
         .headers = headers,
         .content_type = content_type,
+        .proxy = proxy,
         .max_redirects = if (body == null) 3 else null,
         .accept_compression = true,
     };
