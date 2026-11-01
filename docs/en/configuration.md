@@ -738,7 +738,7 @@ Notes:
 
 - Channel config lives under `channels.<name>`.
 - Multi-account channels typically use an `accounts` wrapper.
-- Inbound attachments downloaded by the Signal, WhatsApp, Mattermost, and Discord channels are written to the platform temp directory under `nullclaw-spool/`. Each file is deleted once its inbound message has been processed, whether the turn succeeded or failed; leftovers older than 24 hours are swept when the channel starts and on its existing poll/heartbeat (no extra thread is started). Sweeps only touch that subdirectory.
+- Inbound attachments downloaded by the Signal, WhatsApp, Mattermost, and Discord channels are written to the platform temp directory under `nullclaw-spool/` (spool location is `TMPDIR/nullclaw-spool`, falling back to `/tmp/nullclaw-spool` when `TMPDIR` is unset; on macOS this resolves to a per-user directory). Each file is deleted once its inbound message has been processed, whether the turn succeeded or failed; leftovers older than 24 hours are swept when the channel starts and on its existing poll/heartbeat (no extra thread is started). Sweeps only touch that subdirectory. Legacy leftover files in `/tmp/nullclaw-spool` are no longer swept automatically and can be deleted manually.
 
 External channel plugin example:
 
@@ -815,6 +815,8 @@ Telegram example:
   }
 }
 ```
+
+> **Warning**: The bot token appears in every request URL sent to the `api_base` host; configure only trusted hosts.
 
 WeChat example:
 
@@ -1126,7 +1128,7 @@ Rules:
 - Empty `allow_from` denies inbound messages on allowlist-based channels. Set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 - Telegram webhooks require `channels.telegram.accounts.<id>.webhook_secret` and Telegram's `X-Telegram-Bot-Api-Secret-Token` header to match.
-- Optional `api_base` (defaults to `"https://api.telegram.org"`) overrides the Telegram Bot API endpoint for local mocks or self-hosted Bot API servers.
+- Optional `api_base` (defaults to `"https://api.telegram.org"`) overrides the Telegram Bot API endpoint for local mocks or self-hosted Bot API servers. **Warning**: the bot token appears in every request URL sent to the `api_base` host; configure only trusted hosts.
 - Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams.accounts.<id>.webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
