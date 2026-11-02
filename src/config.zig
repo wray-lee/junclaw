@@ -1848,7 +1848,7 @@ pub const Config = struct {
         }
         for (self.channels.telegram) |telegram_cfg| {
             if (telegram_cfg.api_base) |api_base| {
-                if (!config_types.TelegramConfig.isValidApiBase(api_base)) {
+                if (api_base.len > 256 or !config_types.TelegramConfig.isValidApiBase(api_base)) {
                     return ValidationError.InvalidTelegramApiBase;
                 }
             }
@@ -1921,7 +1921,7 @@ pub const Config = struct {
             ValidationError.InvalidWebTransport => std.debug.print("Config error: channels.web.accounts.<id>.transport must be 'local' or 'relay'.\n", .{}),
             ValidationError.InvalidWebPath => std.debug.print("Config error: channels.web.accounts.<id>.path must start with '/'.\n", .{}),
             ValidationError.InvalidWebAuthToken => std.debug.print("Config error: channels.web.accounts.<id>.auth_token/relay_token must be 16-128 printable chars without whitespace.\n", .{}),
-            ValidationError.InvalidTelegramApiBase => std.debug.print("Config error: channels.telegram.accounts.<id>.api_base must be a valid http:// or https:// URL.\n", .{}),
+            ValidationError.InvalidTelegramApiBase => std.debug.print("Config error: channels.telegram.accounts.<id>.api_base must be a valid http:// or https:// URL of at most 256 bytes.\n", .{}),
             ValidationError.InvalidTelegramWebhookSecret => std.debug.print("Config error: channels.telegram.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidTeamsWebhookSecret => std.debug.print("Config error: channels.teams.accounts.<id>.webhook_secret must be 16-128 printable chars without whitespace when provided.\n", .{}),
             ValidationError.InvalidWebMessageAuthMode => std.debug.print("Config error: channels.web.accounts.<id>.message_auth_mode must be 'pairing' or 'token'.\n", .{}),

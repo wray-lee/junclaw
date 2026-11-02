@@ -1128,7 +1128,7 @@ Rules:
 - Empty `allow_from` denies inbound messages on allowlist-based channels. Set explicit IDs/OpenIDs for a private bot.
 - `allow_from: ["*"]` allows all sources on allowlist-based channels; use it only when you intentionally want an open bot.
 - Telegram webhooks require `channels.telegram.accounts.<id>.webhook_secret` and Telegram's `X-Telegram-Bot-Api-Secret-Token` header to match.
-- Optional `api_base` (defaults to `"https://api.telegram.org"`) overrides the Telegram Bot API endpoint for local mocks or self-hosted Bot API servers. **Warning**: the bot token appears in every request URL sent to the `api_base` host; configure only trusted hosts.
+- Optional `api_base` (defaults to `"https://api.telegram.org"`, at most 256 bytes) overrides the Telegram Bot API endpoint for local mocks or self-hosted Bot API servers. **Warning**: the bot token appears in every request URL sent to the `api_base` host; configure only trusted hosts.
 - Teams inbound webhooks are authenticated with Bot Framework JWT bearer tokens against Microsoft's OpenID metadata. `channels.teams.accounts.<id>.webhook_secret` is optional and, when set, acts as an additional `X-Webhook-Secret` check.
 
 Max example:
