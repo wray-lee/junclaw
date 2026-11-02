@@ -3606,6 +3606,47 @@ test "validation rejects invalid telegram api_base" {
     try std.testing.expectError(Config.ValidationError.InvalidTelegramApiBase, cfg.validate());
 }
 
+// Regression: 超长 api_base 通过校验，运行期组装 URL 才失败
+test "validation rejects telegram api_base exceeding 256 bytes" {
+    const telegram_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "default",
+            .bot_token = "123:ABC",
+            .api_base = "https://a.example/" ++ ("a" ** 256),
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+        },
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidTelegramApiBase, cfg.validate());
+}
+
+test "validation accepts telegram api_base of exactly 256 bytes" {
+    const telegram_accounts = [_]config_types.TelegramConfig{
+        .{
+            .account_id = "default",
+            .bot_token = "123:ABC",
+            .api_base = "https://a.example/" ++ ("a" ** (256 - 18)),
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .allocator = std.testing.allocator,
+        .channels = .{
+            .telegram = &telegram_accounts,
+        },
+    };
+    try cfg.validate();
+}
+
 test "validation rejects malformed telegram webhook secret" {
     const telegram_accounts = [_]config_types.TelegramConfig{
         .{
