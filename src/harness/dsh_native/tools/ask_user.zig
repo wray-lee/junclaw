@@ -159,6 +159,20 @@ test "register binds the generated ask_user_question schema" {
     try testing.expectError(error.DuplicateTool, register(&context, &reg, testing.allocator));
 }
 
+test "generated ask_user_question description is the rc.1 base sentence plus skipped-answer guidance" {
+    // dsh-v0.2.2-rc.1 tool-ask-user/src/index.ts:31-32 composes the base
+    // sentence with timed.ts:28-29 skippedAnswerGuidance; the single trailing
+    // space after the base sentence is part of the model-visible bytes.
+    // Regression: before rc.1 the generated description was the base sentence
+    // alone, so a regeneration could silently drop the skip guidance.
+    try testing.expectEqualStrings(
+        "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding. " ++
+            "An answer item with empty selected and no custom means the user skipped that question: " ++
+            "continue without it, do not ask it again, and do not treat the skip as permission.",
+        ask_text.description,
+    );
+}
+
 test "handler fails closed without a host channel" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
