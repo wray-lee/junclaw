@@ -30,6 +30,7 @@ pub const section_orders = struct {
     pub const TOOL_READ: i32 = 1100;
     pub const TOOL_WRITE: i32 = 1200;
     pub const TOOL_EDIT: i32 = 1300;
+    pub const TOOL_APPLY_PATCH: i32 = 1350;
     pub const TOOL_GLOB: i32 = 1400;
     pub const TOOL_GREP: i32 = 1500;
     pub const TOOL_JOBS: i32 = 1600;
@@ -39,6 +40,7 @@ pub const section_orders = struct {
     pub const TOOL_LSP: i32 = 2200;
     pub const TOOL_SESSION_QUERY: i32 = 2300;
     pub const TOOL_GOAL: i32 = 2400;
+    pub const TOOL_SCHEDULE: i32 = 2500;
     pub const TOOL_WORKFLOW: i32 = 2600;
     pub const TOOL_RALPH: i32 = 2700;
     pub const TOOL_SUBAGENT: i32 = 2800;
@@ -63,36 +65,38 @@ pub const SectionOrderSource = struct {
 };
 
 pub const section_order_sources = [_]SectionOrderSource{
-    .{ .name = "HARNESS_IDENTITY", .line_start = 132, .line_end = 132, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "DEPLOYMENT_PERSONA_PREFIX", .line_start = 133, .line_end = 133, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "PLAN_POLICY", .line_start = 134, .line_end = 134, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TEAM_POLICY", .line_start = 135, .line_end = 135, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "PTC_ONLY", .line_start = 136, .line_end = 136, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "FILE_REFERENCE", .line_start = 137, .line_end = 137, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_BASH", .line_start = 138, .line_end = 138, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_PWSH", .line_start = 139, .line_end = 139, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_READ", .line_start = 140, .line_end = 140, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_WRITE", .line_start = 141, .line_end = 141, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_EDIT", .line_start = 142, .line_end = 142, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_GLOB", .line_start = 143, .line_end = 143, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_GREP", .line_start = 144, .line_end = 144, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_JOBS", .line_start = 145, .line_end = 145, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_PTY", .line_start = 146, .line_end = 146, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_WEB_SEARCH", .line_start = 147, .line_end = 147, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_WEB_FETCH", .line_start = 148, .line_end = 148, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_LSP", .line_start = 149, .line_end = 149, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_SESSION_QUERY", .line_start = 150, .line_end = 150, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_GOAL", .line_start = 151, .line_end = 151, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_WORKFLOW", .line_start = 152, .line_end = 152, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_RALPH", .line_start = 153, .line_end = 153, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_SUBAGENT", .line_start = 154, .line_end = 154, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_REPORT", .line_start = 155, .line_end = 155, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOL_COMPUTER_USE", .line_start = 156, .line_end = 156, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "MCP_SERVERS", .line_start = 157, .line_end = 157, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "TOOLS_SDK", .line_start = 158, .line_end = 158, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "DELIVERABLE_FILE_REFERENCES", .line_start = 159, .line_end = 159, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "STRUCTURED_OUTPUT", .line_start = 160, .line_end = 160, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "HARNESS_SOURCE", .line_start = 162, .line_end = 162, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "WEB_SURFACE", .line_start = 163, .line_end = 163, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
-    .{ .name = "DEPLOYMENT_PERSONA_SUFFIX", .line_start = 164, .line_end = 164, .source_sha256 = "9e254cddc9ef00072f9205950405ba8650bc43c8809fba6162da93253efc7f71" },
+    .{ .name = "HARNESS_IDENTITY", .line_start = 137, .line_end = 137, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "DEPLOYMENT_PERSONA_PREFIX", .line_start = 138, .line_end = 138, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "PLAN_POLICY", .line_start = 139, .line_end = 139, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TEAM_POLICY", .line_start = 140, .line_end = 140, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "PTC_ONLY", .line_start = 141, .line_end = 141, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "FILE_REFERENCE", .line_start = 142, .line_end = 142, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_BASH", .line_start = 143, .line_end = 143, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_PWSH", .line_start = 144, .line_end = 144, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_READ", .line_start = 145, .line_end = 145, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_WRITE", .line_start = 146, .line_end = 146, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_EDIT", .line_start = 147, .line_end = 147, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_APPLY_PATCH", .line_start = 148, .line_end = 148, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_GLOB", .line_start = 149, .line_end = 149, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_GREP", .line_start = 150, .line_end = 150, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_JOBS", .line_start = 151, .line_end = 151, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_PTY", .line_start = 152, .line_end = 152, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_WEB_SEARCH", .line_start = 153, .line_end = 153, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_WEB_FETCH", .line_start = 154, .line_end = 154, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_LSP", .line_start = 155, .line_end = 155, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_SESSION_QUERY", .line_start = 156, .line_end = 156, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_GOAL", .line_start = 157, .line_end = 157, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_SCHEDULE", .line_start = 158, .line_end = 158, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_WORKFLOW", .line_start = 159, .line_end = 159, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_RALPH", .line_start = 160, .line_end = 160, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_SUBAGENT", .line_start = 161, .line_end = 161, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_REPORT", .line_start = 162, .line_end = 162, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOL_COMPUTER_USE", .line_start = 163, .line_end = 163, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "MCP_SERVERS", .line_start = 164, .line_end = 164, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "TOOLS_SDK", .line_start = 165, .line_end = 165, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "DELIVERABLE_FILE_REFERENCES", .line_start = 166, .line_end = 166, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "STRUCTURED_OUTPUT", .line_start = 167, .line_end = 167, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "HARNESS_SOURCE", .line_start = 169, .line_end = 169, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "WEB_SURFACE", .line_start = 170, .line_end = 170, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
+    .{ .name = "DEPLOYMENT_PERSONA_SUFFIX", .line_start = 171, .line_end = 171, .source_sha256 = "1c12dce4d2781be211695b199560602fa2fc7cc86f68672e656ea61d1ceda1a9" },
 };
