@@ -16,14 +16,16 @@
 //! baseline it replaces.
 //!
 //! The dsh context templates are reproduced here verbatim with source
-//! references because `generated/` (P1a codegen) currently emits system-prompt
-//! and tool text only. Do not paraphrase them: tests pin the exact bytes.
+//! references. The approval sentences come from `generated.interaction.approval`;
+//! the rest are inline because `generated/` (P1a codegen) does not cover them.
+//! Do not paraphrase them: tests pin the exact bytes.
 
 const std = @import("std");
 const compat = @import("compat");
 const config_types = @import("../../config_types.zig");
 const fs_compat = @import("../../fs_compat.zig");
 const bootstrap_mod = @import("../../bootstrap/root.zig");
+const generated = @import("generated/interaction.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -166,12 +168,8 @@ pub fn approvalPolicySection(policy: ApprovalPolicy) Section {
         .name = "approval:policy",
         .order = ContextOrder.approval_policy,
         .text = switch (policy) {
-            .never =>
-            // Verbatim dsh sentence.
-            "Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).",
-            .ask =>
-            // Verbatim dsh sentence.
-            "Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.",
+            .never => generated.approval.never_sentence,
+            .ask => generated.approval.ask_sentence,
         },
     };
 }
@@ -1317,6 +1315,18 @@ test "runtime context tracker emits once per change and clears with the fixed te
     var restored = (try tracker.project(allocator, &initial)).?;
     defer restored.deinit(allocator);
     try std.testing.expect(restored.source == .snapshot);
+}
+
+test "runtime context approval policy sentences match dsh-v0.2.2-rc.1" {
+    // dsh-v0.2.2-rc.1 packages/interaction/user-approval/src/index.ts:74/76
+    try std.testing.expectEqualStrings(
+        "Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).",
+        approvalPolicySection(.never).text,
+    );
+    try std.testing.expectEqualStrings(
+        "Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.",
+        approvalPolicySection(.ask).text,
+    );
 }
 
 test "runtime context renders paths over 64 KiB without leaking" {
