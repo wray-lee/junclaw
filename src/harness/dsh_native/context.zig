@@ -160,7 +160,7 @@ pub fn sandboxPolicySection(
     return .{ .name = "sandbox:policy", .order = ContextOrder.sandbox_policy, .text = text };
 }
 
-/// Approval-policy sentence (user-approval/src/index.ts:73-75).
+/// Approval-policy sentence (user-approval/src/index.ts:74-76).
 pub fn approvalPolicySection(policy: ApprovalPolicy) Section {
     return .{
         .name = "approval:policy",
@@ -171,7 +171,7 @@ pub fn approvalPolicySection(policy: ApprovalPolicy) Section {
             "Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).",
             .ask =>
             // Verbatim dsh sentence.
-            "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.",
+            "Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.",
         },
     };
 }
@@ -1272,7 +1272,7 @@ test "runtime context snapshot joins ordered sections with dsh framing" {
         "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n\n" ++
             "Current working directory: \"/work/a b\".\n\n" ++
             "Current DSH file policy: workspace-write. Any available operation enforced by the DSH file sandbox may modify files under the session workspace: \"/work/a b\". Some platform temporary areas may also be writable.\n\n" ++
-            "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.",
+            "Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.",
         text,
     );
 
