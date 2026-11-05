@@ -6,8 +6,8 @@
 
 pub const approval = struct {
     pub const never_sentence = "Approval prompts are disabled in this session: actions that require approval are rejected automatically — do not request sandbox escalation (do not set `sandbox_permissions`).";
-    pub const ask_sentence = "Approval policy: ask. Operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.";
-    pub const policy_change_notice = "The approval policy changed from \"{s}\" to \"{s}\" (changed by the user).";
+    pub const ask_sentence = "Approval prompts are enabled in this session: operations that require approval may ask through the configured answerers; without an available answerer, the request fails closed.";
+    pub const policy_change_notice = "The user changed the approval policy from \"{s}\" to \"{s}\".";
     pub const deny_no_service = "tool \"{s}\" requires approval (not yet supported)";
     pub const deny_no_agent = "tool \"{s}\" requires approval, but the call has no agent to route it through";
     pub const deny_rejected = "the user rejected tool \"{s}\"";
@@ -17,7 +17,7 @@ pub const approval = struct {
 
 pub const ask_user_question = struct {
     pub const name = "ask_user_question";
-    pub const description = "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding.";
+    pub const description = "Ask the user a concise question when you need confirmation, a choice, or missing information before proceeding. An answer item with empty selected and no custom means the user skipped that question: continue without it, do not ask it again, and do not treat the skip as permission.";
     pub const input_schema_json = "{\"type\":\"object\",\"properties\":{\"questions\":{\"type\":\"array\",\"description\":\"Questions to ask the user before continuing.\",\"items\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"id\":{\"type\":\"string\",\"description\":\"Stable id for this question; echoed in the answer.\"},\"question\":{\"type\":\"string\",\"description\":\"The specific question to ask the user.\"},\"header\":{\"type\":\"string\",\"description\":\"Optional short heading for the question, such as \\\"Confirm\\\" or \\\"Choose Mode\\\".\"},\"options\":{\"type\":\"array\",\"description\":\"Optional choices to show the user. If you recommend one, put it first and append \\\"(Recommended)\\\" to that label.\",\"items\":{\"type\":\"object\",\"additionalProperties\":true,\"properties\":{\"label\":{\"type\":\"string\",\"description\":\"Short user-facing option label.\"},\"description\":{\"type\":\"string\",\"description\":\"One sentence explaining the tradeoff or impact.\"}},\"required\":[\"label\"]}},\"multi_select\":{\"type\":\"boolean\",\"description\":\"Whether the user may select more than one option. Defaults to false.\"}},\"required\":[\"id\",\"question\"]}}},\"required\":[\"questions\"]}";
 };
 
@@ -36,11 +36,11 @@ pub const plan_mode = struct {
     pub const narration_off = "The user switched this session back to the default mode.";
     pub const exit_approved_result = "Plan approved — plan mode exited; carry out the plan starting with your next step.";
     pub const exit_dismissed_result = "The user dismissed the plan review to reply in their own words; plan mode remains active.";
-    pub const exit_requires_agent = "{s} requires a calling agent (no session to switch)";
     pub const exit_requires_plan_mode = "{s} is only available in plan mode";
     pub const exit_requires_heading = "{s} requires a non-empty markdown plan starting with a # heading";
     pub const exit_no_channel = "no user-questions channel is available to review the plan; ask the user to switch the session mode instead";
     pub const exit_reloaded = "the plan-mode service was reloaded while the plan was under review; present the plan again";
     pub const exit_keep_planning = "The user chose to keep planning; revise the plan and present it again.";
     pub const exit_keep_planning_feedback = "The user chose to keep planning; their feedback: {s}";
+    pub const exit_requires_agent = "{s} requires a calling agent (no session to switch)";
 };

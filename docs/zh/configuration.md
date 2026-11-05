@@ -239,8 +239,8 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 - `agent.dsh_home`（字符串，默认 `<配置目录>/.dsh`）：dsh home 根目录。会话 JSONL 日志放在它下面；会话键映射放在 `agent.dsh_session_dir` 下。
 - `agent.dsh_session_dir`（字符串，默认 `<配置目录>/dsh-sessions`）：每个宿主会话键对应的 dsh 会话 id 的持久化目录。
-- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：控制执行前的审批门禁。只有请求 `sandbox_permissions` 升级的调用会在参数校验之后请求审批；普通工具调用不会询问。`"ask"` 向宿主通道发起询问；`"never"` 不询问直接拒绝。所有分支都是 fail-closed：没有可用通道、通道报错、用户取消或明确拒绝都会拒绝该调用，并把拒绝原因返回给模型；每次请求恰好写入一对 `approval/asked` + `approval/decided` 事件。即使升级获批，命令仍按当前沙箱级别执行：进程内引擎会记录 `sandboxRequest`，但尚未放宽权限。非交互回合（cron、heartbeat、webhook、A2A）尚未强制按 `"never"` 处理；该规则尚未执行。
-- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的文件策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。进程内引擎对其文件工具执行该模式：所有模式都保持 junclaw 的边界（工作区加 `autonomy.allowed_paths`，解析符号链接，系统路径始终拒绝），`read-only` 额外拒绝 `write` 与 `edit`，`danger-full-access` 不会放宽 junclaw 的边界。该模式不覆盖 `bash`，见下方策略段落。
+- `agent.dsh_approval_policy`（`"ask"` | `"never"`，默认 `"ask"`）：控制执行前的审批门禁。只有请求比会话当前模式更宽的 `sandbox_permissions` 的调用会在参数校验之后请求审批；普通工具调用不会询问。重复当前模式、或省略 `sandbox_permissions` 都算普通调用：不要求 `justification`，也不记录审批；没有 `sandbox_permissions` 时空白 `justification` 被忽略，非空 `justification` 则被拒绝。不同模式仍要求非空 `justification`。`"ask"` 向宿主通道发起询问；`"never"` 不询问直接拒绝。所有分支都是 fail-closed：没有可用通道、通道报错、用户取消或明确拒绝都会拒绝该调用，并把拒绝原因返回给模型；每次请求恰好写入一对 `approval/asked` + `approval/decided` 事件。即使升级获批，命令仍按当前沙箱级别执行：进程内引擎会记录 `sandboxRequest`，但尚未放宽权限。非交互回合（cron、heartbeat、webhook、A2A）尚未强制按 `"never"` 处理；该规则尚未执行。
+- `agent.dsh_sandbox`（`"read-only"` | `"workspace-write"` | `"danger-full-access"`，默认 `"workspace-write"`）：模型看到的文件策略文案，同时写入会话 JSONL 的 `sandbox/mode` 事件。取值与 dsh 的 `SandboxMode` 名称完全一致。进程内引擎对其文件工具执行该模式：所有模式都保持 junclaw 的边界（工作区加 `autonomy.allowed_paths`，解析符号链接，系统路径始终拒绝），`read-only` 额外拒绝 `write` 与 `edit`，`danger-full-access` 不会放宽 junclaw 的边界。该模式还决定 `bash` 中哪些 `sandbox_permissions` 算作重复当前模式，除此之外不限制 `bash`；见下方策略段落。
 - `agent.dsh_max_parallel_tools`（大于 0 的整数，默认 `10`）：并行工具池大小。dsh 自身的默认值就是 10；设得过大将提高 provider 侧并发与超时风险。
 - `agent.dsh_persona`（字符串，默认未设置）：追加到 dsh 系统提示的 persona 文本。未设置时保留 dsh 内置身份。
 - `agent.dsh_on_corrupt`（`"fail"` | `"native"`，默认 `"fail"`）：dsh JSONL 日志无法读取或修复时的行为。`fail` 拒绝该回合并报告解析错误；`native` 新建一个空的 dsh 会话并在其中继续。进程内引擎创建时不会回填 junclaw 存储的 native 历史，因此上下文从零开始。
@@ -252,7 +252,7 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 比例不是数字或越界、`retain_ratio >= threshold_ratio`，以及非零 context window 下 `headroom_tokens >= context_window` 也会在加载配置时报错。
 
-进程内引擎对自己的工具执行 junclaw 安全策略，因此 dsh 会话不会比 native 更宽。每个工具调用都通过 native 的 autonomy 门禁（`read_only` 级别拒绝执行）和每小时动作上限。`read`、`write`、`edit`、`grep`、`glob`、`bash` 都把路径解析到工作区与 `autonomy.allowed_paths`（符号链接会被规范化），并始终拒绝系统路径；`read` 与 `grep` 额外可读 dsh 自己的 spill 目录，因为 dsh 会把这些截断输出文件告知模型。`bash` 命令通过与 native shell 工具相同的 `allowed_commands` 白名单与低/中/高风险检查，模型提供的 `workdir` 也必须落在同一路径边界内。native 工具需要执行审批时，进程内引擎直接拒绝：它目前没有执行审批通道。
+进程内引擎对自己的工具执行 junclaw 安全策略，因此 dsh 会话不会比 native 更宽。每个工具调用都通过 native 的 autonomy 门禁（`read_only` 级别拒绝执行）和每小时动作上限。`read`、`write`、`edit`、`grep`、`glob`、`bash` 都把路径解析到工作区与 `autonomy.allowed_paths`（符号链接会被规范化），并始终拒绝系统路径；`read` 与 `grep` 额外可读 dsh 自己的 spill 目录，因为 dsh 会把这些截断输出文件告知模型。`read`、`write`、`edit`、`grep`、`glob` 会把路径开头的 `~` 或 `~/`（Windows 上还有 `~\`）展开为宿主主目录，与 dsh 的本地文件提供者一致；路径中间出现的 `~` 与 `~user` 前缀保持字面，边界检查针对展开后的路径执行。`bash` 的 workdir 不做展开。`bash` 命令通过与 native shell 工具相同的 `allowed_commands` 白名单与低/中/高风险检查，模型提供的 `workdir` 也必须落在同一路径边界内。`bash` 的升级参数遵循 dsh 的矩阵：`sandbox_permissions` 等于会话当前模式时不需要 `justification`、也不走审批；省略模式且 `justification` 省略或空白属于普通调用；更宽的模式仍需非空 `justification`，并照常经过审批门禁。native 工具需要执行审批时，进程内引擎直接拒绝：它目前没有执行审批通道。
 
 P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `dsh`；`dsh-sidecar` 与 `-Dharness_dsh` 构建的行为不变。该引擎提供审批门禁、用户提问、自动压缩和以下 dsh 斜杠命令：
 

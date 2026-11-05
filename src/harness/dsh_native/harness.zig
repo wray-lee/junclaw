@@ -520,6 +520,7 @@ pub const DshNativeHarness = struct {
             .cwd = dir,
             .spill_dir = self.spill_dir,
             .allowed_paths = self.opts.allowed_paths,
+            .sandbox = self.sandboxMode(),
         };
         try self.registry.register(self.allocator, .{
             .name = generated.bash.name,
@@ -3383,10 +3384,13 @@ pub const DshNativeHarness = struct {
         };
     }
 
-    /// Push the folded sandbox mode into the file tools, so `/permission` and
-    /// resume change enforcement rather than only the prompt sentence.
+    /// Push the folded sandbox mode into the file and bash tools, so
+    /// `/permission` and resume change enforcement and escalation validation
+    /// rather than only the prompt sentence.
     fn syncToolSandbox(self: *Self) void {
-        if (self.builtins) |builtins| builtins.sandbox = self.sandboxMode();
+        const mode = self.sandboxMode();
+        if (self.builtins) |builtins| builtins.sandbox = mode;
+        if (self.bash) |bash| bash.sandbox = mode;
     }
 
     fn approvalPolicy(self: *const Self) context.ApprovalPolicy {
@@ -3470,10 +3474,14 @@ pub const DshNativeHarness = struct {
             else => return null,
         };
         const escalation = object.get("sandbox_permissions") orelse return null;
-        switch (escalation) {
-            .string => |mode| if (mode.len == 0) return null,
+        const requested = switch (escalation) {
+            .string => |mode| mode,
             else => return null,
-        }
+        };
+        if (requested.len == 0) return null;
+        // dsh `approveEscalation`: repeating the standing mode returns it
+        // without an approval prompt.
+        if (std.mem.eql(u8, requested, bash_mod.sandboxModeName(self.sandboxMode()))) return null;
         const reason = switch (object.get("justification") orelse Value{ .null = {} }) {
             .string => |text| text,
             else => "",

@@ -13,6 +13,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
+const context_mod = @import("../context.zig");
 const platform = @import("../../../platform.zig");
 const shell_mod = @import("../../../tools/shell.zig");
 const registry = @import("registry.zig");
@@ -38,6 +39,9 @@ pub const Context = struct {
     spill_dir: ?[]const u8 = null,
     /// `autonomy.allowed_paths`: extra roots a model-supplied workdir may use.
     allowed_paths: []const []const u8 = &.{},
+    /// The session's standing sandbox mode (dsh `ctx.shell.sandboxMode`),
+    /// refreshed by the harness when `/permission` or a restore changes it.
+    sandbox: context_mod.SandboxMode = .workspace_write,
 
     pub fn handler(self: *Context) registry.Handler {
         return .{ .context = self, .call = call };
@@ -62,11 +66,21 @@ const Args = struct {
 const ParseIssue = struct { code: []const u8, message: []const u8 };
 const ParseResult = union(enum) { ok: Args, invalid: ParseIssue };
 
+/// Wire name of a standing sandbox mode (dsh `SandboxMode`), shared with the
+/// harness gate so a repeated mode costs no approval prompt.
+pub fn sandboxModeName(mode: context_mod.SandboxMode) []const u8 {
+    return switch (mode) {
+        .read_only => "read-only",
+        .workspace_write => "workspace-write",
+        .danger_full_access => "danger-full-access",
+    };
+}
+
 fn invalid(message: []const u8) ParseResult {
     return .{ .invalid = .{ .code = "INVALID_ARGUMENTS", .message = message } };
 }
 
-fn parseArgs(value: Value) ParseResult {
+fn parseArgs(context: *const Context, value: Value) ParseResult {
     const obj = switch (value) {
         .object => |obj| obj,
         else => return invalid("tool arguments must be a JSON object"),
@@ -121,6 +135,9 @@ fn parseArgs(value: Value) ParseResult {
         if (!std.mem.eql(u8, mode, "workspace-write") and !std.mem.eql(u8, mode, "danger-full-access")) {
             return invalid("invalid sandbox_permissions: expected workspace-write or danger-full-access");
         }
+        // dsh `validateBashArgs`: repeating the standing mode is a normal call —
+        // no justification, no approval — and keeps the accepted value as given.
+        if (std.mem.eql(u8, mode, sandboxModeName(context.sandbox))) return .{ .ok = args };
         const reason = args.justification orelse return invalid("invalid escalation: sandbox_permissions requires a justification");
         if (std.mem.trim(u8, reason, " \t\r\n").len == 0) return invalid("invalid justification: expected a non-empty sentence");
     } else if (args.justification) |reason| {
@@ -135,7 +152,7 @@ fn parseArgs(value: Value) ParseResult {
 }
 
 pub fn invoke(context: *const Context, allocator: Allocator, value: Value) anyerror!registry.ToolResult {
-    const args = switch (parseArgs(value)) {
+    const args = switch (parseArgs(context, value)) {
         .ok => |args| args,
         .invalid => |issue| return failure(allocator, issue.code, issue.message),
     };
@@ -468,6 +485,11 @@ fn streamMeta(allocator: Allocator, stream: Stream) !Value {
 
 const testing = std.testing;
 
+fn parseArgsStanding(mode: context_mod.SandboxMode, value: Value) ParseResult {
+    const context: Context = .{ .sandbox = mode };
+    return parseArgs(&context, value);
+}
+
 fn parse(allocator: Allocator, text: []const u8) !std.json.Parsed(Value) {
     return std.json.parseFromSlice(Value, allocator, text, .{});
 }
@@ -524,6 +546,61 @@ test "bash requires non-empty command and description" {
     }
 }
 
+test "bash follows the dsh escalation matrix against the standing mode" {
+    // Regression: dsh 0.2.2 accepts a repeated or omitted sandbox mode without
+    // a justification (`validateBashArgs`); the port demanded a sentence for
+    // every `sandbox_permissions` call and only the gate could reject it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const Case = struct {
+        standing: context_mod.SandboxMode,
+        json: []const u8,
+        /// null = accepted; otherwise the rejection needle.
+        needle: ?[]const u8 = null,
+        /// Expected parsed justification when accepted.
+        justification: ?[]const u8 = null,
+    };
+    const cases = [_]Case{
+        // Repeating the standing mode: no justification required, none normalized.
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"workspace-write\"}" },
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"workspace-write\",\"justification\":\"   \"}", .justification = "   " },
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"workspace-write\",\"justification\":\"kept\"}", .justification = "kept" },
+        .{ .standing = .danger_full_access, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"danger-full-access\"}" },
+        // An omitted mode with an omitted or blank justification is a normal call.
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\"}" },
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"justification\":\"   \"}" },
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"justification\":\"because\"}", .needle = "justification is only valid together with sandbox_permissions" },
+        // A different mode still needs a non-empty sentence and the approval gate.
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"danger-full-access\"}", .needle = "sandbox_permissions requires a justification" },
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"danger-full-access\",\"justification\":\"  \"}", .needle = "invalid justification: expected a non-empty sentence" },
+        .{ .standing = .read_only, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"workspace-write\"}", .needle = "sandbox_permissions requires a justification" },
+        .{ .standing = .read_only, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"workspace-write\",\"justification\":\"widen once\"}", .justification = "widen once" },
+        // Invalid targets stay invalid, including the non-target standing mode.
+        .{ .standing = .workspace_write, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"root\",\"justification\":\"because\"}", .needle = "invalid sandbox_permissions: expected workspace-write or danger-full-access" },
+        .{ .standing = .read_only, .json = "{\"description\":\"d\",\"command\":\"true\",\"sandbox_permissions\":\"read-only\",\"justification\":\"because\"}", .needle = "invalid sandbox_permissions: expected workspace-write or danger-full-access" },
+    };
+    for (cases) |case| {
+        var parsed = try parse(allocator, case.json);
+        defer parsed.deinit();
+        switch (parseArgsStanding(case.standing, parsed.value)) {
+            .ok => |args| {
+                if (case.needle != null) return error.ExpectedRejection;
+                if (case.justification) |expected| {
+                    try testing.expectEqualStrings(expected, args.justification orelse return error.MissingJustification);
+                } else {
+                    try testing.expect(args.justification == null);
+                }
+            },
+            .invalid => |issue| {
+                const needle = case.needle orelse return error.ExpectedAcceptance;
+                try testing.expect(std.mem.indexOf(u8, issue.message, needle) != null);
+            },
+        }
+    }
+}
+
 test "bash validates optional argument types and escalation pairing" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -535,10 +612,10 @@ test "bash validates optional argument types and escalation pairing" {
         .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"timeoutMs\":\"fast\"}", .needle = "invalid timeoutMs: expected a positive number" },
         .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"workdir\":7}", .needle = "invalid workdir: expected a string" },
         .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"run_in_background\":\"yes\"}", .needle = "invalid run_in_background: expected a boolean" },
-        .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"sandbox_permissions\":\"workspace-write\"}", .needle = "sandbox_permissions requires a justification" },
+        .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"sandbox_permissions\":\"danger-full-access\"}", .needle = "sandbox_permissions requires a justification" },
         .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"justification\":\"because\"}", .needle = "justification is only valid together with sandbox_permissions" },
         .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"sandbox_permissions\":\"root\",\"justification\":\"because\"}", .needle = "invalid sandbox_permissions: expected workspace-write or danger-full-access" },
-        .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"sandbox_permissions\":\"workspace-write\",\"justification\":\"   \"}", .needle = "invalid justification: expected a non-empty sentence" },
+        .{ .json = "{\"description\":\"d\",\"command\":\"echo ok\",\"sandbox_permissions\":\"danger-full-access\",\"justification\":\"   \"}", .needle = "invalid justification: expected a non-empty sentence" },
     };
     for (cases) |case| {
         var parsed = try parse(allocator, case.json);
@@ -699,12 +776,12 @@ test "bash records a sandbox escalation request without escalating" {
     const allocator = arena.allocator();
     var context: Context = .{};
 
-    var parsed = try parse(allocator, "{\"description\":\"Check escalation recording\",\"command\":\"true\",\"sandbox_permissions\":\"workspace-write\",\"justification\":\"Build artifacts must be written.\"}");
+    var parsed = try parse(allocator, "{\"description\":\"Check escalation recording\",\"command\":\"true\",\"sandbox_permissions\":\"danger-full-access\",\"justification\":\"Build artifacts must be written.\"}");
     defer parsed.deinit();
     const result = try invoke(&context, allocator, parsed.value);
     try testing.expectEqualStrings("(no output)", try expectText(result));
     const request = result.success.meta.?.object.get("sandboxRequest").?.object;
-    try testing.expectEqualStrings("workspace-write", request.get("mode").?.string);
+    try testing.expectEqualStrings("danger-full-access", request.get("mode").?.string);
     try testing.expectEqualStrings("Build artifacts must be written.", request.get("justification").?.string);
 }
 

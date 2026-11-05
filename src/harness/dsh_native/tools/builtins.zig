@@ -3,8 +3,9 @@
 //!
 //! Model-visible names, descriptions and input schemas come from
 //! `generated/tool_schemas.zig`; result text comes from
-//! `generated/tool_render.zig`. Paths resolve against the session cwd; every
-//! tool refuses a resolved path outside the workspace/allowed_paths boundary
+//! `generated/tool_render.zig`. Paths expand a leading `~`/`~/` to the host
+//! home (Windows also `~\`), then resolve against the session cwd; every tool
+//! refuses a resolved path outside the workspace/allowed_paths boundary
 //! (see `security.zig`), and `dsh_sandbox = read-only` refuses mutations.
 //!
 //! Bounded deviations from dsh, all documented at their sites: `grep` matches
@@ -12,11 +13,13 @@
 //! file (64 MiB cap), and the walker approximates ripgrep's ignore/symlink
 //! defaults.
 
+const builtin = @import("builtin");
 const std = @import("std");
 const compat = @import("compat");
 const fs_compat = @import("../../../fs_compat.zig");
 const context_mod = @import("../context.zig");
 const generated = @import("../generated/tool_schemas.zig");
+const platform = @import("../../../platform.zig");
 const render = @import("../generated/tool_render.zig");
 const registry = @import("registry.zig");
 const security_mod = @import("security.zig");
@@ -235,9 +238,37 @@ fn blank(text: []const u8) bool {
 // ---------------------------------------------------------------------------
 // Path helpers
 
+/// dsh fs-local `expandHomePrefix` (packages/fs/fs-local/src/fsio.ts): only a
+/// leading `~`, `~/` — and on Windows `~\` — expands to the host home; a
+/// mid-path `~` or a `~user` segment stays literal. Returns `input` itself
+/// (not a copy) when nothing expands.
+fn expandHomePrefix(allocator: Allocator, input: []const u8, home: []const u8) ![]const u8 {
+    // An empty home would turn "~/x" into a root-relative path; keep it literal.
+    if (home.len == 0) return input;
+    const rest: ?[]const u8 = if (std.mem.eql(u8, input, "~"))
+        input[1..]
+    else if (std.mem.startsWith(u8, input, "~/"))
+        input[1..]
+    else if (comptime builtin.os.tag == .windows)
+        (if (std.mem.startsWith(u8, input, "~\\")) input[1..] else null)
+    else
+        null;
+    if (rest) |suffix| return std.fmt.allocPrint(allocator, "{s}{s}", .{ home, suffix });
+    return input;
+}
+
+/// Resolve a leading `~` against the runtime home, then leave the path alone.
+fn expandHome(allocator: Allocator, input: []const u8) ![]const u8 {
+    if (input.len == 0 or input[0] != '~') return input;
+    const home = platform.getHomeDir(allocator) catch return input;
+    defer allocator.free(home);
+    return expandHomePrefix(allocator, input, home);
+}
+
 fn resolvePath(allocator: Allocator, cwd: []const u8, input: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(input)) return std.fs.path.resolve(allocator, &.{input});
-    return std.fs.path.resolve(allocator, &.{ cwd, input });
+    const expanded = try expandHome(allocator, input);
+    if (std.fs.path.isAbsolute(expanded)) return std.fs.path.resolve(allocator, &.{expanded});
+    return std.fs.path.resolve(allocator, &.{ cwd, expanded });
 }
 
 fn relativeDisplay(allocator: Allocator, cwd: []const u8, absolute: []const u8) ![]const u8 {
@@ -281,7 +312,9 @@ fn runRead(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const absolute = try resolvePath(allocator, cwd, file_path);
-    if (!try security_mod.readPathAllowed(allocator, self.scope(), file_path)) {
+    // The security gate must see the same expanded path that resolution used,
+    // or "~/…" would be judged against the cwd instead of the home it names.
+    if (!try security_mod.readPathAllowed(allocator, self.scope(), try expandHome(allocator, file_path))) {
         return outsideDenial(allocator, "read", absolute);
     }
     const kind = fileKind(absolute) catch |err| return fsFailureFor(allocator, "read", absolute, err);
@@ -409,7 +442,7 @@ fn runWrite(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRe
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const absolute = try resolvePath(allocator, cwd, file_path);
     if (self.sandbox == .read_only) return readOnlyDenial(allocator, "write", file_path);
-    if (!try security_mod.pathAllowed(allocator, self.scope(), file_path)) {
+    if (!try security_mod.pathAllowed(allocator, self.scope(), try expandHome(allocator, file_path))) {
         return outsideDenial(allocator, "write", absolute);
     }
 
@@ -463,7 +496,7 @@ fn runEdit(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
     const absolute = try resolvePath(allocator, cwd, file_path);
     if (self.sandbox == .read_only) return readOnlyDenial(allocator, "edit", file_path);
-    if (!try security_mod.pathAllowed(allocator, self.scope(), file_path)) {
+    if (!try security_mod.pathAllowed(allocator, self.scope(), try expandHome(allocator, file_path))) {
         return outsideDenial(allocator, "edit", absolute);
     }
 
@@ -627,9 +660,12 @@ fn runGrep(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     if (path_arg) |path| {
         if (blank(path)) return invalidArg(allocator, "path must be a non-empty string when given");
     }
+    // Upstream parseGrepArgs (grep.ts): an exact empty `include` is treated as
+    // omitted; whitespace-only values remain invalid.
     const include_arg = stringField(args, "include");
-    if (include_arg) |include| {
-        if (blank(include)) return invalidArg(allocator, "include must be a non-empty glob when given");
+    const include: ?[]const u8 = if (include_arg) |value| (if (value.len == 0) null else value) else null;
+    if (include) |value| {
+        if (blank(value)) return invalidArg(allocator, "include must be a non-empty glob when given");
     }
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
@@ -643,7 +679,7 @@ fn runGrep(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     }
 
     var include_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (include_arg) |include| try expandBraces(allocator, include, &include_patterns);
+    if (include) |value| try expandBraces(allocator, value, &include_patterns);
 
     var matches: std.ArrayListUnmanaged(GrepMatch) = .empty;
     var walk = GrepWalk{
@@ -1316,7 +1352,6 @@ test "write refuses a dangling symlink instead of following it outside" {
     // Regression: the workspace check resolved a dangling final symlink through
     // its parent and allowed it; create(truncate) then followed the link and
     // created the target outside the workspace.
-    const builtin = @import("builtin");
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1545,6 +1580,44 @@ test "grep groups matches by file, honors include, and reports no matches" {
     try testing.expectEqualStrings(render.grep.no_matches, none);
 }
 
+// Upstream: dsh-v0.2.2-rc.1 tool-fs-search/src/grep.ts parseGrepArgs — an exact
+// empty `include` is treated as omitted; whitespace-only stays invalid.
+test "grep treats an exact empty include as omitted and still rejects blank" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    _ = try tools.writeFile("one.zig", "needle zig\n");
+    _ = try tools.writeFile("two.log", "needle log\n");
+
+    // Regression: a blank include used to fail even when it was exactly empty,
+    // so `include: ""` (the model's way of saying "no filter") errored out.
+    const unfiltered = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "include", .{ .string = "" } },
+    })));
+    const one_path = try std.fs.path.join(arena, &.{"one.zig"});
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "Found 2 matches\n\n{s}\nLine 1: needle zig\n\ntwo.log\nLine 1: needle log", .{one_path}),
+        unfiltered,
+    );
+
+    const blank_include = try expectFailure(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "include", .{ .string = "   " } },
+    })), "INVALID_ARGUMENT");
+    try testing.expectEqualStrings("include must be a non-empty glob when given", blank_include);
+
+    const filtered = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "include", .{ .string = "*.zig" } },
+    })));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "Found 1 match\n\n{s}\nLine 1: needle zig", .{one_path}), filtered);
+}
+
 test "grep strips the CR of a CRLF terminator from matched lines" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
@@ -1711,4 +1784,137 @@ test "a path argument anchors grep and glob to a subtree" {
         .{ "path", .{ .string = "sub" } },
     })));
     try testing.expectEqualStrings(inside_path, glob);
+}
+
+// Upstream: dsh-v0.2.2-rc.1 packages/fs/fs-local/src/fsio.ts expandHomePrefix.
+test "expandHomePrefix expands only a leading tilde" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const home = "/home/example";
+
+    const Case = struct { input: []const u8, expected: []const u8 };
+    const cases = [_]Case{
+        .{ .input = "~", .expected = home },
+        .{ .input = "~/", .expected = home ++ "/" },
+        .{ .input = "~/a", .expected = home ++ "/a" },
+        .{ .input = "~/a/b.txt", .expected = home ++ "/a/b.txt" },
+        .{ .input = "a/~/b", .expected = "a/~/b" },
+        .{ .input = "~/a/~/b", .expected = home ++ "/a/~/b" },
+        .{ .input = "~user", .expected = "~user" },
+        .{ .input = "~user/a", .expected = "~user/a" },
+        .{ .input = "", .expected = "" },
+        .{ .input = "/abs/path", .expected = "/abs/path" },
+        .{ .input = "rel/path", .expected = "rel/path" },
+    };
+    for (cases) |case| {
+        try testing.expectEqualStrings(case.expected, try expandHomePrefix(arena, case.input, home));
+    }
+
+    // A backslash prefix is Windows-only; POSIX keeps it literal.
+    if (comptime builtin.os.tag == .windows) {
+        try testing.expectEqualStrings(home ++ "\\a", try expandHomePrefix(arena, "~\\a", home));
+        try testing.expectEqualStrings(home, try expandHomePrefix(arena, "~", home));
+    } else {
+        try testing.expectEqualStrings("~\\a", try expandHomePrefix(arena, "~\\a", home));
+    }
+
+    // An empty home leaves every input literal instead of making it root-relative.
+    try testing.expectEqualStrings("~/a", try expandHomePrefix(arena, "~/a", ""));
+}
+
+fn testHomeEnvName() []const u8 {
+    return if (comptime builtin.os.tag == .windows) "USERPROFILE" else "HOME";
+}
+
+test "file tools expand a leading tilde against the runtime home" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    // A fabricated home inside the workspace, so the expansion is observable and
+    // the read stays inside the boundary.
+    const home = try std.fs.path.join(arena, &.{ tools.base, "fake home" });
+    try fs_compat.makePath(home);
+    const note = try std.fs.path.join(arena, &.{ home, "note.txt" });
+    {
+        const file = try fs_compat.createPath(note, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("home note\n");
+    }
+
+    const env_name = testHomeEnvName();
+    var guard = try platform.TestEnvGuard.captureAndClear(testing.allocator, &.{env_name});
+    defer guard.deinit();
+    try platform.setProcessEnv(testing.allocator, env_name, home);
+
+    const cwd = try std.fs.path.resolve(arena, &.{tools.builtins.cwd});
+    try testing.expectEqualStrings(home, try resolvePath(arena, cwd, "~"));
+    try testing.expectEqualStrings(note, try resolvePath(arena, cwd, "~/note.txt"));
+    // Mid-path `~` and `~user` stay cwd-relative literals.
+    try testing.expectEqualStrings(
+        try std.fs.path.join(arena, &.{ cwd, "a", "~", "b" }),
+        try resolvePath(arena, cwd, "a/~/b"),
+    );
+    try testing.expectEqualStrings(
+        try std.fs.path.join(arena, &.{ cwd, "~user", "x" }),
+        try resolvePath(arena, cwd, "~user/x"),
+    );
+
+    const read = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, "~/note.txt")));
+    try testing.expect(std.mem.indexOf(u8, read, "home note") != null);
+}
+
+test "an expanded home path that escapes the workspace is denied" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var outside_tmp = std.testing.tmpDir(.{});
+    defer outside_tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    const outside_home = try compat.fs.Dir.wrap(outside_tmp.dir).realpathAlloc(arena, ".");
+    const secret = try std.fs.path.join(arena, &.{ outside_home, "secret.txt" });
+    {
+        const file = try fs_compat.createPath(secret, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll("outside secret\n");
+    }
+
+    const env_name = testHomeEnvName();
+    var guard = try platform.TestEnvGuard.captureAndClear(testing.allocator, &.{env_name});
+    defer guard.deinit();
+    try platform.setProcessEnv(testing.allocator, env_name, outside_home);
+
+    // Regression: the security gate used to receive the unexpanded "~/secret.txt",
+    // which resolved inside the cwd, so the denial named the wrong path.
+    const denied = try expectFailure(try callRead(&tools.builtins, arena, try argsFilePath(arena, "~/secret.txt")), "FS_SANDBOX_DENIED");
+    try testing.expect(std.mem.indexOf(u8, denied, secret) != null);
+    _ = try expectFailure(try callWrite(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "~/new.txt" } },
+        .{ "content", .{ .string = "nope" } },
+    })), "FS_SANDBOX_DENIED");
+    _ = try expectFailure(try callEdit(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "file_path", .{ .string = "~/secret.txt" } },
+        .{ "old_string", .{ .string = "outside" } },
+        .{ "new_string", .{ .string = "changed" } },
+    })), "FS_SANDBOX_DENIED");
+    _ = try expectFailure(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "secret" } },
+        .{ "path", .{ .string = "~" } },
+    })), "FS_SANDBOX_DENIED");
+    _ = try expectFailure(try callGlob(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "*.txt" } },
+        .{ "path", .{ .string = "~" } },
+    })), "FS_SANDBOX_DENIED");
+    try testing.expectError(error.FileNotFound, fs_compat.openPath(try std.fs.path.join(arena, &.{ outside_home, "new.txt" }), .{}));
+
+    // allowed_paths still widens exactly the expanded home.
+    tools.builtins.allowed_paths = &.{outside_home};
+    _ = try expectSuccess(try callRead(&tools.builtins, arena, try argsFilePath(arena, "~/secret.txt")));
 }

@@ -54,7 +54,9 @@ const SUMMARIZER = 'packages/compaction/compaction-basic/src/summarizer.ts'
 const PRUNER_CONFIG = 'packages/compaction/compaction-tool-result-pruner/src/config.ts'
 const USER_APPROVAL = 'packages/interaction/user-approval/src/index.ts'
 const CORE_TOOLS = 'packages/core/tools/src/index.ts'
+const PIPELINE = 'packages/core/tools/src/pipeline.ts'
 const TOOL_ASK_USER = 'packages/interaction/tool-ask-user/src/index.ts'
+const TOOL_ASK_USER_TIMED = 'packages/interaction/tool-ask-user/src/timed.ts'
 const PLAN_MODE = 'packages/plan/plan-mode/src/index.ts'
 const TOOL_TODO = 'packages/todo/tool-todo/src/index.ts'
 const BASE_BUNDLE = 'packages/bundle/base/cordis.patch.yml'
@@ -105,6 +107,30 @@ function C(id, file, start, end, value) {
   const source = readSource(file)
   return { id, file, start, end, value, source_sha256: source.sha, content_sha256: sha256hex(Buffer.from(value, 'utf8')) }
 }
+
+// Model-visible literals that dsh 0.2.2-rc.1 changed or removed but junclaw
+// still needs. Each entry keeps the dsh-v0.2.1-rc.2 text verbatim and records
+// the rc.2 file/range as provenance; the value is literal, so generation stays
+// identical against any dsh checkout and `--check` still gates the output.
+//
+// Deviation: B-6 not followed (fs-observation-policy stays enabled in junclaw,
+// so the default-policy parenthetical remains accurate);
+// dsh-v0.2.1-rc.2 packages/fs/tool-fs/src/write.ts:68-70 and
+// packages/fs/tool-fs/src/edit.ts:82 (dsh-v0.2.1-rc.2 687f282e).
+// Deviation: junclaw has no `tool:jobs` prompt section, so the promoted-call
+// hand-off guidance (and the newline that separates it from the marker) stays;
+// dsh-v0.2.1-rc.2 packages/shell/tool-bash/src/render.ts:81-83 (687f282e).
+// Deviation: the rc.1 exit_plan_mode condition change is outside section B;
+// junclaw keeps the distinct "requires a calling agent" failure;
+// dsh-v0.2.1-rc.2 packages/plan/plan-mode/src/index.ts:300 (687f282e).
+function pinned(id, file, start, end, value, sourceSha256) {
+  return { id, file, start, end, value, source_sha256: sourceSha256, content_sha256: sha256hex(Buffer.from(value, 'utf8')) }
+}
+
+const RC2_WRITE_SHA = '87287ca7774af83f8c4841a78bfcfe213c684d172648c7b108a0539d5c674d47'
+const RC2_EDIT_SHA = '2602b2482f5234ab26cddf656cbe0020b53dc69a36bb8a835b57a55ed23a2055'
+const RC2_BASH_RENDER_SHA = 'bfb17540c1902fc0a996ea3833f2a1df18a13cf0c764d1a3f50d11d3f733aedb'
+const RC2_PLAN_MODE_SHA = '748199b16bd9c93b6eda926b0af8c72405585037a5f88cadb290857d0af5b69f'
 
 // A YAML literal block scalar (`section: |`). The base bundle's plan guidance
 // is the deployment-owned plan:policy text; YAML clip chomping keeps one
@@ -400,17 +426,22 @@ function numberConst(name, ext) {
 // Manifest
 
 const sysEntries = [
-  E('identity_text', SYS, 453, 453),
-  E('persona_prefix_section', SYS, 190, 190),
-  E('persona_suffix_section', SYS, 193, 193),
-  E('persona_prefix_default', SYS, 460, 460),
-  E('persona_suffix_default', SYS, 465, 465),
-  E('tool_order_rest', SYS, 202, 202),
+  E('identity_text', SYS, 460, 460),
+  E('persona_prefix_section', SYS, 197, 197),
+  E('persona_suffix_section', SYS, 200, 200),
+  E('persona_prefix_default', SYS, 467, 467),
+  E('persona_suffix_default', SYS, 472, 472),
+  E('tool_order_rest', SYS, 209, 209),
   E('read_prompt', READ, 74, 74),
-  E('write_prompt', WRITE, 68, 70, { pick: [0, 2, 3, 4] }),
-  E('edit_prompt', EDIT, 82, 82),
-  E('glob_prompt', GLOB, 302, 302),
-  E('grep_prompt', GREP, 280, 281, { pick: [0, 3] }),
+  pinned('write_prompt', WRITE, 68, 70,
+    'Read an existing file before overwriting it with write (the default fs-observation-policy requires it)'
+      + ' and prefer edit for targeted changes.',
+    RC2_WRITE_SHA),
+  pinned('edit_prompt', EDIT, 82, 82,
+    'Read a file before editing it (the default fs-observation-policy requires it), unless you just created or edited it in this session.',
+    RC2_EDIT_SHA),
+  E('glob_prompt', GLOB, 317, 317),
+  E('grep_prompt', GREP, 282, 283, { pick: [0, 3] }),
   E('bash_prompt', BASH, 254, 254),
 ]
 
@@ -468,26 +499,26 @@ const tools = [
   {
     module: 'grep',
     file: GREP,
-    name: E('grep.name', GREP, 285, 285),
-    description: E('grep.description', GREP, 286, 287, { subs: { 'caps.maxMatches': '250' } }),
-    schemaRange: [289, 291],
+    name: E('grep.name', GREP, 287, 287),
+    description: E('grep.description', GREP, 288, 289, { subs: { 'caps.maxMatches': '250' } }),
+    schemaRange: [291, 293],
     params: [
-      { name: 'pattern', type: 'string', required: true, desc: E('grep.pattern.description', GREP, 289, 289, { pick: [1] }) },
-      { name: 'path', type: 'string', required: false, desc: E('grep.path.description', GREP, 290, 290, { pick: [1] }) },
-      { name: 'include', type: 'string', required: false, desc: E('grep.include.description', GREP, 291, 291, { pick: [1] }) },
+      { name: 'pattern', type: 'string', required: true, desc: E('grep.pattern.description', GREP, 291, 291, { pick: [1] }) },
+      { name: 'path', type: 'string', required: false, desc: E('grep.path.description', GREP, 292, 292, { pick: [1] }) },
+      { name: 'include', type: 'string', required: false, desc: E('grep.include.description', GREP, 293, 293, { pick: [1] }) },
     ],
   },
   {
     module: 'glob',
     file: GLOB,
-    name: E('glob.name', GLOB, 307, 307),
-    description: E('glob.description', GLOB, 308, 310, {
+    name: E('glob.name', GLOB, 322, 322),
+    description: E('glob.description', GLOB, 323, 325, {
       subs: { 'caps.maxResults': '100', overCapDescription: 'keeps the first paths' },
     }),
-    schemaRange: [315, 318],
+    schemaRange: [327, 333],
     params: [
-      { name: 'pattern', type: 'string', required: true, desc: E('glob.pattern.description', GLOB, 315, 316, { pick: [0, 1] }) },
-      { name: 'path', type: 'string', required: false, desc: E('glob.path.description', GLOB, 318, 318, { pick: [1] }) },
+      { name: 'pattern', type: 'string', required: true, desc: E('glob.pattern.description', GLOB, 330, 331, { pick: [0, 1] }) },
+      { name: 'path', type: 'string', required: false, desc: E('glob.path.description', GLOB, 333, 333, { pick: [1] }) },
     ],
   },
   {
@@ -533,11 +564,11 @@ const tools = [
   {
     module: 'exit_plan_mode',
     file: PLAN_MODE,
-    name: E('exit_plan_mode.name', PLAN_MODE, 66, 66),
-    description: E('exit_plan_mode.description', PLAN_MODE, 84, 86),
-    schemaRange: [280, 282],
+    name: E('exit_plan_mode.name', PLAN_MODE, 64, 64),
+    description: E('exit_plan_mode.description', PLAN_MODE, 82, 84),
+    schemaRange: [283, 285],
     params: [
-      { name: 'plan', type: 'string', required: true, desc: E('exit_plan_mode.plan.description', PLAN_MODE, 281, 281, { pick: [1] }) },
+      { name: 'plan', type: 'string', required: true, desc: E('exit_plan_mode.plan.description', PLAN_MODE, 284, 284, { pick: [1] }) },
     ],
   },
 ]
@@ -614,35 +645,35 @@ const renderGroups = [
       E('edit.error_empty_path', EDIT, 48, 48),
       E('edit.error_empty_old', EDIT, 49, 49),
       E('edit.error_equal', EDIT, 50, 50),
-      E('edit.error_not_observed', FS_ERROR, 25, 25, { subs: { displayPath: '{s}' } }),
-      E('edit.error_stale_suffix', FS_ERROR, 31, 31, { subs: { 'error.message': '{s}' } }),
+      E('edit.error_not_observed', FS_ERROR, 33, 33, { subs: { displayPath: '{s}' } }),
+      E('edit.error_stale_suffix', FS_ERROR, 39, 39, { subs: { 'error.message': '{s}' } }),
     ],
   },
   {
     name: 'grep',
     consts: [
-      E('grep.header_truncated', GREP, 217, 217, { subs: { 'retained.kept': '{d}', 'retained.seen': '{d}' } }),
-      E('grep.header_found', GREP, 218, 218, { subs: { 'retained.seen': '{d}', 'matchNoun(retained.seen)': '{s}' } }),
-      E('grep.match_singular', GREP, 181, 181, { pick: 0 }),
-      E('grep.match_plural', GREP, 181, 181, { pick: 1 }),
-      E('grep.recovery_saved', GREP, 222, 222, {
+      E('grep.header_truncated', GREP, 219, 219, { subs: { 'retained.kept': '{d}', 'retained.seen': '{d}' } }),
+      E('grep.header_found', GREP, 220, 220, { subs: { 'retained.seen': '{d}', 'matchNoun(retained.seen)': '{s}' } }),
+      E('grep.match_singular', GREP, 183, 183, { pick: 0 }),
+      E('grep.match_plural', GREP, 183, 183, { pick: 1 }),
+      E('grep.recovery_saved', GREP, 224, 224, {
         subs: { 'spillRef.locator': '{s}', 'spillRef.retrievalHint': '{s}' },
       }),
-      E('grep.recovery_unsaved', GREP, 223, 223),
-      E('grep.no_matches', GREP, 229, 229),
+      E('grep.recovery_unsaved', GREP, 225, 225),
+      E('grep.no_matches', GREP, 231, 231),
     ],
   },
   {
     name: 'glob',
     consts: [
-      E('glob.no_files', GLOB, 232, 232),
-      E('glob.sampled_basis', GLOB, 216, 216, { subs: { 'sample.shown': '{d}', 'sample.total': '{d}' } }),
-      E('glob.narrow_hint', GLOB, 217, 217, { pick: 0 }),
-      E('glob.recovery_saved', GLOB, 225, 225, {
+      E('glob.no_files', GLOB, 247, 247),
+      E('glob.sampled_basis', GLOB, 231, 231, { subs: { 'sample.shown': '{d}', 'sample.total': '{d}' } }),
+      E('glob.narrow_hint', GLOB, 232, 232, { pick: 0 }),
+      E('glob.recovery_saved', GLOB, 240, 240, {
         subs: { 'spillRef.locator': '{s}', 'spillRef.retrievalHint': '{s}' },
       }),
-      E('glob.recovery_unsaved', GLOB, 226, 226),
-      E('glob.page', GLOB, 227, 227, {
+      E('glob.recovery_unsaved', GLOB, 241, 241),
+      E('glob.page', GLOB, 242, 242, {
         subs: { body: '{s}', 'items.length': '{d}', seen: '{d}', basis: '{s}', recovery: '{s}' },
       }),
     ],
@@ -659,14 +690,19 @@ const renderGroups = [
       E('bash.stopped', BASH_RENDER, 56, 56, { subs: { 'result.stopped': '{s}' } }),
       E('bash.killed_by_signal', BASH_RENDER, 58, 58, { subs: { 'result.signal': '{s}' } }),
       E('bash.exit_code', BASH_RENDER, 60, 60, { subs: { 'result.exitCode': '{d}' } }),
-      E('bash.promoted', BASH_RENDER, 81, 81, {
-        subs: { body: '{s}', 'promoted.timeoutMs': '{d}', 'promoted.jobId': '{s}' },
-      }),
-      E('bash.promoted_hint', BASH_RENDER, 82, 83),
-      E('bash.lossy_notice', BASH_RENDER, 108, 108, {
+      // rc.1 dropped the hand-off sentence and its trailing newline; the pinned
+      // pair keeps both (see the deviation table above).
+      pinned('bash.promoted', BASH_RENDER, 81, 81,
+        '{s}[still running after {d}ms; moved to background job {s}]\n',
+        RC2_BASH_RENDER_SHA),
+      pinned('bash.promoted_hint', BASH_RENDER, 82, 83,
+        'The command keeps running in the background. You will be notified when it finishes; '
+          + 'read newer output with job_output, stop it with job_kill.',
+        RC2_BASH_RENDER_SHA),
+      E('bash.lossy_notice', BASH_RENDER, 106, 106, {
         subs: { "spillPaths.length > 0 ? spillPaths.join(', ') : '(unavailable)'": '{s}' },
       }),
-      E('bash.sandbox_runner_failed', BASH_RENDER, 111, 111, { subs: { 'sandbox.mode': '{s}' } }),
+      E('bash.sandbox_runner_failed', BASH_RENDER, 109, 109, { subs: { 'sandbox.mode': '{s}' } }),
     ],
   },
   {
@@ -682,7 +718,7 @@ const renderGroups = [
   {
     name: 'todo_write',
     consts: [
-      E('todo_write.success', TOOL_TODO, 189, 189, {
+      E('todo_write.success', TOOL_TODO, 190, 190, {
         subs: {
           'value.counts.pending': '{d}',
           'value.counts.inProgress': '{d}',
@@ -693,7 +729,7 @@ const renderGroups = [
       E('todo_write.error_duplicate_content', TOOL_TODO, 90, 90, {
         subs: { 'JSON.stringify(content)': '{s}' },
       }),
-      E('todo_write.error_requires_agent', TOOL_TODO, 197, 197),
+      E('todo_write.error_requires_agent', TOOL_TODO, 198, 198),
     ],
   },
 ]
@@ -711,7 +747,7 @@ const compactionNumberEntries = [
 function sectionOrders() {
   const source = readSource(SYS)
   const out = []
-  for (let line = 132; line <= 164; line++) {
+  for (let line = 136; line <= 172; line++) {
     const match = source.lines[line - 1].match(/^\s*([A-Z][A-Z0-9_]*):\s*(-?\d+),/)
     if (match === null) continue
     out.push({ name: match[1], value: match[2], line, source_sha256: source.sha })
@@ -743,7 +779,7 @@ function generateSystemPrompt() {
   // Deployment-owned plan:policy text from the base bundle, appended while plan
   // mode is active (PLAN_POLICY order below).
   out += moduleConst('system_prompt', 'plan_policy_text',
-    yamlBlockScalar('plan_policy_text', BASE_BUNDLE, 335, 346))
+    yamlBlockScalar('plan_policy_text', BASE_BUNDLE, 339, 350))
   const orders = sectionOrders()
   out += '\npub const section_orders = struct {\n'
   for (const order of orders) out += `    pub const ${order.name}: i32 = ${order.value};\n`
@@ -796,18 +832,18 @@ function generateToolSchemas() {
     properties: {
       todos: {
         type: 'array',
-        description: extract(E('todo_write.todos.description', TOOL_TODO, 142, 142)).value,
+        description: extract(E('todo_write.todos.description', TOOL_TODO, 143, 143)).value,
         items: {
           type: 'object',
           additionalProperties: false,
           properties: {
             content: {
               type: 'string',
-              description: extract(E('todo_write.content.description', TOOL_TODO, 147, 147, { pick: [1] })).value,
+              description: extract(E('todo_write.content.description', TOOL_TODO, 148, 148, { pick: [1] })).value,
             },
             status: {
               type: 'string',
-              description: extract(E('todo_write.status.description', TOOL_TODO, 152, 152)).value,
+              description: extract(E('todo_write.status.description', TOOL_TODO, 153, 153)).value,
               enum: ['pending', 'in_progress', 'completed'],
             },
           },
@@ -818,13 +854,13 @@ function generateToolSchemas() {
     required: ['todos'],
   })
   out += '\npub const todo_write = struct {\n'
-  out += structConst('tool_schemas', 'todo_write', 'name', extract(E('todo_write.name', TOOL_TODO, 136, 136)))
+  out += structConst('tool_schemas', 'todo_write', 'name', extract(E('todo_write.name', TOOL_TODO, 137, 137)))
   out += structConst('tool_schemas', 'todo_write', 'description', todoDescription)
   out += structConst('tool_schemas', 'todo_write', 'input_schema_json', {
     id: 'todo_write.input_schema_json',
     file: TOOL_TODO,
-    start: 139,
-    end: 156,
+    start: 140,
+    end: 157,
     value: todoSchema,
     source_sha256: readSource(TOOL_TODO).sha,
     content_sha256: sha256hex(Buffer.from(todoSchema, 'utf8')),
@@ -884,28 +920,28 @@ function buildAskUserQuestionSchema() {
     properties: {
       questions: {
         type: 'array',
-        description: askUserDescription(45),
+        description: askUserDescription(46),
         items: {
           type: 'object',
           additionalProperties: true,
           properties: {
-            id: { type: 'string', description: askUserDescription(50, 1) },
-            question: { type: 'string', description: askUserDescription(51, 1) },
-            header: { type: 'string', description: askUserDescription(54) },
+            id: { type: 'string', description: askUserDescription(51, 1) },
+            question: { type: 'string', description: askUserDescription(52, 1) },
+            header: { type: 'string', description: askUserDescription(55) },
             options: {
               type: 'array',
-              description: askUserDescription(58),
+              description: askUserDescription(59),
               items: {
                 type: 'object',
                 additionalProperties: true,
                 properties: {
-                  label: { type: 'string', description: askUserDescription(63, 1) },
-                  description: { type: 'string', description: askUserDescription(64, 1) },
+                  label: { type: 'string', description: askUserDescription(64, 1) },
+                  description: { type: 'string', description: askUserDescription(65, 1) },
                 },
                 required: ['label'],
               },
             },
-            multi_select: { type: 'boolean', description: askUserDescription(70) },
+            multi_select: { type: 'boolean', description: askUserDescription(71) },
           },
           required: ['id', 'question'],
         },
@@ -919,38 +955,43 @@ function generateInteraction() {
   let out = header('approval policy text, ask_user_question tool schema, /plan command/narration text, and exit_plan_mode result/error text', 'B26, B27, B34, B35')
   out += '\npub const approval = struct {\n'
   out += structConst('interaction', 'approval', 'never_sentence',
-    extract(E('approval.never_sentence', USER_APPROVAL, 73, 73)))
+    extract(E('approval.never_sentence', USER_APPROVAL, 74, 74)))
   out += structConst('interaction', 'approval', 'ask_sentence',
-    extract(E('approval.ask_sentence', USER_APPROVAL, 75, 75)))
+    extract(E('approval.ask_sentence', USER_APPROVAL, 76, 76)))
   out += structConst('interaction', 'approval', 'policy_change_notice',
-    extract(E('approval.policy_change_notice', USER_APPROVAL, 191, 191, {
-      subs: { previous: '{s}', policy: '{s}' },
+    extract(E('approval.policy_change_notice', USER_APPROVAL, 218, 218, {
+      subs: { 'POLICY_NOTICE_NAMES[previous]': '{s}', 'POLICY_NOTICE_NAMES[policy]': '{s}' },
     })))
+  // rc.1 moved the approval denials from core/tools/src/index.ts to pipeline.ts.
   const denials = [
-    ['deny_no_service', 1742],
-    ['deny_no_agent', 1748],
-    ['deny_rejected', 1763],
-    ['deny_cancelled', 1767],
-    ['deny_no_channel', 1771],
+    ['deny_no_service', 439],
+    ['deny_no_agent', 445],
+    ['deny_rejected', 460],
+    ['deny_cancelled', 464],
+    ['deny_no_channel', 468],
   ]
   for (const [name, line] of denials) {
     out += structConst('interaction', 'approval', name,
-      extract(E(`approval.${name}`, CORE_TOOLS, line, line, {
+      extract(E(`approval.${name}`, PIPELINE, line, line, {
         pick: 1, subs: { 'exec.name': '{s}' },
       })))
   }
   out += '};\n'
   out += '\npub const ask_user_question = struct {\n'
   out += structConst('interaction', 'ask_user_question', 'name',
-    extract(E('questions.name', TOOL_ASK_USER, 39, 39)))
+    extract(E('questions.name', TOOL_ASK_USER, 40, 40)))
+  // rc.1 composes the base sentence with the shared skipped-answer guidance;
+  // the composed CONTENT_SHA256 covers both anchors.
+  const guidance = extract(E('questions.skipped_answer_guidance', TOOL_ASK_USER_TIMED, 28, 29))
+  const descriptionBase = extract(E('questions.description_base', TOOL_ASK_USER, 31, 31))
   out += structConst('interaction', 'ask_user_question', 'description',
-    extract(E('questions.description', TOOL_ASK_USER, 31, 31)))
+    C('questions.description', TOOL_ASK_USER, 31, 32, descriptionBase.value + guidance.value))
   const schema = buildAskUserQuestionSchema()
   out += structConst('interaction', 'ask_user_question', 'input_schema_json', {
     id: 'questions.input_schema_json',
     file: TOOL_ASK_USER,
-    start: 41,
-    end: 75,
+    start: 42,
+    end: 76,
     value: schema,
     source_sha256: readSource(TOOL_ASK_USER).sha,
     content_sha256: sha256hex(Buffer.from(schema, 'utf8')),
@@ -960,28 +1001,27 @@ function generateInteraction() {
   // Settlement lines also carry the command/done kind literal; pick only the
   // text.
   const planTexts = [
-    ['command_name', 232],
-    ['command_description', 233],
-    ['command_hint', 234],
-    ['off_attachments_error', 238, 1],
-    ['off_committed', 243, 1],
-    ['off_queued', 245, 1],
-    ['off_cancelled', 247, 1],
-    ['off_already_inactive', 254, 1],
-    ['on_committed', 270],
-    ['on_queued', 271],
-    ['narration_on', 467],
-    ['narration_off', 468],
+    ['command_name', 235],
+    ['command_description', 236],
+    ['command_hint', 237],
+    ['off_attachments_error', 241, 1],
+    ['off_committed', 246, 1],
+    ['off_queued', 248, 1],
+    ['off_cancelled', 250, 1],
+    ['off_already_inactive', 257, 1],
+    ['on_committed', 273],
+    ['on_queued', 274],
+    ['narration_on', 473],
+    ['narration_off', 474],
     // exit_plan_mode model-visible result and failure text (B35).
-    ['exit_approved_result', 294],
-    ['exit_dismissed_result', 295],
-    ['exit_requires_agent', 300, undefined, { EXIT_PLAN_MODE: '{s}' }],
-    ['exit_requires_plan_mode', 302, undefined, { EXIT_PLAN_MODE: '{s}' }],
-    ['exit_requires_heading', 305, undefined, { EXIT_PLAN_MODE: '{s}' }],
-    ['exit_no_channel', 309],
-    ['exit_reloaded', 345],
-    ['exit_keep_planning', 352],
-    ['exit_keep_planning_feedback', 353, undefined, { feedback: '{s}' }],
+    ['exit_approved_result', 297],
+    ['exit_dismissed_result', 298],
+    ['exit_requires_plan_mode', 305, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_requires_heading', 308, undefined, { EXIT_PLAN_MODE: '{s}' }],
+    ['exit_no_channel', 312],
+    ['exit_reloaded', 348],
+    ['exit_keep_planning', 355],
+    ['exit_keep_planning_feedback', 356, undefined, { feedback: '{s}' }],
   ]
   for (const [name, line, pick, subs] of planTexts) {
     const opts = {}
@@ -990,6 +1030,11 @@ function generateInteraction() {
     out += structConst('interaction', 'plan_mode', name,
       extract(E(`plan_mode.${name}`, PLAN_MODE, line, line, opts)))
   }
+  // Deviation: rc.1 folded the no-agent case into the plan-mode check; junclaw
+  // keeps the distinct failure (see the deviation table at the top).
+  out += structConst('interaction', 'plan_mode', 'exit_requires_agent',
+    pinned('plan_mode.exit_requires_agent', PLAN_MODE, 300, 300,
+      '{s} requires a calling agent (no session to switch)', RC2_PLAN_MODE_SHA))
   out += '};\n'
   return out
 }
