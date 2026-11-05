@@ -252,7 +252,7 @@ NullClaw 内置了原生的 Anthropic provider，可直接连接 Anthropic API�
 
 比例不是数字或越界、`retain_ratio >= threshold_ratio`，以及非零 context window 下 `headroom_tokens >= context_window` 也会在加载配置时报错。
 
-进程内引擎对自己的工具执行 junclaw 安全策略，因此 dsh 会话不会比 native 更宽。每个工具调用都通过 native 的 autonomy 门禁（`read_only` 级别拒绝执行）和每小时动作上限。`read`、`write`、`edit`、`grep`、`glob`、`bash` 都把路径解析到工作区与 `autonomy.allowed_paths`（符号链接会被规范化），并始终拒绝系统路径；`read` 与 `grep` 额外可读 dsh 自己的 spill 目录，因为 dsh 会把这些截断输出文件告知模型。`bash` 命令通过与 native shell 工具相同的 `allowed_commands` 白名单与低/中/高风险检查，模型提供的 `workdir` 也必须落在同一路径边界内。native 工具需要执行审批时，进程内引擎直接拒绝：它目前没有执行审批通道。
+进程内引擎对自己的工具执行 junclaw 安全策略，因此 dsh 会话不会比 native 更宽。每个工具调用都通过 native 的 autonomy 门禁（`read_only` 级别拒绝执行）和每小时动作上限。`read`、`write`、`edit`、`grep`、`glob`、`bash` 都把路径解析到工作区与 `autonomy.allowed_paths`（符号链接会被规范化），并始终拒绝系统路径；`read` 与 `grep` 额外可读 dsh 自己的 spill 目录，因为 dsh 会把这些截断输出文件告知模型。`read`、`write`、`edit`、`grep`、`glob` 会把路径开头的 `~` 或 `~/`（Windows 上还有 `~\`）展开为宿主主目录，与 dsh 的本地文件提供者一致；路径中间出现的 `~` 与 `~user` 前缀保持字面，边界检查针对展开后的路径执行。`bash` 的 workdir 不做展开。`bash` 命令通过与 native shell 工具相同的 `allowed_commands` 白名单与低/中/高风险检查，模型提供的 `workdir` 也必须落在同一路径边界内。native 工具需要执行审批时，进程内引擎直接拒绝：它目前没有执行审批通道。
 
 P3 状态：进程内引擎已是默认值。省略 `agent.harness` 即保持 `dsh`；`dsh-sidecar` 与 `-Dharness_dsh` 构建的行为不变。该引擎提供审批门禁、用户提问、自动压缩和以下 dsh 斜杠命令：
 
