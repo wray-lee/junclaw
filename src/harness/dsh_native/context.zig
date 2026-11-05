@@ -9,8 +9,10 @@
 //! becomes empty (runtime-context.ts:20,152-163).
 //!
 //! Instructions: dsh's ordered user-global and project-root-to-cwd discovery,
-//! trimmed-content dedup, 65536-byte default budget (omit broader files first,
-//! then truncate the most specific file), and replacement-baseline bookkeeping.
+//! trimmed-content dedup, 65536-byte default budget per chain (omit broader
+//! files first, then truncate the most specific file; the user-global and
+//! project chains are budgeted independently, so a baseline holding both can
+//! reach twice the budget), and replacement-baseline bookkeeping.
 //! The session layer owns the actual `user/message` event and its
 //! `surfaceOp: replace`; this module returns the content plus the seq of the
 //! baseline it replaces.
@@ -433,7 +435,9 @@ pub const Options = struct {
     project_root_markers: []const []const u8 = &default_root_markers,
     /// Ordered same-directory candidates (files.ts:13-15 config defaults).
     instruction_file_candidates: []const []const u8 = &default_file_candidates,
-    /// UTF-8 byte cap for the rendered baseline (dsh default 65536).
+    /// UTF-8 byte cap per instruction chain (dsh default 65536). The
+    /// user-global and project chains each get this budget, so a baseline
+    /// holding both is capped at twice this value.
     max_bytes: usize = default_max_bytes,
     /// Per-file read cap; larger files are ignored (config.ts:13).
     max_source_bytes: usize = default_max_source_bytes,
@@ -567,15 +571,36 @@ pub const BaselineTracker = struct {
     }
 };
 
+/// dsh baselineRenderStyle (render.ts:245-255): the intro depends only on the
+/// replacement flag and whether the full file set is empty.
+fn baselineIntro(replacement: bool, file_count: usize) []const u8 {
+    return if (replacement)
+        (if (file_count == 0) empty_replacement_intro else replacement_intro)
+    else
+        instructions_intro;
+}
+
+/// One file whose section the rendered text holds, with the content it holds.
+const SectionRef = struct {
+    /// Index into the input file slice.
+    index: usize,
+    content: []const u8,
+};
+
+/// dsh `RenderedInstructionContext` (render.ts:41-59). `sections` and
+/// `represented` differ only for a truncated file whose kept content is empty,
+/// and both are empty when the text carries a notice or heading alone.
 const RenderPlan = struct {
     text: []u8,
-    /// Input files `[start..]` survive as sections.
-    start: usize,
-    truncated_content: ?[]const u8 = null,
-    truncated: ?Truncated = null,
-    /// Final compact fallback rendered only a notice/heading, so no file is
-    /// semantically represented.
-    unrepresented: bool = false,
+    /// Files whose sections the text holds, in text order.
+    sections: []const SectionRef = &.{},
+    /// Indices of files the text semantically represents.
+    represented: []const usize = &.{},
+    /// Indices of omitted files, in loaded order.
+    omitted: []const usize = &.{},
+    truncated: []const Truncated = &.{},
+    /// Intro block of the frame; null when the text has no frame.
+    intro: ?[]const u8 = null,
 };
 
 fn buildBaseline(
@@ -589,52 +614,32 @@ fn buildBaseline(
     // Every allocation finishes before the arena state is copied into the
     // returned struct (arena red line).
     const allocator = arena.allocator();
-    const plan = try planRender(allocator, files, max_bytes, replacement);
+    const plan = try planRenderChains(allocator, files, max_bytes, replacement);
 
     var represented: []RenderedFile = &.{};
-    if (!plan.unrepresented) {
-        if (plan.truncated) |truncated| {
-            if (truncated.included_bytes > 0 or truncated.original_bytes == 0) {
-                const file = files[files.len - 1];
-                const out = try allocator.alloc(RenderedFile, 1);
-                out[0] = .{
-                    .absolute_path = file.absolute_path,
-                    .display_path = file.display_path,
-                    .content = plan.truncated_content.?,
-                };
-                represented = out;
-            }
-        } else {
-            const out = try allocator.alloc(RenderedFile, files.len - plan.start);
-            for (files[plan.start..], 0..) |file, index| {
-                out[index] = .{
-                    .absolute_path = file.absolute_path,
-                    .display_path = file.display_path,
-                    .content = file.content,
-                };
-            }
-            represented = out;
-        }
-    }
-
-    const omitted_end = if (plan.truncated != null) files.len - 1 else plan.start;
-    var omitted: []Omitted = &.{};
-    if (omitted_end > 0) {
-        const out = try allocator.alloc(Omitted, omitted_end);
-        for (files[0..omitted_end], 0..) |file, index| {
-            out[index] = .{
+    if (plan.represented.len > 0) {
+        const out = try allocator.alloc(RenderedFile, plan.represented.len);
+        for (plan.represented, 0..) |index, position| {
+            const file = files[index];
+            out[position] = .{
                 .absolute_path = file.absolute_path,
                 .display_path = file.display_path,
+                .content = sectionContent(plan.sections, index),
+            };
+        }
+        represented = out;
+    }
+
+    var omitted: []Omitted = &.{};
+    if (plan.omitted.len > 0) {
+        const out = try allocator.alloc(Omitted, plan.omitted.len);
+        for (plan.omitted, 0..) |index, position| {
+            out[position] = .{
+                .absolute_path = files[index].absolute_path,
+                .display_path = files[index].display_path,
             };
         }
         omitted = out;
-    }
-
-    var truncated_list: []Truncated = &.{};
-    if (plan.truncated) |truncated| {
-        const out = try allocator.alloc(Truncated, 1);
-        out[0] = truncated;
-        truncated_list = out;
     }
 
     return .{
@@ -642,27 +647,67 @@ fn buildBaseline(
         .text = plan.text,
         .files = represented,
         .omitted = omitted,
-        .truncated = truncated_list,
+        .truncated = plan.truncated,
         .identity = identity,
         .replacement = replacement,
         .replace_seq = replace_seq,
     };
 }
 
+fn sectionContent(sections: []const SectionRef, index: usize) []const u8 {
+    for (sections) |section| {
+        if (section.index == index) return section.content;
+    }
+    return "";
+}
+
+fn indexRange(allocator: Allocator, start: usize, end: usize) ![]usize {
+    const out = try allocator.alloc(usize, end - start);
+    for (out, 0..) |*slot, offset| slot.* = start + offset;
+    return out;
+}
+
+fn sectionRange(allocator: Allocator, files: []const LoadedFile, start: usize, end: usize) ![]SectionRef {
+    const out = try allocator.alloc(SectionRef, end - start);
+    for (out, 0..) |*slot, offset| slot.* = .{
+        .index = start + offset,
+        .content = files[start + offset].content,
+    };
+    return out;
+}
+
+fn singleSection(allocator: Allocator, index: usize, content: []const u8) ![]SectionRef {
+    const out = try allocator.alloc(SectionRef, 1);
+    out[0] = .{ .index = index, .content = content };
+    return out;
+}
+
+fn singleTruncated(allocator: Allocator, truncated: Truncated) ![]Truncated {
+    const out = try allocator.alloc(Truncated, 1);
+    out[0] = truncated;
+    return out;
+}
+
+/// dsh renderInstructionContext (render.ts:363-421): render one chain of files
+/// under `max_bytes` — keep everything when it fits, else omit the broadest
+/// files, truncate the most specific one, keep only its heading, and finally
+/// keep only the notice. Indices refer to `files`.
 fn planRender(
     allocator: Allocator,
     files: []const LoadedFile,
     max_bytes: usize,
     replacement: bool,
 ) !RenderPlan {
-    const intro = if (replacement)
-        (if (files.len == 0) empty_replacement_intro else replacement_intro)
-    else
-        instructions_intro;
+    const intro = baselineIntro(replacement, files.len);
 
     const full_text = try buildInstructionText(allocator, files, max_bytes, &.{}, null, intro, true);
     if (full_text.len <= max_bytes) {
-        return .{ .text = full_text, .start = 0 };
+        return .{
+            .text = full_text,
+            .sections = try sectionRange(allocator, files, 0, files.len),
+            .represented = try indexRange(allocator, 0, files.len),
+            .intro = intro,
+        };
     }
     allocator.free(full_text);
 
@@ -680,18 +725,27 @@ fn planRender(
             intro,
             true,
         );
-        if (text.len <= max_bytes) return .{ .text = text, .start = start };
+        if (text.len <= max_bytes) {
+            return .{
+                .text = text,
+                .sections = try sectionRange(allocator, files, start, files.len),
+                .represented = try indexRange(allocator, start, files.len),
+                .omitted = try indexRange(allocator, 0, start),
+                .intro = intro,
+            };
+        }
         allocator.free(text);
     }
 
     // Even the most specific file alone is too large: truncate it. Try the
     // normal intro first, then dsh's shorter compact intro.
-    if (files.len == 0) return .{ .text = try allocator.dupe(u8, ""), .start = 0 };
+    if (files.len == 0) return .{ .text = try allocator.dupe(u8, "") };
 
     const most_specific = files[files.len - 1];
     const omitted = try omittedDisplays(allocator, files[0 .. files.len - 1]);
     defer allocator.free(omitted);
     const original_bytes = most_specific.content.len;
+    const omitted_indices = try indexRange(allocator, 0, files.len - 1);
 
     for ([_]bool{ false, true }) |compact| {
         const candidate_intro = if (compact) compact_intro else intro;
@@ -726,15 +780,20 @@ fn planRender(
         if (text.len <= max_bytes) {
             return .{
                 .text = text,
-                .start = files.len - 1,
-                .truncated_content = content,
-                .truncated = truncated,
+                .sections = try singleSection(allocator, files.len - 1, content),
+                .represented = if (content.len > 0 or original_bytes == 0)
+                    try indexRange(allocator, files.len - 1, files.len)
+                else
+                    &.{},
+                .omitted = omitted_indices,
+                .truncated = try singleTruncated(allocator, truncated),
+                .intro = candidate_intro,
             };
         }
         allocator.free(text);
     }
 
-    // Last resort, verbatim dsh render.ts:392-403: either a notice plus the
+    // Last resort, verbatim dsh render.ts:407-420: either a notice plus the
     // file heading, or just the notice, without the system-reminder frame.
     const truncated = Truncated{
         .display_path = most_specific.display_path,
@@ -760,30 +819,153 @@ fn planRender(
     if (heading.len <= max_bytes) {
         return .{
             .text = heading,
-            .start = files.len - 1,
-            .truncated_content = "",
-            .truncated = truncated,
-            .unrepresented = original_bytes != 0,
+            .sections = try singleSection(allocator, files.len - 1, ""),
+            .represented = if (original_bytes == 0)
+                try indexRange(allocator, files.len - 1, files.len)
+            else
+                &.{},
+            .omitted = omitted_indices,
+            .truncated = try singleTruncated(allocator, truncated),
         };
     }
     allocator.free(heading);
 
-    if (marker.len <= max_bytes) {
-        return .{
-            .text = try allocator.dupe(u8, marker),
-            .start = files.len - 1,
-            .truncated_content = "",
-            .truncated = truncated,
-            .unrepresented = true,
-        };
-    }
+    const text = if (marker.len <= max_bytes)
+        try allocator.dupe(u8, marker)
+    else
+        try allocator.dupe(u8, truncateUtf8(marker, max_bytes));
     return .{
-        .text = try allocator.dupe(u8, truncateUtf8(marker, max_bytes)),
-        .start = files.len - 1,
-        .truncated_content = "",
-        .truncated = truncated,
-        .unrepresented = true,
+        .text = text,
+        .omitted = omitted_indices,
+        .truncated = try singleTruncated(allocator, truncated),
     };
+}
+
+/// dsh isUserGlobalInstruction (render.ts:423-425): both user-global roots
+/// share the discovery group `user-global`.
+fn isUserGlobalFile(file: LoadedFile) bool {
+    return std.mem.eql(u8, file.group, "user-global");
+}
+
+/// dsh renderInstructionChains (render.ts:440-482): budget the user-global and
+/// project chains independently under one `max_bytes` each, merge their
+/// records in loaded order, and keep the merged frame only while it stays
+/// within twice the budget; otherwise the single-budget rendering stands.
+fn planRenderChains(
+    allocator: Allocator,
+    files: []const LoadedFile,
+    max_bytes: usize,
+    replacement: bool,
+) !RenderPlan {
+    const whole = try planRender(allocator, files, max_bytes, replacement);
+    if (whole.omitted.len == 0 and whole.truncated.len == 0) return whole;
+
+    var chain_files: [2]std.ArrayListUnmanaged(LoadedFile) = .{ .empty, .empty };
+    var chain_index: [2]std.ArrayListUnmanaged(usize) = .{ .empty, .empty };
+    defer for (&chain_files) |*chain| chain.deinit(allocator);
+    defer for (&chain_index) |*chain| chain.deinit(allocator);
+    for (files, 0..) |file, index| {
+        const chain: usize = if (isUserGlobalFile(file)) 0 else 1;
+        try chain_files[chain].append(allocator, file);
+        try chain_index[chain].append(allocator, index);
+    }
+    if (chain_files[0].items.len == 0 or chain_files[1].items.len == 0) return whole;
+
+    var chains: [2]RenderPlan = undefined;
+    for (&chains, 0..) |*plan, chain| {
+        plan.* = try planRender(allocator, chain_files[chain].items, max_bytes, replacement);
+    }
+
+    // Merged records and sections keep the loaded order. A chain truncates
+    // only its last file, so the chain whose last file loads first lists its
+    // truncation first (render.ts:466-471).
+    const first_last = chain_index[0].items[chain_index[0].items.len - 1];
+    const second_last = chain_index[1].items[chain_index[1].items.len - 1];
+    const truncation_order = if (first_last < second_last) [2]usize{ 0, 1 } else [2]usize{ 1, 0 };
+
+    const sections = try allocator.alloc(SectionRef, chains[0].sections.len + chains[1].sections.len);
+    const represented = try allocator.alloc(usize, chains[0].represented.len + chains[1].represented.len);
+    const omitted = try allocator.alloc(usize, chains[0].omitted.len + chains[1].omitted.len);
+    var section_count: usize = 0;
+    var represented_count: usize = 0;
+    var omitted_count: usize = 0;
+    for (&chains, 0..) |*plan, chain| {
+        for (plan.sections) |section| {
+            sections[section_count] = .{
+                .index = chain_index[chain].items[section.index],
+                .content = section.content,
+            };
+            section_count += 1;
+        }
+        for (plan.represented) |index| {
+            represented[represented_count] = chain_index[chain].items[index];
+            represented_count += 1;
+        }
+        for (plan.omitted) |index| {
+            omitted[omitted_count] = chain_index[chain].items[index];
+            omitted_count += 1;
+        }
+    }
+    std.mem.sort(SectionRef, sections, {}, sectionByIndex);
+    std.mem.sort(usize, represented, {}, std.sort.asc(usize));
+    std.mem.sort(usize, omitted, {}, std.sort.asc(usize));
+
+    const truncated = try allocator.alloc(Truncated, chains[0].truncated.len + chains[1].truncated.len);
+    var truncated_count: usize = 0;
+    for (truncation_order) |chain| {
+        for (chains[chain].truncated) |record| {
+            truncated[truncated_count] = record;
+            truncated_count += 1;
+        }
+    }
+
+    // A chain that kept the full frame decides the intro; otherwise the first
+    // surviving (compact) intro applies; otherwise the frame has none.
+    const style_intro = baselineIntro(replacement, files.len);
+    var intro: []const u8 = "";
+    if (chains[0].intro != null and std.mem.eql(u8, chains[0].intro.?, style_intro)) {
+        intro = style_intro;
+    } else if (chains[1].intro != null and std.mem.eql(u8, chains[1].intro.?, style_intro)) {
+        intro = style_intro;
+    } else if (chains[0].intro) |value| {
+        intro = value;
+    } else if (chains[1].intro) |value| {
+        intro = value;
+    }
+
+    const omitted_displays = try allocator.alloc([]const u8, omitted.len);
+    const views = try allocator.alloc(LoadedFile, sections.len);
+    for (omitted, 0..) |index, position| omitted_displays[position] = files[index].display_path;
+    for (sections, 0..) |section, position| {
+        views[position] = files[section.index];
+        views[position].content = section.content;
+    }
+    const text = try buildInstructionText(
+        allocator,
+        views,
+        max_bytes,
+        omitted_displays,
+        truncated,
+        intro,
+        true,
+    );
+    // Each chain text fits max_bytes; the merged frame exceeds 2 * maxBytes only
+    // by the join beside a frameless chain or by a chain marker cut to fit, and
+    // the single-budget rendering then replaces it (render.ts:477-480).
+    if (text.len > max_bytes *| 2) return whole;
+
+    return .{
+        .text = text,
+        .sections = sections,
+        .represented = represented,
+        .omitted = omitted,
+        .truncated = truncated,
+        .intro = intro,
+    };
+}
+
+fn sectionByIndex(_: void, left: SectionRef, right: SectionRef) bool {
+    return left.index < right.index;
 }
 
 fn truncateToFit(
@@ -1599,4 +1781,241 @@ test "AGENTS.md baseline over 64 KiB frees cleanly" {
     defer baseline.deinit();
     try std.testing.expect(baseline.text.len <= default_max_bytes);
     try std.testing.expectEqual(@as(usize, 1), baseline.truncated.len);
+}
+
+test "AGENTS.md budget gives the user-global and project chains independent budgets" {
+    // Upstream: dsh-v0.2.2-rc.1 renderInstructionChains (render.ts:440-482).
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tree = try TestTree.init(a);
+    defer tree.deinit();
+
+    try tree.write(&.{".git"}, "");
+    const global_content = try a.alloc(u8, 600);
+    @memset(global_content, 'g');
+    try tree.write(&.{ "dsh home", "AGENTS.md" }, global_content);
+    const project_content = try a.alloc(u8, 600);
+    @memset(project_content, 'p');
+    try tree.write(&.{"AGENTS.md"}, project_content);
+
+    var baseline = (try loadBaseline(a, .{
+        .cwd = tree.root,
+        .dsh_home = try tree.path(&.{"dsh home"}),
+        .max_bytes = 400,
+    })).?;
+    defer baseline.deinit();
+
+    // Regression: the single budget omitted the user-global file and only the
+    // project chain survived. Each chain now truncates its own file.
+    try std.testing.expectEqual(@as(usize, 0), baseline.omitted.len);
+    try std.testing.expectEqual(@as(usize, 2), baseline.truncated.len);
+    const home_display_path = try compat.fs.path.join(a, &.{ "$DSH_HOME", "AGENTS.md" });
+    try std.testing.expectEqualStrings(home_display_path, baseline.truncated[0].display_path);
+    try std.testing.expectEqualStrings("AGENTS.md", baseline.truncated[1].display_path);
+    try std.testing.expectEqual(@as(usize, 2), baseline.files.len);
+    try std.testing.expect(baseline.files[0].content.len > 0);
+    try std.testing.expect(baseline.files[1].content.len > 0);
+    const global_heading = try std.fmt.allocPrint(a, "Instructions from: {s}\n\ngg", .{home_display_path});
+    try std.testing.expect(std.mem.indexOf(u8, baseline.text, global_heading) != null);
+    try std.testing.expect(std.mem.indexOf(u8, baseline.text, "Instructions from: AGENTS.md\n\npp") != null);
+    try std.testing.expect(baseline.text.len <= 2 * 400);
+}
+
+fn testLoadedFile(display_path: []const u8, content: []const u8, group: []const u8) LoadedFile {
+    return .{
+        .absolute_path = display_path,
+        .display_path = display_path,
+        .content = content,
+        .group = group,
+    };
+}
+
+test "AGENTS.md chain merge falls back to the exact whole render above twice the budget" {
+    // Upstream: dsh-v0.2.2-rc.1 render.ts:476-480 — each chain text fits
+    // maxBytes, so a merged frame over 2 * maxBytes is replaced wholesale.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const global_content = try a.alloc(u8, 1000);
+    @memset(global_content, 'g');
+    const project_content = try a.alloc(u8, 1000);
+    @memset(project_content, 'p');
+    const files = [_]LoadedFile{
+        testLoadedFile("$DSH_HOME/AGENTS.md", global_content, "user-global"),
+        testLoadedFile("AGENTS.md", project_content, "."),
+    };
+
+    // Both chain texts fit 50 bytes, but the merged frame (158 bytes) would
+    // exceed 2 * 50, so the whole single-budget render stands.
+    {
+        const max_bytes: usize = 50;
+        const whole = try planRender(a, &files, max_bytes, false);
+        const merged = try planRenderChains(a, &files, max_bytes, false);
+        try std.testing.expectEqualStrings("Workspace instruction budget 50 bytes: omitted $DS", whole.text);
+        try std.testing.expectEqualStrings(whole.text, merged.text);
+        try std.testing.expectEqual(@as(usize, max_bytes), merged.text.len);
+        try std.testing.expectEqualSlices(usize, whole.omitted, merged.omitted);
+        try std.testing.expectEqual(whole.truncated.len, merged.truncated.len);
+    }
+
+    // At 80 bytes the merged frame fits 2 * 80 = 160 and replaces the whole
+    // render: each chain contributes its own notice.
+    {
+        const max_bytes: usize = 80;
+        const whole = try planRender(a, &files, max_bytes, false);
+        const merged = try planRenderChains(a, &files, max_bytes, false);
+        try std.testing.expect(whole.text.len <= max_bytes);
+        try std.testing.expect(whole.text.len != merged.text.len);
+        try std.testing.expect(std.mem.indexOf(u8, whole.text, "<system-reminder>") == null);
+        try std.testing.expectEqualStrings(
+            "<system-reminder>\nWorkspace instruction budget 80 bytes: truncated $DSH_HOME/AGENTS.md " ++
+                "from 1000 to 0 bytes, AGENTS.md from 1000 to 0 bytes\n</system-reminder>",
+            merged.text,
+        );
+        try std.testing.expect(merged.text.len <= 2 * max_bytes);
+    }
+}
+
+test "AGENTS.md chains under one budget keep the single-budget render byte for byte" {
+    // Upstream: dsh-v0.2.2-rc.1 render.ts:448-449 — a disabled budget, one
+    // empty chain, or a whole render with no omission/truncation returns the
+    // single-budget rendering unchanged.
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const content = try a.alloc(u8, 600);
+    @memset(content, 'x');
+    const both = [_]LoadedFile{
+        testLoadedFile("$DSH_HOME/AGENTS.md", content, "user-global"),
+        testLoadedFile("AGENTS.md", content, "."),
+    };
+
+    for ([_]usize{ 4096, 65_536 }) |max_bytes| {
+        const whole = try planRender(a, &both, max_bytes, false);
+        const chains = try planRenderChains(a, &both, max_bytes, false);
+        try std.testing.expectEqualStrings(whole.text, chains.text);
+        try std.testing.expectEqual(@as(usize, 2), chains.sections.len);
+        try std.testing.expect(std.mem.indexOf(u8, chains.text, "omitted") == null);
+        try std.testing.expect(std.mem.indexOf(u8, chains.text, "truncated") == null);
+    }
+
+    const global_content = try a.alloc(u8, 600);
+    @memset(global_content, 'g');
+    const global_only = [_]LoadedFile{testLoadedFile("$DSH_HOME/AGENTS.md", global_content, "user-global")};
+    const project_only = [_]LoadedFile{testLoadedFile("AGENTS.md", global_content, ".")};
+
+    for ([_]usize{ 400, 4096 }) |max_bytes| {
+        for ([_][]const LoadedFile{ &global_only, &project_only }) |files| {
+            const whole = try planRender(a, files, max_bytes, false);
+            const chains = try planRenderChains(a, files, max_bytes, false);
+            try std.testing.expectEqualStrings(whole.text, chains.text);
+            try std.testing.expectEqual(whole.sections.len, chains.sections.len);
+            try std.testing.expectEqual(whole.represented.len, chains.represented.len);
+            try std.testing.expectEqual(whole.omitted.len, chains.omitted.len);
+            try std.testing.expectEqual(whole.truncated.len, chains.truncated.len);
+        }
+    }
+
+    // The exact pre-change text for a chain that fits its budget.
+    const small = [_]LoadedFile{testLoadedFile("AGENTS.md", "project rule", ".")};
+    const small_text = (try planRenderChains(a, &small, 4096, false)).text;
+    try std.testing.expectEqualStrings(
+        "<system-reminder>\n" ++ instructions_intro ++ "\n\n" ++
+            "Instructions from: AGENTS.md\n\nproject rule\n</system-reminder>",
+        small_text,
+    );
+}
+
+test "AGENTS.md merged frame picks the intro like upstream renderInstructionChains" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const big = try a.alloc(u8, 1000);
+    @memset(big, 'x');
+    const small = "global rule";
+
+    // One chain keeps the full frame: its intro wins.
+    const framed = [_]LoadedFile{
+        testLoadedFile("$DSH_HOME/AGENTS.md", small, "user-global"),
+        testLoadedFile("AGENTS.md", big, "."),
+    };
+    const framed_plan = try planRenderChains(a, &framed, 400, false);
+    const framed_text = framed_plan.text;
+    try std.testing.expect(std.mem.indexOf(u8, framed_text, instructions_intro) != null);
+    try std.testing.expect(std.mem.indexOf(u8, framed_text, compact_intro) == null);
+
+    // Both chains truncate: the first surviving compact intro applies.
+    const compact = [_]LoadedFile{
+        testLoadedFile("$DSH_HOME/AGENTS.md", big, "user-global"),
+        testLoadedFile("AGENTS.md", big, "."),
+    };
+    const compact_plan = try planRenderChains(a, &compact, 300, false);
+    const compact_text = compact_plan.text;
+    try std.testing.expect(std.mem.indexOf(u8, compact_text, compact_intro) != null);
+    try std.testing.expect(std.mem.indexOf(u8, compact_text, instructions_intro) == null);
+
+    // Both chains fall back to a heading plus notice without a frame: no intro.
+    const frameless_text = (try planRenderChains(a, &compact, 80, false)).text;
+    try std.testing.expect(std.mem.indexOf(u8, frameless_text, instructions_intro) == null);
+    try std.testing.expect(std.mem.indexOf(u8, frameless_text, compact_intro) == null);
+    try std.testing.expectEqualStrings(
+        "<system-reminder>\nWorkspace instruction budget 80 bytes: truncated $DSH_HOME/AGENTS.md " ++
+            "from 1000 to 0 bytes, AGENTS.md from 1000 to 0 bytes\n</system-reminder>",
+        frameless_text,
+    );
+}
+
+test "AGENTS.md merged records keep loaded order and truncations follow last-index order" {
+    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    const content = try a.alloc(u8, 600);
+    @memset(content, 'r');
+    const files = [_]LoadedFile{
+        testLoadedFile("$DSH_HOME/AGENTS.md", content, "user-global"),
+        testLoadedFile("$AGENTS_HOME/AGENTS.md", content, "user-global"),
+        testLoadedFile("AGENTS.md", content, "."),
+        testLoadedFile("sub" ++ compat.fs.path.sep_str ++ "AGENTS.md", content, "sub"),
+    };
+    const plan = try planRenderChains(a, &files, 400, false);
+
+    try std.testing.expectEqual(@as(usize, 2), plan.omitted.len);
+    try std.testing.expectEqualStrings("$DSH_HOME/AGENTS.md", files[plan.omitted[0]].display_path);
+    try std.testing.expectEqualStrings("AGENTS.md", files[plan.omitted[1]].display_path);
+    try std.testing.expectEqual(@as(usize, 2), plan.truncated.len);
+    try std.testing.expectEqualStrings("$AGENTS_HOME/AGENTS.md", plan.truncated[0].display_path);
+    try std.testing.expectEqualStrings("sub" ++ compat.fs.path.sep_str ++ "AGENTS.md", plan.truncated[1].display_path);
+    try std.testing.expectEqual(@as(usize, 2), plan.sections.len);
+    try std.testing.expectEqual(@as(usize, 1), plan.sections[0].index);
+    try std.testing.expectEqual(@as(usize, 3), plan.sections[1].index);
+    try std.testing.expectEqual(@as(usize, 110), plan.sections[0].content.len);
+    try std.testing.expectEqual(@as(usize, 138), plan.sections[1].content.len);
+    try std.testing.expectEqual(@as(usize, 110), plan.truncated[0].included_bytes);
+    try std.testing.expectEqual(@as(usize, 138), plan.truncated[1].included_bytes);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 1, 3 }, plan.represented);
+    try std.testing.expectEqualStrings(compact_intro, plan.intro.?);
+    try std.testing.expectEqual(@as(usize, 622), plan.text.len);
+    try std.testing.expect(plan.text.len <= 2 * 400);
+    // Upstream findLastIndex: the chain whose last file loads first lists its
+    // truncation first, even when its files start later in the list.
+    const interleaved = [_]LoadedFile{
+        testLoadedFile("AGENTS.md", content, "."),
+        testLoadedFile("$DSH_HOME/AGENTS.md", content, "user-global"),
+    };
+    const reversed = try planRenderChains(a, &interleaved, 400, false);
+    try std.testing.expectEqual(@as(usize, 2), reversed.truncated.len);
+    try std.testing.expectEqualStrings("AGENTS.md", reversed.truncated[0].display_path);
+    try std.testing.expectEqualStrings("$DSH_HOME/AGENTS.md", reversed.truncated[1].display_path);
+    try std.testing.expectEqual(@as(usize, 630), reversed.text.len);
+    try std.testing.expect(reversed.text.len <= 2 * 400);
 }
