@@ -2260,6 +2260,7 @@ test "dsh-native adapter: sandbox escalation fails closed without an approval ch
 }
 
 test "dsh-native adapter: repeating the standing sandbox mode needs no approval" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sh -c execution
     // Regression: dsh 0.2.2 (`validateBashArgs` + `approveEscalation`) treats a
     // mode equal to the session's standing mode as a normal call; the port sent
     // every `sandbox_permissions` call through the approval gate.
@@ -2298,6 +2299,7 @@ test "dsh-native adapter: repeating the standing sandbox mode needs no approval"
 }
 
 test "dsh-native adapter: a session mode change reaches the bash tool" {
+    if (comptime @import("builtin").os.tag == .windows) return error.SkipZigTest; // POSIX sh -c execution
     // Regression: the bash context had no standing mode, so after
     // `/permission danger-full-access` a repeated mode still hit the gate.
     const allocator = testing.allocator;
