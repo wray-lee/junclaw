@@ -627,9 +627,12 @@ fn runGrep(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     if (path_arg) |path| {
         if (blank(path)) return invalidArg(allocator, "path must be a non-empty string when given");
     }
+    // Upstream parseGrepArgs (grep.ts): an exact empty `include` is treated as
+    // omitted; whitespace-only values remain invalid.
     const include_arg = stringField(args, "include");
-    if (include_arg) |include| {
-        if (blank(include)) return invalidArg(allocator, "include must be a non-empty glob when given");
+    const include: ?[]const u8 = if (include_arg) |value| (if (value.len == 0) null else value) else null;
+    if (include) |value| {
+        if (blank(value)) return invalidArg(allocator, "include must be a non-empty glob when given");
     }
 
     const cwd = try std.fs.path.resolve(allocator, &.{self.cwd});
@@ -643,7 +646,7 @@ fn runGrep(self: *Builtins, allocator: Allocator, args: Value) !registry.ToolRes
     }
 
     var include_patterns: std.ArrayListUnmanaged([]const u8) = .empty;
-    if (include_arg) |include| try expandBraces(allocator, include, &include_patterns);
+    if (include) |value| try expandBraces(allocator, value, &include_patterns);
 
     var matches: std.ArrayListUnmanaged(GrepMatch) = .empty;
     var walk = GrepWalk{
@@ -1543,6 +1546,44 @@ test "grep groups matches by file, honors include, and reports no matches" {
         .{ "pattern", .{ .string = "missing-token" } },
     })));
     try testing.expectEqualStrings(render.grep.no_matches, none);
+}
+
+// Upstream: dsh-v0.2.2-rc.1 tool-fs-search/src/grep.ts parseGrepArgs — an exact
+// empty `include` is treated as omitted; whitespace-only stays invalid.
+test "grep treats an exact empty include as omitted and still rejects blank" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var tools = try TestTools.init(arena, &tmp);
+
+    _ = try tools.writeFile("one.zig", "needle zig\n");
+    _ = try tools.writeFile("two.log", "needle log\n");
+
+    // Regression: a blank include used to fail even when it was exactly empty,
+    // so `include: ""` (the model's way of saying "no filter") errored out.
+    const unfiltered = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "include", .{ .string = "" } },
+    })));
+    const one_path = try std.fs.path.join(arena, &.{"one.zig"});
+    try testing.expectEqualStrings(
+        try std.fmt.allocPrint(arena, "Found 2 matches\n\n{s}\nLine 1: needle zig\n\ntwo.log\nLine 1: needle log", .{one_path}),
+        unfiltered,
+    );
+
+    const blank_include = try expectFailure(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "include", .{ .string = "   " } },
+    })), "INVALID_ARGUMENT");
+    try testing.expectEqualStrings("include must be a non-empty glob when given", blank_include);
+
+    const filtered = try expectSuccess(try callGrep(&tools.builtins, arena, try objectWith(arena, &.{
+        .{ "pattern", .{ .string = "needle" } },
+        .{ "include", .{ .string = "*.zig" } },
+    })));
+    try testing.expectEqualStrings(try std.fmt.allocPrint(arena, "Found 1 match\n\n{s}\nLine 1: needle zig", .{one_path}), filtered);
 }
 
 test "grep strips the CR of a CRLF terminator from matched lines" {
