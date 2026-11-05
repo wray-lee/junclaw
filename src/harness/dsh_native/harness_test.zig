@@ -2234,7 +2234,7 @@ test "dsh-native adapter: sandbox escalation fails closed without an approval ch
     const allocator = testing.allocator;
     const bash_args =
         "{\"description\":\"d\",\"command\":\"echo hi\"," ++
-        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+        "\"sandbox_permissions\":\"danger-full-access\",\"justification\":\"needed\"}";
     var fx = try Fixture.init(allocator, &.{
         .{ .text = "", .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = bash_args }} },
         .{ .text = "done" },
@@ -2257,6 +2257,83 @@ test "dsh-native adapter: sandbox escalation fails closed without an approval ch
     try testing.expect(std.mem.indexOf(u8, log_text, "\"approval/decided\"") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "ToolApprovalError") != null);
     try testing.expect(std.mem.indexOf(u8, log_text, "APPROVAL_DENIED") != null);
+}
+
+test "dsh-native adapter: repeating the standing sandbox mode needs no approval" {
+    // Regression: dsh 0.2.2 (`validateBashArgs` + `approveEscalation`) treats a
+    // mode equal to the session's standing mode as a normal call; the port sent
+    // every `sandbox_permissions` call through the approval gate.
+    const allocator = testing.allocator;
+    const repeat = "{\"description\":\"d\",\"command\":\"echo hi\",\"sandbox_permissions\":\"workspace-write\"}";
+    const blank = "{\"description\":\"d\",\"command\":\"echo hi\",\"sandbox_permissions\":\"workspace-write\",\"justification\":\"   \"}";
+    const plain = "{\"description\":\"d\",\"command\":\"echo hi\",\"justification\":\"\"}";
+    var fx = try Fixture.init(allocator, &.{
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = repeat }} },
+        .{ .tool_calls = &.{.{ .id = "call-2", .name = "bash", .arguments = blank }} },
+        .{ .tool_calls = &.{.{ .id = "call-3", .name = "bash", .arguments = plain }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const result = try h.runTurn(turnInput("repeat the mode"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/asked"));
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/decided"));
+    var results: usize = 0;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        try testing.expect(!toolResultFailed(event));
+        results += 1;
+    }
+    try testing.expectEqual(@as(usize, 3), results);
+}
+
+test "dsh-native adapter: a session mode change reaches the bash tool" {
+    // Regression: the bash context had no standing mode, so after
+    // `/permission danger-full-access` a repeated mode still hit the gate.
+    const allocator = testing.allocator;
+    const repeated = "{\"description\":\"d\",\"command\":\"echo hi\",\"sandbox_permissions\":\"danger-full-access\"}";
+    var fx = try Fixture.init(allocator, &.{
+        .{ .text = "ready" },
+        .{ .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = repeated }} },
+        .{ .text = "done" },
+    });
+    defer fx.deinit();
+    fx.approval_policy = .ask;
+
+    var engine = try fx.harness();
+    defer engine.deinit(allocator);
+    const h = engine.harness();
+    const first = try h.runTurn(turnInput("hello"));
+    defer allocator.free(first.reply);
+    // The configured mode is workspace-write, so this preset writes the new
+    // sandbox/mode event the harness must fold into the bash context.
+    _ = (try h.handleLocalCommand("/permission danger-full-access")) orelse return error.CommandNotClaimed;
+    const result = try h.runTurn(turnInput("repeat the new mode"));
+    defer allocator.free(result.reply);
+    try testing.expectEqualStrings("done", result.reply);
+
+    const path = try fx.logPath(allocator, engine.session_id);
+    defer allocator.free(path);
+    var read = try session_log.readLog(allocator, path);
+    defer read.deinit();
+    try testing.expectEqual(@as(usize, 0), eventCount(read.events, "approval/asked"));
+    var ran = false;
+    for (read.events) |event| {
+        if (!std.mem.eql(u8, event.event_type, "tool/result")) continue;
+        try testing.expect(!toolResultFailed(event));
+        ran = true;
+    }
+    try testing.expect(ran);
 }
 
 test "dsh-native adapter: pre-step pressure compacts and rewrites the surface" {
@@ -2681,7 +2758,7 @@ test "dsh-native adapter: restore seeds ids past the session log" {
     defer allocator.free(first_text);
     const bash_args =
         "{\"description\":\"d\",\"command\":\"echo hi\"," ++
-        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+        "\"sandbox_permissions\":\"danger-full-access\",\"justification\":\"needed\"}";
     var fx = try Fixture.init(allocator, &.{
         .{ .text = "one" },
         .{ .text = "condensed history" },
@@ -2753,7 +2830,7 @@ test "dsh-native adapter: restore reapplies the logged approval policy" {
     const allocator = poison.allocator();
     const bash_args =
         "{\"description\":\"d\",\"command\":\"echo hi\"," ++
-        "\"sandbox_permissions\":\"workspace-write\",\"justification\":\"needed\"}";
+        "\"sandbox_permissions\":\"danger-full-access\",\"justification\":\"needed\"}";
     var fx = try Fixture.init(allocator, &.{
         .{ .text = "ready" },
         .{ .text = "", .tool_calls = &.{.{ .id = "call-1", .name = "bash", .arguments = bash_args }} },
